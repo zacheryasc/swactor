@@ -55,7 +55,6 @@ impl TokioBackend {
     /// deterministic.
     // The engine's Tokio backend is the substrate owner: it is the one place
     // permitted to construct a Tokio runtime (ENGINE_SPEC.md §2).
-    #[allow(clippy::disallowed_methods)]
     pub fn new(config: TokioConfig) -> Result<Self, EngineError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.worker_threads)
@@ -80,7 +79,6 @@ impl TokioBackend {
 
 /// This impl is the Tokio substrate implementor: it is the one place permitted
 /// to schedule directly on the owned runtime (ENGINE_SPEC.md §2).
-#[allow(clippy::disallowed_methods)]
 impl ExecutionBackend for TokioBackend {
     fn spawn(&self, task: BoxTask) {
         // The handle is used ephemerally and never stored or returned.
@@ -152,7 +150,6 @@ impl LazySleep {
 
 // `LazySleep` arms a `tokio::time::sleep` inside an engine task where the time
 // driver is available; this is the substrate's own time primitive.
-#[allow(clippy::disallowed_methods)]
 impl Future for LazySleep {
     type Output = ();
 

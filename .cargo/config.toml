@@ -1,3 +1,6 @@
+[build]
+rustc-workspace-wrapper = "tools/actor-control-flow-lint/rustc-wrapper.py"
+
 [alias]
 xtask = "run --package xtask --"
 myelin-chat = "run --package xtask -- myelin-chat"

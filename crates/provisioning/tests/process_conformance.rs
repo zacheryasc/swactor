@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use provisioning::plugin::{NodeProvisionSpec, PluginNodeHandle, PluginSink, ProvisionPlugin};
+use swactor_process::{child_kill, child_wait, command_spawn};
 
 use common::{
     AMBIGUOUS_FAULT_MARKER, Fault, PluginBackendAdapter, TestablePlugin, assert_plugin_contracts,
@@ -49,8 +50,8 @@ impl Drop for ProcessPlugin {
         let mut state = self.state.lock();
         let children: Vec<Child> = std::mem::take(&mut state.children).into_values().collect();
         for mut child in children {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child_kill(&mut child);
+            let _ = child_wait(&mut child);
         }
     }
 }
@@ -108,10 +109,10 @@ impl ProvisionPlugin for ProcessPlugin {
         if matches!(fault, Some(Fault::Definite)) {
             return Err("scripted definite failure".to_owned());
         }
-        let child = Command::new("sleep")
-            .arg("infinity")
-            .spawn()
-            .map_err(|error| format!("spawn failed: {error}"))?;
+        let mut command = Command::new("sleep");
+        command.arg("infinity");
+        let child =
+            command_spawn(&mut command).map_err(|error| format!("spawn failed: {error}"))?;
         let pid = child.id();
         state.children.insert(attempt, child);
         state.created += 1;
@@ -141,12 +142,8 @@ impl ProvisionPlugin for ProcessPlugin {
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
         let mut state = self.state.lock();
         if let Some(mut child) = state.children.remove(&handle.id) {
-            child
-                .kill()
-                .map_err(|error| format!("kill failed: {error}"))?;
-            child
-                .wait()
-                .map_err(|error| format!("reap failed: {error}"))?;
+            child_kill(&mut child).map_err(|error| format!("kill failed: {error}"))?;
+            child_wait(&mut child).map_err(|error| format!("reap failed: {error}"))?;
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 //! Behavior guarantees for the `node` module.
 //!
-//! These unit tests drive a manual `SingleThreadRuntime` host in isolation to verify actor
-//! message routing — they are not engine integration tests.
+//! These tests use the engine's deterministic stepping backend to verify actor
+//! message routing without constructing or driving a runtime directly.
 
 use crate::node_actor::{NodeAgentActor, NodeAgentMsg, NodeAgentReport};
 use crate::orchestration::actor::OrchestratorMsg;
@@ -9,13 +9,15 @@ use iroh::{EndpointAddr, SecretKey};
 use myelin::staging as stage;
 use swactor::actor::ActorAddress;
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{RuntimeParts, SingleThreadRuntime};
+use swactor::runtime::RuntimeParts;
+use swactor_engine::{Engine, SteppingBackend};
 
 #[test]
 fn node_agent_runtime_loaded_reports_orchestrator() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
-    let mut host = SingleThreadRuntime::new(parts);
+    let backend = SteppingBackend::new();
+    let _engine = Engine::new(parts, backend.clone()).expect("stepping engine");
     let orchestrator_inbox = runtime
         .new_inbox::<OrchestratorMsg>()
         .expect("orchestrator inbox");
@@ -39,7 +41,7 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
             },
         )
         .expect("send runtime loaded");
-    host.tick();
+    backend.step();
 
     assert_eq!(
         orchestrator_inbox.try_recv(),
@@ -58,7 +60,8 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
 fn node_agent_runtime_ready_ack_reports_worker_loop() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
-    let mut host = SingleThreadRuntime::new(parts);
+    let backend = SteppingBackend::new();
+    let _engine = Engine::new(parts, backend.clone()).expect("stepping engine");
     let orchestrator_inbox = runtime
         .new_inbox::<OrchestratorMsg>()
         .expect("orchestrator inbox");
@@ -84,7 +87,7 @@ fn node_agent_runtime_ready_ack_reports_worker_loop() {
             },
         )
         .expect("send runtime ready ack");
-    host.tick();
+    backend.step();
 
     assert_eq!(
         reports.try_recv(),

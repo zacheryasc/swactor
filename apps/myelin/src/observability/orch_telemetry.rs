@@ -285,7 +285,7 @@ impl DashboardSupport {
             .page_script_urls
             .push(crate::orchestration::control::FLEET_CONTROL_SCRIPT_URL.to_owned());
         let handle = dashboard::DashboardHandle::new(config);
-        engine.spawn(handle.http_server_with_plugins(plugins));
+        handle.spawn_with_plugins(engine, plugins);
         Ok(Some(Self { handle }))
     }
 

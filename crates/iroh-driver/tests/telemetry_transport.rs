@@ -1,15 +1,20 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh_driver::{
-    TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection,
+    TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection, spawn_pull_collector,
     write_available_subscription,
 };
 use swactor::config::RuntimeConfig;
 use swactor::runtime::RuntimeParts;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use telemetry::frame::TelemetryEvent;
-use telemetry::{ChannelContent, Lifetime, NodeId, Position, StreamId, TelemetryEndpoint};
+use telemetry::{
+    ChannelContent, DeliveryFanout, Lifetime, NodeId, Position, StreamId, SubscriptionRequest,
+    TelemetryEndpoint,
+};
 
 /// Telemetry transport test scheduled through `EngineHandle`, not an ambient
 /// `#[tokio::test]` runtime (ENGINE_SPEC.md).
@@ -110,6 +115,57 @@ fn iroh_telemetry_alpn_carries_catalog_and_numeric_frames() {
         Ok(Err(e)) => panic!("test failed: {e}"),
         Err(_) => panic!("test task dropped"),
     }
+}
+
+#[test]
+fn pull_collector_cancellation_interrupts_inflight_io() {
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("test backend"),
+    )
+    .expect("test engine");
+    let handle = engine.handle();
+    let (resource_tx, resource_rx) = std::sync::mpsc::channel();
+    let setup_handle = handle.clone();
+    handle.spawn(async move {
+        let collector_endpoint = test_endpoint().await;
+        let silent_peer = test_endpoint().await;
+        let (header_tx, header_rx) = std::sync::mpsc::channel();
+        let collector = spawn_pull_collector(
+            &setup_handle,
+            collector_endpoint.clone(),
+            endpoint_addr(&silent_peer),
+            [3; 16],
+            Vec::new(),
+            SubscriptionRequest::all(),
+            Arc::new(DeliveryFanout::new(8)),
+            header_tx,
+        );
+        resource_tx
+            .send((collector, collector_endpoint, silent_peer, header_rx))
+            .expect("return collector resources");
+    });
+    let (collector, collector_endpoint, silent_peer, _header_rx) = resource_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("collector setup");
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !collector.is_finished(),
+        "collector was not retained in silent-peer network I/O"
+    );
+
+    collector.cancel();
+    let stopped_deadline = Instant::now() + Duration::from_secs(2);
+    while !collector.is_finished() && Instant::now() < stopped_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        collector.is_finished(),
+        "cancelled collector remained blocked in network I/O"
+    );
+    drop((collector_endpoint, silent_peer));
 }
 
 async fn test_endpoint() -> Endpoint {

@@ -38,9 +38,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::RelayMode;
+use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::RuntimeParts;
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor::runtime::{ExternalSender, Runtime, RuntimeParts};
+use swactor_engine::{ActorCompletion, Engine, TokioBackend, TokioConfig};
 
 use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
@@ -62,6 +63,36 @@ pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(2);
 pub const DEFAULT_PORT: u16 = 9871;
 /// Default initial cluster size.
 pub const DEFAULT_NODES: u64 = 3;
+
+#[cfg(test)]
+pub(super) fn shared_test_driver() -> Arc<IrohDriver> {
+    thread_local! {
+        static DRIVER: (Arc<IrohDriver>, Engine) = {
+            let mut config = RuntimeConfig::default();
+            config.worker_count = 1;
+            let parts = RuntimeParts::new(config);
+            let backend = TokioBackend::new(TokioConfig::default())
+                .expect("create shared demo test backend");
+            let engine =
+                Engine::new(parts, backend).expect("create shared demo test I/O engine");
+            let driver = Arc::new(
+                IrohDriver::with_engine(
+                    engine.handle(),
+                    IrohDriverConfig {
+                        secret_key: None,
+                        relay_mode: RelayMode::Disabled,
+                        node: DistributedNodeConfig::default(),
+                        peer_auth: None,
+                        additional_alpns: vec![],
+                    },
+                )
+                .expect("create shared demo test driver"),
+            );
+            (driver, engine)
+        };
+    }
+    DRIVER.with(|(driver, _)| Arc::clone(driver))
+}
 
 /// Resolve the executable path for node-role re-execs. `current_exe()`
 /// returns a "(deleted)" path or fails once the binary file has been
@@ -116,10 +147,11 @@ impl DemoDriverHandle {
 /// the supervisor actor so frames can be classified before publishing.
 struct DemoTelemetryCollector {
     engine: swactor_engine::EngineHandle,
+    runtime: Runtime,
     endpoint: iroh::Endpoint,
     fanout: Arc<telemetry::DeliveryFanout>,
     sender: swactor::runtime::ExternalSender,
-    supervisor_slot: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>>,
+    supervisor_slot: Arc<std::sync::OnceLock<ActorAddress>>,
 }
 
 impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
@@ -138,8 +170,24 @@ impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
         );
         let mut flow_id = [0u8; 16];
         flow_id[..8].copy_from_slice(&identity.attempt.to_le_bytes());
-        let (header_tx, header_rx) = std::sync::mpsc::channel();
-        iroh_driver::spawn_pull_collector(
+        let Some(supervisor) = self.supervisor_slot.get().copied() else {
+            return;
+        };
+        let logical_node = identity.logical_node.clone();
+        let attempt = identity.attempt;
+        let header_actor = match self.runtime.spawn(PullHeaderActor {
+            sender: self.sender.clone(),
+            supervisor,
+            logical_node,
+            attempt,
+        }) {
+            Ok(actor) => actor,
+            Err(error) => {
+                eprintln!("demo: cannot spawn telemetry header actor: {error}");
+                return;
+            }
+        };
+        iroh_driver::spawn_pull_collector_to_actor(
             &self.engine,
             self.endpoint.clone(),
             addr,
@@ -147,26 +195,32 @@ impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
             Vec::new(),
             telemetry::SubscriptionRequest::all(),
             Arc::clone(&self.fanout),
-            header_tx,
+            self.sender.clone(),
+            header_actor,
         );
-        let sender = self.sender.clone();
-        if let Some(supervisor) = self.supervisor_slot.get() {
-            let supervisor = supervisor.clone();
-            let logical_node = identity.logical_node.clone();
-            let attempt = identity.attempt;
-            std::thread::spawn(move || {
-                if let Ok(header) = header_rx.recv() {
-                    let _ = sender.send_to(
-                        supervisor,
-                        feed::SupervisorMsg::NodeStream {
-                            header,
-                            logical_node,
-                            attempt,
-                        },
-                    );
-                }
-            });
-        }
+    }
+}
+
+struct PullHeaderActor {
+    sender: swactor::runtime::ExternalSender,
+    supervisor: ActorAddress,
+    logical_node: String,
+    attempt: u64,
+}
+
+impl ActorInterface for PullHeaderActor {
+    type Incoming = iroh_driver::TelemetryQuicHeader;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, header: Self::Incoming) {
+        let _ = self.sender.send_to(
+            self.supervisor,
+            feed::SupervisorMsg::NodeStream {
+                header,
+                logical_node: self.logical_node.clone(),
+                attempt: self.attempt,
+            },
+        );
     }
 }
 
@@ -212,11 +266,9 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         .unwrap_or(DEFAULT_NODES);
     let docker_mode = args.iter().any(|arg| arg == "--docker");
 
-    // Node registry + spawn channel: needed before the actor bridge so the
-    // announce relay can route wire announces into bootstrap actors.
+    // Node registry: wire announces and provisioning effects converge through
+    // the supervisor actor once it is installed below.
     let manager = NodeManager::new();
-    let (spawn_tx, spawn_rx) = std::sync::mpsc::channel::<provider::SpawnNodeRequest>();
-    manager.set_spawn_channel(spawn_tx);
 
     // Telemetry endpoint with the runtime stats hook attached before the
     // engine takes the parts.
@@ -318,7 +370,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         ..dashboard::DashboardConfig::default()
     });
     dashboard.register_view(Arc::new(view::ReconcilerDashboardView::default()));
-    engine.handle().spawn(dashboard.http_server());
+    dashboard.spawn(&engine.handle());
 
     // Provisioning: driver + plugin + executor.
     let launch = if docker_mode {
@@ -349,7 +401,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         ClusterDriver::new(shape, demo_retry_policy()).map_err(|e| format!("driver: {e}"))?;
 
     let plugin = DemoProvider::new(manager.clone());
-    let spawner = EngineSpawner::new(engine.handle());
+    let spawner = EngineSpawner::new(&engine.handle());
     let executor = IdempotentEffectExecutor::new(
         DemoBackend {
             plugin: Arc::new(std::sync::Mutex::new(plugin)),
@@ -392,17 +444,24 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     let collector: Arc<dyn provisioning::NodeTelemetryCollector> =
         Arc::new(DemoTelemetryCollector {
             engine: engine.handle(),
+            runtime: runtime.clone(),
             endpoint: driver_handle.endpoint(),
             fanout: Arc::clone(&fanout),
             sender: sender.clone(),
             supervisor_slot: supervisor_slot.clone(),
         });
 
-    let (edge_cmd_tx, edge_cmd_rx) = std::sync::mpsc::channel::<edge::EdgePumpCmd>();
+    let edge_actor = edge::start_edge_pump(
+        &runtime,
+        engine.handle(),
+        edge_driver,
+        sender.clone(),
+        supervisor_slot.clone(),
+    )?;
     let supervisor = SupervisorActor::new(
         cluster_driver,
         executor,
-        manager,
+        manager.clone(),
         driver_handle,
         telemetry,
         dashboard.clone(),
@@ -414,42 +473,11 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         slots,
         RunId(1),
         launch.clone(),
-        edge_cmd_tx,
+        edge_actor,
     );
 
     // Control plane: dashboard → supervisor.
-    control::install(&engine.handle(), sender.clone(), supervisor_slot.clone());
-
-    // Spawn-request pump: provider blocking threads → supervisor actor.
-    let pump_sender = sender.clone();
-    let pump_slot = supervisor_slot.clone();
-    engine.handle().spawn_blocking(move || {
-        loop {
-            match spawn_rx.recv() {
-                Ok(request) => {
-                    if let Some(addr) = pump_slot.get() {
-                        let _ = pump_sender.send_to(addr.clone(), SupervisorMsg::Spawn(request));
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
-    // Tick: engine interval → supervisor actor.
-    let tick_sender = sender.clone();
-    let tick_engine = engine.handle();
-    let interval_engine = tick_engine.clone();
-    let tick_slot = supervisor_slot.clone();
-    tick_engine.spawn(async move {
-        let mut interval = interval_engine.interval(TICK);
-        loop {
-            (&mut interval).await;
-            if let Some(addr) = tick_slot.get() {
-                let _ = tick_sender.send_to(addr.clone(), SupervisorMsg::Tick);
-            }
-        }
-    });
+    control::install(&runtime, supervisor_slot.clone());
 
     let supervisor_addr = runtime
         .spawn(supervisor)
@@ -457,85 +485,220 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     supervisor_slot
         .set(supervisor_addr.clone())
         .expect("supervisor address slot set once");
+    manager.set_spawn_actor(sender.clone(), supervisor_slot.clone());
 
-    // Edge pump on the blocking pool: it solely owns the edge sessions —
-    // edge runtime polls block their thread (connect handshakes), which
-    // must never run on a Tokio worker or hold a lock the actor needs.
-    edge::start_edge_pump(
-        &engine.handle(),
-        edge_driver,
-        edge_cmd_rx,
-        sender.clone(),
-        supervisor_slot.clone(),
-    );
-
+    let completion = ActorCompletion::new();
+    let stop_actor = runtime
+        .spawn(SupervisorStopActor {
+            sender: sender.clone(),
+            supervisor: supervisor_addr,
+            completion: completion.clone(),
+        })
+        .map_err(|error| format!("spawn supervisor stop actor: {error}"))?;
+    #[cfg(target_os = "linux")]
+    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor);
     println!("demo: dashboard on http://localhost:{port}");
     println!("  /view/fleet        — per-node cards (pid, lifecycle)");
     println!("  /view/demo-control — Fleet Control: stages, feeds, kill / provision / edge");
     println!("  Ctrl-C to tear down.");
+    completion.wait();
 
-    // Block until Ctrl-C (synchronous signal flag — the wait must not depend
-    // on engine task progression).
-    install_sigint_flag();
-    while !sigint_requested() {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    // Teardown: drain the cluster through the real destroy path (desired →
-    // empty → BeginDelete → DestroyLease → process actors stop children),
-    // pumping ticks until the driver quiesces.
-    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _ = sender.send_to(
-        supervisor_addr.clone(),
-        SupervisorMsg::Shutdown {
-            drained: drained.clone(),
-        },
-    );
-    let mut settle_ticks = 0_u32;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while std::time::Instant::now() < deadline {
-        if drained.load(std::sync::atomic::Ordering::SeqCst) {
-            // Give DestroyLease results a few extra ticks to land.
-            settle_ticks += 1;
-            if settle_ticks >= 8 {
-                break;
-            }
-        }
-        std::thread::sleep(TICK);
-    }
-    // Best-effort drain window closed: children still alive (if any) are
-    // killed by the kernel parent-death signal armed in the node role
-    // (process kind) or swept by label below (docker kind).
     if let LaunchStyle::Docker(docker) = &launch {
         docker::sweep_run(docker);
     }
-    std::process::exit(0);
+    Ok(())
 }
 
-static SIGINT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn sigint_requested() -> bool {
-    SIGINT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+struct SupervisorStopActor {
+    sender: ExternalSender,
+    supervisor: ActorAddress,
+    completion: ActorCompletion<()>,
 }
 
-#[cfg(target_os = "linux")]
-fn install_sigint_flag() {
-    unsafe {
-        let handler: extern "C" fn(libc::c_int) = sigint_handler;
-        libc::signal(libc::SIGINT, handler as usize);
-        // Supervisors under process managers (systemd, container runtimes,
-        // harnesses) stop children with SIGTERM; treat it exactly like
-        // Ctrl-C so the drain + sweep path runs instead of a default kill.
-        libc::signal(libc::SIGTERM, handler as usize);
+impl ActorInterface for SupervisorStopActor {
+    type Incoming = swactor_process::ProcessStopSignal;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+        let _ = self.sender.send_to(
+            self.supervisor,
+            SupervisorMsg::Shutdown {
+                completion: self.completion.clone(),
+            },
+        );
+        ctx.stop_self();
     }
 }
 
-#[cfg(target_os = "linux")]
-extern "C" fn sigint_handler(_signal: libc::c_int) {
-    SIGINT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
+#[cfg(all(test, target_os = "linux"))]
+mod properties {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
-#[cfg(not(target_os = "linux"))]
-fn install_sigint_flag() {
-    // Non-Linux builds wait for SIGTERM's default disposition instead.
+    use swactor_process::ProcessExitObservation;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum ReadinessObservation {
+        Line(String),
+        Error(String),
+        Closed,
+        Timeout,
+    }
+
+    struct ReadinessObserver {
+        pid: i32,
+        completion: ActorCompletion<Result<(), String>>,
+    }
+
+    impl ReadinessObserver {
+        fn fail(&self, ctx: &Ctx, error: String) {
+            let _ = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            let _ = self.completion.complete(Err(error));
+            ctx.stop_self();
+        }
+    }
+
+    impl ActorInterface for ReadinessObserver {
+        type Incoming = ReadinessObservation;
+        type Response = ();
+
+        fn handle(&mut self, ctx: &Ctx, observation: Self::Incoming) {
+            match observation {
+                ReadinessObservation::Line(line) if line.contains("demo: dashboard on") => {
+                    if unsafe { libc::kill(self.pid, libc::SIGTERM) } != 0 {
+                        self.fail(
+                            ctx,
+                            format!(
+                                "send SIGTERM to direct demo binary: {}",
+                                std::io::Error::last_os_error()
+                            ),
+                        );
+                    } else {
+                        ctx.stop_self();
+                    }
+                }
+                ReadinessObservation::Line(_) => {}
+                ReadinessObservation::Error(error) => {
+                    self.fail(ctx, format!("read direct demo stdout: {error}"));
+                }
+                ReadinessObservation::Closed => {
+                    self.fail(ctx, "direct demo stdout closed before readiness".to_owned());
+                }
+                ReadinessObservation::Timeout => {
+                    self.fail(
+                        ctx,
+                        "direct demo binary did not become ready within ten seconds".to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    struct ExitObserver {
+        pid: i32,
+        completion: ActorCompletion<Result<(), String>>,
+    }
+
+    impl ActorInterface for ExitObserver {
+        type Incoming = ProcessExitObservation;
+        type Response = ();
+
+        fn handle(&mut self, ctx: &Ctx, observation: Self::Incoming) {
+            let result = match (observation.status, observation.error) {
+                (Some(0), None) => Ok(()),
+                (status, Some(error)) => {
+                    let _ = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+                    Err(format!(
+                        "direct demo process observation failed: status={status:?}, error={error}"
+                    ))
+                }
+                (status, None) => Err(format!(
+                    "direct demo binary did not exit cleanly after SIGTERM: status={status:?}"
+                )),
+            };
+            let _ = self.completion.complete(result);
+            ctx.stop_self();
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess entrypoint for direct_binary_signal_smoke_has_a_hard_timeout"]
+    fn direct_binary_signal_smoke_child() {
+        run_supervisor(&[
+            "--nodes".to_owned(),
+            "0".to_owned(),
+            "--port".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect("empty demo supervisor exits after its OS stop signal");
+    }
+
+    #[test]
+    fn direct_binary_signal_smoke_has_a_hard_timeout() {
+        const CHILD_TEST: &str = "demo::properties::direct_binary_signal_smoke_child";
+        const HARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let mut command = Command::new(std::env::current_exe().expect("current xtask test binary"));
+        command
+            .args(["--ignored", "--exact", CHILD_TEST, "--nocapture"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child =
+            swactor_process::command_spawn(&mut command).expect("spawn direct xtask test binary");
+        let pid = child.id() as i32;
+        let stdout = child.stdout.take().expect("capture demo supervisor stdout");
+
+        let mut config = RuntimeConfig::default();
+        config.worker_count = 1;
+        let parts = RuntimeParts::new(config);
+        let runtime = parts.runtime().clone();
+        let engine = Engine::new(
+            parts,
+            TokioBackend::new(TokioConfig::default()).expect("create signal smoke backend"),
+        )
+        .expect("create signal smoke engine");
+        let sender = runtime.create_sender();
+        let completion = ActorCompletion::new();
+        let readiness = runtime
+            .spawn(ReadinessObserver {
+                pid,
+                completion: completion.clone(),
+            })
+            .expect("spawn readiness observer");
+        let exit = runtime
+            .spawn(ExitObserver {
+                pid,
+                completion: completion.clone(),
+            })
+            .expect("spawn exit observer");
+
+        swactor_process::spawn_mapped_line_reader(
+            stdout,
+            sender.clone(),
+            readiness,
+            ReadinessObservation::Line,
+            ReadinessObservation::Error,
+            ReadinessObservation::Closed,
+        );
+        swactor_process::spawn_child_wait(child, sender.clone(), exit);
+        let _readiness_timeout = engine.handle().send_after(
+            HARD_TIMEOUT,
+            sender.clone(),
+            readiness,
+            ReadinessObservation::Timeout,
+        );
+        let _exit_timeout = engine.handle().send_after(
+            HARD_TIMEOUT,
+            sender,
+            exit,
+            ProcessExitObservation {
+                status: None,
+                error: Some("demo subprocess exceeded ten-second hard timeout".to_owned()),
+            },
+        );
+
+        completion.wait().expect("direct demo signal smoke");
+    }
 }

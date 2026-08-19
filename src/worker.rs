@@ -322,13 +322,29 @@ impl Worker {
             );
         }
 
-        // 9. Clean up poisoned and stopping actors
-        did_work |= Self::cleanup_dead_actors(
+        // 9. Clean up poisoned and stopping actors. Cleanup changes the pool after
+        // phase 8 published its snapshot, so republish cardinality and mailbox
+        // state when actors were removed rather than leaving observability stale
+        // until unrelated work reaches this worker.
+        let cleaned_dead = Self::cleanup_dead_actors(
             &mut self.pool,
             &mut self.worker_ext,
             &mut self.deferred_transfers,
             &tc,
         );
+        if cleaned_dead {
+            did_work = true;
+            self.stats
+                .num_actors
+                .store(self.pool.len(), Ordering::Relaxed);
+            self.stats
+                .total_mailbox_depth
+                .store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
+            if let Some(hook) = tc.stats_hook {
+                self.pool.mailbox_depths_into(&mut self.snapshot_buf);
+                hook.on_tick(wid.index(), &self.snapshot_buf);
+            }
+        }
 
         self.has_backlog = did_work;
         did_work

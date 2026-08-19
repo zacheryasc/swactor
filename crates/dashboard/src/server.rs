@@ -313,7 +313,20 @@ async fn frame_stream(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "demo-control")]
+    use std::sync::{LazyLock, Mutex};
+    #[cfg(feature = "demo-control")]
+    use std::time::Duration;
+
     use super::*;
+    #[cfg(feature = "demo-control")]
+    use axum::body::Body;
+    #[cfg(feature = "demo-control")]
+    use axum::http::Request;
+    #[cfg(feature = "demo-control")]
+    use proptest::prelude::*;
+    #[cfg(feature = "demo-control")]
+    use tower::util::ServiceExt;
 
     fn state_with_plugin(page: PluginPage) -> AppState {
         let views = Arc::new(ViewRegistry::new());
@@ -340,5 +353,308 @@ mod tests {
         let rendered = inject_nav("<!--swactor:nav-->", "provision", &state);
         assert!(rendered.contains(r#"<a href="/provision""#));
         assert!(rendered.contains(r#"aria-current="page" data-active="true">Provision</a>"#));
+    }
+
+    #[cfg(feature = "demo-control")]
+    const HTTP_RESPONSE_BUDGET: Duration = Duration::from_secs(1);
+
+    #[cfg(feature = "demo-control")]
+    static TEST_CONTROL_RECEIVER: LazyLock<
+        Mutex<std::sync::mpsc::Receiver<crate::control::ControlCommand>>,
+    > = LazyLock::new(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        crate::control::set_control_sender(sender);
+        Mutex::new(receiver)
+    });
+
+    #[cfg(feature = "demo-control")]
+    fn test_control_receiver()
+    -> &'static Mutex<std::sync::mpsc::Receiver<crate::control::ControlCommand>> {
+        &TEST_CONTROL_RECEIVER
+    }
+
+    #[cfg(feature = "demo-control")]
+    #[derive(Clone, Debug)]
+    struct HttpAction {
+        route: u8,
+        payload: u8,
+        value: u8,
+    }
+
+    #[cfg(feature = "demo-control")]
+    impl HttpAction {
+        fn uri(&self) -> &'static str {
+            match self.route % 4 {
+                0 => "/control/kill",
+                1 => "/control/provision",
+                2 => "/control/remove",
+                _ => "/control/edge",
+            }
+        }
+
+        fn command_json(&self, route: u8) -> String {
+            let command_id = format!("repeated-{}", self.value % 4);
+            match route % 4 {
+                0 => serde_json::json!({
+                    "Kill": {
+                        "command_id": command_id,
+                        "node": format!("node-{}", self.value),
+                    }
+                })
+                .to_string(),
+                1 => serde_json::json!({
+                    "Provision": {
+                        "command_id": command_id,
+                        "count": self.value,
+                    }
+                })
+                .to_string(),
+                2 => serde_json::json!({
+                    "Remove": {
+                        "command_id": command_id,
+                        "count": self.value,
+                    }
+                })
+                .to_string(),
+                _ => serde_json::json!({
+                    "EstablishEdge": {
+                        "command_id": command_id,
+                        "node": format!("node-{}", self.value),
+                    }
+                })
+                .to_string(),
+            }
+        }
+
+        fn body(&self) -> String {
+            match self.payload % 5 {
+                0 => self.command_json(self.route),
+                1 => match self.value % 6 {
+                    0 => String::new(),
+                    1 => "{".to_owned(),
+                    2 => "[".to_owned(),
+                    3 => "{\"".to_owned(),
+                    4 => "{\"command_id\":".to_owned(),
+                    _ => "not-json".to_owned(),
+                },
+                2 => {
+                    let command_id = format!("repeated-{}", self.value % 4);
+                    match self.route % 4 {
+                        0 => serde_json::json!({
+                            "Kill": {"command_id": command_id}
+                        })
+                        .to_string(),
+                        1 => serde_json::json!({
+                            "Provision": {"count": self.value}
+                        })
+                        .to_string(),
+                        2 => serde_json::json!({
+                            "Remove": {"command_id": command_id}
+                        })
+                        .to_string(),
+                        _ => serde_json::json!({
+                            "EstablishEdge": {"node": format!("node-{}", self.value)}
+                        })
+                        .to_string(),
+                    }
+                }
+                3 => self.command_json(self.route.wrapping_add(1)),
+                _ => match self.route % 4 {
+                    0 => r#"{"Kill":{"command_id":7,"node":[]}}"#.to_owned(),
+                    1 => r#"{"Provision":{"command_id":7,"count":"one"}}"#.to_owned(),
+                    2 => r#"{"Remove":{"command_id":[],"count":-1}}"#.to_owned(),
+                    _ => r#"{"EstablishEdge":{"command_id":false,"node":7}}"#.to_owned(),
+                },
+            }
+        }
+
+        fn is_valid_for_route(&self) -> bool {
+            self.payload % 5 == 0
+        }
+    }
+
+    #[cfg(feature = "demo-control")]
+    #[derive(Clone, Debug)]
+    struct HttpObservation {
+        index: usize,
+        uri: &'static str,
+        body: String,
+        expected_valid: bool,
+        status: StatusCode,
+    }
+
+    #[cfg(feature = "demo-control")]
+    async fn send_control_request(
+        app: Router,
+        index: usize,
+        action: HttpAction,
+    ) -> Result<HttpObservation, String> {
+        let uri = action.uri();
+        let body = action.body();
+        let expected_valid = action.is_valid_for_route();
+        let request = Request::post(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .map_err(|error| format!("build dashboard request: {error}"))?;
+        let response = tokio::time::timeout(HTTP_RESPONSE_BUDGET, app.oneshot(request))
+            .await
+            .map_err(|_| format!("request {index} {uri} exceeded {HTTP_RESPONSE_BUDGET:?}"))?
+            .map_err(|error| format!("route dashboard request: {error}"))?;
+        Ok(HttpObservation {
+            index,
+            uri,
+            body,
+            expected_valid,
+            status: response.status(),
+        })
+    }
+
+    #[cfg(feature = "demo-control")]
+    fn http_invariant_failure(
+        actions: &[HttpAction],
+        responses: &[HttpObservation],
+        forwarded: usize,
+    ) -> Option<String> {
+        let expected_forwarded = actions
+            .iter()
+            .filter(|action| action.is_valid_for_route())
+            .count();
+        let terminal = responses.len() == actions.len();
+        let response_log = responses
+            .iter()
+            .map(|response| {
+                format!(
+                    "#{} {} body={:?} -> {}",
+                    response.index, response.uri, response.body, response.status,
+                )
+            })
+            .collect::<Vec<_>>();
+        let statuses_valid = responses.iter().all(|response| {
+            !response.status.is_server_error()
+                && if response.expected_valid {
+                    response.status == StatusCode::ACCEPTED
+                } else {
+                    response.status.is_client_error()
+                }
+        });
+        if terminal && statuses_valid && forwarded == expected_forwarded {
+            None
+        } else {
+            Some(format!(
+                "terminal={terminal}, expected_forwarded={expected_forwarded}, \
+                 forwarded={forwarded}, responses={response_log:?}, \
+                 actor_census=dashboard HTTP routes own no actors"
+            ))
+        }
+    }
+
+    #[cfg(feature = "demo-control")]
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn generated_control_http_sequences_are_bounded_and_typed(
+            raw_actions in prop::collection::vec(
+                (any::<u8>(), any::<u8>(), any::<u8>()),
+                0..=32,
+            ),
+            concurrent in any::<bool>(),
+        ) {
+            let actions = raw_actions
+                .into_iter()
+                .map(|(route, payload, value)| HttpAction {
+                    route,
+                    payload,
+                    value,
+                })
+                .collect::<Vec<_>>();
+            let receiver = test_control_receiver();
+            while receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_recv()
+                .is_ok()
+            {}
+            let state = state_with_plugin(PluginPage::new(
+                "control-test",
+                "Control test",
+                "/control-test",
+                "",
+            ));
+            let current_thread = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread dashboard HTTP runtime");
+            let outcome = current_thread.block_on(async {
+                let mut responses = Vec::with_capacity(actions.len());
+                if concurrent {
+                    let mut requests = tokio::task::JoinSet::new();
+                    for (index, action) in actions.iter().cloned().enumerate() {
+                        requests.spawn(send_control_request(router(state.clone()), index, action));
+                    }
+                    while let Some(result) = requests.join_next().await {
+                        responses.push(
+                            result
+                                .map_err(|error| format!("dashboard request task failed: {error}"))??,
+                        );
+                    }
+                } else {
+                    for (index, action) in actions.iter().cloned().enumerate() {
+                        responses.push(
+                            send_control_request(router(state.clone()), index, action).await?,
+                        );
+                    }
+                }
+                responses.sort_by_key(|response| response.index);
+                Ok::<_, String>(responses)
+            });
+            prop_assert!(
+                outcome.is_ok(),
+                "dashboard HTTP request did not terminate; actions={:?}; error={:?}; \
+                 responses=[]; actor_census=dashboard HTTP routes own no actors",
+                actions,
+                outcome.as_ref().err(),
+            );
+            let responses = outcome.expect("outcome checked above");
+            let forwarded = {
+                let receiver = receiver
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                receiver.try_iter().count()
+            };
+            let failure = http_invariant_failure(&actions, &responses, forwarded);
+            prop_assert!(
+                failure.is_none(),
+                "dashboard HTTP invariant failed; actions={:?}; responses={:?}; failure={}",
+                actions,
+                responses,
+                failure.unwrap_or_default(),
+            );
+        }
+    }
+
+    #[cfg(feature = "demo-control")]
+    #[test]
+    fn control_http_invariant_rejects_a_controlled_server_error() {
+        let actions = vec![HttpAction {
+            route: 0,
+            payload: 1,
+            value: 0,
+        }];
+        let responses = vec![HttpObservation {
+            index: 0,
+            uri: actions[0].uri(),
+            body: actions[0].body(),
+            expected_valid: false,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }];
+        assert!(
+            http_invariant_failure(&actions, &responses, 0).is_some(),
+            "HTTP invariant accepted a controlled 5xx response for invalid JSON"
+        );
     }
 }

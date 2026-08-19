@@ -74,7 +74,7 @@ fn run_step(step: &TestStep) -> bool {
     println!("    cargo {}", step.args.join(" "));
     println!();
 
-    match Command::new(cargo_bin()).args(step.args).status() {
+    match swactor_process::command_status(Command::new(cargo_bin()).args(step.args)) {
         Ok(status) => status.success(),
         Err(error) => {
             eprintln!("Failed to execute cargo: {error}");

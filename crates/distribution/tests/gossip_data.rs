@@ -228,14 +228,14 @@ mod standalone_gossip_transport {
     //! Actorized registry/metadata/directory gossip over one codec and transport, proving
     //! standalone frames converge without piggybacking on SWIM.
 
-    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
 
     use swactor::Error;
     use swactor::actor::ActorAddress;
-    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts};
     use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
     use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
 
     use distribution::crypto::{Keypair, KeypairExt};
@@ -272,7 +272,8 @@ mod standalone_gossip_transport {
     /// plus the shared state needed to wire it into a mesh.
     struct Node {
         rt: Runtime,
-        host: RefCell<SingleThreadRuntime>,
+        _engine: Engine,
+        backend: SteppingBackend,
         registry: ActorAddress,
         metadata: ActorAddress,
         directory: ActorAddress,
@@ -305,7 +306,9 @@ mod standalone_gossip_transport {
                     codec.clone(),
                     router.clone(),
                 )));
-                let host = RefCell::new(SingleThreadRuntime::new(parts));
+                let backend = SteppingBackend::new();
+                let engine =
+                    Engine::new(parts, backend.clone()).expect("create stepping actor engine");
 
                 let dir = SharedPeerDirectory::new();
                 let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
@@ -336,7 +339,8 @@ mod standalone_gossip_transport {
 
                 nodes.push(Node {
                     rt,
-                    host,
+                    _engine: engine,
+                    backend,
                     registry,
                     metadata,
                     directory,
@@ -407,7 +411,7 @@ mod standalone_gossip_transport {
         fn pump(&self, k: usize) {
             for _ in 0..k {
                 for node in &self.nodes {
-                    node.host.borrow_mut().tick();
+                    node.backend.step();
                 }
             }
         }
@@ -448,7 +452,7 @@ mod standalone_gossip_transport {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].host.borrow_mut().tick();
+            self.nodes[observer].backend.step();
             inbox.try_recv().and_then(|r| r.binding)
         }
 
@@ -465,7 +469,7 @@ mod standalone_gossip_transport {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].host.borrow_mut().tick();
+            self.nodes[observer].backend.step();
             inbox.try_recv().and_then(|r| r.relay_url)
         }
 
@@ -482,7 +486,7 @@ mod standalone_gossip_transport {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].host.borrow_mut().tick();
+            self.nodes[observer].backend.step();
             inbox.try_recv().and_then(|located| located.host)
         }
     }

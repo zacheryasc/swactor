@@ -7,6 +7,8 @@ use std::time::Duration;
 use crossbeam_channel::TryRecvError;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
+use swactor::actor::ActorAddress;
+use swactor::runtime::ExternalSender;
 use swactor_engine::EngineHandle;
 use telemetry::frame::{
     ChannelDescriptor, ChannelId, ChannelRef, FrameDelivery, Position, StreamDescriptor,
@@ -104,6 +106,44 @@ pub fn spawn_pull_server(
     });
 }
 
+/// Cancellation handle for one collector-initiated telemetry subscription.
+///
+/// Cancellation is idempotent and immediately interrupts network I/O,
+/// reconnect backoff, and all subsequent reconnect attempts.
+#[derive(Debug)]
+pub struct PullCollectorHandle {
+    cancellation: tokio::sync::watch::Sender<bool>,
+    completion: tokio::sync::watch::Receiver<bool>,
+}
+
+impl PullCollectorHandle {
+    pub fn cancel(&self) {
+        self.cancellation.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancellation.borrow()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        *self.completion.borrow()
+    }
+}
+
+impl Drop for PullCollectorHandle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct PullCollectorCompletion(tokio::sync::watch::Sender<bool>);
+
+impl Drop for PullCollectorCompletion {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// Supervisor side: retain a pull subscription to a node on `TELEMETRY_ALPN`.
 ///
 /// A transport interruption reconnects with bounded backoff. Returning after
@@ -118,17 +158,91 @@ pub fn spawn_pull_collector(
     request: telemetry::SubscriptionRequest,
     fanout: std::sync::Arc<telemetry::DeliveryFanout>,
     on_header: std::sync::mpsc::Sender<TelemetryQuicHeader>,
-) {
+) -> PullCollectorHandle {
+    spawn_pull_collector_with_sink(
+        engine,
+        endpoint,
+        peer,
+        flow_id,
+        token,
+        request,
+        fanout,
+        PullHeaderSink::Channel(on_header),
+    )
+}
+
+/// Supervisor side variant that delivers each connection header directly to
+/// an actor. Transport owns the subscription task; the actor owns how the
+/// stream identity changes domain state.
+pub fn spawn_pull_collector_to_actor(
+    engine: &EngineHandle,
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    flow_id: [u8; 16],
+    token: Vec<u8>,
+    request: telemetry::SubscriptionRequest,
+    fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) -> PullCollectorHandle {
+    spawn_pull_collector_with_sink(
+        engine,
+        endpoint,
+        peer,
+        flow_id,
+        token,
+        request,
+        fanout,
+        PullHeaderSink::Actor { sender, actor },
+    )
+}
+
+enum PullHeaderSink {
+    Channel(std::sync::mpsc::Sender<TelemetryQuicHeader>),
+    Actor {
+        sender: ExternalSender,
+        actor: ActorAddress,
+    },
+}
+
+impl PullHeaderSink {
+    fn deliver(&self, header: TelemetryQuicHeader) -> bool {
+        match self {
+            Self::Channel(sender) => sender.send(header).is_ok(),
+            Self::Actor { sender, actor } => sender.send_to(*actor, header).is_ok(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_pull_collector_with_sink(
+    engine: &EngineHandle,
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    flow_id: [u8; 16],
+    token: Vec<u8>,
+    request: telemetry::SubscriptionRequest,
+    fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+    on_header: PullHeaderSink,
+) -> PullCollectorHandle {
+    let (cancellation, mut cancellation_rx) = tokio::sync::watch::channel(false);
+    let (completion, completion_rx) = tokio::sync::watch::channel(false);
     let engine_handle = engine.clone();
     engine.spawn(async move {
+        let _completion = PullCollectorCompletion(completion);
         let peer_id = peer.id.to_string();
         let mut retry_delay = Duration::from_millis(250);
         loop {
-            match collect_pull_once(
-                &endpoint, &peer, flow_id, &token, &request, &fanout, &on_header,
-            )
-            .await
-            {
+            if *cancellation_rx.borrow() {
+                return;
+            }
+            let result = tokio::select! {
+                _ = cancellation_rx.changed() => return,
+                result = collect_pull_once(
+                    &endpoint, &peer, flow_id, &token, &request, &fanout, &on_header,
+                ) => result,
+            };
+            match result {
                 Ok(()) => return,
                 Err(error) => {
                     eprintln!(
@@ -137,13 +251,20 @@ pub fn spawn_pull_collector(
                     );
                 }
             }
-            engine_handle.timer(retry_delay).await;
+            tokio::select! {
+                _ = cancellation_rx.changed() => return,
+                _ = engine_handle.timer(retry_delay) => {}
+            }
             retry_delay = retry_delay
                 .checked_mul(2)
                 .unwrap_or(Duration::from_secs(5))
                 .min(Duration::from_secs(5));
         }
     });
+    PullCollectorHandle {
+        cancellation,
+        completion: completion_rx,
+    }
 }
 
 async fn collect_pull_once(
@@ -153,7 +274,7 @@ async fn collect_pull_once(
     token: &[u8],
     request: &telemetry::SubscriptionRequest,
     fanout: &telemetry::DeliveryFanout,
-    on_header: &std::sync::mpsc::Sender<TelemetryQuicHeader>,
+    on_header: &PullHeaderSink,
 ) -> Result<(), String> {
     let conn = endpoint
         .connect(peer.clone(), TELEMETRY_ALPN)
@@ -173,14 +294,18 @@ async fn collect_pull_once(
     let header = read_header(&mut recv)
         .await
         .map_err(|error| format!("answer header unreadable: {error}"))?;
-    if on_header.send(header.clone()).is_err() {
+    if !on_header.deliver(header.clone()) {
         return Ok(());
     }
     let stream = header.stream;
     loop {
         match read_next_event(&mut recv, &stream).await {
             Ok(Some(event)) => {
+                let ended = matches!(event, TelemetryEvent::StreamEnded(_));
                 fanout.publish(event);
+                if ended {
+                    return Ok(());
+                }
             }
             Ok(None) => return Err("answer stream closed".to_owned()),
             Err(error) => return Err(format!("read answer stream failed: {error}")),

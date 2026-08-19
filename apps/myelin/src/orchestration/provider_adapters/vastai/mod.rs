@@ -1,24 +1,16 @@
-// VastAI provider adapter: owns private blocking facades and a legacy provider
-// monitor thread outside the orchestration engine. The monitor's swactor core
-// is driven by an explicit SingleThreadRuntime owned by that thread; the main
-// orchestration engine owns all bootstrap actors spawned on its runtime handle.
-#![allow(clippy::disallowed_methods)]
+// VastAI provider adapter. Actors own provider lifecycle policy; the
+// swactor-vastai and swactor-process crates own API and process mechanics.
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{
-    Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
-};
+use swactor::runtime::{Ctx, ExternalSender, Runtime};
+use swactor_engine::EngineHandle;
 use swactor_vastai::{
-    CreateInstanceRequest, LifecyclePolicy, Offer, OfferBrowseCriteria, ProvisionRequest,
-    ProvisionedInstance, SelectionPolicy, classify_vastai_error,
+    BlockingVastClient, CreateInstanceRequest, LifecyclePolicy, Offer, OfferBrowseCriteria,
+    ProvisionRequest, ProvisionedInstance, SelectionPolicy, classify_vastai_error,
 };
 use telemetry::TelemetryProducer;
 
@@ -27,6 +19,7 @@ use crate::provisioning::{
     AdoptedNode, NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink,
     ProvisionPlugin,
 };
+use swactor_process::{LineReaderHandle, ProcessStream, ProcessStreamObservation};
 
 #[derive(Clone, Debug)]
 pub(crate) struct VastAiProvisioningConfig {
@@ -65,42 +58,17 @@ pub(crate) struct VastAiSshEndpoint {
 pub(crate) struct VastAiProviderMonitor {
     runtime: Runtime,
     actor: ActorAddress,
-    tick_thread: Option<JoinHandle<()>>,
-    stop_flag: Arc<AtomicBool>,
 }
 
 impl VastAiProviderMonitor {
-    fn new(runtime: Runtime, mut host: SingleThreadRuntime, actor: ActorAddress) -> Self {
-        let stop_flag = Arc::new(AtomicBool::new(false));
-
-        let flag = Arc::clone(&stop_flag);
-        let tick_thread = thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) || host.has_work() {
-                if host.has_work() {
-                    host.tick();
-                } else {
-                    thread::sleep(Duration::from_millis(10));
-                }
-            }
-        });
-
-        Self {
-            runtime,
-            actor,
-            tick_thread: Some(tick_thread),
-            stop_flag,
-        }
+    fn new(runtime: Runtime, actor: ActorAddress) -> Self {
+        Self { runtime, actor }
     }
 
     fn stop(&mut self) {
-        let Some(tick_thread) = self.tick_thread.take() else {
-            return;
-        };
         let _ = self
             .runtime
             .send_to(self.actor, VastAiProviderMonitorMsg::Stop);
-        self.stop_flag.store(true, Ordering::Relaxed);
-        let _ = tick_thread.join();
     }
 }
 
@@ -126,6 +94,21 @@ pub(crate) trait VastAiLeaseClient: Send {
     /// Resolves the live contract id carrying `label`, if any.
     fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String>;
 
+    fn contract_by_label_with_retry(
+        &mut self,
+        label: &str,
+        attempts: usize,
+        _pace: Duration,
+    ) -> Result<Option<u64>, String> {
+        for _ in 0..attempts.max(1) {
+            let contract = self.contract_by_label(label)?;
+            if contract.is_some() {
+                return Ok(contract);
+            }
+        }
+        Ok(None)
+    }
+
     fn ssh_endpoint(
         &mut self,
         contract_id: u64,
@@ -148,17 +131,21 @@ pub(crate) trait VastAiLeaseClient: Send {
 }
 
 pub(crate) struct ToolsVastAiLeaseClient {
-    client: swactor_vastai::VastClient,
-    runtime: tokio::runtime::Runtime,
+    client: BlockingVastClient,
+    actor_host: Option<(Runtime, EngineHandle)>,
 }
 
 impl ToolsVastAiLeaseClient {
     pub(crate) fn new(client: swactor_vastai::VastClient) -> Result<Self, String> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("vastai tokio runtime: {e}"))?;
-        Ok(Self { client, runtime })
+        Ok(Self {
+            client: BlockingVastClient::new(client)?,
+            actor_host: None,
+        })
+    }
+
+    pub(crate) fn with_actor_host(mut self, runtime: Runtime, engine: EngineHandle) -> Self {
+        self.actor_host = Some((runtime, engine));
+        self
     }
 
     pub(crate) fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
@@ -169,7 +156,7 @@ impl ToolsVastAiLeaseClient {
         &mut self,
         criteria: &OfferBrowseCriteria,
     ) -> Result<Vec<Offer>, String> {
-        self.runtime.block_on(self.client.browse_offers(criteria))
+        self.client.browse_offers(criteria)
     }
 
     fn create_request_for_offer(
@@ -195,8 +182,7 @@ impl ToolsVastAiLeaseClient {
     }
 
     fn candidate_pool(&mut self, request: &ProvisionRequest) -> Result<Vec<Offer>, String> {
-        self.runtime
-            .block_on(self.client.search_offers(&request.selection, 1))
+        self.client.search_offers(&request.selection, 1)
     }
 
     fn create_from_offer(
@@ -205,9 +191,7 @@ impl ToolsVastAiLeaseClient {
         offer: &Offer,
     ) -> Result<ProvisionedInstance, String> {
         let create = Self::create_request_for_offer(request, offer.id);
-        let info = self
-            .runtime
-            .block_on(self.client.create_instance(&create))?;
+        let info = self.client.create_instance(&create)?;
         Ok(ProvisionedInstance {
             index: 0,
             contract_id: info.contract_id,
@@ -234,6 +218,7 @@ struct VastAiProviderMonitorActor {
     spec: NodeProvisionSpec,
     sink: PluginSink,
     sender: ExternalSender,
+    engine: EngineHandle,
     last_state: Option<String>,
     state_since: Instant,
     poll: u64,
@@ -249,6 +234,7 @@ impl VastAiProviderMonitorActor {
         spec: NodeProvisionSpec,
         sink: PluginSink,
         sender: ExternalSender,
+        engine: EngineHandle,
     ) -> Self {
         Self {
             client,
@@ -258,6 +244,7 @@ impl VastAiProviderMonitorActor {
             spec,
             sink,
             sender,
+            engine,
             last_state: None,
             state_since: Instant::now(),
             poll: 0,
@@ -282,10 +269,11 @@ impl VastAiProviderMonitorActor {
     }
 
     fn schedule_next_poll(&self, ctx: &Ctx) {
-        schedule_provider_monitor_poll(
+        self.engine.send_after(
+            self.lifecycle.poll_interval,
             self.sender.clone(),
             ctx.self_addr(),
-            self.lifecycle.poll_interval,
+            VastAiProviderMonitorMsg::Poll,
         );
     }
 
@@ -295,11 +283,7 @@ impl VastAiProviderMonitorActor {
         }
         self.poll = self.poll.saturating_add(1);
         let poll = self.poll;
-        let status = match self
-            .client
-            .runtime
-            .block_on(self.client.client.instance_status(self.contract_id))
-        {
+        let status = match self.client.client.instance_status(self.contract_id) {
             Ok(status) => status,
             Err(error)
                 if error.contains("not found while fetching provider status")
@@ -415,21 +399,11 @@ impl ActorInterface for VastAiProviderMonitorActor {
     }
 }
 
-fn schedule_provider_monitor_poll(sender: ExternalSender, actor: ActorAddress, delay: Duration) {
-    thread::spawn(move || {
-        thread::sleep(delay);
-        let _ = sender.send_to(actor, VastAiProviderMonitorMsg::Poll);
-    });
-}
-
 impl Clone for ToolsVastAiLeaseClient {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            runtime: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("clone VastAI lease client runtime"),
+            actor_host: self.actor_host.clone(),
         }
     }
 }
@@ -448,7 +422,30 @@ fn adopted_instance(contract_id: u64) -> ProvisionedInstance {
 
 impl VastAiLeaseClient for ToolsVastAiLeaseClient {
     fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String> {
-        let instances = self.runtime.block_on(self.client.list_by_label(label))?;
+        let instances = self.client.list_by_label(label)?;
+        match instances.as_slice() {
+            [] => Ok(None),
+            [instance] => Ok(Some(instance.contract_id)),
+            _ => Err(format!(
+                "multiple VastAI contracts share stable label {label}: {}",
+                instances
+                    .iter()
+                    .map(|instance| instance.contract_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+        }
+    }
+
+    fn contract_by_label_with_retry(
+        &mut self,
+        label: &str,
+        attempts: usize,
+        pace: Duration,
+    ) -> Result<Option<u64>, String> {
+        let instances = self
+            .client
+            .list_by_label_with_retry(label, attempts, pace)?;
         match instances.as_slice() {
             [] => Ok(None),
             [instance] => Ok(Some(instance.contract_id)),
@@ -565,11 +562,9 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         lifecycle: &LifecyclePolicy,
         ssh_user: &str,
     ) -> Result<VastAiSshEndpoint, String> {
-        let endpoint = self.runtime.block_on(self.client.wait_for_ssh_endpoint(
-            contract_id,
-            label,
-            lifecycle,
-        ))?;
+        let endpoint = self
+            .client
+            .wait_for_ssh_endpoint(contract_id, label, lifecycle)?;
         let host = endpoint.ip;
         let port = endpoint.port;
         if host.is_empty() || host == "unknown" {
@@ -593,8 +588,7 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Option<VastAiProviderMonitor> {
-        let parts = RuntimeParts::new(RuntimeConfig::default());
-        let runtime = parts.runtime().clone();
+        let (runtime, engine) = self.actor_host.as_ref()?.clone();
         let sender = runtime.create_sender();
         let actor = runtime
             .spawn(VastAiProviderMonitorActor::new(
@@ -605,18 +599,14 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
                 spec,
                 sink,
                 sender,
+                engine,
             ))
             .ok()?;
-        Some(VastAiProviderMonitor::new(
-            runtime,
-            SingleThreadRuntime::new(parts),
-            actor,
-        ))
+        Some(VastAiProviderMonitor::new(runtime, actor))
     }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
-        self.runtime
-            .block_on(self.client.destroy_instance_with_retry(contract_id))
+        self.client.destroy_instance_with_retry(contract_id)
     }
 }
 
@@ -692,17 +682,55 @@ enum SshBootstrapMsg {
     ReaderClosed {
         stream: SshBootstrapStream,
     },
+    #[cfg(test)]
+    ScriptedAttemptFinished {
+        result: Result<i32, String>,
+    },
     Stop,
 }
 
+struct SshOutputRelay {
+    target: ActorAddress,
+}
+
+impl ActorInterface for SshOutputRelay {
+    type Incoming = ProcessStreamObservation;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, observation: Self::Incoming) {
+        let message = match observation {
+            ProcessStreamObservation::Line { stream, line } => SshBootstrapMsg::OutputLine {
+                stream: map_process_stream(stream),
+                line,
+            },
+            ProcessStreamObservation::Error { stream, error } => SshBootstrapMsg::ReaderError {
+                stream: map_process_stream(stream),
+                error,
+            },
+            ProcessStreamObservation::Closed { stream } => SshBootstrapMsg::ReaderClosed {
+                stream: map_process_stream(stream),
+            },
+        };
+        let _ = ctx.send(self.target, message);
+    }
+}
+
+fn map_process_stream(stream: ProcessStream) -> SshBootstrapStream {
+    match stream {
+        ProcessStream::Stdout => SshBootstrapStream::Stdout,
+        ProcessStream::Stderr => SshBootstrapStream::Stderr,
+    }
+}
 struct SshBootstrapActor {
     bridge: BootstrapTelemetryBridge,
     endpoint: VastAiSshEndpoint,
     ssh_identity: Option<PathBuf>,
     sender: ExternalSender,
+    engine: EngineHandle,
     child: Option<Child>,
-    stdout_reader: Option<JoinHandle<()>>,
-    stderr_reader: Option<JoinHandle<()>>,
+    reader_relay: Option<ActorAddress>,
+    stdout_reader: Option<LineReaderHandle>,
+    stderr_reader: Option<LineReaderHandle>,
     stdout_closed: bool,
     stderr_closed: bool,
     pending_status: Option<std::process::ExitStatus>,
@@ -711,6 +739,10 @@ struct SshBootstrapActor {
     backoff: Duration,
     observation_class: Option<&'static str>,
     stopped: bool,
+    #[cfg(test)]
+    disable_attempt_spawn: bool,
+    #[cfg(test)]
+    spawn_pending_test_child: bool,
 }
 
 impl SshBootstrapActor {
@@ -719,16 +751,19 @@ impl SshBootstrapActor {
         endpoint: VastAiSshEndpoint,
         ssh_identity: Option<PathBuf>,
         sender: ExternalSender,
+        engine: EngineHandle,
     ) -> Self {
         Self {
             bridge,
             endpoint,
             ssh_identity,
             sender,
+            engine,
             child: None,
             stdout_reader: None,
             stderr_reader: None,
             stdout_closed: true,
+            reader_relay: None,
             stderr_closed: true,
             pending_status: None,
             pending_wait_error: None,
@@ -736,6 +771,10 @@ impl SshBootstrapActor {
             backoff: Duration::from_secs(1),
             observation_class: None,
             stopped: false,
+            #[cfg(test)]
+            disable_attempt_spawn: false,
+            #[cfg(test)]
+            spawn_pending_test_child: false,
         }
     }
 
@@ -747,6 +786,32 @@ impl SshBootstrapActor {
         self.bridge.spec().node_id
     }
 
+    #[cfg(test)]
+    fn with_attempt_spawn_disabled(mut self) -> Self {
+        self.disable_attempt_spawn = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_pending_test_child(mut self) -> Self {
+        self.disable_attempt_spawn = true;
+        self.spawn_pending_test_child = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_open_test_streams(mut self) -> Self {
+        self.disable_attempt_spawn = true;
+        self.stdout_closed = false;
+        self.stderr_closed = false;
+        self
+    }
+
+    fn schedule(&self, ctx: &Ctx, message: SshBootstrapMsg, delay: Duration) {
+        self.engine
+            .send_after(delay, self.sender.clone(), ctx.self_addr(), message);
+    }
+
     fn start_attempt(&mut self, ctx: &Ctx) {
         if self.stopped {
             return;
@@ -756,11 +821,28 @@ impl SshBootstrapActor {
             self.attempt, self.endpoint.user, self.endpoint.host, self.endpoint.port
         ));
 
-        match spawn_ssh_bootstrap_attempt(
+        #[cfg(test)]
+        let attempt = if self.disable_attempt_spawn {
+            if self.spawn_pending_test_child {
+                spawn_pending_test_child()
+            } else {
+                return;
+            }
+        } else {
+            spawn_ssh_bootstrap_attempt(
+                self.bridge.spec(),
+                &self.endpoint,
+                self.ssh_identity.as_deref(),
+            )
+        };
+        #[cfg(not(test))]
+        let attempt = spawn_ssh_bootstrap_attempt(
             self.bridge.spec(),
             &self.endpoint,
             self.ssh_identity.as_deref(),
-        ) {
+        );
+
+        match attempt {
             Ok((child, stdout, stderr)) => {
                 self.child = Some(child);
                 self.stdout_closed = false;
@@ -768,24 +850,22 @@ impl SshBootstrapActor {
                 self.observation_class = None;
                 self.pending_status = None;
                 self.pending_wait_error = None;
-                self.stdout_reader = Some(spawn_ssh_output_reader(
-                    SshBootstrapStream::Stdout,
+                let reader_relay = self
+                    .reader_relay
+                    .expect("SSH output relay is installed before attempts start");
+                self.stdout_reader = Some(swactor_process::spawn_line_reader(
+                    ProcessStream::Stdout,
                     stdout,
                     self.sender.clone(),
-                    ctx.self_addr(),
+                    reader_relay,
                 ));
-                self.stderr_reader = Some(spawn_ssh_output_reader(
-                    SshBootstrapStream::Stderr,
+                self.stderr_reader = Some(swactor_process::spawn_line_reader(
+                    ProcessStream::Stderr,
                     stderr,
                     self.sender.clone(),
-                    ctx.self_addr(),
+                    reader_relay,
                 ));
-                schedule_ssh_message(
-                    self.sender.clone(),
-                    ctx.self_addr(),
-                    SshBootstrapMsg::PollChild,
-                    Duration::from_millis(100),
-                );
+                self.schedule(ctx, SshBootstrapMsg::PollChild, Duration::from_millis(100));
             }
             Err(error) => {
                 self.bridge.observe_provider_line(format!(
@@ -804,18 +884,15 @@ impl SshBootstrapActor {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        match child.try_wait() {
+        match swactor_process::child_try_wait(child) {
             Ok(Some(status)) => {
                 self.child = None;
                 self.pending_status = Some(status);
                 self.maybe_finish_attempt(ctx);
             }
-            Ok(None) => schedule_ssh_message(
-                self.sender.clone(),
-                ctx.self_addr(),
-                SshBootstrapMsg::PollChild,
-                Duration::from_millis(100),
-            ),
+            Ok(None) => {
+                self.schedule(ctx, SshBootstrapMsg::PollChild, Duration::from_millis(100));
+            }
             Err(error) => {
                 self.child = None;
                 self.pending_wait_error = Some(error.to_string());
@@ -862,6 +939,29 @@ impl SshBootstrapActor {
         self.maybe_finish_attempt(ctx);
     }
 
+    fn finish_completed_attempt(&mut self, ctx: &Ctx, status: String, success: bool) {
+        self.join_readers();
+        let readiness = if success {
+            "exited before runtime ready"
+        } else {
+            "not ready before runtime ready"
+        };
+        let observation_class = self.observation_class.unwrap_or("process_exit");
+        self.bridge.observe_provider_line(
+            serde_json::json!({
+                "type": "VastAiBootstrapAttemptCompleted",
+                "run_id": self.run_id(),
+                "node_id": self.node_id(),
+                "attempt": self.attempt,
+                "status": status,
+                "class": observation_class,
+                "classification": readiness,
+            })
+            .to_string(),
+        );
+        self.schedule_retry(ctx);
+    }
+
     fn maybe_finish_attempt(&mut self, ctx: &Ctx) {
         if self.stopped || !self.stdout_closed || !self.stderr_closed {
             return;
@@ -878,26 +978,8 @@ impl SshBootstrapActor {
         let Some(status) = self.pending_status.take() else {
             return;
         };
-        self.join_readers();
-        let readiness = if status.success() {
-            "exited before runtime ready"
-        } else {
-            "not ready before runtime ready"
-        };
-        let observation_class = self.observation_class.unwrap_or("process_exit");
-        self.bridge.observe_provider_line(
-            serde_json::json!({
-                "type": "VastAiBootstrapAttemptCompleted",
-                "run_id": self.run_id(),
-                "node_id": self.node_id(),
-                "attempt": self.attempt,
-                "status": status.to_string(),
-                "class": observation_class,
-                "classification": readiness,
-            })
-            .to_string(),
-        );
-        self.schedule_retry(ctx);
+        let success = status.success();
+        self.finish_completed_attempt(ctx, status.to_string(), success);
     }
 
     fn schedule_retry(&mut self, ctx: &Ctx) {
@@ -912,20 +994,15 @@ impl SshBootstrapActor {
         ));
         self.backoff = std::cmp::min(self.backoff.saturating_mul(2), Duration::from_secs(30));
         self.attempt = self.attempt.saturating_add(1);
-        schedule_ssh_message(
-            self.sender.clone(),
-            ctx.self_addr(),
-            SshBootstrapMsg::StartAttempt,
-            delay,
-        );
+        self.schedule(ctx, SshBootstrapMsg::StartAttempt, delay);
     }
 
     fn join_readers(&mut self) {
         if let Some(reader) = self.stdout_reader.take() {
-            let _ = reader.join();
+            reader.join();
         }
         if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
+            reader.join();
         }
         self.stdout_closed = true;
         self.stderr_closed = true;
@@ -935,6 +1012,30 @@ impl SshBootstrapActor {
         stop_ssh_child(&mut self.child);
         self.join_readers();
     }
+
+    fn stop_relay(&mut self, ctx: &Ctx) {
+        if let Some(reader_relay) = self.reader_relay.take() {
+            let _ = ctx.stop_actor(reader_relay);
+        }
+    }
+
+    fn mark_stopped(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.bridge.observe_provider_line(
+            serde_json::json!({
+                "type": "VastAiBootstrapStopped",
+                "run_id": self.run_id(),
+                "node_id": self.node_id(),
+                "attempt": self.attempt,
+                "child_active": self.child.is_some(),
+                "classification": "bootstrap_stopped",
+            })
+            .to_string(),
+        );
+    }
 }
 
 impl ActorInterface for SshBootstrapActor {
@@ -942,7 +1043,19 @@ impl ActorInterface for SshBootstrapActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        let _ = ctx.send(ctx.self_addr(), SshBootstrapMsg::StartAttempt);
+        match ctx.spawn(SshOutputRelay {
+            target: ctx.self_addr(),
+        }) {
+            Ok(reader_relay) => {
+                self.reader_relay = Some(reader_relay);
+                let _ = ctx.send(ctx.self_addr(), SshBootstrapMsg::StartAttempt);
+            }
+            Err(error) => {
+                self.bridge
+                    .observe_provider_line(format!("spawn SSH output relay actor: {error}"));
+                ctx.stop_self();
+            }
+        }
     }
 
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
@@ -954,17 +1067,36 @@ impl ActorInterface for SshBootstrapActor {
                 self.handle_reader_error(stream, error)
             }
             SshBootstrapMsg::ReaderClosed { stream } => self.handle_reader_closed(ctx, stream),
+            #[cfg(test)]
+            SshBootstrapMsg::ScriptedAttemptFinished { result } => {
+                self.stdout_closed = true;
+                self.stderr_closed = true;
+                match result {
+                    Ok(status) => self.finish_completed_attempt(
+                        ctx,
+                        format!("exit status: {status}"),
+                        status == 0,
+                    ),
+                    Err(error) => {
+                        self.stop_child();
+                        self.pending_wait_error = Some(error);
+                        self.maybe_finish_attempt(ctx);
+                    }
+                }
+            }
             SshBootstrapMsg::Stop => {
-                self.stopped = true;
+                self.mark_stopped();
                 self.stop_child();
+                self.stop_relay(ctx);
                 ctx.stop_self();
             }
         }
     }
 
-    fn on_stop(&mut self, _ctx: &Ctx) {
-        self.stopped = true;
+    fn on_stop(&mut self, ctx: &Ctx) {
+        self.mark_stopped();
         self.stop_child();
+        self.stop_relay(ctx);
     }
 }
 
@@ -972,14 +1104,37 @@ fn stop_ssh_child(child: &mut Option<Child>) {
     let Some(mut child) = child.take() else {
         return;
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = swactor_process::child_kill(&mut child);
+    let _ = swactor_process::child_wait(&mut child);
+}
+
+#[cfg(test)]
+fn spawn_pending_test_child()
+-> Result<(Child, std::process::ChildStdout, std::process::ChildStderr), String> {
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "read _"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = swactor_process::command_spawn(&mut command)
+        .map_err(|error| format!("spawn pending SSH test child: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "pending SSH test child missing stdout".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "pending SSH test child missing stderr".to_owned())?;
+    Ok((child, stdout, stderr))
 }
 
 #[derive(Clone)]
 pub(crate) struct SshCommandBootstrapLauncher {
     ssh_identity: Option<PathBuf>,
     runtime: Runtime,
+    engine: EngineHandle,
 }
 pub(crate) struct SshCommandBootstrapHandle {
     actor: ActorAddress,
@@ -987,10 +1142,15 @@ pub(crate) struct SshCommandBootstrapHandle {
 }
 
 impl SshCommandBootstrapLauncher {
-    pub(crate) fn new(ssh_identity: Option<PathBuf>, runtime: Runtime) -> Self {
+    pub(crate) fn new(
+        ssh_identity: Option<PathBuf>,
+        runtime: Runtime,
+        engine: EngineHandle,
+    ) -> Self {
         Self {
             ssh_identity,
             runtime,
+            engine,
         }
     }
 }
@@ -1022,6 +1182,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
                 endpoint,
                 self.ssh_identity.clone(),
                 sender,
+                self.engine.clone(),
             ))
             .map_err(|e| format!("spawn VastAI SSH bootstrap actor: {e}"))?;
 
@@ -1059,50 +1220,6 @@ fn classify_ssh_observation(line: &str) -> Option<&'static str> {
     None
 }
 
-fn spawn_ssh_output_reader<R>(
-    stream: SshBootstrapStream,
-    reader: R,
-    sender: ExternalSender,
-    actor: ActorAddress,
-) -> JoinHandle<()>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for next in reader.lines() {
-            match next {
-                Ok(line) => {
-                    let _ = sender.send_to(actor, SshBootstrapMsg::OutputLine { stream, line });
-                }
-                Err(error) => {
-                    let _ = sender.send_to(
-                        actor,
-                        SshBootstrapMsg::ReaderError {
-                            stream,
-                            error: error.to_string(),
-                        },
-                    );
-                    break;
-                }
-            }
-        }
-        let _ = sender.send_to(actor, SshBootstrapMsg::ReaderClosed { stream });
-    })
-}
-
-fn schedule_ssh_message(
-    sender: ExternalSender,
-    actor: ActorAddress,
-    msg: SshBootstrapMsg,
-    delay: Duration,
-) {
-    thread::spawn(move || {
-        thread::sleep(delay);
-        let _ = sender.send_to(actor, msg);
-    });
-}
-
 fn spawn_ssh_bootstrap_attempt(
     spec: &NodeProvisionSpec,
     endpoint: &VastAiSshEndpoint,
@@ -1115,8 +1232,7 @@ fn spawn_ssh_bootstrap_attempt(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let mut child = swactor_process::command_spawn(&mut command)
         .map_err(|e| format!("spawn VastAI SSH bootstrap {}: {e}", spec.node_id))?;
     let stdout = child
         .stdout
@@ -1571,16 +1687,11 @@ where
         sink: PluginSink,
     ) -> Result<Option<AdoptedNode>, String> {
         let label = self.label_for(spec);
-        let mut contract = None;
-        for attempt in 0..10 {
-            contract = self.client.contract_by_label(&label)?;
-            if contract.is_some() {
-                break;
-            }
-            if attempt < 9 {
-                thread::sleep(self.config.lifecycle.lease_pace);
-            }
-        }
+        let contract = self.client.contract_by_label_with_retry(
+            &label,
+            10,
+            self.config.lifecycle.lease_pace,
+        )?;
         if contract.is_none() {
             return Ok(None);
         }
@@ -1624,9 +1735,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+    use proptest::prelude::*;
     use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use swactor::runtime::{RuntimeConfig, RuntimeParts};
+    use swactor_engine::{Engine, SteppingBackend};
+    use swactor_vastai::test_http::{TestHttpRoute, TestHttpServer};
+
+    use crate::tests::fuzz_support::{actor_census, advance_and_drive, drive_steps};
 
     use super::*;
 
@@ -1653,27 +1771,22 @@ mod tests {
 
     #[test]
     fn provision_one_adopts_stable_label_before_offer_search() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = runtime.block_on(MockServer::start());
-        runtime.block_on(async {
-            Mock::given(method("GET"))
-                .and(path("/api/v0/instances/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "instances": [{
-                        "id": 73,
-                        "label": "run-5-node-7-attempt-9",
-                        "actual_status": "loading",
-                        "ssh_host": "",
-                        "ssh_port": 0,
-                        "public_ipaddr": ""
-                    }]
-                })))
-                .mount(&server)
-                .await;
-        });
+        let server = TestHttpServer::start(vec![TestHttpRoute::json(
+            "GET",
+            "/api/v0/instances/",
+            200,
+            json!({
+                "instances": [{
+                    "id": 73,
+                    "label": "run-5-node-7-attempt-9",
+                    "actual_status": "loading",
+                    "ssh_host": "",
+                    "ssh_port": 0,
+                    "public_ipaddr": ""
+                }]
+            }),
+        )])
+        .unwrap();
         let client = swactor_vastai::VastClient::with_base_url(server.uri(), "secret");
         let mut client = ToolsVastAiLeaseClient::new(client).unwrap();
         let adopted = client
@@ -1694,9 +1807,9 @@ mod tests {
 
         assert_eq!(adopted.contract_id, 73);
         assert_eq!(adopted.offer_id, 0);
-        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let requests = server.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url.path(), "/api/v0/instances/");
+        assert_eq!(requests[0].path, "/api/v0/instances/");
     }
 
     use std::sync::atomic::AtomicUsize;
@@ -1895,30 +2008,25 @@ mod tests {
 
     #[test]
     fn offer_search_is_read_only() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = runtime.block_on(MockServer::start());
-        runtime.block_on(async {
-            Mock::given(method("GET"))
-                .and(path("/api/v0/bundles/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "offers": [{
-                        "id": 41,
-                        "gpu_name": "A",
-                        "dph_total": 0.2,
-                        "host_id": 1,
-                        "compute_cap": 800,
-                        "reliability2": 0.99,
-                        "inet_down": 500.0,
-                        "inet_up": 500.0,
-                        "geolocation": "US"
-                    }]
-                })))
-                .mount(&server)
-                .await;
-        });
+        let server = TestHttpServer::start(vec![TestHttpRoute::json(
+            "GET",
+            "/api/v0/bundles/",
+            200,
+            json!({
+                "offers": [{
+                    "id": 41,
+                    "gpu_name": "A",
+                    "dph_total": 0.2,
+                    "host_id": 1,
+                    "compute_cap": 800,
+                    "reliability2": 0.99,
+                    "inet_down": 500.0,
+                    "inet_up": 500.0,
+                    "geolocation": "US"
+                }]
+            }),
+        )])
+        .unwrap();
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
             "secret",
@@ -1933,28 +2041,21 @@ mod tests {
             offers.iter().map(|offer| offer.id).collect::<Vec<_>>(),
             [41]
         );
-        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let requests = server.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method.as_str(), "GET");
-        assert_eq!(requests[0].url.path(), "/api/v0/bundles/");
+        assert_eq!(requests[0].path, "/api/v0/bundles/");
     }
 
     #[test]
     fn exact_offer_creation_never_requests_an_alternative() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = runtime.block_on(MockServer::start());
-        runtime.block_on(async {
-            Mock::given(method("GET"))
-                .and(path("/api/v0/instances/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instances": []})))
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/api/v0/bundles/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        let server = TestHttpServer::start(vec![
+            TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
+            TestHttpRoute::json(
+                "GET",
+                "/api/v0/bundles/",
+                200,
+                json!({
                     "offers": [
                         {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
                          "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
@@ -1963,17 +2064,11 @@ mod tests {
                          "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
                          "geolocation": "US"}
                     ]
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("PUT"))
-                .and(path("/api/v0/asks/42/"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(json!({"new_contract": 700})),
-                )
-                .mount(&server)
-                .await;
-        });
+                }),
+            ),
+            TestHttpRoute::json("PUT", "/api/v0/asks/42/", 200, json!({"new_contract": 700})),
+        ])
+        .unwrap();
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
             "secret",
@@ -1982,12 +2077,12 @@ mod tests {
         let instance = client.provision_exact(exact_request(), 42).unwrap();
         assert_eq!(instance.offer_id, 42);
         assert_eq!(instance.contract_id, 700);
-        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let requests = server.requests();
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request.method.as_str() == "PUT")
-                .map(|request| request.url.path().to_owned())
+                .map(|request| request.path.clone())
                 .collect::<Vec<_>>(),
             vec!["/api/v0/asks/42/"]
         );
@@ -1995,29 +2090,22 @@ mod tests {
 
     #[test]
     fn unavailable_exact_offer_fails_without_any_create_request() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = runtime.block_on(MockServer::start());
-        runtime.block_on(async {
-            Mock::given(method("GET"))
-                .and(path("/api/v0/instances/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instances": []})))
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/api/v0/bundles/"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        let server = TestHttpServer::start(vec![
+            TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
+            TestHttpRoute::json(
+                "GET",
+                "/api/v0/bundles/",
+                200,
+                json!({
                     "offers": [{
                         "id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
                         "geolocation": "US"
                     }]
-                })))
-                .mount(&server)
-                .await;
-        });
+                }),
+            ),
+        ])
+        .unwrap();
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
             "secret",
@@ -2029,11 +2117,1301 @@ mod tests {
                 .unwrap_err()
                 .contains("selected offer 42")
         );
-        let requests = runtime.block_on(server.received_requests()).unwrap();
+        let requests = server.requests();
         assert!(
             requests
                 .iter()
                 .all(|request| request.method.as_str() != "PUT")
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        observations: Mutex<Vec<PluginObservation>>,
+    }
+
+    impl PluginObservationSink for RecordingSink {
+        fn observe(&self, observation: PluginObservation) {
+            self.observations.lock().push(observation);
+        }
+    }
+
+    fn offer_fixture(id: u64) -> serde_json::Value {
+        json!({
+            "id": id,
+            "gpu_name": "RTX 4090",
+            "dph_total": 0.2,
+            "gpu_ram": 24_000.0,
+            "host_id": id.saturating_add(100),
+            "compute_cap": 890,
+            "reliability2": 0.99,
+            "inet_down": 500.0,
+            "inet_up": 250.0,
+            "geolocation": "US"
+        })
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum OfferBrowseOutcome {
+        Offers(Vec<u64>),
+        Rejected(String),
+    }
+
+    fn browse_offer_fixture(route: TestHttpRoute) -> (OfferBrowseOutcome, usize) {
+        let server = TestHttpServer::start(vec![route]).expect("start offer HTTP fixture");
+        let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
+            server.uri(),
+            "secret",
+        ))
+        .expect("blocking VastAI client");
+        let outcome = match client.browse_offers(&OfferBrowseCriteria::default()) {
+            Ok(offers) => {
+                OfferBrowseOutcome::Offers(offers.into_iter().map(|offer| offer.id).collect())
+            }
+            Err(error) => OfferBrowseOutcome::Rejected(error),
+        };
+        (outcome, server.requests().len())
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum TerminalOutcome {
+        MonitorRejected {
+            run_id: u64,
+            node_id: u64,
+            reason: String,
+        },
+        BootstrapStopped {
+            run_id: u64,
+            node_id: u64,
+            attempt: u64,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TerminalInvariantError {
+        MalformedTerminal(String),
+        DuplicateTerminal {
+            first: TerminalOutcome,
+            duplicate: TerminalOutcome,
+        },
+    }
+
+    fn single_terminal_outcome(
+        observations: &[PluginObservation],
+    ) -> Result<Option<TerminalOutcome>, TerminalInvariantError> {
+        let mut terminal = None;
+        for observation in observations {
+            let candidate = match observation {
+                PluginObservation::Failed {
+                    run_id,
+                    node_id,
+                    reason,
+                } => Some(TerminalOutcome::MonitorRejected {
+                    run_id: *run_id,
+                    node_id: *node_id,
+                    reason: reason.clone(),
+                }),
+                PluginObservation::ProviderLine {
+                    run_id: observed_run_id,
+                    node_id: observed_node_id,
+                    line,
+                } => {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if value.get("type").and_then(serde_json::Value::as_str)
+                        != Some("VastAiBootstrapStopped")
+                    {
+                        continue;
+                    }
+                    let run_id = value
+                        .get("run_id")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| TerminalInvariantError::MalformedTerminal(line.clone()))?;
+                    let node_id = value
+                        .get("node_id")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| TerminalInvariantError::MalformedTerminal(line.clone()))?;
+                    let attempt = value
+                        .get("attempt")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| TerminalInvariantError::MalformedTerminal(line.clone()))?;
+                    if run_id != *observed_run_id || node_id != *observed_node_id {
+                        return Err(TerminalInvariantError::MalformedTerminal(line.clone()));
+                    }
+                    Some(TerminalOutcome::BootstrapStopped {
+                        run_id,
+                        node_id,
+                        attempt,
+                    })
+                }
+                _ => None,
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if let Some(first) = terminal {
+                return Err(TerminalInvariantError::DuplicateTerminal {
+                    first,
+                    duplicate: candidate,
+                });
+            }
+            terminal = Some(candidate);
+        }
+        Ok(terminal)
+    }
+
+    fn observations(recording: &RecordingSink) -> Vec<PluginObservation> {
+        recording.observations.lock().clone()
+    }
+
+    fn runtime_is_clean(runtime: &Runtime, baseline: usize, actor_limit: usize) -> bool {
+        let stats = runtime.stats();
+        stats.actors.len() <= baseline.saturating_add(actor_limit)
+            && stats.actor_details.iter().all(|actor| !actor.poisoned)
+            && stats
+                .workers
+                .iter()
+                .map(|worker| worker.panics)
+                .sum::<u64>()
+                == 0
+    }
+
+    fn monitor_spec(run_id: u64, node_id: u64) -> NodeProvisionSpec {
+        NodeProvisionSpec {
+            run_id,
+            node_id,
+            attempt_id: 9,
+            stage_index: Some(0),
+            image: "node:v1".to_owned(),
+            env: Vec::new(),
+            args: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+
+    fn monitor_route(contract_id: u64, kind: u8) -> TestHttpRoute {
+        let path = format!("/api/v0/instances/{contract_id}/");
+        match kind {
+            0 => TestHttpRoute::json(
+                "GET",
+                &path,
+                200,
+                json!({"instances": {
+                    "actual_status": "running",
+                    "intended_status": "running",
+                    "public_ipaddr": "127.0.0.1",
+                    "ssh_port": 22
+                }}),
+            ),
+            1 => TestHttpRoute::json(
+                "GET",
+                &path,
+                200,
+                json!({"instances": {
+                    "actual_status": "error",
+                    "intended_status": "running",
+                    "status_msg": "container failed"
+                }}),
+            ),
+            2 => TestHttpRoute::raw("GET", &path, 404, b"missing".to_vec()),
+            3 => TestHttpRoute::raw("GET", &path, 200, b"{broken".to_vec()),
+            4 => TestHttpRoute::raw("GET", &path, 500, b"retry".to_vec()),
+            _ => TestHttpRoute::json(
+                "GET",
+                &path,
+                200,
+                json!({"instances": [
+                    {"actual_status": "running", "intended_status": "running"},
+                    {"actual_status": "error", "intended_status": "running"}
+                ]}),
+            ),
+        }
+    }
+
+    struct MonitorHarness {
+        server: TestHttpServer,
+        runtime: Runtime,
+        backend: SteppingBackend,
+        _engine: Engine,
+        actor: ActorAddress,
+        baseline: usize,
+        recording: Arc<RecordingSink>,
+    }
+
+    fn monitor_harness(contract_id: u64, spec: NodeProvisionSpec, kind: u8) -> MonitorHarness {
+        let server = TestHttpServer::start(vec![monitor_route(contract_id, kind)])
+            .expect("start monitor HTTP fixture");
+        let client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
+            server.uri(),
+            "secret",
+        ))
+        .expect("blocking VastAI client");
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let baseline = runtime.stats().actors.len();
+        let recording = Arc::new(RecordingSink::default());
+        let actor = runtime
+            .spawn(VastAiProviderMonitorActor::new(
+                client,
+                contract_id,
+                format!(
+                    "run-{}-node-{}-attempt-{}",
+                    spec.run_id, spec.node_id, spec.attempt_id
+                ),
+                LifecyclePolicy {
+                    lease_pace: Duration::ZERO,
+                    poll_interval: Duration::from_millis(1),
+                    state_timeout: Duration::from_millis(10),
+                },
+                spec,
+                PluginSink::new(recording.clone()),
+                runtime.create_sender(),
+                engine.handle(),
+            ))
+            .expect("spawn VastAI monitor");
+        MonitorHarness {
+            server,
+            runtime,
+            backend,
+            _engine: engine,
+            actor,
+            baseline,
+            recording,
+        }
+    }
+
+    struct SshHarness {
+        runtime: Runtime,
+        backend: SteppingBackend,
+        _engine: Engine,
+        actor: ActorAddress,
+        baseline: usize,
+        recording: Arc<RecordingSink>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SshHarnessMode {
+        Idle,
+        OpenStreams,
+        PendingChild,
+    }
+
+    fn ssh_harness_with_mode(mode: SshHarnessMode) -> SshHarness {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let baseline = runtime.stats().actors.len();
+        let recording = Arc::new(RecordingSink::default());
+        let bridge = BootstrapTelemetryBridge::new(
+            monitor_spec(5, 7),
+            PluginSink::new(recording.clone()),
+            None,
+        );
+        let actor = SshBootstrapActor::new(
+            bridge,
+            VastAiSshEndpoint {
+                host: "scripted.invalid".to_owned(),
+                port: 22,
+                user: "root".to_owned(),
+            },
+            None,
+            runtime.create_sender(),
+            engine.handle(),
+        );
+        let actor = match mode {
+            SshHarnessMode::Idle => actor.with_attempt_spawn_disabled(),
+            SshHarnessMode::OpenStreams => actor.with_open_test_streams(),
+            SshHarnessMode::PendingChild => actor.with_pending_test_child(),
+        };
+        let actor = runtime.spawn(actor).expect("spawn SSH bootstrap actor");
+        drive_steps(&backend, 8);
+        SshHarness {
+            runtime,
+            backend,
+            _engine: engine,
+            actor,
+            baseline,
+            recording,
+        }
+    }
+
+    fn ssh_harness() -> SshHarness {
+        ssh_harness_with_mode(SshHarnessMode::Idle)
+    }
+
+    fn malformed_protocol_line(kind: u8, nonce: u16) -> String {
+        match kind % 8 {
+            0 => "{broken".to_owned(),
+            1 => json!({"myelin_stdio_event": 1}).to_string(),
+            2 => json!({
+                "myelin_stdio_event": 2,
+                "kind": "telemetry_frame",
+                "channel": "test",
+                "payload": {"nonce": nonce}
+            })
+            .to_string(),
+            3 => json!({
+                "myelin_stdio_event": 1,
+                "kind": "wrong",
+                "channel": "test",
+                "payload": {"nonce": nonce}
+            })
+            .to_string(),
+            4 => json!({
+                "myelin_stdio_event": 1,
+                "kind": "telemetry_frame",
+                "channel": nonce
+            })
+            .to_string(),
+            5 => json!([1, 2, nonce]).to_string(),
+            6 => "null".to_owned(),
+            _ => format!("malformed-protocol-{nonce}"),
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum SshOutputAction {
+        Stdout(String),
+        Stderr(String),
+        Protocol(u16),
+    }
+
+    fn ssh_output_actions() -> impl Strategy<Value = Vec<SshOutputAction>> {
+        prop::collection::vec(
+            prop_oneof![
+                "[ -~]{0,32}".prop_map(SshOutputAction::Stdout),
+                "[ -~]{0,32}".prop_map(SshOutputAction::Stderr),
+                any::<u16>().prop_map(SshOutputAction::Protocol),
+            ],
+            0..=32,
+        )
+    }
+
+    #[derive(Clone, Debug)]
+    enum SshOrderingAction {
+        Poll,
+        Stdout(String),
+        ReaderError(bool),
+        Advance(u16),
+        Stop,
+    }
+
+    fn ssh_ordering_actions() -> impl Strategy<Value = Vec<SshOrderingAction>> {
+        prop::collection::vec(
+            prop_oneof![
+                Just(SshOrderingAction::Poll),
+                "[ -~]{0,16}".prop_map(SshOrderingAction::Stdout),
+                any::<bool>().prop_map(SshOrderingAction::ReaderError),
+                (0_u16..=1_000).prop_map(SshOrderingAction::Advance),
+                Just(SshOrderingAction::Stop),
+            ],
+            0..=32,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn offer_status_classes_are_offers_or_typed_rejections(
+            status_index in 0_usize..11,
+            empty in any::<bool>(),
+        ) {
+            let statuses = [200, 201, 206, 204, 300, 302, 400, 404, 429, 500, 503];
+            let status = statuses[status_index];
+            let expected_ids = if empty { Vec::new() } else { vec![41] };
+            let offers = if empty {
+                Vec::new()
+            } else {
+                vec![offer_fixture(41)]
+            };
+            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
+                "GET",
+                "/api/v0/bundles/",
+                status,
+                json!({"offers": offers}),
+            ));
+            let should_parse = matches!(status, 200 | 201 | 206);
+            prop_assert_eq!(
+                matches!(&outcome, OfferBrowseOutcome::Offers(_)),
+                should_parse,
+                "status={}, outcome={:?}",
+                status,
+                outcome,
+            );
+            if should_parse {
+                prop_assert_eq!(
+                    &outcome,
+                    &OfferBrowseOutcome::Offers(expected_ids),
+                    "status={}, empty={}, outcome={:?}",
+                    status,
+                    empty,
+                    outcome,
+                );
+            }
+            if let OfferBrowseOutcome::Rejected(error) = &outcome {
+                prop_assert!(
+                    !error.trim().is_empty(),
+                    "status={}, typed rejection was empty: {:?}",
+                    status,
+                    outcome,
+                );
+            }
+            prop_assert_eq!(
+                request_count,
+                1,
+                "status={}, outcome={:?}",
+                status,
+                outcome,
+            );
+        }
+
+        #[test]
+        fn malformed_offer_bodies_are_typed_rejections(
+            kind in 0_u8..5,
+            fuzz in prop::collection::vec(any::<u8>(), 0..=32),
+        ) {
+            let body = match kind {
+                0 => Vec::new(),
+                1 => {
+                    let mut body = b"{broken".to_vec();
+                    body.extend_from_slice(&fuzz);
+                    body.push(0xff);
+                    body
+                }
+                2 => {
+                    let mut body = b"{\"offers\":[".to_vec();
+                    body.extend_from_slice(&fuzz);
+                    body.push(0xff);
+                    body
+                }
+                3 => {
+                    let mut body = fuzz.clone();
+                    body.push(0xff);
+                    body
+                }
+                _ => {
+                    let mut body = b"[".to_vec();
+                    body.extend_from_slice(&fuzz);
+                    body.push(0xff);
+                    body
+                }
+            };
+            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::raw(
+                "GET",
+                "/api/v0/bundles/",
+                200,
+                body,
+            ));
+            prop_assert!(
+                matches!(&outcome, OfferBrowseOutcome::Rejected(error) if !error.trim().is_empty()),
+                "kind={}, fuzz={:?}, outcome={:?}",
+                kind,
+                fuzz,
+                outcome,
+            );
+            prop_assert_eq!(
+                request_count,
+                1,
+                "kind={}, fuzz={:?}, outcome={:?}",
+                kind,
+                fuzz,
+                outcome,
+            );
+        }
+
+        #[test]
+        fn wrong_or_missing_offer_fields_are_typed_rejections(kind in 0_u8..8) {
+            let body = match kind {
+                0 => json!({}),
+                1 => json!({"offers": "wrong"}),
+                2 => json!({"offers": {}}),
+                3 => json!({"offers": [{"gpu_name": "A", "dph_total": 0.2}]}),
+                4 => json!({"offers": [{"id": "41", "gpu_name": "A", "dph_total": 0.2}]}),
+                5 => json!({"offers": [{"id": 41, "gpu_name": 9, "dph_total": 0.2}]}),
+                6 => json!({"offers": [{"id": 41, "gpu_name": "A", "dph_total": "cheap"}]}),
+                _ => json!({"offers": null}),
+            };
+            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
+                "GET",
+                "/api/v0/bundles/",
+                200,
+                body,
+            ));
+            prop_assert!(
+                matches!(&outcome, OfferBrowseOutcome::Rejected(error) if !error.trim().is_empty()),
+                "wrong-field kind={}, outcome={:?}",
+                kind,
+                outcome,
+            );
+            prop_assert_eq!(
+                request_count,
+                1,
+                "wrong-field kind={}, outcome={:?}",
+                kind,
+                outcome,
+            );
+        }
+
+        #[test]
+        fn duplicate_offer_records_remain_explicit_values(
+            id in 0_u64..=1_000_000,
+            repetitions in 2_usize..=32,
+        ) {
+            let repeated = (0..repetitions).map(|_| offer_fixture(id)).collect::<Vec<_>>();
+            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
+                "GET",
+                "/api/v0/bundles/",
+                200,
+                json!({"offers": repeated}),
+            ));
+            prop_assert_eq!(
+                outcome,
+                OfferBrowseOutcome::Offers(vec![id; repetitions]),
+                "id={}, repetitions={}",
+                id,
+                repetitions,
+            );
+            prop_assert_eq!(
+                request_count,
+                1,
+                "id={}, repetitions={}",
+                id,
+                repetitions,
+            );
+        }
+
+        #[test]
+        fn provider_monitor_preserves_contract_identity_and_cardinality(
+            run_id in 1_u64..=10_000,
+            node_id in 1_u64..=10_000,
+            contract_id in 1_u64..=10_000,
+        ) {
+            let actions = [
+                format!("spawn({contract_id})"),
+                "initial_poll".to_owned(),
+                "stop".to_owned(),
+            ];
+            let harness = monitor_harness(contract_id, monitor_spec(run_id, node_id), 0);
+            drive_steps(&harness.backend, 8);
+            let before_stop = observations(&harness.recording);
+            let census = actor_census(&harness.runtime);
+            prop_assert!(
+                harness.runtime.stats().actors.len() == harness.baseline + 1,
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                before_stop,
+                census,
+            );
+            prop_assert!(
+                harness.server.requests().iter().all(|request| {
+                    request.path == format!("/api/v0/instances/{contract_id}/")
+                }),
+                "actions={:?}, outcomes={:?}, requests={:?}, census={}",
+                actions,
+                before_stop,
+                harness.server.requests(),
+                census,
+            );
+            let identities = before_stop
+                .iter()
+                .filter_map(|observation| match observation {
+                    PluginObservation::ProviderLine {
+                        run_id: observed_run,
+                        node_id: observed_node,
+                        line,
+                    } => serde_json::from_str::<serde_json::Value>(line)
+                        .ok()
+                        .filter(|value| {
+                            value.get("type").and_then(serde_json::Value::as_str)
+                                == Some("VastAiProviderStatusObserved")
+                        })
+                        .map(|value| (*observed_run, *observed_node, value)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            prop_assert!(
+                !identities.is_empty()
+                    && identities.iter().all(|(observed_run, observed_node, value)| {
+                        *observed_run == run_id
+                            && *observed_node == node_id
+                            && value.get("run_id").and_then(serde_json::Value::as_u64)
+                                == Some(run_id)
+                            && value.get("node_id").and_then(serde_json::Value::as_u64)
+                                == Some(node_id)
+                            && value.get("contract_id").and_then(serde_json::Value::as_u64)
+                                == Some(contract_id)
+                    }),
+                "actions={:?}, identities={:?}, outcomes={:?}, census={}",
+                actions,
+                identities,
+                before_stop,
+                census,
+            );
+            let _ = harness
+                .runtime
+                .send_to(harness.actor, VastAiProviderMonitorMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            let final_outcomes = observations(&harness.recording);
+            prop_assert!(
+                runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                final_outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn provider_monitor_terminal_polling_stops_after_one_typed_outcome(
+            terminal_kind in 0_usize..4,
+            extra_polls in 0_usize..=32,
+        ) {
+            let kinds = [1_u8, 2, 3, 5];
+            let kind = kinds[terminal_kind];
+            let actions = vec!["poll"; extra_polls];
+            let harness = monitor_harness(73, monitor_spec(5, 7), kind);
+            for _ in 0..extra_polls {
+                let _ = harness
+                    .runtime
+                    .send_to(harness.actor, VastAiProviderMonitorMsg::Poll);
+            }
+            drive_steps(&harness.backend, 64);
+            let first_request_count = harness.server.requests().len();
+            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            let second_request_count = harness.server.requests().len();
+            let outcomes = observations(&harness.recording);
+            let terminal = single_terminal_outcome(&outcomes);
+            let census = actor_census(&harness.runtime);
+            prop_assert_eq!(
+                first_request_count,
+                second_request_count,
+                "kind={}, actions={:?}, outcomes={:?}, census={}",
+                kind,
+                actions,
+                outcomes,
+                census,
+            );
+            prop_assert_eq!(
+                first_request_count,
+                1,
+                "kind={}, actions={:?}, outcomes={:?}, census={}",
+                kind,
+                actions,
+                outcomes,
+                census,
+            );
+            prop_assert!(
+                matches!(
+                    &terminal,
+                    Ok(Some(TerminalOutcome::MonitorRejected { reason, .. }))
+                        if reason.contains("[class=")
+                ),
+                "kind={}, actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                kind,
+                actions,
+                terminal,
+                outcomes,
+                census,
+            );
+            prop_assert!(
+                runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "kind={}, actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                kind,
+                actions,
+                terminal,
+                outcomes,
+                census,
+            );
+        }
+
+        #[test]
+        fn provider_monitor_poll_stop_orderings_cease_polling(
+            retrying in any::<bool>(),
+            actions in prop::collection::vec(0_u8..3, 0..=32),
+        ) {
+            let kind = if retrying { 4 } else { 0 };
+            let harness = monitor_harness(73, monitor_spec(5, 7), kind);
+            drive_steps(&harness.backend, 8);
+            let mut stopped = false;
+            let mut stopped_request_count = None;
+            for action in &actions {
+                match action {
+                    0 => {
+                        let _ = harness
+                            .runtime
+                            .send_to(harness.actor, VastAiProviderMonitorMsg::Poll);
+                        drive_steps(&harness.backend, 8);
+                    }
+                    1 => advance_and_drive(
+                        &harness.backend,
+                        Duration::from_millis(1),
+                        8,
+                    ),
+                    _ => {
+                        let _ = harness
+                            .runtime
+                            .send_to(harness.actor, VastAiProviderMonitorMsg::Stop);
+                        drive_steps(&harness.backend, 8);
+                        stopped = true;
+                        stopped_request_count
+                            .get_or_insert_with(|| harness.server.requests().len());
+                    }
+                }
+                let outcomes = observations(&harness.recording);
+                prop_assert!(
+                    runtime_is_clean(&harness.runtime, harness.baseline, 1),
+                    "actions={:?}, stopped={}, outcomes={:?}, census={}",
+                    actions,
+                    stopped,
+                    outcomes,
+                    actor_census(&harness.runtime),
+                );
+                if let Some(count) = stopped_request_count {
+                    prop_assert_eq!(
+                        harness.server.requests().len(),
+                        count,
+                        "polling resumed after stop; actions={:?}, outcomes={:?}, census={}",
+                        actions,
+                        outcomes,
+                        actor_census(&harness.runtime),
+                    );
+                }
+            }
+            let _ = harness
+                .runtime
+                .send_to(harness.actor, VastAiProviderMonitorMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            let settled_requests = harness.server.requests().len();
+            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            let outcomes = observations(&harness.recording);
+            prop_assert_eq!(
+                harness.server.requests().len(),
+                settled_requests,
+                "polling did not cease; actions={:?}, stopped={}, outcomes={:?}, census={}",
+                actions,
+                stopped,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert!(
+                runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, stopped={}, outcomes={:?}, census={}",
+                actions,
+                stopped,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn duplicate_terminal_detector_rejects_controlled_fault(
+            run_id in any::<u64>(),
+            node_id in any::<u64>(),
+        ) {
+            let injected = vec![
+                PluginObservation::ProviderLine {
+                    run_id,
+                    node_id,
+                    line: json!({
+                        "type": "VastAiBootstrapStopped",
+                        "run_id": run_id,
+                        "node_id": node_id,
+                        "attempt": 1,
+                    })
+                    .to_string(),
+                },
+                PluginObservation::ProviderLine {
+                    run_id,
+                    node_id,
+                    line: json!({
+                        "type": "VastAiBootstrapStopped",
+                        "run_id": run_id,
+                        "node_id": node_id,
+                        "attempt": 2,
+                    })
+                    .to_string(),
+                },
+            ];
+            let detected = single_terminal_outcome(&injected);
+            prop_assert!(
+                matches!(
+                    &detected,
+                    Err(TerminalInvariantError::DuplicateTerminal { .. })
+                ),
+                "controlled duplicate terminal escaped detector; actions=[inject_first, inject_duplicate], outcomes={:?}, detected={:?}",
+                injected,
+                detected,
+            );
+        }
+
+        #[test]
+        fn ssh_bootstrap_output_lines_preserve_stream_and_protocol(actions in ssh_output_actions()) {
+            let harness = ssh_harness();
+            let initial_census = actor_census(&harness.runtime);
+            prop_assert!(
+                harness.runtime.stats().actors.len() == harness.baseline + 2,
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                observations(&harness.recording),
+                initial_census,
+            );
+            for action in &actions {
+                let message = match action {
+                    SshOutputAction::Stdout(line) => SshBootstrapMsg::OutputLine {
+                        stream: SshBootstrapStream::Stdout,
+                        line: line.clone(),
+                    },
+                    SshOutputAction::Stderr(line) => SshBootstrapMsg::OutputLine {
+                        stream: SshBootstrapStream::Stderr,
+                        line: line.clone(),
+                    },
+                    SshOutputAction::Protocol(nonce) => SshBootstrapMsg::OutputLine {
+                        stream: SshBootstrapStream::Stdout,
+                        line: json!({
+                            "myelin_stdio_event": 1,
+                            "kind": "telemetry_frame",
+                            "channel": "generated",
+                            "payload": {"nonce": nonce}
+                        })
+                        .to_string(),
+                    },
+                };
+                harness
+                    .runtime
+                    .send_to(harness.actor, message)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "queue SSH output failed: error={error}, action={action:?}, actions={actions:?}, outcomes={:?}, census={}",
+                            observations(&harness.recording),
+                            actor_census(&harness.runtime),
+                        )
+                    });
+                drive_steps(&harness.backend, 4);
+            }
+            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let outcomes = observations(&harness.recording);
+            let expected_stdout = actions
+                .iter()
+                .filter(|action| matches!(action, SshOutputAction::Stdout(_)))
+                .count();
+            let expected_stderr = actions
+                .iter()
+                .filter(|action| matches!(action, SshOutputAction::Stderr(_)))
+                .count();
+            let expected_protocol = actions
+                .iter()
+                .filter(|action| matches!(action, SshOutputAction::Protocol(_)))
+                .count();
+            prop_assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, PluginObservation::StdoutLine { .. }))
+                    .count(),
+                expected_stdout,
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, PluginObservation::StderrLine { .. }))
+                    .count(),
+                expected_stderr,
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, PluginObservation::TelemetryFrame { .. }))
+                    .count(),
+                expected_protocol,
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            let terminal = single_terminal_outcome(&outcomes);
+            prop_assert!(
+                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. }))),
+                "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert!(
+                runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn ssh_bootstrap_malformed_protocol_is_data_not_poison(
+            actions in prop::collection::vec((0_u8..8, any::<u16>()), 0..=32),
+        ) {
+            let harness = ssh_harness();
+            for (kind, nonce) in &actions {
+                harness
+                    .runtime
+                    .send_to(
+                        harness.actor,
+                        SshBootstrapMsg::OutputLine {
+                            stream: SshBootstrapStream::Stdout,
+                            line: malformed_protocol_line(*kind, *nonce),
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "queue malformed SSH protocol failed: error={error}, action=({kind}, {nonce}), actions={actions:?}, outcomes={:?}, census={}",
+                            observations(&harness.recording),
+                            actor_census(&harness.runtime),
+                        )
+                    });
+                drive_steps(&harness.backend, 4);
+            }
+            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let outcomes = observations(&harness.recording);
+            prop_assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, PluginObservation::StdoutLine { .. }))
+                    .count(),
+                actions.len(),
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, PluginObservation::TelemetryFrame { .. }))
+                    .count(),
+                0,
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            let terminal = single_terminal_outcome(&outcomes);
+            prop_assert!(
+                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                    && runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn ssh_bootstrap_eof_orderings_stop_relay_and_actor(
+            generated_actions in prop::collection::vec(any::<bool>(), 0..=30),
+        ) {
+            let mut actions = generated_actions;
+            actions.push(false);
+            actions.push(true);
+            let harness = ssh_harness_with_mode(SshHarnessMode::OpenStreams);
+            for stderr in &actions {
+                harness
+                    .runtime
+                    .send_to(
+                        harness.actor,
+                        SshBootstrapMsg::ReaderClosed {
+                            stream: if *stderr {
+                                SshBootstrapStream::Stderr
+                            } else {
+                                SshBootstrapStream::Stdout
+                            },
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "queue SSH EOF failed: error={error}, action={stderr}, actions={actions:?}, outcomes={:?}, census={}",
+                            observations(&harness.recording),
+                            actor_census(&harness.runtime),
+                        )
+                    });
+                drive_steps(&harness.backend, 4);
+            }
+            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let outcomes = observations(&harness.recording);
+            let terminal = single_terminal_outcome(&outcomes);
+            prop_assert!(
+                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                    && runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn ssh_bootstrap_child_failures_have_typed_attempt_outcomes(
+            actions in prop::collection::vec(1_i32..=255, 1..=32),
+        ) {
+            let harness = ssh_harness();
+            for status in &actions {
+                harness
+                    .runtime
+                    .send_to(
+                        harness.actor,
+                        SshBootstrapMsg::ScriptedAttemptFinished {
+                            result: Ok(*status),
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "queue SSH child failure failed: error={error}, action={status}, actions={actions:?}, outcomes={:?}, census={}",
+                            observations(&harness.recording),
+                            actor_census(&harness.runtime),
+                        )
+                    });
+                drive_steps(&harness.backend, 4);
+            }
+            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let outcomes = observations(&harness.recording);
+            let completions = outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    PluginObservation::ProviderLine { line, .. } => {
+                        serde_json::from_str::<serde_json::Value>(line).ok()
+                    }
+                    _ => None,
+                })
+                .filter(|value| {
+                    value.get("type").and_then(serde_json::Value::as_str)
+                        == Some("VastAiBootstrapAttemptCompleted")
+                        && value
+                            .get("classification")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("not ready before runtime ready")
+                })
+                .count();
+            prop_assert_eq!(
+                completions,
+                actions.len(),
+                "actions={:?}, outcomes={:?}, census={}",
+                actions,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            let terminal = single_terminal_outcome(&outcomes);
+            prop_assert!(
+                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                    && runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn ssh_bootstrap_timeout_is_typed_and_stops_polling(
+            advances in prop::collection::vec(0_u16..=1_000, 0..=31),
+        ) {
+            let harness = ssh_harness_with_mode(SshHarnessMode::PendingChild);
+            advance_and_drive(&harness.backend, Duration::from_millis(100), 8);
+            let initial_outcomes = observations(&harness.recording);
+            prop_assert!(
+                harness.runtime.stats().actors.len() == harness.baseline + 2
+                    && !initial_outcomes.iter().any(|outcome| matches!(
+                        outcome,
+                        PluginObservation::ProviderLine { line, .. }
+                            if line.contains("spawn VastAI SSH bootstrap attempt")
+                                && line.contains("failed")
+                    )),
+                "actions=[start_pending_child, poll, timeout, {:?}, stop], outcomes={:?}, census={}",
+                advances,
+                initial_outcomes,
+                actor_census(&harness.runtime),
+            );
+            harness
+                .runtime
+                .send_to(
+                    harness.actor,
+                    SshBootstrapMsg::ScriptedAttemptFinished {
+                        result: Err("bootstrap timeout".to_owned()),
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "queue SSH timeout failed: error={error}, actions=[timeout, {advances:?}], outcomes={:?}, census={}",
+                        observations(&harness.recording),
+                        actor_census(&harness.runtime),
+                    )
+                });
+            drive_steps(&harness.backend, 4);
+            for millis in &advances {
+                advance_and_drive(
+                    &harness.backend,
+                    Duration::from_millis(u64::from(*millis)),
+                    4,
+                );
+            }
+            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let outcomes = observations(&harness.recording);
+            prop_assert!(
+                outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    PluginObservation::ProviderLine { line, .. }
+                        if line.contains("bootstrap timeout") && line.contains("retrying")
+                )),
+                "actions=[timeout, {:?}, stop], outcomes={:?}, census={}",
+                advances,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            let settled_attempts = outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    PluginObservation::ProviderLine { line, .. }
+                        if line.contains("VastAI SSH bootstrap attempt")
+                ))
+                .count();
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let final_outcomes = observations(&harness.recording);
+            let final_attempts = final_outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    PluginObservation::ProviderLine { line, .. }
+                        if line.contains("VastAI SSH bootstrap attempt")
+                ))
+                .count();
+            let terminal = single_terminal_outcome(&final_outcomes);
+            prop_assert_eq!(
+                final_attempts,
+                settled_attempts,
+                "polling resumed after timeout stop; actions=[timeout, {:?}, stop], terminal={:?}, outcomes={:?}, census={}",
+                advances,
+                terminal,
+                final_outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert!(
+                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                    && runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions=[timeout, {:?}, stop], terminal={:?}, outcomes={:?}, census={}",
+                advances,
+                terminal,
+                final_outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
+
+        #[test]
+        fn ssh_bootstrap_stop_orderings_emit_one_terminal_and_stop_all_actors(
+            actions in ssh_ordering_actions(),
+        ) {
+            let harness = ssh_harness();
+            let mut stopped = false;
+            for action in &actions {
+                match action {
+                    SshOrderingAction::Poll => {
+                        let _ = harness
+                            .runtime
+                            .send_to(harness.actor, SshBootstrapMsg::PollChild);
+                        drive_steps(&harness.backend, 4);
+                    }
+                    SshOrderingAction::Stdout(line) => {
+                        let _ = harness.runtime.send_to(
+                            harness.actor,
+                            SshBootstrapMsg::OutputLine {
+                                stream: SshBootstrapStream::Stdout,
+                                line: line.clone(),
+                            },
+                        );
+                        drive_steps(&harness.backend, 4);
+                    }
+                    SshOrderingAction::ReaderError(stderr) => {
+                        let _ = harness.runtime.send_to(
+                            harness.actor,
+                            SshBootstrapMsg::ReaderError {
+                                stream: if *stderr {
+                                    SshBootstrapStream::Stderr
+                                } else {
+                                    SshBootstrapStream::Stdout
+                                },
+                                error: "scripted reader failure".to_owned(),
+                            },
+                        );
+                        drive_steps(&harness.backend, 4);
+                    }
+                    SshOrderingAction::Advance(millis) => advance_and_drive(
+                        &harness.backend,
+                        Duration::from_millis(u64::from(*millis)),
+                        4,
+                    ),
+                    SshOrderingAction::Stop => {
+                        let _ = harness
+                            .runtime
+                            .send_to(harness.actor, SshBootstrapMsg::Stop);
+                        drive_steps(&harness.backend, 4);
+                        stopped = true;
+                    }
+                }
+                let outcomes = observations(&harness.recording);
+                prop_assert!(
+                    runtime_is_clean(&harness.runtime, harness.baseline, 2),
+                    "actions={:?}, stopped={}, outcomes={:?}, census={}",
+                    actions,
+                    stopped,
+                    outcomes,
+                    actor_census(&harness.runtime),
+                );
+            }
+            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
+            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            let outcomes = observations(&harness.recording);
+            let terminal = single_terminal_outcome(&outcomes);
+            prop_assert!(
+                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. }))),
+                "actions={:?}, stopped={}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                stopped,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+            prop_assert!(
+                runtime_is_clean(&harness.runtime, harness.baseline, 0),
+                "actions={:?}, stopped={}, terminal={:?}, outcomes={:?}, census={}",
+                actions,
+                stopped,
+                terminal,
+                outcomes,
+                actor_census(&harness.runtime),
+            );
+        }
     }
 }

@@ -270,6 +270,19 @@ impl DashboardHandle {
             server::run_server_with_routes(state, port, routes).await;
         }
     }
+    /// Schedule the dashboard HTTP server on its approved execution owner.
+    pub fn spawn(&self, engine: &swactor_engine::EngineHandle) {
+        engine.spawn(self.http_server());
+    }
+
+    /// Schedule the dashboard HTTP server on its approved execution owner.
+    pub fn spawn_with_plugins(
+        &self,
+        engine: &swactor_engine::EngineHandle,
+        plugins: Vec<DashboardPlugin>,
+    ) {
+        engine.spawn(self.http_server_with_plugins(plugins));
+    }
 }
 
 /// Create the telemetry dashboard state.

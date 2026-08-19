@@ -91,17 +91,16 @@ impl DockerProcessLogic {
         }
         self.removed = true;
         let name = container_name(self.spec.attempt);
-        std::thread::spawn(move || {
-            let status = std::process::Command::new("docker")
-                .args(["rm", "-f", "--", &name])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if let Err(error) = status {
-                eprintln!("demo: docker rm -f {name} failed: {error}");
-            }
-        });
+        let mut command = std::process::Command::new("docker");
+        command
+            .args(["rm", "-f", "--", &name])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        swactor_process::spawn_detached_command_status(
+            command,
+            format!("demo: docker rm -f {name} failed"),
+        );
     }
 }
 
@@ -361,19 +360,20 @@ fn build_image(root: &Path, image: &str) -> Result<(), String> {
 }
 
 fn run_cargo_build(root: &Path) -> Result<(), String> {
-    let output = std::process::Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            IMAGE_TARGET,
-            "--package",
-            "xtask",
-        ])
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("run cargo: {e}"))?;
+    let output = swactor_process::command_output(
+        std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                IMAGE_TARGET,
+                "--package",
+                "xtask",
+            ])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("run cargo: {e}"))?;
     if !output.status.success() {
         let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if stderr.len() > 4000 {
@@ -414,11 +414,12 @@ fn docker_output(args: &[&str], label: &str) -> Result<String, String> {
 }
 
 fn docker_raw(args: &[&str]) -> Result<std::process::Output, String> {
-    std::process::Command::new("docker")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("run docker {args:?}: {e}"))
+    swactor_process::command_output(
+        std::process::Command::new("docker")
+            .args(args)
+            .stdin(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("run docker {args:?}: {e}"))
 }
 
 fn unix_ms() -> u64 {

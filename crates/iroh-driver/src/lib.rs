@@ -25,9 +25,10 @@ pub use iroh_driver::{
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};
 
 pub use telemetry_transport::{
-    TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, TelemetryQuicWriteStats,
-    read_events_from_stream, read_next_event, read_next_uni_from_connection, read_pull_request,
-    read_stream_header, read_stream_into_fanout, spawn_connection_reader, spawn_pull_collector,
+    PullCollectorHandle, TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead,
+    TelemetryQuicWriteStats, read_events_from_stream, read_next_event,
+    read_next_uni_from_connection, read_pull_request, read_stream_header, read_stream_into_fanout,
+    spawn_connection_reader, spawn_pull_collector, spawn_pull_collector_to_actor,
     spawn_pull_server, spawn_subscription_writer, write_available_subscription, write_event,
     write_pull_request, write_subscription_until_closed,
 };

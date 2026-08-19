@@ -16,15 +16,15 @@ mod directory_actor {
     //! DirectoryActor convergence and safety: signed claims, supersede, deterministic conflict
     //! resolution, dead-host hiding, catch-up, quieting, and retained recovery claims.
 
-    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
 
     use swactor::Error;
     use swactor::actor::ActorAddress;
-    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts};
     use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
     use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
 
     use distribution::crypto::{Keypair, KeypairExt};
@@ -63,7 +63,8 @@ mod directory_actor {
     /// wire it into a mesh and observe it.
     struct Node {
         rt: Runtime,
-        host: RefCell<SingleThreadRuntime>,
+        _engine: Engine,
+        backend: SteppingBackend,
         directory: ActorAddress,
         dir: SharedPeerDirectory,
         router: Arc<TransportRouter>,
@@ -94,7 +95,9 @@ mod directory_actor {
                     codec.clone(),
                     router.clone(),
                 )));
-                let host = RefCell::new(SingleThreadRuntime::new(parts));
+                let backend = SteppingBackend::new();
+                let engine =
+                    Engine::new(parts, backend.clone()).expect("create stepping actor engine");
 
                 let dir = SharedPeerDirectory::new();
                 let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
@@ -109,7 +112,8 @@ mod directory_actor {
 
                 nodes.push(Node {
                     rt,
-                    host,
+                    _engine: engine,
+                    backend,
                     directory,
                     dir,
                     router,
@@ -181,7 +185,7 @@ mod directory_actor {
         fn pump(&self, k: usize) {
             for _ in 0..k {
                 for node in &self.nodes {
-                    node.host.borrow_mut().tick();
+                    node.backend.step();
                 }
             }
         }
@@ -246,7 +250,7 @@ mod directory_actor {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].host.borrow_mut().tick();
+            self.nodes[observer].backend.step();
             inbox.try_recv().and_then(|located| located.host)
         }
 
@@ -585,15 +589,15 @@ mod directory_route_path {
     //! Application delivery through the directory route view: address-only sends, supersede, and
     //! best-effort drops.
 
-    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, RwLock};
 
     use serde::{Deserialize, Serialize};
     use swactor::Error;
     use swactor::actor::{ActorAddress, ActorInterface};
-    use swactor::runtime::{Ctx, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+    use swactor::runtime::{Ctx, Runtime, RuntimeConfig, RuntimeParts};
     use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
     use swactor_transport::{CodecRegistry, NetworkMessage, TransportRouter};
 
     use distribution::crypto::{Keypair, KeypairExt};
@@ -659,7 +663,8 @@ mod directory_route_path {
 
     struct RouteNode {
         rt: Runtime,
-        host: RefCell<SingleThreadRuntime>,
+        _engine: Engine,
+        backend: SteppingBackend,
         outbox: Outbox,
         route_view: RouteView,
         directory: ActorAddress,
@@ -702,7 +707,9 @@ mod directory_route_path {
                     codec.clone(),
                     router.clone(),
                 )));
-                let host = RefCell::new(SingleThreadRuntime::new(parts));
+                let backend = SteppingBackend::new();
+                let engine =
+                    Engine::new(parts, backend.clone()).expect("create stepping actor engine");
 
                 let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
                 let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
@@ -731,7 +738,8 @@ mod directory_route_path {
 
                 nodes.push(RouteNode {
                     rt,
-                    host,
+                    _engine: engine,
+                    backend,
                     outbox,
                     route_view,
                     directory,
@@ -801,7 +809,7 @@ mod directory_route_path {
         fn settle(&self, k: usize) {
             for _ in 0..k {
                 for node in &self.nodes {
-                    node.host.borrow_mut().tick();
+                    node.backend.step();
                 }
                 self.deliver_wire();
             }

@@ -181,11 +181,22 @@ impl SteppingBackend {
     pub fn pending_task_count(&self) -> usize {
         self.inner.tasks.lock().len()
     }
+
+    /// Join every blocking operation submitted so far.
+    ///
+    /// Deterministic tests use this as a barrier before stepping actor replies.
+    /// Returns the first worker panic instead of silently discarding it.
+    pub fn join_blocking(&self) -> std::thread::Result<()> {
+        let handles: Vec<_> = self.inner.blocking.lock().drain(..).collect();
+        for handle in handles {
+            handle.join()?;
+        }
+        Ok(())
+    }
 }
 
 /// This impl is the substrate implementor for the deterministic stepping
 /// backend; blocking work runs on a std thread (ENGINE_SPEC.md §2).
-#[allow(clippy::disallowed_methods)]
 impl ExecutionBackend for SteppingBackend {
     fn spawn(&self, task: BoxTask) {
         self.inner.tasks.lock().push(task);

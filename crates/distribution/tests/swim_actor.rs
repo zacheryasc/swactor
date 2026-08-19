@@ -16,13 +16,13 @@ mod single_runtime_actor {
     //! SwimActor behavior in one runtime: subscription stream convergence and genuine unreachable-
     //! peer death detection.
 
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+    use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts};
     use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
 
     use distribution::swim::actor::{
         MembershipChanged, PeerDirectory, SharedPeerDirectory, SwimActor, SwimIn,
@@ -55,7 +55,8 @@ mod single_runtime_actor {
     /// `MembershipChanged` subscriber inbox, and a shared Binding.
     struct ActorCluster {
         rt: Runtime,
-        host: RefCell<SingleThreadRuntime>,
+        _engine: Engine,
+        backend: SteppingBackend,
         ids: Vec<NodeId>,
         addrs: Vec<swactor::actor::ActorAddress>,
         inboxes: Vec<swactor::runtime::Inbox<MembershipChanged>>,
@@ -72,7 +73,8 @@ mod single_runtime_actor {
             let parts = RuntimeParts::new(RuntimeConfig::default())
                 .with_extension(Arc::new(StdExtension::new()));
             let rt = parts.runtime().clone();
-            let host = RefCell::new(SingleThreadRuntime::new(parts));
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).expect("create stepping actor engine");
             let dir = SharedPeerDirectory::new();
             let now = Instant::now();
             let ids: Vec<NodeId> = (0..n).map(|i| id(i as u8)).collect();
@@ -103,7 +105,8 @@ mod single_runtime_actor {
             }
             let mut c = ActorCluster {
                 rt,
-                host,
+                _engine: engine,
+                backend,
                 ids,
                 addrs,
                 inboxes,
@@ -128,7 +131,7 @@ mod single_runtime_actor {
 
         fn pump(&self, n: usize) {
             for _ in 0..n {
-                self.host.borrow_mut().tick();
+                self.backend.step();
             }
         }
 
@@ -242,15 +245,15 @@ mod transport_runtime_actor {
     //! SwimActor behavior across separate runtimes through codec, TransportRouter, deliver_raw, and
     //! transport send failure.
 
-    use std::cell::RefCell;
     use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use swactor::Error;
     use swactor::actor::ActorAddress;
-    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts};
     use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
     use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
 
     use distribution::messages::actor_codec_registry;
@@ -321,7 +324,8 @@ mod transport_runtime_actor {
     /// `Link` transports — the multi-runtime analog of `swim_actor.rs::ActorCluster`.
     struct TransportCluster {
         rts: Vec<Runtime>,
-        hosts: Vec<RefCell<SingleThreadRuntime>>,
+        _engines: Vec<Engine>,
+        backends: Vec<SteppingBackend>,
         swims: Vec<ActorAddress>,
         inboxes: Vec<Inbox<MembershipChanged>>,
         streams: Vec<Vec<MembershipChanged>>,
@@ -338,7 +342,8 @@ mod transport_runtime_actor {
             let partition = Arc::new(Mutex::new(HashSet::new()));
 
             let mut rts = Vec::new();
-            let mut hosts = Vec::new();
+            let mut engines = Vec::new();
+            let mut backends = Vec::new();
             let mut swims = Vec::new();
             let mut dirs = Vec::new();
             let mut routers = Vec::new();
@@ -355,7 +360,9 @@ mod transport_runtime_actor {
                     codec.clone(),
                     router.clone(),
                 )));
-                let host = RefCell::new(SingleThreadRuntime::new(parts));
+                let backend = SteppingBackend::new();
+                let engine =
+                    Engine::new(parts, backend.clone()).expect("create stepping actor engine");
 
                 let dir = SharedPeerDirectory::new();
                 let swim = rt
@@ -378,7 +385,8 @@ mod transport_runtime_actor {
                 .unwrap();
 
                 rts.push(rt);
-                hosts.push(host);
+                engines.push(engine);
+                backends.push(backend);
                 swims.push(swim);
                 dirs.push(dir);
                 routers.push(router);
@@ -412,7 +420,8 @@ mod transport_runtime_actor {
 
             let mut c = TransportCluster {
                 rts,
-                hosts,
+                _engines: engines,
+                backends,
                 swims,
                 inboxes,
                 streams: vec![Vec::new(); n],
@@ -443,8 +452,8 @@ mod transport_runtime_actor {
         /// iterations; `k` is sized so a probe + its notification settle per round.
         fn pump(&self, k: usize) {
             for _ in 0..k {
-                for host in &self.hosts {
-                    host.borrow_mut().tick();
+                for backend in &self.backends {
+                    backend.step();
                 }
             }
         }
@@ -547,13 +556,13 @@ mod actor_membership_safety_edges {
     //! Actor-observable safety edges: resurrection after silence, multi-hop death dissemination,
     //! and bounded stale-refute behavior.
 
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+    use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts};
     use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
 
     use distribution::swim::actor::{
         MembershipChanged, PeerDirectory, SharedPeerDirectory, SwimActor, SwimIn,
@@ -589,7 +598,8 @@ mod actor_membership_safety_edges {
     /// but lets the test choose the config and rebind a dropped node.
     struct Cluster {
         rt: Runtime,
-        host: RefCell<SingleThreadRuntime>,
+        _engine: Engine,
+        backend: SteppingBackend,
         ids: Vec<NodeId>,
         addrs: Vec<swactor::actor::ActorAddress>,
         inboxes: Vec<swactor::runtime::Inbox<MembershipChanged>>,
@@ -603,7 +613,8 @@ mod actor_membership_safety_edges {
             let parts = RuntimeParts::new(RuntimeConfig::default())
                 .with_extension(Arc::new(StdExtension::new()));
             let rt = parts.runtime().clone();
-            let host = RefCell::new(SingleThreadRuntime::new(parts));
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).expect("create stepping actor engine");
             let dir = SharedPeerDirectory::new();
             let now = Instant::now();
             let ids: Vec<NodeId> = (0..n).map(|i| id(i as u8)).collect();
@@ -633,7 +644,8 @@ mod actor_membership_safety_edges {
             }
             let mut c = Cluster {
                 rt,
-                host,
+                _engine: engine,
+                backend,
                 ids,
                 addrs,
                 inboxes,
@@ -655,7 +667,7 @@ mod actor_membership_safety_edges {
 
         fn pump(&self, n: usize) {
             for _ in 0..n {
-                self.host.borrow_mut().tick();
+                self.backend.step();
             }
         }
 

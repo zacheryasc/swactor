@@ -7,9 +7,9 @@
 //! only through these closures.
 
 use iroh::EndpointAddr;
-use iroh_driver::{IrohDriver, TelemetryQuicHeader, spawn_pull_collector};
+use iroh_driver::{IrohDriver, PullCollectorHandle, TelemetryQuicHeader, spawn_pull_collector};
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, mpsc};
 use swactor_engine::EngineHandle;
 use telemetry::frame::{ChannelRef, Frame, StreamId, TelemetryEvent};
@@ -38,6 +38,8 @@ pub(crate) struct FrameCollector {
     pull_header_rx: mpsc::Receiver<TelemetryQuicHeader>,
     pull_channels: Mutex<BTreeMap<ChannelRef, String>>,
     pull_streams: Mutex<BTreeMap<StreamId, StreamDescriptor>>,
+    pull_stream_owners: Mutex<BTreeMap<StreamId, (u64, u64)>>,
+    pull_collectors: Mutex<BTreeMap<(u64, u64), PullCollectorHandle>>,
 }
 
 impl FrameCollector {
@@ -61,6 +63,8 @@ impl FrameCollector {
             pull_header_rx,
             pull_channels: Mutex::new(BTreeMap::new()),
             pull_streams: Mutex::new(BTreeMap::new()),
+            pull_stream_owners: Mutex::new(BTreeMap::new()),
+            pull_collectors: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -76,7 +80,7 @@ impl FrameCollector {
         let mut flow_id = [0_u8; 16];
         flow_id[..8].copy_from_slice(&run_id.to_le_bytes());
         flow_id[8..].copy_from_slice(&node_id.to_le_bytes());
-        spawn_pull_collector(
+        let collector = spawn_pull_collector(
             engine,
             endpoint,
             peer,
@@ -86,6 +90,36 @@ impl FrameCollector {
             Arc::clone(&self.pull_fanout),
             self.pull_header_tx.clone(),
         );
+        if let Some(previous) = self
+            .pull_collectors
+            .lock()
+            .insert((run_id, node_id), collector)
+        {
+            previous.cancel();
+        }
+    }
+    /// Stop retaining and reconnecting a telemetry subscription for a terminal node.
+    pub(crate) fn unsubscribe_node(&self, run_id: u64, node_id: u64) {
+        if let Some(collector) = self.pull_collectors.lock().remove(&(run_id, node_id)) {
+            collector.cancel();
+        }
+        let mut ended = BTreeSet::new();
+        self.pull_stream_owners.lock().retain(|stream, owner| {
+            if *owner == (run_id, node_id) {
+                ended.insert(stream.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !ended.is_empty() {
+            self.pull_streams
+                .lock()
+                .retain(|stream, _| !ended.contains(stream));
+            self.pull_channels
+                .lock()
+                .retain(|channel, _| !ended.contains(&channel.stream));
+        }
     }
 
     fn pump_pulls(&self) {
@@ -93,6 +127,14 @@ impl FrameCollector {
             self.pull_streams
                 .lock()
                 .insert(header.stream.stream.clone(), header.stream.clone());
+            let mut run_id = [0_u8; 8];
+            run_id.copy_from_slice(&header.flow_id[..8]);
+            let mut node_id = [0_u8; 8];
+            node_id.copy_from_slice(&header.flow_id[8..]);
+            self.pull_stream_owners.lock().insert(
+                header.stream.stream.clone(),
+                (u64::from_le_bytes(run_id), u64::from_le_bytes(node_id)),
+            );
             let mut channels = self.pull_channels.lock();
             for descriptor in header.channels {
                 channels.insert(
@@ -145,6 +187,10 @@ impl FrameCollector {
                 }
                 TelemetryEvent::StreamEnded(stream) => {
                     self.pull_streams.lock().remove(&stream);
+                    self.pull_stream_owners.lock().remove(&stream);
+                    self.pull_channels
+                        .lock()
+                        .retain(|channel, _| channel.stream != stream);
                 }
             }
         }
@@ -318,5 +364,69 @@ mod tests {
         assert_eq!(observed_channel, "host.net");
         assert_eq!(observed_frame.position, Position(11));
         assert_eq!(observed_frame.payload, br#"{"rx":1}"#);
+        collector
+            .pull_fanout
+            .publish(TelemetryEvent::StreamEnded(stream.clone()));
+        collector.pump_pulls();
+        assert!(!collector.pull_streams.lock().contains_key(&stream));
+        assert!(
+            collector
+                .pull_channels
+                .lock()
+                .keys()
+                .all(|channel| channel.stream != stream),
+            "ended stream retained channel descriptors"
+        );
+    }
+
+    #[test]
+    fn node_unsubscribe_releases_abrupt_stream_metadata() {
+        let collector = FrameCollector::new();
+        let stream = StreamId::new(NodeId::new("node-9"), Lifetime(4));
+        let descriptor = StreamDescriptor {
+            stream: stream.clone(),
+            label: Some("worker nine".to_owned()),
+            origin: StreamOrigin::RemoteNode,
+        };
+        let channel = ChannelDescriptor {
+            stream: stream.clone(),
+            id: ChannelId(3),
+            name: "runtime.actors".to_owned(),
+            label: None,
+            content: ChannelContent::JsonRecord { schema: None },
+        };
+        let mut flow_id = [0_u8; 16];
+        flow_id[..8].copy_from_slice(&5_u64.to_le_bytes());
+        flow_id[8..].copy_from_slice(&9_u64.to_le_bytes());
+        collector
+            .pull_header_tx
+            .send(TelemetryQuicHeader::new(
+                flow_id,
+                Vec::new(),
+                descriptor,
+                vec![channel],
+            ))
+            .unwrap();
+        collector.pump_pulls();
+        assert!(collector.pull_streams.lock().contains_key(&stream));
+        assert!(
+            collector
+                .pull_channels
+                .lock()
+                .keys()
+                .any(|channel| channel.stream == stream)
+        );
+
+        collector.unsubscribe_node(5, 9);
+
+        assert!(!collector.pull_streams.lock().contains_key(&stream));
+        assert!(
+            collector
+                .pull_channels
+                .lock()
+                .keys()
+                .all(|channel| channel.stream != stream),
+            "abrupt node stop retained channel descriptors"
+        );
     }
 }

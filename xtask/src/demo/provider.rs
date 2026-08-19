@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
+use swactor_engine::ActorCompletion;
 use swactor_process::{ExitStatus, ProcessOutput};
 
 use provisioning::executor::{EffectBackend, EffectError};
@@ -33,9 +34,6 @@ use provisioning::node::{
 use provisioning::plugin::{NodeProvisionSpec, PluginNodeHandle, PluginSink, ProvisionPlugin};
 use provisioning::reconciler::{OperationId, OperationOutcome, PlannedEffect};
 use telemetry::{ChannelContent, StreamDescriptor, TelemetryEndpoint, TelemetryProducer};
-
-/// How long a blocking plugin call waits for the supervisor actor.
-pub const BACKEND_WAIT: Duration = Duration::from_secs(20);
 
 /// One provisioned node's runtime facts.
 #[derive(Clone)]
@@ -61,20 +59,26 @@ pub struct NodeRuntime {
 pub struct SpawnNodeRequest {
     pub attempt: u64,
     pub logical_node: String,
-    pub reply: std::sync::mpsc::Sender<Result<NodeRuntime, String>>,
+    pub reply: ActorCompletion<Result<NodeRuntime, String>>,
 }
 
-/// Shared node registry + spawn queue: hub between executor blocking threads,
-/// relay actors, and the supervisor actor.
+/// Shared node registry and actor route for provisioning requests.
 #[derive(Clone, Default)]
 pub struct NodeManager {
     inner: Arc<Mutex<NodeManagerInner>>,
 }
 
+#[derive(Clone)]
+struct SpawnRoute {
+    sender: ExternalSender,
+    supervisor: Arc<std::sync::OnceLock<ActorAddress>>,
+}
+
 #[derive(Default)]
 struct NodeManagerInner {
     nodes: BTreeMap<u64, NodeRuntime>,
-    spawn_tx: Option<std::sync::mpsc::Sender<SpawnNodeRequest>>,
+    spawn_route: Option<SpawnRoute>,
+    exit_waiters: BTreeMap<u64, Vec<ActorCompletion<()>>>,
 }
 
 impl NodeManager {
@@ -82,30 +86,41 @@ impl NodeManager {
         Self::default()
     }
 
-    pub fn set_spawn_channel(&self, sender: std::sync::mpsc::Sender<SpawnNodeRequest>) {
-        self.inner.lock().expect("node manager").spawn_tx = Some(sender);
+    pub fn set_spawn_actor(
+        &self,
+        sender: ExternalSender,
+        supervisor: Arc<std::sync::OnceLock<ActorAddress>>,
+    ) {
+        self.inner.lock().expect("node manager").spawn_route =
+            Some(SpawnRoute { sender, supervisor });
     }
 
     pub fn request_spawn(&self, attempt: u64, logical_node: String) -> Result<NodeRuntime, String> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        let request = SpawnNodeRequest {
-            attempt,
-            logical_node,
-            reply: reply_tx,
-        };
-        {
-            let inner = self.inner.lock().expect("node manager");
-            let sender = inner
-                .spawn_tx
-                .as_ref()
-                .ok_or_else(|| "supervisor spawn channel not installed".to_owned())?;
-            sender
-                .send(request)
-                .map_err(|_| "supervisor actor gone".to_owned())?;
-        }
-        reply_rx
-            .recv_timeout(BACKEND_WAIT)
-            .map_err(|_| "timed out waiting for node spawn".to_owned())?
+        let reply = ActorCompletion::new();
+        let route = self
+            .inner
+            .lock()
+            .expect("node manager")
+            .spawn_route
+            .clone()
+            .ok_or_else(|| "supervisor actor route not installed".to_owned())?;
+        let supervisor = route
+            .supervisor
+            .get()
+            .copied()
+            .ok_or_else(|| "supervisor actor not ready".to_owned())?;
+        route
+            .sender
+            .send_to(
+                supervisor,
+                crate::demo::feed::SupervisorMsg::Spawn(SpawnNodeRequest {
+                    attempt,
+                    logical_node,
+                    reply: reply.clone(),
+                }),
+            )
+            .map_err(|_| "supervisor actor gone".to_owned())?;
+        reply.wait()
     }
 
     pub fn register(&self, runtime: NodeRuntime) {
@@ -163,7 +178,41 @@ impl NodeManager {
     }
 
     pub fn set_exited(&self, attempt: u64, status: ExitStatus) {
-        self.update(attempt, |runtime| runtime.exited = Some(status));
+        let waiters = {
+            let mut inner = self.inner.lock().expect("node manager");
+            if let Some(runtime) = inner.nodes.get_mut(&attempt) {
+                runtime.exited = Some(status);
+            }
+            inner.exit_waiters.remove(&attempt).unwrap_or_default()
+        };
+        for waiter in waiters {
+            let _ = waiter.complete(());
+        }
+    }
+
+    pub fn watch_exit(&self, attempt: u64) -> ActorCompletion<()> {
+        let completion = ActorCompletion::new();
+        let already_exited = {
+            let mut inner = self.inner.lock().expect("node manager");
+            if inner
+                .nodes
+                .get(&attempt)
+                .is_some_and(|runtime| runtime.exited.is_some())
+            {
+                true
+            } else {
+                inner
+                    .exit_waiters
+                    .entry(attempt)
+                    .or_default()
+                    .push(completion.clone());
+                false
+            }
+        };
+        if already_exited {
+            let _ = completion.complete(());
+        }
+        completion
     }
 
     pub fn set_spawn_failed(&self, attempt: u64, reason: String) {
@@ -394,12 +443,6 @@ pub fn session_id_for(operation: OperationId) -> BootstrapSessionId {
     BootstrapSessionId(operation.attempt.0)
 }
 
-fn runtime_exited(manager: &NodeManager, attempt: u64) -> bool {
-    manager
-        .get(attempt)
-        .is_some_and(|runtime| runtime.exited.is_some())
-}
-
 /// The demo `EffectBackend`: routes effects through the plugin.
 pub struct DemoBackend {
     /// The plugin lives behind a mutex: `EffectBackend::execute` is `&self`
@@ -496,22 +539,20 @@ fn stop_node_with_sender(
     handle: &PluginNodeHandle,
     sender: &ExternalSender,
 ) -> Result<(), String> {
-    if let Some(runtime) = manager.get(handle.id) {
-        if runtime.pid.is_some() && runtime.exited.is_none() {
-            let _ = sender.send_to(
+    if let Some(runtime) = manager.get(handle.id)
+        && runtime.pid.is_some()
+        && runtime.exited.is_none()
+    {
+        let exited = manager.watch_exit(handle.id);
+        sender
+            .send_to(
                 runtime.bootstrap,
                 provisioning::BootstrapMsg::Stop {
                     kill_after: Some(Duration::from_secs(1)),
                 },
-            );
-        }
-        let deadline = std::time::Instant::now() + BACKEND_WAIT;
-        while !runtime_exited(manager, handle.id) {
-            if std::time::Instant::now() > deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+            )
+            .map_err(|_| "bootstrap actor stopped before process shutdown".to_owned())?;
+        exited.wait();
     }
     plugin.lock().expect("demo provider").stop_node(handle)
 }
@@ -539,4 +580,240 @@ pub fn unix_ms(now: SystemTime) -> u64 {
     now.duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::RuntimeParts;
+    use swactor_engine::{Engine, SteppingBackend};
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum RelayAction {
+        Started(u16),
+        ExitedCode(u8),
+        ExitedSignal(u8),
+        SpawnFailed(u8),
+        Error,
+    }
+
+    fn relay_actions() -> impl Strategy<Value = Vec<RelayAction>> {
+        prop::collection::vec(
+            prop_oneof![
+                3 => any::<u16>().prop_map(RelayAction::Started),
+                2 => any::<u8>().prop_map(RelayAction::ExitedCode),
+                2 => any::<u8>().prop_map(RelayAction::ExitedSignal),
+                1 => any::<u8>().prop_map(RelayAction::SpawnFailed),
+                1 => Just(RelayAction::Error),
+            ],
+            0..=32,
+        )
+    }
+
+    fn output(action: &RelayAction) -> ProcessOutput {
+        match *action {
+            RelayAction::Started(pid) => ProcessOutput::Started {
+                pid: u32::from(pid) + 1,
+            },
+            RelayAction::ExitedCode(code) => ProcessOutput::Exited {
+                status: ExitStatus::Code(i32::from(code)),
+            },
+            RelayAction::ExitedSignal(signal) => ProcessOutput::Exited {
+                status: ExitStatus::Signal(i32::from(signal) + 1),
+            },
+            RelayAction::SpawnFailed(code) => ProcessOutput::SpawnFailed {
+                error: format!("spawn-{code}"),
+            },
+            RelayAction::Error => ProcessOutput::Error {
+                error: "scripted process error".to_owned(),
+            },
+        }
+    }
+
+    fn drive(backend: &SteppingBackend) {
+        for _ in 0..64 {
+            backend.step();
+        }
+    }
+
+    fn check_relay_invariants(
+        observed: &NodeRuntime,
+        expected_pid: Option<u32>,
+        expected_exit: &Option<ExitStatus>,
+        expected_spawn_failure: &Option<String>,
+        final_actors: usize,
+        worker_panics: u64,
+    ) -> Result<(), String> {
+        if observed.pid != expected_pid {
+            return Err(format!(
+                "pid mismatch: observed={:?} expected={expected_pid:?}",
+                observed.pid
+            ));
+        }
+        if observed.exited.as_ref() != expected_exit.as_ref() {
+            return Err(format!(
+                "exit mismatch: observed={:?} expected={expected_exit:?}",
+                observed.exited
+            ));
+        }
+        if observed.spawn_failed.as_ref() != expected_spawn_failure.as_ref() {
+            return Err(format!(
+                "spawn failure mismatch: observed={:?} expected={expected_spawn_failure:?}",
+                observed.spawn_failed
+            ));
+        }
+        if final_actors != 0 {
+            return Err(format!(
+                "process relay did not return to baseline: observed={final_actors}"
+            ));
+        }
+        if worker_panics != 0 {
+            return Err(format!(
+                "process relay worker panicked {worker_panics} time(s)"
+            ));
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn generated_process_reports_complete_exit_watchers_once_and_preserve_last_state(
+            mut actions in relay_actions(),
+            watcher_count in 0_usize..=8,
+            fallback_exit in any::<u8>(),
+        ) {
+            if !actions.iter().any(|action| {
+                matches!(action, RelayAction::ExitedCode(_) | RelayAction::ExitedSignal(_))
+            }) {
+                let terminal = RelayAction::ExitedCode(fallback_exit);
+                if let Some(last) = actions.get_mut(31) {
+                    *last = terminal;
+                } else {
+                    actions.push(terminal);
+                }
+            }
+            let mut config = RuntimeConfig::default();
+            config.worker_count = 1;
+            let parts = RuntimeParts::new(config);
+            let runtime = parts.runtime().clone();
+            let backend = SteppingBackend::new();
+            let _engine =
+                Engine::new(parts, backend.clone()).expect("demo process stepping engine");
+            let manager = NodeManager::new();
+            let attempt = 41;
+            manager.register(NodeRuntime {
+                attempt,
+                logical_node: "generated-node".to_owned(),
+                bootstrap: ActorAddress::default(),
+                pid: None,
+                exited: None,
+                spawn_failed: None,
+                last_announce_ms: None,
+                endpoint_addr: None,
+            });
+            let relay = runtime
+                .spawn(NodeRelayActor::new(manager.clone(), attempt))
+                .expect("spawn demo process relay");
+            let watchers = (0..watcher_count)
+                .map(|_| manager.watch_exit(attempt))
+                .collect::<Vec<_>>();
+
+            let mut expected_pid = None;
+            let mut expected_exit = None;
+            let mut expected_spawn_failure = None;
+            for action in &actions {
+                match action {
+                    RelayAction::Started(pid) => expected_pid = Some(u32::from(*pid) + 1),
+                    RelayAction::ExitedCode(code) => {
+                        expected_exit = Some(ExitStatus::Code(i32::from(*code)));
+                    }
+                    RelayAction::ExitedSignal(signal) => {
+                        expected_exit = Some(ExitStatus::Signal(i32::from(*signal) + 1));
+                    }
+                    RelayAction::SpawnFailed(code) => {
+                        expected_spawn_failure = Some(format!("spawn-{code}"));
+                    }
+                    RelayAction::Error => {}
+                }
+                runtime
+                    .send_to(relay, output(action))
+                    .expect("send demo process report");
+            }
+            drive(&backend);
+
+            for watcher in watchers {
+                prop_assert!(
+                    watcher.complete(()).is_err(),
+                    "exit watcher remained pending after fixed drive budget; actions={actions:?} \
+                     census={:?}",
+                    runtime.stats()
+                );
+                watcher.wait();
+            }
+            let late_watcher = manager.watch_exit(attempt);
+            prop_assert!(
+                late_watcher.complete(()).is_err(),
+                "late exit watcher did not complete immediately; actions={actions:?} census={:?}",
+                runtime.stats()
+            );
+            late_watcher.wait();
+            let observed = manager.get(attempt).expect("registered demo node");
+
+            runtime.stop_actor(relay).expect("stop demo process relay");
+            drive(&backend);
+            let stats = runtime.stats();
+            let worker_panics = stats
+                .workers
+                .iter()
+                .map(|worker| worker.panics)
+                .sum::<u64>();
+            prop_assert!(
+                check_relay_invariants(
+                    &observed,
+                    expected_pid,
+                    &expected_exit,
+                    &expected_spawn_failure,
+                    stats.actors.len(),
+                    worker_panics,
+                )
+                .is_ok(),
+                "demo process relay invariant failed; actions={actions:?} \
+                 expected_pid={expected_pid:?} expected_exit={expected_exit:?} \
+                 expected_spawn_failure={expected_spawn_failure:?} observed_pid={:?} \
+                 observed_exit={:?} observed_spawn_failure={:?} census={stats:?}",
+                observed.pid,
+                observed.exited,
+                observed.spawn_failed,
+            );
+        }
+    }
+
+    #[test]
+    fn process_relay_oracle_rejects_lost_exit() {
+        let observed = NodeRuntime {
+            attempt: 7,
+            logical_node: "fault-sensitive-node".to_owned(),
+            bootstrap: ActorAddress::default(),
+            pid: Some(9),
+            exited: None,
+            spawn_failed: None,
+            last_announce_ms: None,
+            endpoint_addr: None,
+        };
+        let rejected =
+            check_relay_invariants(&observed, Some(9), &Some(ExitStatus::Code(0)), &None, 0, 0);
+        assert!(
+            rejected.is_err(),
+            "provider property oracle accepted a controlled lost-exit defect"
+        );
+    }
 }

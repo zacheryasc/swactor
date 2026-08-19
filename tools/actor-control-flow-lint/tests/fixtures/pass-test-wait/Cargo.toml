@@ -1,0 +1,7 @@
+[package]
+name = "actor-lint-test-wait-pass"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]

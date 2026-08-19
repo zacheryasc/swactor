@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a36a5c2d2904ecfb2cf31f3e446db588a7591e074994fc61142f37aad33272c8 # shrinks to actions = [Provision(163), Drive, Configure(240), StaleSearch(108), Configure(85), Search(84), Flush, Kill(76), Configure(190), StaleValidation(217), Provision(209), StaleSearch(18), StaleValidation(70), Provision(97), Drive, Flush, StaleValidation(81), Search(121), Query, Flush, StaleValidation(91), StaleValidation(110)]
+cc aa67d0e8e7fd15f0b8cad5ac675b6fcee25fc5246a6841d141054b6932f0db34 # shrinks to actions = [Search(0), Search(0), Provision(86)]
+cc ad4aa3d6008d92f09c315c680c258a2b3776719bca98ff49d72668542f0c4772 # shrinks to actions = [Provision(17), Flush(81), OfferSearchFinished(200), PersistenceFinished(145), Provision(202), ProviderTerminalFailure(29), Kill(222), Provision(21), Provision(117), Query(131), Provision(126), Rejoin(27), Provision(89), OfferSearchFinished(148), Query(54), Kill(77)]
+cc be1220292a8604bca5d52ed98402b55bfd81ca591ee47c4139829365a5c1eddc # shrinks to actions = [ProviderValidated(17), Flush(231), OfferSearchFinished(238), Drive, Provision(32), Configure(101), Configure(194), ProviderValidated(226), Provision(152), Configure(235), Provision(208), Kill(68), ProviderValidated(50)]
+cc fbc45330b5c55a483c910567ed49b8c2f40e4d9b8ad17f9a88f666fc120d4305 # shrinks to actions = [PersistenceFinished(73), Flush(190), EffectFinished(224), Query(58), Kill(182), Rejoin(82), Flush(137), OfferSearchFinished(173), Drive, Provision(204), Kill(137), EffectFinished(187), Configure(80), Configure(104), Drive, PersistenceFinished(92), Flush(180), Search(86), Configure(246), Query(33), Search(43)]

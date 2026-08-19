@@ -3,11 +3,9 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 use swactor::actor::{ActorAddress, ActorExited, ActorInterface};
-use swactor::runtime::{
-    Ctx, Inbox, Runtime, RuntimeConfig, RuntimeParts,
-    SingleThreadRuntime as SingleThreadRuntimeHost,
-};
+use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig, RuntimeParts};
 use swactor::std::{CtxGroups, CtxWatching, RuntimeGroups, RuntimeNaming, StdExtension};
+use swactor_engine::{Engine, SteppingBackend};
 
 // ─── Core JS-facing types ───────────────────────────────────────────────────
 
@@ -94,14 +92,15 @@ impl WasmInboxString {
 
 /// The browser-facing swactor runtime.
 ///
-/// Owns a cloneable `swactor::Runtime` handle plus the single-threaded host that
-/// drives its workers, with StdExtension installed (naming, monitoring, groups).
+/// Owns a cloneable `swactor::Runtime` handle plus an engine-backed stepping
+/// substrate, with StdExtension installed (naming, monitoring, groups).
 /// Actors are spawned via dedicated spawn functions (one per actor type). The
 /// runtime is driven by calling `tick()`.
 #[wasm_bindgen]
 pub struct WasmRuntime {
     rt: Runtime,
-    host: SingleThreadRuntimeHost,
+    _engine: Engine,
+    backend: SteppingBackend,
 }
 
 #[wasm_bindgen]
@@ -111,13 +110,18 @@ impl WasmRuntime {
         let parts = RuntimeParts::new(RuntimeConfig::default())
             .with_extension(Arc::new(StdExtension::new()));
         let rt = parts.runtime().clone();
-        let host = SingleThreadRuntimeHost::new(parts);
-        Self { rt, host }
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("create wasm actor engine");
+        Self {
+            rt,
+            _engine: engine,
+            backend,
+        }
     }
 
     /// Drive one tick of the runtime.
     pub fn tick(&mut self) {
-        self.host.tick();
+        self.backend.step();
     }
 
     /// Number of actors currently alive.

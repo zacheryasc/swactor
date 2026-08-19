@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+pub const VASTAI_BASE_URL_ENV: &str = "VASTAI_BASE_URL";
+const DEFAULT_VASTAI_BASE_URL: &str = "https://cloud.vast.ai";
+
 use crate::search::OfferBrowseCriteria;
 
 use crate::types::{
@@ -18,8 +21,16 @@ pub struct VastClient {
 impl VastClient {
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
+    /// Build a client for the configured Vast.ai API endpoint.
+    ///
+    /// `VASTAI_BASE_URL` supports operator proxies and production-shaped local
+    /// fixtures. Empty values retain the public Vast.ai endpoint.
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url("https://cloud.vast.ai", api_key)
+        let base_url = std::env::var(VASTAI_BASE_URL_ENV)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_VASTAI_BASE_URL.to_owned());
+        Self::with_base_url(base_url, api_key)
     }
 
     pub fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {

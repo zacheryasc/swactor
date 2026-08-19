@@ -9,4 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 swactor = { path = "../../..", default-features = false, features = ["wasm", "std"] }
+swactor-engine = { path = "../../engine", default-features = false }
 wasm-bindgen = "0.2"

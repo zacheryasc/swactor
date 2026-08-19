@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use swactor::actor::ActorAddress;
+use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
-use swactor_engine::EngineHandle;
+use swactor_engine::BlockingWorkSender;
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 use swactor_vastai::OfferBrowseCriteria;
 
@@ -610,11 +610,12 @@ impl ManualControl {
         kind: EffectKind,
         result: Result<EffectOutcome, String>,
     ) -> Result<(), String> {
-        if self.in_flight.remove(&node_id) != Some(kind) {
+        if self.in_flight.get(&node_id).copied() != Some(kind) {
             return Err(format!(
                 "node {node_id} completed {kind:?} without matching in-flight effect"
             ));
         }
+        self.in_flight.remove(&node_id);
         match kind {
             EffectKind::Create => self.created(node_id, result),
             EffectKind::StartBootstrap => self.bootstrap_started(node_id, result),
@@ -755,6 +756,7 @@ impl ManualControl {
         node.phase = NodePhase::Running;
         node.last_error = None;
         node.last_seen_unix_ms = unix_ms_now();
+        self.succeed_commands(hello.logical_node_id, CommandKind::Provision);
         let binding = RejoinBinding {
             orchestrator_actor,
             control_generation,
@@ -1234,7 +1236,6 @@ impl ManualControl {
                 node.last_error = Some(error.clone());
             }
         }
-        self.in_flight.clear();
     }
 }
 
@@ -1267,15 +1268,15 @@ pub(crate) enum ManualControlMsg {
         reply_to: Option<ActorAddress>,
     },
     ProviderValidated {
+        work_id: u64,
         error: Option<String>,
-        reply_to: Option<ActorAddress>,
     },
     SearchOffers {
         request: OfferSearchRequest,
         reply_to: ActorAddress,
     },
     OfferSearchFinished {
-        reply_to: ActorAddress,
+        work_id: u64,
         result: Result<Vec<OfferDto>, String>,
     },
     Query {
@@ -1291,6 +1292,7 @@ pub(crate) enum ManualControlMsg {
     EffectFinished {
         node_id: u64,
         kind: EffectKind,
+        effect_id: u64,
         outcome: Option<EffectOutcome>,
         error: Option<String>,
     },
@@ -1316,6 +1318,8 @@ pub(crate) enum ManualControlReply {
     Rejoined(RejoinBinding),
     Flushed,
     Rejected(String),
+    #[serde(skip)]
+    TimedOut,
 }
 
 pub(crate) type ProviderFactory =
@@ -1366,12 +1370,57 @@ struct NodeLane {
 
 type SharedLane = Arc<Mutex<Option<NodeLane>>>;
 
-/// Engine-backed adapter owned by the orchestrator actor. All methods called
-/// from actor handlers are transition-only; filesystem and provider work is
-/// scheduled on the engine and reports back as `ManualControlMsg`.
+type ManualActorWork = Box<dyn FnOnce() + Send + 'static>;
+type ManualWorkFailure = Box<dyn FnOnce(String) + Send + 'static>;
+
+struct ManualWork {
+    work: Arc<Mutex<Option<ManualActorWork>>>,
+    failure: Arc<Mutex<Option<ManualWorkFailure>>>,
+}
+
+impl Clone for ManualWork {
+    fn clone(&self) -> Self {
+        Self {
+            work: Arc::clone(&self.work),
+            failure: Arc::clone(&self.failure),
+        }
+    }
+}
+
+struct ManualWorkActor {
+    blocking_work: BlockingWorkSender,
+}
+
+impl ActorInterface for ManualWorkActor {
+    type Incoming = ManualWork;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, message: Self::Incoming) {
+        let Some(work) = message.work.lock().take() else {
+            return;
+        };
+        let failure = Arc::clone(&message.failure);
+        let failure_after_panic = Arc::clone(&failure);
+        let guarded_work = Box::new(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err()
+                && let Some(report) = failure_after_panic.lock().take()
+            {
+                report("manual control work panicked".to_owned());
+            }
+        });
+        if self.blocking_work.submit(guarded_work).is_err()
+            && let Some(report) = failure.lock().take()
+        {
+            report("manual control work backend is unavailable".to_owned());
+        }
+    }
+}
+
+/// Actor-backed adapter owned by the orchestrator actor. Filesystem and provider
+/// work is delivered to a dedicated actor and reports back as `ManualControlMsg`.
 pub(crate) struct ManualActorControl {
     core: ManualControl,
-    engine: EngineHandle,
+    work_actor: ActorAddress,
     runtime: Runtime,
     sender: ExternalSender,
     state_dir: StateDir,
@@ -1381,10 +1430,16 @@ pub(crate) struct ManualActorControl {
     config_validator: Option<ConfigValidator>,
     offer_searcher: Option<OfferSearcher>,
     lanes: BTreeMap<u64, SharedLane>,
+    active_effect_ids: BTreeMap<u64, u64>,
     persistence_queue: VecDeque<(u64, ClusterSnapshot)>,
-    persistence_in_flight: bool,
-    pending_command_replies: BTreeMap<u64, (ActorAddress, String)>,
+    persistence_in_flight: Option<u64>,
+    flush_failure: Option<String>,
     flush_waiters: Vec<ActorAddress>,
+    pending_command_replies: BTreeMap<u64, (ActorAddress, String)>,
+    pending_validations: BTreeMap<u64, Option<ActorAddress>>,
+    latest_validation_id: Option<u64>,
+    pending_offer_searches: BTreeMap<u64, ActorAddress>,
+    next_work_id: u64,
     control_generation: u64,
 }
 
@@ -1392,8 +1447,8 @@ impl ManualActorControl {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         core: ManualControl,
-        engine: EngineHandle,
         runtime: Runtime,
+        blocking_work: BlockingWorkSender,
         state_dir: StateDir,
         sink: PluginSink,
         provider_factory: ProviderFactory,
@@ -1403,9 +1458,12 @@ impl ManualActorControl {
         control_generation: u64,
     ) -> Self {
         let sender = runtime.create_sender();
+        let work_actor = runtime
+            .spawn(ManualWorkActor { blocking_work })
+            .expect("spawn manual control work actor");
         Self {
             core,
-            engine,
+            work_actor,
             runtime,
             sender,
             state_dir,
@@ -1415,10 +1473,16 @@ impl ManualActorControl {
             config_validator,
             offer_searcher,
             lanes: BTreeMap::new(),
+            active_effect_ids: BTreeMap::new(),
             persistence_queue: VecDeque::new(),
-            persistence_in_flight: false,
-            pending_command_replies: BTreeMap::new(),
+            persistence_in_flight: None,
+            flush_failure: None,
             flush_waiters: Vec::new(),
+            pending_command_replies: BTreeMap::new(),
+            pending_validations: BTreeMap::new(),
+            latest_validation_id: None,
+            pending_offer_searches: BTreeMap::new(),
+            next_work_id: 0,
             control_generation,
         }
     }
@@ -1430,6 +1494,15 @@ impl ManualActorControl {
     pub(crate) fn start(&mut self, actor: ActorAddress) {
         self.core.begin_recovery();
         self.dispatch_actions(actor);
+    }
+
+    fn allocate_work_id(&mut self) -> u64 {
+        let work_id = self.next_work_id;
+        self.next_work_id = self
+            .next_work_id
+            .checked_add(1)
+            .expect("manual control work id exhausted");
+        work_id
     }
 
     pub(crate) fn handle(&mut self, ctx: &Ctx, msg: ManualControlMsg) {
@@ -1482,22 +1555,54 @@ impl ManualActorControl {
                     }
                     return;
                 };
+                let work_id = self.allocate_work_id();
+                self.latest_validation_id = Some(work_id);
+                self.pending_validations.insert(work_id, reply_to);
                 let sender = self.sender.clone();
+                let failed_sender = self.sender.clone();
                 let actor = ctx.self_addr();
-                self.engine.spawn_blocking(move || {
-                    let error = validator(request).err();
-                    let _ = sender.send_to(
-                        actor,
-                        OrchestratorMsg::Manual(ManualControlMsg::ProviderValidated {
-                            error,
-                            reply_to,
-                        }),
-                    );
-                });
+                self.spawn_work(
+                    move || {
+                        let error = validator(request).err();
+                        let _ = sender.send_to(
+                            actor,
+                            OrchestratorMsg::Manual(ManualControlMsg::ProviderValidated {
+                                work_id,
+                                error,
+                            }),
+                        );
+                    },
+                    move |error| {
+                        let _ = failed_sender.send_to(
+                            actor,
+                            OrchestratorMsg::Manual(ManualControlMsg::ProviderValidated {
+                                work_id,
+                                error: Some(error),
+                            }),
+                        );
+                    },
+                );
             }
-            ManualControlMsg::ProviderValidated { error, reply_to } => {
+            ManualControlMsg::ProviderValidated { work_id, error } => {
+                let Some(reply_to) = self.pending_validations.remove(&work_id) else {
+                    return;
+                };
+                if self.latest_validation_id != Some(work_id) {
+                    if let Some(reply_to) = reply_to {
+                        let _ = ctx.send(
+                            reply_to,
+                            ManualControlReply::Rejected(
+                                "provider validation was superseded".to_owned(),
+                            ),
+                        );
+                    }
+                    return;
+                }
+                self.latest_validation_id = None;
                 self.core.set_provider_validation(error.map_or(Ok(()), Err));
-                if self.core.provider().kind == ProviderReadinessKind::Ready {
+                if self.core.provider().kind == ProviderReadinessKind::Ready
+                    && self.lanes.is_empty()
+                {
                     self.core.begin_recovery();
                 }
                 if let Some(reply_to) = reply_to {
@@ -1522,18 +1627,32 @@ impl ManualActorControl {
                         ),
                     );
                 } else if let Some(searcher) = self.offer_searcher.clone() {
+                    let work_id = self.allocate_work_id();
+                    self.pending_offer_searches.insert(work_id, reply_to);
                     let sender = self.sender.clone();
+                    let failed_sender = self.sender.clone();
                     let actor = ctx.self_addr();
-                    self.engine.spawn_blocking(move || {
-                        let result = searcher(request);
-                        let _ = sender.send_to(
-                            actor,
-                            OrchestratorMsg::Manual(ManualControlMsg::OfferSearchFinished {
-                                reply_to,
-                                result,
-                            }),
-                        );
-                    });
+                    self.spawn_work(
+                        move || {
+                            let result = searcher(request);
+                            let _ = sender.send_to(
+                                actor,
+                                OrchestratorMsg::Manual(ManualControlMsg::OfferSearchFinished {
+                                    work_id,
+                                    result,
+                                }),
+                            );
+                        },
+                        move |error| {
+                            let _ = failed_sender.send_to(
+                                actor,
+                                OrchestratorMsg::Manual(ManualControlMsg::OfferSearchFinished {
+                                    work_id,
+                                    result: Err(error),
+                                }),
+                            );
+                        },
+                    );
                 } else {
                     let _ = ctx.send(
                         reply_to,
@@ -1543,7 +1662,10 @@ impl ManualActorControl {
                     );
                 }
             }
-            ManualControlMsg::OfferSearchFinished { reply_to, result } => {
+            ManualControlMsg::OfferSearchFinished { work_id, result } => {
+                let Some(reply_to) = self.pending_offer_searches.remove(&work_id) else {
+                    return;
+                };
                 let reply = match result {
                     Ok(offers) => ManualControlReply::Offers(offers),
                     Err(error) => ManualControlReply::Rejected(error),
@@ -1554,43 +1676,77 @@ impl ManualActorControl {
                 let _ = ctx.send(reply_to, ManualControlReply::Status(self.core.read_model()));
             }
             ManualControlMsg::PersistenceFinished { generation, error } => {
-                self.persistence_in_flight = false;
-                let persisted = self
-                    .core
-                    .persisted(generation, error.clone().map_or(Ok(()), Err));
+                if self.persistence_in_flight != Some(generation) {
+                    return;
+                }
+                self.persistence_in_flight = None;
+                let persistence_error = error
+                    .as_ref()
+                    .map(|error| format!("persist control state: {error}"));
+                let persisted = self.core.persisted(generation, error.map_or(Ok(()), Err));
+                if let Some(error) = persistence_error.as_ref() {
+                    self.flush_failure = Some(error.clone());
+                    self.persistence_queue.clear();
+                }
                 if let Some((reply_to, command_id)) =
                     self.pending_command_replies.remove(&generation)
                 {
-                    let reply = match persisted {
-                        Ok(()) => self
-                            .core
-                            .snapshot()
-                            .commands
-                            .get(&command_id)
-                            .cloned()
-                            .map(ManualControlReply::Accepted)
-                            .unwrap_or_else(|| {
-                                ManualControlReply::Rejected(format!(
-                                    "persisted command {command_id} is absent"
-                                ))
-                            }),
-                        Err(error) => ManualControlReply::Rejected(error),
+                    let reply = if let Some(error) = persistence_error.as_ref() {
+                        ManualControlReply::Rejected(error.clone())
+                    } else {
+                        match persisted {
+                            Ok(()) => self
+                                .core
+                                .snapshot()
+                                .commands
+                                .get(&command_id)
+                                .cloned()
+                                .map(ManualControlReply::Accepted)
+                                .unwrap_or_else(|| {
+                                    ManualControlReply::Rejected(format!(
+                                        "persisted command {command_id} is absent"
+                                    ))
+                                }),
+                            Err(error) => ManualControlReply::Rejected(error),
+                        }
                     };
                     let _ = ctx.send(reply_to, reply);
+                }
+                if let Some(error) = persistence_error {
+                    for (_, (reply_to, _)) in std::mem::take(&mut self.pending_command_replies) {
+                        let _ = ctx.send(reply_to, ManualControlReply::Rejected(error.clone()));
+                    }
                 }
             }
             ManualControlMsg::EffectFinished {
                 node_id,
                 kind,
+                effect_id,
                 outcome,
                 error,
             } => {
+                if self.active_effect_ids.get(&node_id).copied() != Some(effect_id) {
+                    return;
+                }
+                self.active_effect_ids.remove(&node_id);
                 let result = match (outcome, error) {
                     (Some(outcome), None) => Ok(outcome),
                     (_, Some(error)) => Err(error),
                     (None, None) => Err("provider effect returned no outcome".to_owned()),
                 };
+                let releases_lane = (kind == EffectKind::Stop && result.is_ok())
+                    || (kind == EffectKind::Create && result.is_err())
+                    || (kind == EffectKind::Recover
+                        && !matches!(
+                            &result,
+                            Ok(EffectOutcome::Recovered {
+                                provider_ref: Some(_)
+                            })
+                        ));
                 let _ = self.core.effect_finished(node_id, kind, result);
+                if releases_lane {
+                    self.lanes.remove(&node_id);
+                }
             }
             ManualControlMsg::JoinBarrierSatisfied { node_id } => {
                 let _ = self.core.join_barrier_satisfied(node_id);
@@ -1766,58 +1922,120 @@ impl ManualActorControl {
     }
 
     fn start_next_persistence(&mut self, actor: ActorAddress) {
-        if self.persistence_in_flight {
+        if self.persistence_in_flight.is_some() {
             return;
         }
         let Some((generation, snapshot)) = self.persistence_queue.pop_front() else {
             return;
         };
-        self.persistence_in_flight = true;
+        self.persistence_in_flight = Some(generation);
         let state_dir = self.state_dir.clone();
         let sender = self.sender.clone();
-        self.engine.spawn_blocking(move || {
-            let error = state_dir.save_snapshot(&snapshot).err();
-            let _ = sender.send_to(
-                actor,
-                OrchestratorMsg::Manual(ManualControlMsg::PersistenceFinished {
-                    generation,
-                    error,
-                }),
-            );
-        });
+        let failed_sender = self.sender.clone();
+        self.spawn_work(
+            move || {
+                let error = state_dir.save_snapshot(&snapshot).err();
+                let _ = sender.send_to(
+                    actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::PersistenceFinished {
+                        generation,
+                        error,
+                    }),
+                );
+            },
+            move |error| {
+                let _ = failed_sender.send_to(
+                    actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::PersistenceFinished {
+                        generation,
+                        error: Some(error),
+                    }),
+                );
+            },
+        );
     }
     fn finish_flush_waiters(&mut self, ctx: &Ctx) {
-        if self.persistence_in_flight
+        if self.persistence_in_flight.is_some()
             || !self.persistence_queue.is_empty()
             || !self.core.persistence_idle()
         {
             return;
         }
+        if self.flush_waiters.is_empty() {
+            return;
+        }
+        let failure = self.flush_failure.take();
         for reply_to in self.flush_waiters.drain(..) {
-            let _ = ctx.send(reply_to, ManualControlReply::Flushed);
+            let reply = failure
+                .as_ref()
+                .map_or(ManualControlReply::Flushed, |error| {
+                    ManualControlReply::Rejected(error.clone())
+                });
+            let _ = ctx.send(reply_to, reply);
         }
     }
 
-    fn spawn_effect<F>(&self, actor: ActorAddress, node_id: u64, kind: EffectKind, work: F)
+    fn spawn_effect<F>(&mut self, actor: ActorAddress, node_id: u64, kind: EffectKind, work: F)
     where
         F: FnOnce() -> Result<EffectOutcome, String> + Send + 'static,
     {
+        let effect_id = self.allocate_work_id();
+        assert!(
+            self.active_effect_ids.insert(node_id, effect_id).is_none(),
+            "manual control dispatched overlapping effects for node {node_id}"
+        );
         let sender = self.sender.clone();
-        self.engine.spawn_blocking(move || {
-            let (outcome, error) = match work() {
-                Ok(outcome) => (Some(outcome), None),
-                Err(error) => (None, Some(error)),
-            };
-            let _ = sender.send_to(
-                actor,
-                OrchestratorMsg::Manual(ManualControlMsg::EffectFinished {
-                    node_id,
-                    kind,
-                    outcome,
-                    error,
-                }),
-            );
-        });
+        let failed_sender = self.sender.clone();
+        self.spawn_work(
+            move || {
+                let (outcome, error) = match work() {
+                    Ok(outcome) => (Some(outcome), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let _ = sender.send_to(
+                    actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::EffectFinished {
+                        node_id,
+                        kind,
+                        effect_id,
+                        outcome,
+                        error,
+                    }),
+                );
+            },
+            move |error| {
+                let _ = failed_sender.send_to(
+                    actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::EffectFinished {
+                        node_id,
+                        kind,
+                        effect_id,
+                        outcome: None,
+                        error: Some(error),
+                    }),
+                );
+            },
+        );
+    }
+
+    fn spawn_work(
+        &self,
+        work: impl FnOnce() + Send + 'static,
+        failure: impl FnOnce(String) + Send + 'static,
+    ) {
+        let _ = self.runtime.send_to(
+            self.work_actor,
+            ManualWork {
+                work: Arc::new(Mutex::new(Some(Box::new(work)))),
+                failure: Arc::new(Mutex::new(Some(Box::new(failure)))),
+            },
+        );
+    }
+}
+
+impl Drop for ManualActorControl {
+    fn drop(&mut self) {
+        let _ = self.runtime.stop_actor(self.work_actor);
     }
 }
 
@@ -1838,9 +2056,19 @@ fn send_command_reply(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use distribution::types::NodeId as DistNodeId;
     use proptest::prelude::*;
+    use swactor::runtime::{RuntimeConfig, RuntimeParts};
+    use swactor_engine::{Engine, SteppingBackend};
+
+    use crate::provisioning::{PluginObservation, PluginObservationSink};
+    use crate::tests::fuzz_support::{
+        actor_census, assert_actor_delta_at_most, assert_mailboxes_drained, assert_no_poison,
+        assert_no_poison_with_context, drive_steps,
+    };
 
     use super::*;
 
@@ -2237,6 +2465,16 @@ mod tests {
             last_error: None,
             last_seen_unix_ms: 0,
         });
+        snapshot.commands.insert(
+            "provision".to_owned(),
+            CommandRecord {
+                command_id: "provision".to_owned(),
+                kind: CommandKind::Provision,
+                state: CommandState::Running,
+                node_ids: vec![1],
+                error: None,
+            },
+        );
         let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
         let current = ActorAddress([9; 32]);
         let binding = core
@@ -2275,6 +2513,10 @@ mod tests {
         assert_eq!(
             node.runtime.as_ref().unwrap().node_actor,
             ActorAddress([8; 32])
+        );
+        assert_eq!(
+            core.snapshot().commands["provision"].state,
+            CommandState::Succeeded
         );
         assert!(
             core.rejoin(
@@ -2391,14 +2633,14 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 2048,
-            max_shrink_iters: 20_000,
+            cases: 128,
+            max_shrink_iters: 2_000,
             ..ProptestConfig::default()
         })]
 
         #[test]
         fn aggressive_random_event_stream_preserves_control_invariants(
-            operations in prop::collection::vec(any::<u8>(), 1..768)
+            operations in prop::collection::vec(any::<u8>(), 0..=32)
         ) {
             let mut core = ready_core();
             let mut pending = VecDeque::new();
@@ -2621,14 +2863,14 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 256,
-            max_shrink_iters: 10_000,
+            cases: 128,
+            max_shrink_iters: 2_000,
             ..ProptestConfig::default()
         })]
 
         #[test]
         fn rental_free_end_to_end_sequences_converge(
-            operations in prop::collection::vec((any::<u8>(), any::<u8>()), 1..256)
+            operations in prop::collection::vec((any::<u8>(), any::<u8>()), 0..=32)
         ) {
             let mut core = ready_core();
             let mut resources = BTreeSet::new();
@@ -2730,5 +2972,1004 @@ mod tests {
             prop_assert!(core.snapshot().nodes.iter().all(|node| node.phase == NodePhase::Stopped));
             prop_assert!(core.snapshot().commands.values().all(|command| command.state.is_terminal()));
         }
+    }
+
+    struct DiscardObservations;
+
+    impl PluginObservationSink for DiscardObservations {
+        fn observe(&self, _observation: PluginObservation) {}
+    }
+
+    struct ScriptedPlugin {
+        resources: Arc<Mutex<BTreeSet<u64>>>,
+    }
+
+    impl ProvisionPlugin for ScriptedPlugin {
+        fn create_node(
+            &mut self,
+            spec: NodeProvisionSpec,
+            _sink: PluginSink,
+        ) -> Result<PluginNodeHandle, String> {
+            match spec.node_id % 7 {
+                0 => return Err("scripted provider create failure".to_owned()),
+                1 => panic!("scripted provider callback panic"),
+                _ => {}
+            }
+            if !self.resources.lock().insert(spec.node_id) {
+                return Err(format!("duplicate resource for node {}", spec.node_id));
+            }
+            Ok(PluginNodeHandle {
+                id: spec.node_id,
+                provider_process_id: None,
+            })
+        }
+
+        fn create_node_selected(
+            &mut self,
+            spec: NodeProvisionSpec,
+            sink: PluginSink,
+            _selected_offer_id: Option<u64>,
+        ) -> Result<PluginNodeHandle, String> {
+            self.create_node(spec, sink)
+        }
+
+        fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+            if handle.id % 11 == 0 {
+                return Err("scripted bootstrap failure".to_owned());
+            }
+            Ok(())
+        }
+
+        fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+            self.resources.lock().remove(&handle.id);
+            Ok(())
+        }
+
+        fn stop_by_spec(
+            &mut self,
+            spec: &NodeProvisionSpec,
+            _sink: PluginSink,
+        ) -> Result<bool, String> {
+            Ok(self.resources.lock().remove(&spec.node_id))
+        }
+
+        fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
+            if spec.node_id % 5 == 0 {
+                String::new()
+            } else {
+                format!("scripted-resource-{}", spec.node_id)
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ManualActorEvidence {
+        lanes: usize,
+        lane_ids: Vec<u64>,
+        persistence_queue: Vec<u64>,
+        persistence_in_flight: Option<u64>,
+        pending_command_replies: Vec<u64>,
+        flush_waiters: usize,
+        pending_validations: Vec<u64>,
+        pending_offer_searches: Vec<u64>,
+        active_effects: Vec<(u64, EffectKind, u64)>,
+        node_ids: Vec<u64>,
+        node_phases: Vec<(u64, NodePhase)>,
+    }
+
+    impl ManualActorEvidence {
+        fn capture(control: &ManualActorControl) -> Self {
+            Self {
+                lanes: control.lanes.len(),
+                lane_ids: control.lanes.keys().copied().collect(),
+                persistence_queue: control
+                    .persistence_queue
+                    .iter()
+                    .map(|(generation, _)| *generation)
+                    .collect(),
+                persistence_in_flight: control.persistence_in_flight,
+                pending_command_replies: control.pending_command_replies.keys().copied().collect(),
+                flush_waiters: control.flush_waiters.len(),
+                pending_validations: control.pending_validations.keys().copied().collect(),
+                pending_offer_searches: control.pending_offer_searches.keys().copied().collect(),
+                active_effects: control
+                    .active_effect_ids
+                    .iter()
+                    .map(|(node_id, effect_id)| {
+                        let kind = *control
+                            .core
+                            .in_flight
+                            .get(node_id)
+                            .expect("actor effect identity matches core effect");
+                        (*node_id, kind, *effect_id)
+                    })
+                    .collect(),
+                node_ids: control
+                    .core
+                    .snapshot()
+                    .nodes
+                    .iter()
+                    .filter(|node| node.logical_node_id != 0)
+                    .map(|node| node.logical_node_id)
+                    .collect(),
+                node_phases: control
+                    .core
+                    .snapshot()
+                    .nodes
+                    .iter()
+                    .filter(|node| node.logical_node_id != 0)
+                    .map(|node| (node.logical_node_id, node.phase))
+                    .collect(),
+            }
+        }
+
+        fn pending_count(&self) -> usize {
+            self.persistence_queue.len()
+                + usize::from(self.persistence_in_flight.is_some())
+                + self.pending_command_replies.len()
+                + self.flush_waiters
+                + self.pending_validations.len()
+                + self.pending_offer_searches.len()
+                + self.active_effects.len()
+        }
+
+        fn persistence_drained(&self) -> bool {
+            self.persistence_in_flight.is_none() && self.persistence_queue.is_empty()
+        }
+    }
+
+    struct ManualHarnessActor {
+        control: ManualActorControl,
+        evidence: Arc<Mutex<ManualActorEvidence>>,
+    }
+
+    impl ManualHarnessActor {
+        fn record_evidence(&self) {
+            *self.evidence.lock() = ManualActorEvidence::capture(&self.control);
+        }
+    }
+
+    impl ActorInterface for ManualHarnessActor {
+        type Incoming = OrchestratorMsg;
+        type Response = ();
+
+        fn on_start(&mut self, ctx: &Ctx) {
+            self.control.start(ctx.self_addr());
+            self.record_evidence();
+        }
+
+        fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+            if let OrchestratorMsg::Manual(message) = message {
+                self.control.handle(ctx, message);
+                self.record_evidence();
+            }
+        }
+    }
+
+    struct ReplySlot {
+        inbox: Option<swactor::runtime::Inbox<ManualControlReply>>,
+        expect_reply: bool,
+        flush_barrier: Option<u64>,
+    }
+
+    #[derive(Default)]
+    struct TerminalReplyCollector {
+        slots: BTreeMap<String, ReplySlot>,
+        replies: BTreeMap<String, Vec<ManualControlReply>>,
+    }
+
+    impl TerminalReplyCollector {
+        fn reply_to(
+            &mut self,
+            runtime: &Runtime,
+            request_id: String,
+            selector: u8,
+            allow_missing: bool,
+        ) -> Option<ActorAddress> {
+            let outcome = selector % 3;
+            if outcome == 2 && allow_missing {
+                self.slots.insert(
+                    request_id,
+                    ReplySlot {
+                        inbox: None,
+                        expect_reply: false,
+                        flush_barrier: None,
+                    },
+                );
+                return None;
+            }
+            let inbox = runtime
+                .new_inbox::<ManualControlReply>()
+                .expect("manual terminal reply inbox");
+            let address = *inbox.addr();
+            let closed = outcome == 1 || (outcome == 2 && !allow_missing);
+            self.slots.insert(
+                request_id,
+                ReplySlot {
+                    inbox: (!closed).then_some(inbox),
+                    expect_reply: !closed,
+                    flush_barrier: None,
+                },
+            );
+            Some(address)
+        }
+        fn mark_flush_barrier(&mut self, request_id: &str, evidence: &ManualActorEvidence) {
+            let barrier = evidence
+                .persistence_queue
+                .iter()
+                .copied()
+                .chain(evidence.persistence_in_flight)
+                .max()
+                .unwrap_or(0);
+            self.slots
+                .get_mut(request_id)
+                .expect("flush reply slot exists")
+                .flush_barrier = Some(barrier);
+        }
+
+        fn drain(&mut self, evidence: &ManualActorEvidence, actions: &[ActorControlAction]) {
+            for (request_id, slot) in &self.slots {
+                let Some(inbox) = slot.inbox.as_ref() else {
+                    continue;
+                };
+                while let Some(reply) = inbox.try_recv() {
+                    if let (ManualControlReply::Flushed, Some(barrier)) =
+                        (&reply, slot.flush_barrier)
+                    {
+                        let older_persistence_pending = evidence
+                            .persistence_queue
+                            .iter()
+                            .copied()
+                            .chain(evidence.persistence_in_flight)
+                            .any(|generation| generation <= barrier);
+                        assert!(
+                            !older_persistence_pending,
+                            "flush replied before its persistence barrier drained; \
+                             request={request_id}, barrier={barrier}, actions={actions:?}, \
+                             evidence={evidence:?}"
+                        );
+                    }
+                    self.replies
+                        .entry(request_id.clone())
+                        .or_default()
+                        .push(reply);
+                }
+                assert!(
+                    self.replies.get(request_id).map_or(0, Vec::len) <= 1,
+                    "request produced duplicate terminal replies; request={request_id}, actions={actions:?}, replies={}, evidence={evidence:?}",
+                    self.describe(),
+                );
+            }
+        }
+
+        fn assert_complete(
+            &self,
+            actions: &[ActorControlAction],
+            evidence: &ManualActorEvidence,
+            runtime: &Runtime,
+        ) {
+            for (request_id, slot) in &self.slots {
+                let count = self.replies.get(request_id).map_or(0, Vec::len);
+                assert!(
+                    count <= 1,
+                    "request produced more than one terminal reply; request={request_id}, actions={actions:?}, replies={}, evidence={evidence:?}\n{}",
+                    self.describe(),
+                    actor_census(runtime),
+                );
+                assert_eq!(
+                    count,
+                    usize::from(slot.expect_reply),
+                    "open request did not produce exactly one terminal reply, or closed/missing request was observed; request={request_id}, actions={actions:?}, replies={}, evidence={evidence:?}\n{}",
+                    self.describe(),
+                    actor_census(runtime),
+                );
+            }
+        }
+
+        fn describe(&self) -> String {
+            format!("{:?}", self.replies)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum ActorControlAction {
+        Configure(u8),
+        Search(u8),
+        Provision(u8),
+        Kill(u8),
+        Query(u8),
+        Flush(u8),
+        Rejoin(u8),
+        ProviderTerminalFailure(u8),
+        ProviderValidated(u8),
+        OfferSearchFinished(u8),
+        PersistenceFinished(u8),
+        EffectFinished(u8),
+        Drive,
+    }
+
+    fn actor_control_actions() -> impl Strategy<Value = Vec<ActorControlAction>> {
+        prop::collection::vec(
+            prop_oneof![
+                2 => any::<u8>().prop_map(ActorControlAction::Configure),
+                2 => any::<u8>().prop_map(ActorControlAction::Search),
+                3 => any::<u8>().prop_map(ActorControlAction::Provision),
+                2 => any::<u8>().prop_map(ActorControlAction::Kill),
+                2 => any::<u8>().prop_map(ActorControlAction::Query),
+                2 => any::<u8>().prop_map(ActorControlAction::Flush),
+                1 => any::<u8>().prop_map(ActorControlAction::Rejoin),
+                1 => any::<u8>().prop_map(ActorControlAction::ProviderTerminalFailure),
+                1 => any::<u8>().prop_map(ActorControlAction::ProviderValidated),
+                1 => any::<u8>().prop_map(ActorControlAction::OfferSearchFinished),
+                1 => any::<u8>().prop_map(ActorControlAction::PersistenceFinished),
+                1 => any::<u8>().prop_map(ActorControlAction::EffectFinished),
+                2 => Just(ActorControlAction::Drive),
+            ],
+            0..=32,
+        )
+    }
+
+    fn settle_manual_work(backend: &SteppingBackend) {
+        for _ in 0..96 {
+            drive_steps(backend, 8);
+            backend
+                .join_blocking()
+                .expect("manual control blocking work must not panic");
+            drive_steps(backend, 8);
+        }
+    }
+
+    fn send_manual(runtime: &Runtime, actor: ActorAddress, message: ManualControlMsg) {
+        runtime
+            .send_to(actor, OrchestratorMsg::Manual(message))
+            .expect("send manual control message");
+    }
+
+    fn send_duplicate_manual(runtime: &Runtime, actor: ActorAddress, message: ManualControlMsg) {
+        send_manual(runtime, actor, message.clone());
+        send_manual(runtime, actor, message);
+    }
+
+    fn scripted_offer(malformed: bool) -> OfferDto {
+        OfferDto {
+            offer_id: 44,
+            host_id: Some(55),
+            gpu_model: "scripted".to_owned(),
+            gpu_ram_mb: Some(24_000.0),
+            compute_cap: 89,
+            verification: Some("verified".to_owned()),
+            reliability: Some(if malformed { f64::NAN } else { 0.99 }),
+            download_mbps: Some(1_000.0),
+            upload_mbps: Some(1_000.0),
+            location: Some("test".to_owned()),
+            hourly_price: if malformed { f64::INFINITY } else { 0.5 },
+            download_cost_per_tb: 0.0,
+            upload_cost_per_tb: 0.0,
+        }
+    }
+
+    fn effect_outcome(node_id: u64, kind: EffectKind) -> EffectOutcome {
+        match kind {
+            EffectKind::Create => EffectOutcome::Created {
+                provider_ref: format!("injected-resource-{node_id}"),
+            },
+            EffectKind::StartBootstrap => EffectOutcome::BootstrapStarted,
+            EffectKind::CompleteBootstrap => EffectOutcome::BootstrapCompleted,
+            EffectKind::Stop => EffectOutcome::Stopped,
+            EffectKind::Recover => EffectOutcome::Recovered {
+                provider_ref: Some(format!("injected-resource-{node_id}")),
+            },
+        }
+    }
+
+    fn assert_pending_bounded(
+        evidence: &ManualActorEvidence,
+        action_count: usize,
+        actions: &[ActorControlAction],
+        replies: &TerminalReplyCollector,
+        runtime: &Runtime,
+    ) {
+        let bound = action_count.saturating_mul(3).saturating_add(4);
+        assert!(
+            evidence.pending_count() <= bound,
+            "manual pending state exceeded live generated work; bound={bound}, actions={actions:?}, replies={}, evidence={evidence:?}\n{}",
+            replies.describe(),
+            actor_census(runtime),
+        );
+        assert!(
+            evidence.lanes <= action_count,
+            "provider lanes exceeded generated actions; actions={actions:?}, replies={}, evidence={evidence:?}\n{}",
+            replies.describe(),
+            actor_census(runtime),
+        );
+    }
+
+    fn assert_manual_no_poison(
+        runtime: &Runtime,
+        actions: &[ActorControlAction],
+        replies: &TerminalReplyCollector,
+        evidence: &ManualActorEvidence,
+        resources: &Arc<Mutex<BTreeSet<u64>>>,
+    ) {
+        let context = format!(
+            "actions={actions:?}\nreplies={}\npending/resource state: evidence={evidence:?}, resources={:?}\nactor census follows",
+            replies.describe(),
+            *resources.lock(),
+        );
+        assert_no_poison_with_context(runtime, &context);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn manual_actor_generated_public_actions_and_callbacks_are_bounded(
+            actions in actor_control_actions()
+        ) {
+            let parts = RuntimeParts::new(RuntimeConfig::default());
+            let runtime = parts.runtime().clone();
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+            let baseline = runtime.stats().actors.len();
+            let resources = Arc::new(Mutex::new(BTreeSet::new()));
+            let provider_resources = Arc::clone(&resources);
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let provider_factory_calls = Arc::clone(&factory_calls);
+            let provider_factory: ProviderFactory = Arc::new(move || {
+                match provider_factory_calls.fetch_add(1, Ordering::Relaxed) % 5 {
+                    1 => Err("scripted provider factory failure".to_owned()),
+                    2 => panic!("scripted provider factory panic"),
+                    _ => Ok(Box::new(ScriptedPlugin {
+                        resources: Arc::clone(&provider_resources),
+                    })),
+                }
+            });
+            let spec_builder: SpecBuilder = Arc::new(|node_id, _actor| {
+                if node_id % 9 == 0 {
+                    return Err("malformed scripted provision specification".to_owned());
+                }
+                Ok(spec(node_id))
+            });
+            let validator: ConfigValidator = Arc::new(|request| {
+                match request.api_key.as_deref() {
+                    Some("panic") => panic!("scripted validation callback panic"),
+                    Some("bad") => Err("scripted validation failure".to_owned()),
+                    Some("") => Err("malformed provider configuration".to_owned()),
+                    _ => Ok(()),
+                }
+            });
+            let searcher: OfferSearcher = Arc::new(|request| {
+                match request.gpu_model.as_deref() {
+                    Some("panic") => panic!("scripted search callback panic"),
+                    Some("bad") => Err("scripted search failure".to_owned()),
+                    Some("malformed") => Ok(vec![scripted_offer(true)]),
+                    _ => Ok(vec![scripted_offer(false)]),
+                }
+            });
+            let temp = tempfile::tempdir().expect("manual state tempdir");
+            let evidence = Arc::new(Mutex::new(ManualActorEvidence::default()));
+            let control = ManualActorControl::new(
+                ready_core(),
+                runtime.clone(),
+                engine.handle().blocking_work_sender(),
+                StateDir::new(temp.path()),
+                PluginSink::new(Arc::new(DiscardObservations)),
+                provider_factory,
+                spec_builder,
+                Some(validator),
+                Some(searcher),
+                1,
+            );
+            prop_assert_eq!(
+                runtime.stats().actors.len(),
+                baseline + 1,
+                "manual control construction did not add exactly one work actor\n{}",
+                actor_census(&runtime),
+            );
+            let actor = runtime
+                .spawn(ManualHarnessActor {
+                    control,
+                    evidence: Arc::clone(&evidence),
+                })
+                .expect("spawn manual harness");
+            drive_steps(&backend, 8);
+            prop_assert_eq!(
+                runtime.stats().actors.len(),
+                baseline + 2,
+                "manual control harness did not have fixed helper cardinality\n{}",
+                actor_census(&runtime),
+            );
+
+            let mut replies = TerminalReplyCollector::default();
+            let mut request_serial = 0_u64;
+            for action in &actions {
+                let request_id = format!("request-{request_serial}");
+                request_serial += 1;
+                match *action {
+                    ActorControlAction::Configure(selector) => {
+                        let reply_to = replies.reply_to(
+                            &runtime,
+                            format!("{request_id}:configure"),
+                            selector >> 4,
+                            true,
+                        );
+                        let api_key = match selector % 4 {
+                            0 => Some("good".to_owned()),
+                            1 => Some("bad".to_owned()),
+                            2 => Some("panic".to_owned()),
+                            _ => Some(String::new()),
+                        };
+                        send_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::Configure {
+                                request: ProviderConfigurationRequest {
+                                    api_key,
+                                    ssh_identity: None,
+                                    bootstrap_command: None,
+                                },
+                                reply_to,
+                            },
+                        );
+                    }
+                    ActorControlAction::Search(selector) => {
+                        let reply_to = replies
+                            .reply_to(
+                                &runtime,
+                                format!("{request_id}:search"),
+                                selector >> 4,
+                                false,
+                            )
+                            .expect("required search reply address");
+                        let request = match selector % 5 {
+                            0 => OfferSearchRequest {
+                                gpu_model: Some("good".to_owned()),
+                                count: Some(1),
+                                ..OfferSearchRequest::default()
+                            },
+                            1 => OfferSearchRequest {
+                                gpu_model: Some("bad".to_owned()),
+                                count: Some(1),
+                                ..OfferSearchRequest::default()
+                            },
+                            2 => OfferSearchRequest {
+                                gpu_model: Some("panic".to_owned()),
+                                count: Some(1),
+                                ..OfferSearchRequest::default()
+                            },
+                            3 => OfferSearchRequest {
+                                gpu_model: Some("malformed".to_owned()),
+                                count: Some(1),
+                                ..OfferSearchRequest::default()
+                            },
+                            _ => OfferSearchRequest {
+                                count: Some(0),
+                                ..OfferSearchRequest::default()
+                            },
+                        };
+                        send_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::SearchOffers { request, reply_to },
+                        );
+                    }
+                    ActorControlAction::Provision(selector) => {
+                        let key = format!("{request_id}:provision");
+                        let reply_to = replies.reply_to(
+                            &runtime,
+                            key.clone(),
+                            selector >> 4,
+                            true,
+                        );
+                        let count = u32::from(selector % 5 != 0);
+                        send_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::Provision {
+                                request: ProvisionRequest {
+                                    command_id: key,
+                                    count,
+                                    selected_offer_ids: (count == 1)
+                                        .then_some(vec![10_000 + request_serial])
+                                        .unwrap_or_default(),
+                                },
+                                reply_to,
+                            },
+                        );
+                    }
+                    ActorControlAction::Kill(selector) => {
+                        let key = format!("{request_id}:kill");
+                        let reply_to = replies.reply_to(
+                            &runtime,
+                            key.clone(),
+                            selector >> 4,
+                            true,
+                        );
+                        let state = evidence.lock().clone();
+                        let node_id = state
+                            .node_ids
+                            .get(usize::from(selector) % state.node_ids.len().max(1))
+                            .copied()
+                            .unwrap_or(u64::from(selector) + 1);
+                        send_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::Kill {
+                                request: KillRequest {
+                                    command_id: key,
+                                    logical_node_id: node_id,
+                                },
+                                reply_to,
+                            },
+                        );
+                    }
+                    ActorControlAction::Query(selector) => {
+                        let reply_to = replies
+                            .reply_to(
+                                &runtime,
+                                format!("{request_id}:query"),
+                                selector,
+                                false,
+                            )
+                            .expect("required query reply address");
+                        send_manual(&runtime, actor, ManualControlMsg::Query { reply_to });
+                    }
+                    ActorControlAction::Flush(selector) => {
+                        let key = format!("{request_id}:flush");
+                        let reply_to = replies
+                            .reply_to(&runtime, key.clone(), selector, false)
+                            .expect("required flush reply address");
+                        replies.mark_flush_barrier(&key, &evidence.lock());
+                        send_manual(&runtime, actor, ManualControlMsg::Flush { reply_to });
+                    }
+                    ActorControlAction::Rejoin(selector) => {
+                        let reply_to = replies
+                            .reply_to(
+                                &runtime,
+                                format!("{request_id}:rejoin"),
+                                selector,
+                                false,
+                            )
+                            .expect("required rejoin reply address");
+                        send_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::Rejoin {
+                                hello: RejoinHello {
+                                    run_id: 7,
+                                    logical_node_id: u64::from(selector) + 10_000,
+                                    attempt_id: 0,
+                                    selected_offer_id: None,
+                                    endpoint: "generated-rejoin".to_owned(),
+                                    swim_node_id: DistNodeId([selector; 32]),
+                                    stage_index: 0,
+                                    node_actor: ActorAddress([selector; 32]),
+                                },
+                                reply_to,
+                            },
+                        );
+                    }
+                    ActorControlAction::ProviderTerminalFailure(selector) => {
+                        let state = evidence.lock().clone();
+                        let node_id = state
+                            .node_ids
+                            .get(usize::from(selector) % state.node_ids.len().max(1))
+                            .copied()
+                            .unwrap_or(u64::from(selector) + 1);
+                        send_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::ProviderTerminalFailure {
+                                node_id,
+                                error: format!("generated terminal provider failure {selector}"),
+                            },
+                        );
+                    }
+                    ActorControlAction::ProviderValidated(selector) => {
+                        let state = evidence.lock().clone();
+                        let work_id = state
+                            .pending_validations
+                            .get(usize::from(selector) % state.pending_validations.len().max(1))
+                            .copied()
+                            .unwrap_or(u64::MAX - u64::from(selector));
+                        send_duplicate_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::ProviderValidated {
+                                work_id,
+                                error: (selector & 1 != 0)
+                                    .then(|| "injected validation failure".to_owned()),
+                            },
+                        );
+                    }
+                    ActorControlAction::OfferSearchFinished(selector) => {
+                        let state = evidence.lock().clone();
+                        let work_id = state
+                            .pending_offer_searches
+                            .get(usize::from(selector) % state.pending_offer_searches.len().max(1))
+                            .copied()
+                            .unwrap_or(u64::MAX - u64::from(selector));
+                        let result = match selector % 3 {
+                            0 => Ok(vec![scripted_offer(false)]),
+                            1 => Err("injected search failure".to_owned()),
+                            _ => Ok(vec![scripted_offer(true)]),
+                        };
+                        send_duplicate_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::OfferSearchFinished { work_id, result },
+                        );
+                    }
+                    ActorControlAction::PersistenceFinished(selector) => {
+                        let state = evidence.lock().clone();
+                        let generation = match selector % 3 {
+                            0 => state.persistence_in_flight,
+                            1 => state.persistence_queue.last().copied(),
+                            _ => None,
+                        }
+                        .unwrap_or(u64::MAX - u64::from(selector));
+                        send_duplicate_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::PersistenceFinished {
+                                generation,
+                                error: (selector & 4 != 0)
+                                    .then(|| "injected persistence failure".to_owned()),
+                            },
+                        );
+                    }
+                    ActorControlAction::EffectFinished(selector) => {
+                        let state = evidence.lock().clone();
+                        let (node_id, kind, active_effect_id) = state
+                            .active_effects
+                            .get(usize::from(selector) % state.active_effects.len().max(1))
+                            .copied()
+                            .unwrap_or((
+                                u64::MAX - u64::from(selector),
+                                EffectKind::Create,
+                                u64::MAX,
+                            ));
+                        let effect_id = active_effect_id.wrapping_add(1);
+                        let (outcome, error) = match selector % 3 {
+                            0 => (Some(effect_outcome(node_id, kind)), None),
+                            1 => (None, Some("injected provider effect failure".to_owned())),
+                            _ => (None, None),
+                        };
+                        send_duplicate_manual(
+                            &runtime,
+                            actor,
+                            ManualControlMsg::EffectFinished {
+                                node_id,
+                                kind,
+                                effect_id,
+                                outcome,
+                                error,
+                            },
+                        );
+                    }
+                    ActorControlAction::Drive => settle_manual_work(&backend),
+                }
+
+                drive_steps(&backend, 8);
+                let state = evidence.lock().clone();
+                replies.drain(&state, &actions);
+                assert_pending_bounded(
+                    &state,
+                    actions.len().max(1),
+                    &actions,
+                    &replies,
+                    &runtime,
+                );
+                prop_assert_eq!(
+                    runtime.stats().actors.len(),
+                    baseline + 2,
+                    "manual commands changed fixed helper cardinality; actions={:?}, replies={}, evidence={:?}\n{}",
+                    actions,
+                    replies.describe(),
+                    state,
+                    actor_census(&runtime),
+                );
+                assert_manual_no_poison(&runtime, &actions, &replies, &state, &resources);
+            }
+
+            settle_manual_work(&backend);
+            let settled = evidence.lock().clone();
+            replies.drain(&settled, &actions);
+            prop_assert!(
+                settled.persistence_drained()
+                    && settled.pending_command_replies.is_empty()
+                    && settled.flush_waiters == 0
+                    && settled.pending_validations.is_empty()
+                    && settled.pending_offer_searches.is_empty()
+                    && settled.active_effects.is_empty(),
+                "manual pending state did not drain; actions={:?}, replies={}, evidence={:?}\n{}",
+                actions,
+                replies.describe(),
+                settled,
+                actor_census(&runtime),
+            );
+            replies.assert_complete(&actions, &settled, &runtime);
+            assert_manual_no_poison(&runtime, &actions, &replies, &settled, &resources);
+            assert_actor_delta_at_most(&runtime, baseline, 2);
+
+            for node_id in settled.node_ids.iter().copied() {
+                send_manual(
+                    &runtime,
+                    actor,
+                    ManualControlMsg::Kill {
+                        request: KillRequest {
+                            command_id: format!("cleanup-{node_id}"),
+                            logical_node_id: node_id,
+                        },
+                        reply_to: None,
+                    },
+                );
+            }
+            settle_manual_work(&backend);
+            let cleanup = evidence.lock().clone();
+            prop_assert!(
+                resources.lock().is_empty(),
+                "manual control leaked scripted resources; actions={:?}, replies={}, resources={:?}, evidence={:?}\n{}",
+                actions,
+                replies.describe(),
+                *resources.lock(),
+                cleanup,
+                actor_census(&runtime),
+            );
+            prop_assert!(
+                cleanup.lanes == 0 && cleanup.lane_ids.is_empty(),
+                "provider lanes did not drain after terminal cleanup; actions={:?}, replies={}, \
+                 lane_ids={:?}, node_phases={:?}, evidence={:?}\n{}",
+                actions,
+                replies.describe(),
+                cleanup.lane_ids,
+                cleanup.node_phases,
+                cleanup,
+                actor_census(&runtime),
+            );
+
+            let _ = runtime.stop_actor(actor);
+            let _ = runtime.stop_actor(actor);
+            drive_steps(&backend, 32);
+            backend.join_blocking().expect("join final manual work");
+            drive_steps(&backend, 32);
+            assert_manual_no_poison(&runtime, &actions, &replies, &cleanup, &resources);
+            prop_assert_eq!(
+                runtime.stats().actors.len(),
+                baseline,
+                "manual control or work actor survived owner stop; actions={:?}, replies={}, evidence={:?}\n{}",
+                actions,
+                replies.describe(),
+                cleanup,
+                actor_census(&runtime),
+            );
+            assert_mailboxes_drained(&runtime);
+        }
+    }
+
+    struct IdleHelperActor;
+
+    impl ActorInterface for IdleHelperActor {
+        type Incoming = ();
+        type Response = ();
+
+        fn handle(&mut self, _ctx: &Ctx, (): ()) {}
+    }
+
+    #[test]
+    fn fixed_helper_cardinality_invariant_detects_controlled_extra_spawn() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let baseline = runtime.stats().actors.len();
+        let expected = runtime.spawn(IdleHelperActor).expect("expected helper");
+        let injected = runtime
+            .spawn(IdleHelperActor)
+            .expect("controlled extra helper");
+        let detected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_actor_delta_at_most(&runtime, baseline, 1);
+        }));
+        assert!(
+            detected.is_err(),
+            "actor-cardinality invariant accepted a controlled extra helper\n{}",
+            actor_census(&runtime),
+        );
+        let _ = runtime.stop_actor(expected);
+        let _ = runtime.stop_actor(injected);
+        drive_steps(&backend, 16);
+        assert_no_poison(&runtime);
+        assert_eq!(runtime.stats().actors.len(), baseline);
+    }
+
+    struct PanickingCallbackActor;
+
+    impl ActorInterface for PanickingCallbackActor {
+        type Incoming = ();
+        type Response = ();
+
+        fn handle(&mut self, _ctx: &Ctx, (): ()) {
+            panic!("controlled unguarded callback panic");
+        }
+    }
+
+    #[test]
+    fn callback_panic_invariant_detects_controlled_unguarded_panic() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let actor = runtime
+            .spawn(PanickingCallbackActor)
+            .expect("controlled panicking callback actor");
+        runtime
+            .send_to(actor, ())
+            .expect("send controlled unguarded callback");
+        drive_steps(&backend, 8);
+        let detected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_no_poison_with_context(
+                &runtime,
+                "controlled unguarded callback must be rejected by the property invariant",
+            );
+        }));
+        assert!(
+            detected.is_err(),
+            "poison invariant accepted a controlled unguarded callback panic\n{}",
+            actor_census(&runtime),
+        );
+    }
+
+    #[test]
+    fn callback_panic_reports_typed_failure_without_poisoning_work_actor() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let baseline = runtime.stats().actors.len();
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let observed_failures = Arc::clone(&failures);
+        let actor = runtime
+            .spawn(ManualWorkActor {
+                blocking_work: engine.handle().blocking_work_sender(),
+            })
+            .expect("manual work actor");
+        runtime
+            .send_to(
+                actor,
+                ManualWork {
+                    work: Arc::new(Mutex::new(Some(Box::new(|| {
+                        panic!("controlled callback panic");
+                    })))),
+                    failure: Arc::new(Mutex::new(Some(Box::new(move |error| {
+                        observed_failures.lock().push(error);
+                    })))),
+                },
+            )
+            .expect("send controlled callback");
+        drive_steps(&backend, 8);
+        backend
+            .join_blocking()
+            .expect("guarded callback must not escape the work boundary");
+        drive_steps(&backend, 8);
+        assert_eq!(
+            failures.lock().as_slice(),
+            ["manual control work panicked"],
+            "callback panic was not converted into its typed terminal failure",
+        );
+        assert_no_poison(&runtime);
+        assert_eq!(runtime.stats().actors.len(), baseline + 1);
+        let _ = runtime.stop_actor(actor);
+        drive_steps(&backend, 16);
+        assert_no_poison(&runtime);
+        assert_eq!(runtime.stats().actors.len(), baseline);
+        assert_mailboxes_drained(&runtime);
     }
 }

@@ -1,6 +1,3 @@
-use std::io::{BufRead, BufReader, Read};
-use std::thread::{self, JoinHandle};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use telemetry::{ChannelContent, Lifetime, NodeId, StreamId, TelemetryProducer};
@@ -72,66 +69,6 @@ impl BootstrapTelemetryBridge {
             node_id: self.spec.node_id,
             line,
         });
-    }
-
-    // provider log capture is out of scope (ENGINE_SPEC.md §2)
-    #[allow(clippy::disallowed_methods)]
-    pub(crate) fn spawn_stdout_reader<R>(&self, stdout: R) -> JoinHandle<()>
-    where
-        R: Read + Send + 'static,
-    {
-        let bridge = self.clone();
-        thread::spawn(move || bridge.read_stdout(stdout))
-    }
-
-    // provider log capture is out of scope (ENGINE_SPEC.md §2)
-    #[allow(clippy::disallowed_methods)]
-    pub(crate) fn spawn_stderr_reader<R>(&self, stderr: R) -> JoinHandle<()>
-    where
-        R: Read + Send + 'static,
-    {
-        let bridge = self.clone();
-        thread::spawn(move || bridge.read_stderr(stderr))
-    }
-
-    fn read_stdout<R>(&self, stdout: R)
-    where
-        R: Read,
-    {
-        let reader = BufReader::new(stdout);
-        for next in reader.lines() {
-            match next {
-                Ok(line) => self.observe_stdout_line(line),
-                Err(error) => {
-                    self.sink.observe(PluginObservation::Failed {
-                        run_id: self.spec.run_id,
-                        node_id: self.spec.node_id,
-                        reason: format!("read stdout: {error}"),
-                    });
-                    break;
-                }
-            }
-        }
-    }
-
-    fn read_stderr<R>(&self, stderr: R)
-    where
-        R: Read,
-    {
-        let reader = BufReader::new(stderr);
-        for next in reader.lines() {
-            match next {
-                Ok(line) => self.observe_stderr_line(line),
-                Err(error) => {
-                    self.sink.observe(PluginObservation::Failed {
-                        run_id: self.spec.run_id,
-                        node_id: self.spec.node_id,
-                        reason: format!("read stderr: {error}"),
-                    });
-                    break;
-                }
-            }
-        }
     }
 
     fn submit_log(&self, stream: ProvisionLogStream, line: &str) {

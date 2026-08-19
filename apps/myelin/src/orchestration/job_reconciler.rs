@@ -14,10 +14,13 @@ use provisioning::{
     BootSpec, ClusterShape, DesiredNodeShape, LogicalNodeId, NodeAttemptId, NodeGroupId,
     ProviderKind, RetryPolicy, RoleId, RunId, RunNodeGroupSpec, SwactorId, SwarmJoinTemplate,
 };
+use swactor::actor::ActorInterface;
+use swactor::runtime::{Ctx, ExternalSender};
+use swactor_engine::{ActorCompletion, EngineHandle};
 use swactor_job_runner::{Job, JobDone};
 use swactor_vastai::SelectionPolicy;
 
-use crate::job_deploy::{self, NodeIdentity};
+use crate::job_deploy::{self, JobRunStateMachine, NodeIdentity};
 use crate::orchestration::app::{
     derive_ssh_public_key, ensure_vastai_account_ssh_key, resolve_vastai_ssh_identity,
     ssh_public_key_fingerprint,
@@ -124,7 +127,7 @@ pub(crate) fn run_vastai_job(
     validate_non_empty("worker workdir", &options.worker_workdir)?;
     validate_non_empty("endpoint address mask", &options.endpoint_addr_mask)?;
 
-    let mut session = job_deploy::start_orchestrator(landing)?;
+    let session = job_deploy::start_orchestrator(landing)?;
     let orch_json = session.identity_json()?;
     println!("JOB_ORCH_IDENTITY {orch_json}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -134,102 +137,235 @@ pub(crate) fn run_vastai_job(
     );
 
     let (sink, observations) = observation_channel();
-    let provisioner = build_vastai_provisioner(&api_key, &options, session.runtime())?;
+    let runtime = session.runtime();
+    let engine = session.engine_handle();
+    let provisioner =
+        build_vastai_provisioner(&api_key, &options, runtime.clone(), engine.clone())?;
     let spec = job_node_spec(&options, image, &orch_json)?;
-    let mut cluster = build_cluster(&options, spec, provisioner, session.engine_handle(), sink)?;
+    let cluster = build_cluster(
+        &options,
+        spec,
+        provisioner,
+        engine.clone(),
+        runtime.clone(),
+        sink,
+    )?;
+    let completion = ActorCompletion::new();
+    runtime
+        .spawn(ReconciledJobActor {
+            cluster,
+            observations,
+            session: Some(session),
+            job: Some(job),
+            phase: ReconciledJobPhase::Provisioning {
+                deadline: Instant::now() + options.provision_timeout,
+            },
+            node_id: options.node_id,
+            engine,
+            sender: runtime.create_sender(),
+            completion: completion.clone(),
+        })
+        .map_err(|error| format!("spawn reconciled job actor: {error}"))?;
+    completion.wait()
+}
 
-    let result = run_with_cluster(job, &mut session, &mut cluster, &observations, &options);
-    let stop_result = cluster.stop();
-    match (result, stop_result) {
-        (Ok(done), Ok(())) => Ok(done),
-        (Ok(_), Err(cleanup)) => Err(format!(
+#[derive(Clone)]
+struct ReconciledJobTick;
+
+enum ReconciledJobPhase {
+    Provisioning {
+        deadline: Instant,
+    },
+    Converging {
+        deadline: Instant,
+        worker: NodeIdentity,
+    },
+    Running(JobRunStateMachine),
+    Stopping {
+        result: Result<JobDone, String>,
+    },
+    Finished,
+}
+
+struct ReconciledJobActor {
+    cluster: ProvisionedClusterGuard,
+    observations: mpsc::Receiver<PluginObservation>,
+    session: Option<job_deploy::JobOrchestratorSession>,
+    job: Option<Job>,
+    phase: ReconciledJobPhase,
+    node_id: u64,
+    engine: EngineHandle,
+    sender: ExternalSender,
+    completion: ActorCompletion<Result<JobDone, String>>,
+}
+
+impl ReconciledJobActor {
+    fn schedule(&self, ctx: &Ctx) {
+        self.engine.send_after(
+            POLL,
+            self.sender.clone(),
+            ctx.self_addr(),
+            ReconciledJobTick,
+        );
+    }
+
+    fn begin_stop(&mut self, result: Result<JobDone, String>) {
+        let result = match self.cluster.begin_shutdown() {
+            Ok(()) => result,
+            Err(cleanup) => merge_cleanup(result, cleanup),
+        };
+        self.phase = ReconciledJobPhase::Stopping { result };
+    }
+
+    fn complete(
+        &mut self,
+        ctx: &Ctx,
+        result: Result<JobDone, String>,
+        cleanup: Result<(), String>,
+    ) {
+        let result = match cleanup {
+            Ok(()) => result,
+            Err(cleanup) => merge_cleanup(result, cleanup),
+        };
+        assert!(
+            self.completion.complete(result).is_ok(),
+            "reconciled job completed twice"
+        );
+        self.phase = ReconciledJobPhase::Finished;
+        ctx.stop_self();
+    }
+}
+
+impl ActorInterface for ReconciledJobActor {
+    type Incoming = ReconciledJobTick;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        let _ = ctx.send(ctx.self_addr(), ReconciledJobTick);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+        if let Err(error) = self.cluster.poll(SystemTime::now()) {
+            let cleanup = self.cluster.finish_shutdown();
+            self.complete(ctx, Err(format!("job reconciler poll: {error}")), cleanup);
+            return;
+        }
+
+        let phase = std::mem::replace(&mut self.phase, ReconciledJobPhase::Finished);
+        match phase {
+            ReconciledJobPhase::Provisioning { deadline } => {
+                let mut worker = None;
+                if let Err(error) = drain_observations(&self.observations, &mut worker) {
+                    self.begin_stop(Err(error));
+                } else if let Some(worker) = worker {
+                    eprintln!("job-reconcile: worker identity observed through reconciler stdout");
+                    let result = job_deploy::parse_actor(&worker.actor_hex).and_then(|actor| {
+                        let attempt = self.cluster.current_attempt(self.node_id).ok_or_else(|| {
+                            format!(
+                                "reconciler has no active attempt for node {}",
+                                self.node_id
+                            )
+                        })?;
+                        self.cluster
+                            .observe_runtime_ready(
+                                self.node_id,
+                                NodeAttemptId(attempt.0),
+                                SwactorId(format!("{actor:?}")),
+                                SystemTime::now(),
+                            )
+                            .then_some(())
+                            .ok_or_else(|| {
+                                format!(
+                                    "reconciler rejected runtime-ready observation for node {} attempt {}",
+                                    self.node_id, attempt.0
+                                )
+                            })
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.phase = ReconciledJobPhase::Converging {
+                                deadline: Instant::now() + RUNTIME_CONVERGENCE_TIMEOUT,
+                                worker,
+                            };
+                        }
+                        Err(error) => self.begin_stop(Err(error)),
+                    }
+                } else if Instant::now() >= deadline {
+                    self.begin_stop(Err(format!(
+                        "timed out waiting for reconciled job worker identity"
+                    )));
+                } else {
+                    self.phase = ReconciledJobPhase::Provisioning { deadline };
+                }
+            }
+            ReconciledJobPhase::Converging { deadline, worker } => {
+                let mut ignored = None;
+                if let Err(error) = drain_observations(&self.observations, &mut ignored) {
+                    self.begin_stop(Err(error));
+                } else if self.cluster.is_converged() {
+                    eprintln!("job-reconcile: reconciler accepted runtime-ready worker");
+                    let machine = self
+                        .session
+                        .take()
+                        .zip(self.job.take())
+                        .ok_or_else(|| "reconciled job lost session state".to_owned())
+                        .and_then(|(session, job)| JobRunStateMachine::new(session, job, worker));
+                    match machine {
+                        Ok(mut machine) => {
+                            machine.start(Instant::now());
+                            self.phase = ReconciledJobPhase::Running(machine);
+                        }
+                        Err(error) => self.begin_stop(Err(error)),
+                    }
+                } else if Instant::now() >= deadline {
+                    self.begin_stop(Err(format!(
+                        "timed out after {RUNTIME_CONVERGENCE_TIMEOUT:?} waiting for reconciler convergence"
+                    )));
+                } else {
+                    self.phase = ReconciledJobPhase::Converging { deadline, worker };
+                }
+            }
+            ReconciledJobPhase::Running(mut machine) => {
+                let mut ignored = None;
+                if let Err(error) = drain_observations(&self.observations, &mut ignored) {
+                    self.begin_stop(Err(error));
+                } else if let Some(result) = machine.advance(Instant::now()) {
+                    self.begin_stop(result);
+                } else {
+                    self.phase = ReconciledJobPhase::Running(machine);
+                }
+            }
+            ReconciledJobPhase::Stopping { result } => {
+                if self.cluster.is_stopped() {
+                    let cleanup = self.cluster.finish_shutdown();
+                    self.complete(ctx, result, cleanup);
+                    return;
+                }
+                self.phase = ReconciledJobPhase::Stopping { result };
+            }
+            ReconciledJobPhase::Finished => {
+                ctx.stop_self();
+                return;
+            }
+        }
+        self.schedule(ctx);
+    }
+}
+
+fn merge_cleanup(result: Result<JobDone, String>, cleanup: String) -> Result<JobDone, String> {
+    match result {
+        Ok(_) => Err(format!(
             "job completed but reconciler cleanup failed: {cleanup}"
         )),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; reconciler cleanup failed: {cleanup}")),
+        Err(error) => Err(format!("{error}; reconciler cleanup failed: {cleanup}")),
     }
-}
-
-fn run_with_cluster(
-    job: Job,
-    session: &mut job_deploy::JobOrchestratorSession,
-    cluster: &mut ProvisionedClusterGuard,
-    observations: &mpsc::Receiver<PluginObservation>,
-    options: &VastAiJobOptions,
-) -> Result<JobDone, String> {
-    let worker = wait_for_worker_identity(cluster, observations, options)?;
-    let actor = job_deploy::parse_actor(&worker.actor_hex)?;
-    let attempt = cluster.current_attempt(options.node_id).ok_or_else(|| {
-        format!(
-            "reconciler has no active attempt for node {}",
-            options.node_id
-        )
-    })?;
-    if !cluster.observe_runtime_ready(
-        options.node_id,
-        NodeAttemptId(attempt.0),
-        SwactorId(format!("{actor:?}")),
-        SystemTime::now(),
-    ) {
-        return Err(format!(
-            "reconciler rejected runtime-ready observation for node {} attempt {}",
-            options.node_id, attempt.0
-        ));
-    }
-    wait_for_cluster_convergence(cluster, observations)?;
-    session.run_to_completion(job, worker)
-}
-
-fn wait_for_worker_identity(
-    cluster: &mut ProvisionedClusterGuard,
-    observations: &mpsc::Receiver<PluginObservation>,
-    options: &VastAiJobOptions,
-) -> Result<NodeIdentity, String> {
-    let started = Instant::now();
-    let mut worker = None;
-    while started.elapsed() < options.provision_timeout {
-        cluster
-            .poll(SystemTime::now())
-            .map_err(|error| format!("job reconciler poll: {error}"))?;
-        drain_observations(observations, &mut worker)?;
-        if let Some(worker) = worker.take() {
-            eprintln!("job-reconcile: worker identity observed through reconciler stdout");
-            return Ok(worker);
-        }
-        std::thread::sleep(POLL);
-    }
-    Err(format!(
-        "timed out after {:?} waiting for reconciled job worker identity",
-        options.provision_timeout
-    ))
-}
-
-fn wait_for_cluster_convergence(
-    cluster: &mut ProvisionedClusterGuard,
-    observations: &mpsc::Receiver<PluginObservation>,
-) -> Result<(), String> {
-    let started = Instant::now();
-    let mut ignored = None;
-    while started.elapsed() < RUNTIME_CONVERGENCE_TIMEOUT {
-        cluster
-            .poll(SystemTime::now())
-            .map_err(|error| format!("job reconciler convergence poll: {error}"))?;
-        drain_observations(observations, &mut ignored)?;
-        if cluster.is_converged() {
-            eprintln!("job-reconcile: reconciler accepted runtime-ready worker");
-            return Ok(());
-        }
-        std::thread::sleep(POLL);
-    }
-    Err(format!(
-        "timed out after {RUNTIME_CONVERGENCE_TIMEOUT:?} waiting for reconciler convergence"
-    ))
 }
 
 fn build_vastai_provisioner(
     api_key: &str,
     options: &VastAiJobOptions,
     runtime: swactor::runtime::Runtime,
+    engine: swactor_engine::EngineHandle,
 ) -> Result<Box<dyn ProvisionPlugin>, String> {
     let identity = resolve_vastai_ssh_identity(options.ssh_identity.clone())?;
     if !identity.is_file() {
@@ -259,8 +395,9 @@ fn build_vastai_provisioner(
     }
 
     Ok(Box::new(VastAiProvisioningPlugin::new(
-        ToolsVastAiLeaseClient::from_api_key(api_key.to_owned())?,
-        SshCommandBootstrapLauncher::new(Some(identity), runtime),
+        ToolsVastAiLeaseClient::from_api_key(api_key.to_owned())?
+            .with_actor_host(runtime.clone(), engine.clone()),
+        SshCommandBootstrapLauncher::new(Some(identity), runtime, engine),
         config,
     )))
 }
@@ -320,6 +457,7 @@ fn build_cluster(
     spec: NodeProvisionSpec,
     provisioner: Box<dyn ProvisionPlugin>,
     engine: swactor_engine::EngineHandle,
+    runtime: swactor::runtime::Runtime,
     sink: PluginSink,
 ) -> Result<ProvisionedClusterGuard, String> {
     let group_id = NodeGroupId(format!("job-node-{}", spec.node_id));
@@ -375,6 +513,7 @@ fn build_cluster(
         }],
         retry,
         engine,
+        runtime,
         sink,
     )
 }

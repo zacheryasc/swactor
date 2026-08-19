@@ -101,9 +101,7 @@ fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
     (engine, driver, stack)
 }
 
-/// Poll an inbox until a value arrives or the deadline elapses. The only
-/// `thread::sleep` in this module: test observation, not engine work.
-#[allow(clippy::disallowed_methods)]
+/// Bounded inbox polling for test observation; not runtime work.
 fn recv_within<T: Message>(inbox: &Inbox<T>, deadline: Duration) -> Option<T> {
     let started = Instant::now();
     loop {
@@ -161,7 +159,7 @@ fn dashboard_server_is_scheduled_through_the_engine() {
     let mut config = dashboard::DashboardConfig::default();
     config.port = free_port;
     let handle = dashboard::DashboardHandle::new(config);
-    engine.handle().spawn(handle.http_server());
+    handle.spawn(&engine.handle());
 
     // Behavioral proof the server future is actually running on the engine:
     // the bound port accepts a TCP connection. No second runtime is involved.
@@ -171,7 +169,6 @@ fn dashboard_server_is_scheduled_through_the_engine() {
 }
 
 #[cfg(feature = "dashboard")]
-#[allow(clippy::disallowed_methods)]
 fn poll_connect(addr: (&str, u16), deadline: Duration) -> bool {
     use std::net::TcpStream;
     let started = Instant::now();

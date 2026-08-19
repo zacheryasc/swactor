@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{Ctx, Runtime, RuntimeParts};
+use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeParts};
 use swactor::stats::StatsHook;
 use swactor::std::StdExtension;
 use swactor_engine::EngineHandle;
@@ -36,6 +36,49 @@ use distribution::transport_bridge::{
     Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
 use distribution::types::{DirectoryEntry, MemberState, NodeId};
+
+#[derive(Clone)]
+struct ProtocolTick;
+
+struct ProtocolTicker {
+    runtime: Runtime,
+    engine: EngineHandle,
+    sender: ExternalSender,
+    period: Duration,
+    swim: ActorAddress,
+    registry: ActorAddress,
+    metadata: ActorAddress,
+    directory: ActorAddress,
+}
+
+impl ProtocolTicker {
+    fn schedule(&self, ctx: &Ctx) {
+        self.engine.send_after(
+            self.period,
+            self.sender.clone(),
+            ctx.self_addr(),
+            ProtocolTick,
+        );
+    }
+}
+
+impl ActorInterface for ProtocolTicker {
+    type Incoming = ProtocolTick;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.schedule(ctx);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+        let now = self.engine.now().to_instant();
+        let _ = self.runtime.send_to(self.swim, SwimIn::Tick { now });
+        let _ = self.runtime.send_to(self.registry, RegistryIn::Tick);
+        let _ = self.runtime.send_to(self.metadata, MetadataIn::Tick);
+        let _ = self.runtime.send_to(self.directory, DirectoryIn::Tick);
+        self.schedule(ctx);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DistributionActorAddrs {
@@ -223,29 +266,20 @@ impl DistributionRuntimeStack {
         routes
     }
 
-    /// Spawn an engine-hosted interval task that injects protocol Tick messages
-    /// (SWIM, registry, metadata, directory), replacing the manual tick
-    /// injection previously done by the application pump loop
-    /// (ENGINE_SPEC.md). The engine owns protocol progression; the
-    /// application loop no longer calls tick or core-driving methods.
+    /// Spawn the actor that owns periodic distribution protocol ticks.
     pub(crate) fn spawn_protocol_ticker(&self, period: Duration) {
-        let runtime = self.runtime.clone();
-        let swim = self.actors.swim;
-        let registry = self.actors.registry;
-        let metadata = self.actors.metadata;
-        let directory = self.actors.directory;
-        let engine = self.engine.clone();
-        engine.clone().spawn(async move {
-            let mut interval = engine.interval(period);
-            loop {
-                (&mut interval).await;
-                let now = engine.now().to_instant();
-                let _ = runtime.send_to(swim, SwimIn::Tick { now });
-                let _ = runtime.send_to(registry, RegistryIn::Tick);
-                let _ = runtime.send_to(metadata, MetadataIn::Tick);
-                let _ = runtime.send_to(directory, DirectoryIn::Tick);
-            }
-        });
+        self.runtime
+            .spawn(ProtocolTicker {
+                runtime: self.runtime.clone(),
+                engine: self.engine.clone(),
+                sender: self.runtime.create_sender(),
+                period,
+                swim: self.actors.swim,
+                registry: self.actors.registry,
+                metadata: self.actors.metadata,
+                directory: self.actors.directory,
+            })
+            .expect("spawn distribution protocol ticker actor");
     }
 
     pub(crate) fn register_local_actor(&self, entry: DirectoryEntry) {

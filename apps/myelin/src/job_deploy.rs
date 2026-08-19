@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use swactor::actor::ActorAddress;
-use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor::actor::{ActorAddress, ActorInterface};
+use swactor::runtime::{Ctx, ExternalSender};
+use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor_job_runner::{
-    JobDone, NodeJobActor, OUTPUTS_EDGE_ID, OrchestratorJobActor, OrchestratorJobMsg,
+    Job, JobDone, NodeJobActor, OUTPUTS_EDGE_ID, OrchestratorJobActor, OrchestratorJobMsg,
     WORKSPACE_EDGE_ID, register_job_codecs,
 };
 use swactor_transport::hex_encode;
@@ -100,33 +101,102 @@ pub(crate) fn build_composition() -> Result<JobComposition, String> {
     Ok((engine, driver, stack))
 }
 
-fn identity_for(driver: &IrohDriver, actor: ActorAddress) -> Result<NodeIdentity, String> {
-    let endpoint = advertised_endpoint_for(driver)?;
-    Ok(NodeIdentity {
-        endpoint,
-        actor_hex: hex_encode(&actor.0),
-    })
+struct ResolveIdentityActor {
+    driver: Option<IrohDriver>,
+    actor: ActorAddress,
+    mask: EndpointAddrMask,
+    started: Instant,
+    engine: EngineHandle,
+    sender: ExternalSender,
+    completion: ActorCompletion<Result<(IrohDriver, NodeIdentity), String>>,
 }
 
-fn advertised_endpoint_for(driver: &IrohDriver) -> Result<EndpointAddr, String> {
-    let mask = endpoint_addr_mask_from_env()?;
-    if !mask.requires_relay() {
-        return advertised_endpoint(driver.endpoint_addr(), mask);
+#[derive(Clone)]
+enum ResolveIdentityMsg {
+    Check,
+}
+
+impl ResolveIdentityActor {
+    fn finish(&mut self, ctx: &swactor::runtime::Ctx, result: Result<NodeIdentity, String>) {
+        let result = result.map(|identity| {
+            (
+                self.driver
+                    .take()
+                    .expect("identity resolver owns driver until completion"),
+                identity,
+            )
+        });
+        assert!(
+            self.completion.complete(result).is_ok(),
+            "identity resolver completed twice"
+        );
+        ctx.stop_self();
     }
 
-    let started = Instant::now();
-    loop {
-        let endpoint = driver.endpoint_addr();
-        if endpoint.relay_urls().next().is_some() {
-            return advertised_endpoint(endpoint, mask);
-        }
-        if started.elapsed() >= RELAY_WAIT_DEADLINE {
-            return Err(format!(
-                "relay-only endpoint address mask did not observe a relay URL within {RELAY_WAIT_DEADLINE:?}; last endpoint={endpoint:?}"
-            ));
-        }
-        std::thread::sleep(POLL);
+    fn schedule_check(&self, ctx: &swactor::runtime::Ctx) {
+        self.engine.send_after(
+            POLL,
+            self.sender.clone(),
+            ctx.self_addr(),
+            ResolveIdentityMsg::Check,
+        );
     }
+}
+
+impl ActorInterface for ResolveIdentityActor {
+    type Incoming = ResolveIdentityMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &swactor::runtime::Ctx) {
+        let _ = ctx.send(ctx.self_addr(), ResolveIdentityMsg::Check);
+    }
+
+    fn handle(&mut self, ctx: &swactor::runtime::Ctx, _message: Self::Incoming) {
+        let driver = self
+            .driver
+            .as_ref()
+            .expect("identity resolver handles messages only while live");
+        let endpoint = driver.endpoint_addr();
+        if !self.mask.requires_relay() || endpoint.relay_urls().next().is_some() {
+            let identity = advertised_endpoint(endpoint, self.mask)
+                .map(|endpoint| NodeIdentity {
+                    endpoint,
+                    actor_hex: hex_encode(&self.actor.0),
+                })
+                .map_err(|error| error.to_string());
+            self.finish(ctx, identity);
+        } else if self.started.elapsed() >= RELAY_WAIT_DEADLINE {
+            self.finish(
+                ctx,
+                Err(format!(
+                    "relay-only endpoint address mask did not observe a relay URL within {RELAY_WAIT_DEADLINE:?}; last endpoint={endpoint:?}"
+                )),
+            );
+        } else {
+            self.schedule_check(ctx);
+        }
+    }
+}
+
+fn resolve_identity(
+    driver: IrohDriver,
+    actor: ActorAddress,
+    stack: &DistributionRuntimeStack,
+) -> Result<(IrohDriver, NodeIdentity), String> {
+    let completion = ActorCompletion::new();
+    stack
+        .runtime
+        .spawn(ResolveIdentityActor {
+            driver: Some(driver),
+            actor,
+            mask: endpoint_addr_mask_from_env()?,
+            started: Instant::now(),
+            engine: stack.engine.clone(),
+            sender: stack.runtime.create_sender(),
+            completion: completion.clone(),
+        })
+        .map_err(|error| format!("spawn endpoint identity resolver: {error}"))?;
+    completion.wait()
 }
 
 fn endpoint_addr_mask_from_env() -> Result<EndpointAddrMask, String> {
@@ -174,6 +244,94 @@ pub(crate) fn parse_actor(hex: &str) -> Result<ActorAddress, String> {
     Ok(ActorAddress(arr))
 }
 
+#[derive(Clone)]
+enum WorkerLifecycleMsg {
+    CheckConnection,
+    Stop,
+}
+
+struct WorkerLifecycleActor {
+    driver: IrohDriver,
+    _stack: DistributionRuntimeStack,
+    orchestrator_endpoint: EndpointAddr,
+    orchestrator_node: swactor_transport::NodeId,
+    output_sink: Arc<Mutex<Option<Box<dyn swactor_job_runner::JobEdgeSink>>>>,
+    started: Instant,
+    armed: bool,
+    engine: EngineHandle,
+    sender: ExternalSender,
+    completion: ActorCompletion<Result<(), String>>,
+}
+
+impl WorkerLifecycleActor {
+    fn schedule_check(&self, ctx: &Ctx) {
+        self.engine.send_after(
+            POLL,
+            self.sender.clone(),
+            ctx.self_addr(),
+            WorkerLifecycleMsg::CheckConnection,
+        );
+    }
+}
+
+impl ActorInterface for WorkerLifecycleActor {
+    type Incoming = WorkerLifecycleMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        let _ = ctx.send(ctx.self_addr(), WorkerLifecycleMsg::CheckConnection);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+        match message {
+            WorkerLifecycleMsg::CheckConnection if !self.armed => {
+                if self.driver.has_active_connection(&self.orchestrator_node)
+                    || self.started.elapsed() >= CONVERGE_DEADLINE
+                {
+                    match self
+                        .driver
+                        .spawn_edge_send_pump(self.orchestrator_endpoint.clone(), OUTPUTS_EDGE_ID)
+                    {
+                        Ok(handle) => {
+                            *self.output_sink.lock() = Some(Box::new(IrohEdgeSink(handle)));
+                            eprintln!("job-worker: output edge sink armed");
+                        }
+                        Err(error) => {
+                            eprintln!("job-worker: failed to arm output edge sink: {error}")
+                        }
+                    }
+                    self.armed = true;
+                } else {
+                    self.schedule_check(ctx);
+                }
+            }
+            WorkerLifecycleMsg::CheckConnection => {}
+            WorkerLifecycleMsg::Stop => {
+                assert!(
+                    self.completion.complete(Ok(())).is_ok(),
+                    "worker lifecycle completed twice"
+                );
+                ctx.stop_self();
+            }
+        }
+    }
+}
+
+struct WorkerStopForwarder {
+    sender: ExternalSender,
+    worker: ActorAddress,
+}
+
+impl ActorInterface for WorkerStopForwarder {
+    type Incoming = ();
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, (): Self::Incoming) {
+        let _ = self.sender.send_to(self.worker, WorkerLifecycleMsg::Stop);
+        ctx.stop_self();
+    }
+}
+
 /// Worker: connect to the orchestrator, expose a `NodeJobActor`, run jobs it
 /// sends over iroh. Prints this node's identity as JSON on stdout, then runs
 /// until killed. Bulk bytes travel over EDGE_ALPN: the orchestrator pushes the
@@ -185,42 +343,38 @@ pub fn run_worker(orch_identity_json: String, workdir: PathBuf) -> Result<(), St
         .map_err(|e| format!("parse orch identity: {e}"))?;
     let orch_actor = parse_actor(&orch.actor_hex)?;
     let orch_endpoint = orch.endpoint.clone();
-    let (_engine, driver, stack) = build_composition()?;
+    let (engine, driver, stack) = build_composition()?;
     let sender = stack.runtime.create_sender();
 
-    // Edge workspace: the orchestrator pushes the workspace tar over EDGE_ALPN
-    // before submitting the job. A background thread drains those bytes,
-    // extracts them into `workdir`, and signals readiness; the node actor waits
-    // on that flag before announcing the workspace materialized.
     let workspace_ready = Arc::new(AtomicBool::new(false));
-    let ws_events = driver.edge_events_handle();
-    let ws_workdir = workdir.clone();
-    let ws_ready = workspace_ready.clone();
-    std::thread::Builder::new()
-        .name("job-worker-ws-edge".to_owned())
-        .spawn(move || {
-            drain_workspace_edge(ws_events, ws_workdir, ws_ready);
+    stack
+        .runtime
+        .spawn(WorkspaceEdgeActor {
+            engine: stack.engine.clone(),
+            sender: stack.runtime.create_sender(),
+            events: driver.edge_events_handle(),
+            workdir: workdir.clone(),
+            ready: workspace_ready.clone(),
+            buf: Vec::new(),
+            started: Instant::now(),
         })
-        .map_err(|e| format!("spawn workspace edge thread: {e}"))?;
+        .map_err(|error| format!("spawn workspace edge actor: {error}"))?;
 
-    // Edge outputs: a slot the main thread fills with an EDGE_ALPN sink to the
-    // orchestrator once the iroh connection is up. The node actor ships
-    // collected outputs through it.
     let output_sink_slot: Arc<Mutex<Option<Box<dyn swactor_job_runner::JobEdgeSink>>>> =
         Arc::new(Mutex::new(None));
-
     let job_actor = stack
         .runtime
         .spawn(
             NodeJobActor::new(orch_actor, workdir, sender, 0)
-                .with_workspace_ready(workspace_ready.clone())
+                .with_actor_timers(engine.handle())
+                .with_workspace_ready(workspace_ready)
                 .with_output_sink_slot(output_sink_slot.clone()),
         )
         .map_err(|e| format!("spawn node job actor: {e}"))?;
     stack.register_local_actor(driver.register_actor(job_actor, 1));
     driver.join(std::slice::from_ref(&orch.endpoint));
 
-    let id = identity_for(&driver, job_actor)?;
+    let (driver, id) = resolve_identity(driver, job_actor, &stack)?;
     println!(
         "JOB_WORKER_IDENTITY {}",
         serde_json::to_string(&id).map_err(|e| e.to_string())?
@@ -231,27 +385,33 @@ pub fn run_worker(orch_identity_json: String, workdir: PathBuf) -> Result<(), St
         id.actor_hex, id.endpoint
     );
 
-    // Wait for the iroh connection to the orchestrator, then arm the output
-    // edge sink so it is ready before a CollectOutputs command can arrive.
-    let orch_node = swactor_transport::NodeId(*orch_endpoint.id.as_bytes());
-    let conn_started = Instant::now();
-    while !driver.has_active_connection(&orch_node) {
-        if conn_started.elapsed() >= CONVERGE_DEADLINE {
-            break;
-        }
-        std::thread::sleep(POLL);
-    }
-    match driver.spawn_edge_send_pump(orch_endpoint.clone(), OUTPUTS_EDGE_ID) {
-        Ok(handle) => {
-            *output_sink_slot.lock() = Some(Box::new(IrohEdgeSink(handle)));
-            eprintln!("job-worker: output edge sink armed");
-        }
-        Err(e) => eprintln!("job-worker: failed to arm output edge sink: {e}"),
-    }
-
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
-    }
+    let runtime = stack.runtime.clone();
+    let completion = ActorCompletion::new();
+    let lifecycle = runtime
+        .spawn(WorkerLifecycleActor {
+            driver,
+            _stack: stack,
+            orchestrator_node: swactor_transport::NodeId(*orch_endpoint.id.as_bytes()),
+            orchestrator_endpoint: orch_endpoint,
+            output_sink: output_sink_slot,
+            started: Instant::now(),
+            armed: false,
+            engine: engine.handle(),
+            sender: runtime.create_sender(),
+            completion: completion.clone(),
+        })
+        .map_err(|error| format!("spawn job worker lifecycle actor: {error}"))?;
+    let stop_forwarder = runtime
+        .spawn(WorkerStopForwarder {
+            sender: runtime.create_sender(),
+            worker: lifecycle,
+        })
+        .map_err(|error| format!("spawn job worker stop forwarder: {error}"))?;
+    #[cfg(target_os = "linux")]
+    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_forwarder);
+    let result = completion.wait();
+    drop(engine);
+    result
 }
 
 /// Starts the operator-side job actor and publishes enough identity for a
@@ -268,7 +428,7 @@ pub(crate) fn start_orchestrator(landing: PathBuf) -> Result<JobOrchestratorSess
         .map_err(|e| format!("spawn orchestrator: {e}"))?;
     stack.register_local_actor(driver.register_actor(orch, 1));
 
-    let identity = identity_for(&driver, orch)?;
+    let (driver, identity) = resolve_identity(driver, orch, &stack)?;
     Ok(JobOrchestratorSession {
         _engine: engine,
         driver,
@@ -278,6 +438,257 @@ pub(crate) fn start_orchestrator(landing: PathBuf) -> Result<JobOrchestratorSess
         identity,
         landing,
     })
+}
+
+pub(crate) struct JobRunStateMachine {
+    session: JobOrchestratorSession,
+    job: Option<Job>,
+    worker: NodeIdentity,
+    node_actor: ActorAddress,
+    phase: JobRunPhase,
+}
+
+enum JobRunPhase {
+    Created,
+    Directory {
+        deadline: Instant,
+    },
+    Connection {
+        started: Instant,
+        deadline: Instant,
+    },
+    Running {
+        deadline: Instant,
+        output_buf: Vec<u8>,
+        outputs_ended: bool,
+        pending_done: Option<JobDone>,
+    },
+    Finished,
+}
+
+impl JobRunStateMachine {
+    pub(crate) fn new(
+        session: JobOrchestratorSession,
+        job: Job,
+        worker: NodeIdentity,
+    ) -> Result<Self, String> {
+        let node_actor = parse_actor(&worker.actor_hex)?;
+        Ok(Self {
+            session,
+            job: Some(job),
+            worker,
+            node_actor,
+            phase: JobRunPhase::Created,
+        })
+    }
+
+    pub(crate) fn start(&mut self, now: Instant) {
+        self.session
+            .driver
+            .join(std::slice::from_ref(&self.worker.endpoint));
+        self.phase = JobRunPhase::Directory {
+            deadline: now + CONVERGE_DEADLINE,
+        };
+    }
+
+    pub(crate) fn advance(&mut self, now: Instant) -> Option<Result<JobDone, String>> {
+        let phase = std::mem::replace(&mut self.phase, JobRunPhase::Finished);
+        match phase {
+            JobRunPhase::Created => {
+                self.phase = JobRunPhase::Created;
+                None
+            }
+            JobRunPhase::Directory { deadline } => {
+                let converged = self
+                    .session
+                    .stack
+                    .route_view
+                    .read()
+                    .map(|view| view.contains_key(&self.node_actor))
+                    .unwrap_or(false);
+                if converged {
+                    eprintln!(
+                        "job-orch: directory converged; waiting for iroh connection to worker"
+                    );
+                    self.phase = JobRunPhase::Connection {
+                        started: now,
+                        deadline: now + CONVERGE_DEADLINE,
+                    };
+                    None
+                } else if now >= deadline {
+                    Some(Err(
+                        "directory did not converge: orchestrator never learned the worker actor"
+                            .into(),
+                    ))
+                } else {
+                    self.phase = JobRunPhase::Directory { deadline };
+                    None
+                }
+            }
+            JobRunPhase::Connection { started, deadline } => {
+                let worker_node = swactor_transport::NodeId(*self.worker.endpoint.id.as_bytes());
+                let connected = self.session.driver.has_active_connection(&worker_node);
+                if !connected && now < deadline {
+                    self.phase = JobRunPhase::Connection { started, deadline };
+                    return None;
+                }
+                if connected {
+                    eprintln!(
+                        "job-orch: iroh connection to worker established after {:?}",
+                        now.saturating_duration_since(started)
+                    );
+                    eprintln!("job-orch: submitting job");
+                } else {
+                    eprintln!(
+                        "job-orch: no iroh connection to worker after {CONVERGE_DEADLINE:?}; join_statuses={:?}; submitting best-effort",
+                        self.session.driver.join_statuses()
+                    );
+                }
+                match self.submit(now) {
+                    Ok(()) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            }
+            JobRunPhase::Running {
+                deadline,
+                mut output_buf,
+                mut outputs_ended,
+                mut pending_done,
+            } => {
+                let edge_events = self.session.driver.edge_events_handle();
+                let drained: Vec<WireEvent> = edge_events.lock().drain(..).collect();
+                for event in drained {
+                    match event {
+                        WireEvent::BytesRead { edge_id, bytes, .. }
+                            if edge_id.0 == OUTPUTS_EDGE_ID =>
+                        {
+                            output_buf.extend_from_slice(&bytes);
+                        }
+                        WireEvent::StreamEnded { edge_id, .. } if edge_id.0 == OUTPUTS_EDGE_ID => {
+                            if !output_buf.is_empty() {
+                                if let Err(error) = swactor_job_runner::extract_tar(
+                                    &output_buf,
+                                    &self.session.landing,
+                                ) {
+                                    eprintln!("job-orch: untar edge outputs failed: {error}");
+                                }
+                                output_buf.clear();
+                            }
+                            outputs_ended = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if pending_done.is_none() {
+                    pending_done = self.session.done.try_recv();
+                }
+                if let Some(done) = pending_done.as_ref() {
+                    let need_outputs = done.exit_code.is_some() && !outputs_ended;
+                    if !need_outputs || now >= deadline {
+                        let done = pending_done
+                            .take()
+                            .expect("pending job result was observed");
+                        if need_outputs {
+                            eprintln!("job-orch: output edge stream did not land before deadline");
+                        }
+                        return Some(Ok(done));
+                    }
+                }
+                if now >= deadline {
+                    return Some(Err("job did not complete within deadline".into()));
+                }
+                self.phase = JobRunPhase::Running {
+                    deadline,
+                    output_buf,
+                    outputs_ended,
+                    pending_done,
+                };
+                None
+            }
+            JobRunPhase::Finished => {
+                Some(Err("job state machine advanced after completion".into()))
+            }
+        }
+    }
+
+    fn submit(&mut self, now: Instant) -> Result<(), String> {
+        let job = self
+            .job
+            .take()
+            .ok_or_else(|| "job was already submitted".to_owned())?;
+        let workspace_bytes =
+            swactor_job_runner::pack_workspace(&job).map_err(|e| format!("pack workspace: {e}"))?;
+        if !workspace_bytes.is_empty() {
+            let pump = self
+                .session
+                .driver
+                .spawn_edge_send_pump(self.worker.endpoint.clone(), WORKSPACE_EDGE_ID)
+                .map_err(|e| format!("workspace edge pump: {e}"))?;
+            for record in workspace_bytes.chunks(swactor_job_runner::EDGE_RECORD_SIZE) {
+                pump.send(record.to_vec())
+                    .map_err(|e| format!("workspace edge send: {e}"))?;
+            }
+            drop(pump);
+            eprintln!("job-orch: workspace pushed over EDGE_ALPN");
+        }
+        self.session
+            .stack
+            .runtime
+            .send_to(
+                self.session.orch,
+                OrchestratorJobMsg::Submit {
+                    job,
+                    node_actor: self.node_actor,
+                },
+            )
+            .map_err(|e| format!("submit: {e}"))?;
+        self.phase = JobRunPhase::Running {
+            deadline: now + JOB_DEADLINE,
+            output_buf: Vec::new(),
+            outputs_ended: false,
+            pending_done: None,
+        };
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct JobRunTick;
+
+struct JobRunActor {
+    machine: JobRunStateMachine,
+    engine: EngineHandle,
+    sender: ExternalSender,
+    completion: ActorCompletion<Result<JobDone, String>>,
+}
+
+impl JobRunActor {
+    fn schedule(&self, ctx: &Ctx) {
+        self.engine
+            .send_after(POLL, self.sender.clone(), ctx.self_addr(), JobRunTick);
+    }
+}
+
+impl ActorInterface for JobRunActor {
+    type Incoming = JobRunTick;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.machine.start(Instant::now());
+        let _ = ctx.send(ctx.self_addr(), JobRunTick);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+        if let Some(result) = self.machine.advance(Instant::now()) {
+            assert!(
+                self.completion.complete(result).is_ok(),
+                "job lifecycle completed twice"
+            );
+            ctx.stop_self();
+        } else {
+            self.schedule(ctx);
+        }
+    }
 }
 
 impl JobOrchestratorSession {
@@ -294,151 +705,29 @@ impl JobOrchestratorSession {
     }
 
     pub(crate) fn run_to_completion(
-        &mut self,
-        job: swactor_job_runner::Job,
+        self,
+        job: Job,
         worker: NodeIdentity,
     ) -> Result<JobDone, String> {
-        let node_actor = parse_actor(&worker.actor_hex)?;
-        self.driver.join(std::slice::from_ref(&worker.endpoint));
-
-        let started = Instant::now();
-        while started.elapsed() < CONVERGE_DEADLINE {
-            if self
-                .stack
-                .route_view
-                .read()
-                .map(|v| v.contains_key(&node_actor))
-                .unwrap_or(false)
-            {
-                break;
-            }
-            std::thread::sleep(POLL);
-        }
-        if !self
-            .stack
-            .route_view
-            .read()
-            .map(|v| v.contains_key(&node_actor))
-            .unwrap_or(false)
-        {
-            return Err(
-                "directory did not converge: orchestrator never learned the worker actor".into(),
-            );
-        }
-        eprintln!("job-orch: directory converged; waiting for iroh connection to worker");
-        let worker_node = swactor_transport::NodeId(*worker.endpoint.id.as_bytes());
-        let conn_started = Instant::now();
-        while !self.driver.has_active_connection(&worker_node) {
-            if conn_started.elapsed() >= CONVERGE_DEADLINE {
-                eprintln!(
-                    "job-orch: no iroh connection to worker after {CONVERGE_DEADLINE:?}; join_statuses={:?}; submitting best-effort",
-                    self.driver.join_statuses()
-                );
-                break;
-            }
-            std::thread::sleep(POLL);
-        }
-        if self.driver.has_active_connection(&worker_node) {
-            eprintln!(
-                "job-orch: iroh connection to worker established after {:?}",
-                conn_started.elapsed()
-            );
-            eprintln!("job-orch: submitting job");
-        } else {
-            eprintln!("job-orch: submitting job (no confirmed connection)");
-        }
-
-        // EDGE: push the workspace tar over EDGE_ALPN before submitting. Small
-        // commands/events still travel as actor messages; only bulk bytes move
-        // onto the edge transport so they survive relay (NAT) traversal.
-        let edge_events = self.driver.edge_events_handle();
-        let workspace_bytes =
-            swactor_job_runner::pack_workspace(&job).map_err(|e| format!("pack workspace: {e}"))?;
-        if !workspace_bytes.is_empty() {
-            let pump = self
-                .driver
-                .spawn_edge_send_pump(worker.endpoint.clone(), WORKSPACE_EDGE_ID)
-                .map_err(|e| format!("workspace edge pump: {e}"))?;
-            for record in workspace_bytes.chunks(swactor_job_runner::EDGE_RECORD_SIZE) {
-                pump.send(record.to_vec())
-                    .map_err(|e| format!("workspace edge send: {e}"))?;
-            }
-            drop(pump); // finish the edge stream → receiver observes end-of-stream
-            eprintln!("job-orch: workspace pushed over EDGE_ALPN");
-        }
-
-        self.stack
-            .runtime
-            .send_to(self.orch, OrchestratorJobMsg::Submit { job, node_actor })
-            .map_err(|e| format!("submit: {e}"))?;
-
-        // Drive lifecycle (actor messages) while draining the output edge stream.
-        let started = Instant::now();
-        let mut output_buf: Vec<u8> = Vec::new();
-        let mut outputs_ended = false;
-        // The orchestrator actor reports `JobDone` exactly once; hold it here
-        // while we wait for the output edge stream to land so it is not lost.
-        let mut pending_done: Option<JobDone> = None;
-        loop {
-            // Drain output edge bytes; extract the tar as soon as the stream ends
-            // (release the edge-event lock before the potentially slow untar).
-            let drained: Vec<WireEvent> = edge_events.lock().drain(..).collect();
-            for ev in drained {
-                match ev {
-                    WireEvent::BytesRead { edge_id, bytes, .. } if edge_id.0 == OUTPUTS_EDGE_ID => {
-                        output_buf.extend_from_slice(&bytes);
-                    }
-                    WireEvent::StreamEnded { edge_id, .. } if edge_id.0 == OUTPUTS_EDGE_ID => {
-                        if !output_buf.is_empty() {
-                            if let Err(e) =
-                                swactor_job_runner::extract_tar(&output_buf, &self.landing)
-                            {
-                                eprintln!("job-orch: untar edge outputs failed: {e}");
-                            }
-                            output_buf.clear();
-                        }
-                        outputs_ended = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            if pending_done.is_none() {
-                pending_done = self.done.try_recv();
-            }
-
-            // A job that ran (exit code observed) collected outputs over edge —
-            // wait for that stream to land before returning so the landing dir is
-            // populated. A pre-run fault (no exit code) ships no outputs.
-            let ready = match &pending_done {
-                Some(done) => {
-                    let need_outputs = done.exit_code.is_some() && !outputs_ended;
-                    !need_outputs || started.elapsed() >= JOB_DEADLINE
-                }
-                None => false,
-            };
-            if ready {
-                let done = pending_done
-                    .take()
-                    .expect("pending_done observed Some in ready branch");
-                if done.exit_code.is_some() && !outputs_ended {
-                    eprintln!("job-orch: output edge stream did not land before deadline");
-                }
-                return Ok(done);
-            }
-
-            if started.elapsed() >= JOB_DEADLINE {
-                return Err("job did not complete within deadline".into());
-            }
-            std::thread::sleep(POLL);
-        }
+        let runtime = self.stack.runtime.clone();
+        let engine = self.stack.engine.clone();
+        let completion = ActorCompletion::new();
+        runtime
+            .spawn(JobRunActor {
+                machine: JobRunStateMachine::new(self, job, worker)?,
+                engine,
+                sender: runtime.create_sender(),
+                completion: completion.clone(),
+            })
+            .map_err(|error| format!("spawn job lifecycle actor: {error}"))?;
+        completion.wait()
     }
 }
 
 /// Orchestrator: expose an `OrchestratorJobActor`, print its identity, read the
 /// worker identity from stdin, drive the job to completion over iroh.
 pub fn run_serve(job: swactor_job_runner::Job, landing: PathBuf) -> Result<JobDone, String> {
-    let mut session = start_orchestrator(landing)?;
+    let session = start_orchestrator(landing)?;
     println!("JOB_ORCH_IDENTITY {}", session.identity_json()?);
     let _ = std::io::Write::flush(&mut std::io::stdout());
     eprintln!("job-orch: published identity; waiting for worker identity on stdin...");
@@ -473,40 +762,64 @@ impl swactor_job_runner::JobEdgeSink for IrohEdgeSink {
 /// without the readiness flag being set).
 const WORKSPACE_EDGE_WAIT: Duration = Duration::from_secs(60 * 30);
 
-/// Drain EDGE_ALPN workspace bytes (edge id `WORKSPACE_EDGE_ID`) the orchestrator
-/// pushed, extract the tar into `workdir`, then signal readiness. Runs on a
-/// background worker thread; the driver auto-accepts EDGE_ALPN connections and
-/// pushes their bytes into the shared event queue drained here.
-fn drain_workspace_edge(
+#[derive(Clone)]
+struct WorkspaceEdgePoll;
+
+struct WorkspaceEdgeActor {
+    engine: EngineHandle,
+    sender: ExternalSender,
     events: Arc<Mutex<Vec<WireEvent>>>,
     workdir: PathBuf,
     ready: Arc<AtomicBool>,
-) {
-    let mut buf = Vec::new();
-    let started = Instant::now();
-    loop {
-        let drained: Vec<WireEvent> = events.lock().drain(..).collect();
-        for ev in drained {
-            match ev {
+    buf: Vec<u8>,
+    started: Instant,
+}
+
+impl WorkspaceEdgeActor {
+    fn schedule(&self, ctx: &Ctx, delay: Duration) {
+        self.engine.send_after(
+            delay,
+            self.sender.clone(),
+            ctx.self_addr(),
+            WorkspaceEdgePoll,
+        );
+    }
+}
+
+impl ActorInterface for WorkspaceEdgeActor {
+    type Incoming = WorkspaceEdgePoll;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.schedule(ctx, Duration::ZERO);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+        let drained: Vec<WireEvent> = self.events.lock().drain(..).collect();
+        for event in drained {
+            match event {
                 WireEvent::BytesRead { edge_id, bytes, .. } if edge_id.0 == WORKSPACE_EDGE_ID => {
-                    buf.extend_from_slice(&bytes);
+                    self.buf.extend_from_slice(&bytes);
                 }
                 WireEvent::StreamEnded { edge_id, .. } if edge_id.0 == WORKSPACE_EDGE_ID => {
-                    if !buf.is_empty() {
-                        if let Err(e) = swactor_job_runner::extract_tar(&buf, &workdir) {
-                            eprintln!("job-worker: untar workspace failed: {e}");
-                        }
+                    if !self.buf.is_empty()
+                        && let Err(error) =
+                            swactor_job_runner::extract_tar(&self.buf, &self.workdir)
+                    {
+                        eprintln!("job-worker: untar workspace failed: {error}");
                     }
-                    ready.store(true, Ordering::Release);
+                    self.ready.store(true, Ordering::Release);
+                    ctx.stop_self();
                     return;
                 }
                 _ => {}
             }
         }
-        if started.elapsed() >= WORKSPACE_EDGE_WAIT {
+        if self.started.elapsed() >= WORKSPACE_EDGE_WAIT {
             eprintln!("job-worker: workspace edge stream did not arrive");
+            ctx.stop_self();
             return;
         }
-        std::thread::sleep(POLL);
+        self.schedule(ctx, POLL);
     }
 }

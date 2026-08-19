@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 734889bb022ba3f70176b64e70fa84e73e172f999533fb15f3c72115080cf4e3 # shrinks to actions = [Spawn { attempt: 60000, succeeds: true }, Spawn { attempt: 60001, succeeds: false }, Started { attempt: 60000, pid: 41 }, Announce { attempt: 60000 }, Heartbeat { attempt: 60000 }, ProviderBlock, Control { kind: 0, attempt: 60000 }, ChildExit { attempt: 60000, code: 0 }, Shutdown, Shutdown]

@@ -179,7 +179,6 @@ fn driver_a_join(
     driver_a.join(std::slice::from_ref(&driver_b.endpoint_addr()));
 }
 
-#[allow(clippy::disallowed_methods)]
 fn wait_until(deadline: Duration, mut check: impl FnMut() -> bool) -> bool {
     let started = Instant::now();
     loop {

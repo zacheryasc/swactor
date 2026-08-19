@@ -13,6 +13,7 @@ members = [
     "apps/myelin",
     "xtask",
     "tools/vastai",
+    "tools/actor-control-flow-lint",
 ]
 default-members = [
     ".",

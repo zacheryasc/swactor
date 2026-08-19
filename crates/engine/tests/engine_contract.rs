@@ -215,9 +215,15 @@ fn blocking_work_does_not_stop_actor_ticks() {
     // task so the owned runtime shuts down deterministically.
     let _release = BarrierRelease(barrier.clone());
     let barrier_for_work = barrier.clone();
-    handle.spawn_blocking(move || {
-        barrier_for_work.wait();
-    });
+    assert!(
+        handle
+            .blocking_work_sender()
+            .submit(Box::new(move || {
+                barrier_for_work.wait();
+            }))
+            .is_ok(),
+        "submit blocking work"
+    );
 
     // Deliver an actor message while the blocking work remains blocked.
     runtime.send_to(addr, Probe).expect("deliver probe message");
@@ -322,7 +328,6 @@ fn engine_timer_can_be_created_off_runtime() {
 // Tokio runtime to hand the engine — the one test-only use of the substrate
 // constructor (ENGINE_SPEC.md §2).
 #[test]
-#[allow(clippy::disallowed_methods)]
 fn engine_adopts_caller_tuned_tokio_runtime() {
     // ENGINE_SPEC.md §9: the native engine supports
     // consuming an explicitly tuned Tokio runtime rather than always building

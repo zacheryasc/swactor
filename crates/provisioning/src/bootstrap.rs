@@ -193,6 +193,8 @@ pub struct BootstrapActor {
     sender: ExternalSender,
     collector: Option<Arc<dyn NodeTelemetryCollector>>,
     phase: Phase,
+    /// Launch was requested; duplicate `Start` messages are inert.
+    started: bool,
     /// `Bootstrapped` reported (and collector fired) exactly once.
     announced: bool,
     /// Terminal report (Failed/Exited) emitted exactly once.
@@ -208,6 +210,7 @@ impl BootstrapActor {
             sender: config.sender,
             collector: config.collector,
             phase: Phase::Bootstrapping,
+            started: false,
             announced: false,
             closed: false,
         }
@@ -299,9 +302,10 @@ impl ActorInterface for BootstrapActor {
     fn handle(&mut self, ctx: &Ctx, msg: BootstrapMsg) {
         match msg {
             BootstrapMsg::Start => {
-                if self.phase != Phase::Bootstrapping {
-                    return; // Restart of a started/stopped attempt: ignore.
+                if self.phase != Phase::Bootstrapping || self.started {
+                    return;
                 }
+                self.started = true;
                 if let Err(reason) = self.logic.start(ctx, ctx.self_addr(), &self.sender) {
                     self.fail(format!("launch failed: {reason}"));
                 }
@@ -334,22 +338,12 @@ pub fn spawn_bootstrap_actor(
     config: BootstrapConfig,
 ) -> Result<ActorAddress, String> {
     let sender = config.sender.clone();
-    let start_sender = sender.clone();
     let period = config.probe_period;
     let actor = ctx
         .spawn(BootstrapActor::new(logic, config))
         .map_err(|error| format!("spawn bootstrap actor: {error}"))?;
-    let probe_engine = engine.clone();
-    engine.spawn(async move {
-        let mut interval = probe_engine.interval(period);
-        loop {
-            (&mut interval).await;
-            if sender.send_to(actor, BootstrapMsg::Probe).is_err() {
-                return;
-            }
-        }
-    });
-    let _ = start_sender.send_to(actor, BootstrapMsg::Start);
+    engine.send_every(period, sender.clone(), actor, BootstrapMsg::Probe);
+    let _ = sender.send_to(actor, BootstrapMsg::Start);
     Ok(actor)
 }
 

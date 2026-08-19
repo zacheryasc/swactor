@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use iroh::RelayMode;
 use serde_json::json;
-use swactor::actor::{ActorInterface, Ctx};
+use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::RuntimeParts;
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor::runtime::{ExternalSender, RuntimeParts};
+use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 
 use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, spawn_pull_server};
@@ -196,54 +196,15 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
     // TELEMETRY_ALPN connections out of the driver-owned ingress so the
     // serve loop below can drain them.
     driver.retain_telemetry_connections();
-    {
-        // Edge agent tick: poll the edge runtime on the supervisor's
-        // session cadence.
-        let sender = runtime.create_sender();
-        let edge_engine = engine.handle();
-        edge_engine.clone().spawn(async move {
-            let mut interval = edge_engine.interval(Duration::from_millis(250));
-            loop {
-                (&mut interval).await;
-                let _ = sender.send_to(edge_agent, edge::NodeEdgeMsg::Tick);
-            }
-        });
-    }
 
     // Join, then announce identity + advertised address to the supervisor's
     // bootstrap actor over the control plane (readiness + telemetry dial).
     driver.join(&[supervisor_addr.clone()]);
     let addr_json =
         serde_json::to_string(&driver.endpoint_addr()).map_err(|e| format!("addr: {e}"))?;
-    let announce_driver = Arc::clone(&driver);
-    let announce_logical = logical_node.clone();
-    let announce_key = node_hex.clone();
-    let announce_engine = engine.handle();
-    announce_engine.clone().spawn(async move {
-        let mut interval = announce_engine.interval(HEARTBEAT_PERIOD);
-        loop {
-            (&mut interval).await;
-            let announce = NodeAnnounce {
-                attempt,
-                logical_node: announce_logical.clone(),
-                key_hex: announce_key.clone(),
-                endpoint_addr_json: addr_json.clone(),
-                at_ms: unix_ms(),
-            };
-            let Ok(bytes) = serde_json::to_vec(&announce) else {
-                continue;
-            };
-            announce_driver.send_tagged_gossip(
-                supervisor_addr.clone(),
-                ANNOUNCE_TAG.as_bytes(),
-                bytes,
-            );
-        }
-    });
 
     // Beat actors: real actors with real message flow, so the node's
     // runtime.actors roster (pulled by the supervisor) is visibly alive.
-    let sender = runtime.create_sender();
     let mut beat_addrs = Vec::new();
     for index in 0..BEAT_ACTORS {
         let name = format!("beat-{index}");
@@ -255,80 +216,183 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
                 channel: beats_channel,
             })
             .map_err(|error| format!("spawn beat actor: {error}"))?;
-        beat_addrs.push((addr, name));
-    }
-
-    // Heartbeats: a node.status telemetry record (the wire announce above is
-    // the supervisor-facing liveness channel).
-    let heartbeat_producer = producer.clone();
-    let heartbeat_logical = logical_node.clone();
-    let heartbeat_key = node_hex.clone();
-    let interval_engine = engine.handle();
-    interval_engine.clone().spawn(async move {
-        let mut interval = interval_engine.interval(HEARTBEAT_PERIOD);
-        let mut seq: u64 = 0;
-        loop {
-            (&mut interval).await;
-            seq += 1;
-            let payload = json!({
-                "at_ms": unix_ms(),
-                "node": heartbeat_logical,
-                "key": heartbeat_key,
-                "seq": seq,
-                "alive": true,
-                "pid": std::process::id(),
-                "beats": BEAT_ACTORS,
-            });
-            let bytes = serde_json::to_vec(&payload).expect("status serializes");
-            heartbeat_producer.submit_bytes(status_channel, bytes);
-        }
-    });
-
-    // Beat driver: engine intervals poking the beat actors.
-    for (index, (addr, _name)) in beat_addrs.iter().enumerate() {
-        let addr = *addr;
-        let beat_sender = sender.clone();
-        let beat_engine = engine.handle();
-        // Stagger the beat periods so roster entries tick at different rates.
-        let period = Duration::from_millis(1000 + 500 * index as u64);
-        beat_engine.clone().spawn(async move {
-            let mut interval = beat_engine.interval(period);
-            loop {
-                (&mut interval).await;
-                let _ = beat_sender.send_to(addr, BeatMsg::Wake);
-            }
-        });
+        beat_addrs.push(addr);
     }
 
     // Serve telemetry pulls: accepted TELEMETRY_ALPN connections answer with
     // this endpoint's subscription stream.
     let telemetry_endpoint = Arc::new(endpoint);
-    let serve_engine = engine.handle();
-    let serve_driver = Arc::clone(&driver);
-    serve_engine.clone().spawn(async move {
-        let mut interval = serve_engine.interval(PULL_POLL_PERIOD);
-        loop {
-            (&mut interval).await;
-            // Drain the mux into the endpoint fanout so producer frames
-            // reach the pull subscription; without this tick the mux fills
-            // and nothing is ever streamed.
-            let _ = telemetry_endpoint.tick();
-            for (_node, conn) in serve_driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
-                spawn_pull_server(
-                    &serve_engine,
-                    conn,
-                    Arc::clone(&telemetry_endpoint),
-                    WRITER_IDLE,
+    let completion = ActorCompletion::new();
+    let runtime_actor = NodeRuntimeActor {
+        engine: engine.handle(),
+        sender: runtime.create_sender(),
+        edge_agent,
+        driver: Arc::clone(&driver),
+        attempt,
+        supervisor_addr,
+        logical_node,
+        node_hex,
+        endpoint_addr_json: addr_json,
+        endpoint: Arc::clone(&telemetry_endpoint),
+        producer,
+        status_channel,
+        beats: beat_addrs
+            .into_iter()
+            .enumerate()
+            .map(|(index, actor)| (actor, Duration::from_millis(1000 + 500 * index as u64)))
+            .collect(),
+        heartbeat_seq: 0,
+        completion: completion.clone(),
+    };
+    let runtime_actor = runtime
+        .spawn(runtime_actor)
+        .map_err(|error| format!("spawn node runtime actor: {error}"))?;
+    let stop_actor = runtime
+        .spawn(NodeStopForwarder {
+            sender: runtime.create_sender(),
+            runtime_actor,
+        })
+        .map_err(|error| format!("spawn node stop actor: {error}"))?;
+    #[cfg(target_os = "linux")]
+    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor);
+
+    // The actor owns lifecycle; the entrypoint waits only for its terminal signal.
+    completion.wait();
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+enum NodeRuntimeMsg {
+    EdgeTick,
+    Announce,
+    Heartbeat,
+    Beat(usize),
+    PullTelemetry,
+    Stop,
+}
+
+struct NodeRuntimeActor {
+    engine: EngineHandle,
+    sender: ExternalSender,
+    attempt: u64,
+    edge_agent: ActorAddress,
+    driver: Arc<IrohDriver>,
+    supervisor_addr: iroh::EndpointAddr,
+    logical_node: String,
+    node_hex: String,
+    endpoint_addr_json: String,
+    endpoint: Arc<TelemetryEndpoint>,
+    producer: TelemetryProducer,
+    status_channel: telemetry::ChannelId,
+    beats: Vec<(ActorAddress, Duration)>,
+    heartbeat_seq: u64,
+    completion: ActorCompletion<()>,
+}
+
+impl NodeRuntimeActor {
+    fn schedule(&self, ctx: &Ctx, delay: Duration, message: NodeRuntimeMsg) {
+        self.engine
+            .send_after(delay, self.sender.clone(), ctx.self_addr(), message);
+    }
+}
+
+impl ActorInterface for NodeRuntimeActor {
+    type Incoming = NodeRuntimeMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.schedule(ctx, Duration::from_millis(250), NodeRuntimeMsg::EdgeTick);
+        self.schedule(ctx, Duration::ZERO, NodeRuntimeMsg::Announce);
+        self.schedule(ctx, HEARTBEAT_PERIOD, NodeRuntimeMsg::Heartbeat);
+        self.schedule(ctx, PULL_POLL_PERIOD, NodeRuntimeMsg::PullTelemetry);
+        for (index, (_, period)) in self.beats.iter().enumerate() {
+            self.schedule(ctx, *period, NodeRuntimeMsg::Beat(index));
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+        match message {
+            NodeRuntimeMsg::EdgeTick => {
+                let _ = self
+                    .sender
+                    .send_to(self.edge_agent, edge::NodeEdgeMsg::Tick);
+                self.schedule(ctx, Duration::from_millis(250), NodeRuntimeMsg::EdgeTick);
+            }
+            NodeRuntimeMsg::Announce => {
+                let announce = NodeAnnounce {
+                    attempt: self.attempt,
+                    logical_node: self.logical_node.clone(),
+                    key_hex: self.node_hex.clone(),
+                    endpoint_addr_json: self.endpoint_addr_json.clone(),
+                    at_ms: unix_ms(),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&announce) {
+                    self.driver.send_tagged_gossip(
+                        self.supervisor_addr.clone(),
+                        ANNOUNCE_TAG.as_bytes(),
+                        bytes,
+                    );
+                }
+                self.schedule(ctx, HEARTBEAT_PERIOD, NodeRuntimeMsg::Announce);
+            }
+            NodeRuntimeMsg::Heartbeat => {
+                self.heartbeat_seq = self.heartbeat_seq.saturating_add(1);
+                let payload = json!({
+                    "at_ms": unix_ms(),
+                    "node": self.logical_node,
+                    "key": self.node_hex,
+                    "seq": self.heartbeat_seq,
+                    "alive": true,
+                    "pid": std::process::id(),
+                    "beats": BEAT_ACTORS,
+                });
+                let bytes = serde_json::to_vec(&payload).expect("status serializes");
+                self.producer.submit_bytes(self.status_channel, bytes);
+                self.schedule(ctx, HEARTBEAT_PERIOD, NodeRuntimeMsg::Heartbeat);
+            }
+            NodeRuntimeMsg::Beat(index) => {
+                if let Some((actor, period)) = self.beats.get(index).copied() {
+                    let _ = self.sender.send_to(actor, BeatMsg::Wake);
+                    self.schedule(ctx, period, NodeRuntimeMsg::Beat(index));
+                }
+            }
+            NodeRuntimeMsg::PullTelemetry => {
+                let _ = self.endpoint.tick();
+                for (_node, connection) in self.driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
+                    spawn_pull_server(
+                        &self.engine,
+                        connection,
+                        Arc::clone(&self.endpoint),
+                        WRITER_IDLE,
+                    );
+                }
+                self.schedule(ctx, PULL_POLL_PERIOD, NodeRuntimeMsg::PullTelemetry);
+            }
+            NodeRuntimeMsg::Stop => {
+                assert!(
+                    self.completion.complete(()).is_ok(),
+                    "demo node completed twice"
                 );
+                ctx.stop_self();
             }
         }
-    });
+    }
+}
 
-    // The engine owns progression; park this thread until killed. `driver`
-    // stays alive until process exit.
-    let _keep_driver = driver;
-    loop {
-        std::thread::park();
+struct NodeStopForwarder {
+    sender: ExternalSender,
+    runtime_actor: ActorAddress,
+}
+
+impl ActorInterface for NodeStopForwarder {
+    type Incoming = swactor_process::ProcessStopSignal;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+        let _ = self
+            .sender
+            .send_to(self.runtime_actor, NodeRuntimeMsg::Stop);
+        ctx.stop_self();
     }
 }
 
@@ -396,4 +460,228 @@ fn install_parent_death_signal() -> Result<(), String> {
 fn install_parent_death_signal() -> Result<(), String> {
     // Non-Linux builds rely on the supervisor's graceful teardown path.
     Ok(())
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::RuntimeParts;
+    use swactor_engine::{ActorCompletion, Engine, SteppingBackend};
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum NodeAction {
+        Announce,
+        Heartbeat,
+        EdgeTick,
+        PullTelemetry,
+        Stop,
+    }
+
+    fn node_actions() -> impl Strategy<Value = Vec<NodeAction>> {
+        prop::collection::vec(
+            prop_oneof![
+                3 => Just(NodeAction::Announce),
+                4 => Just(NodeAction::Heartbeat),
+                2 => Just(NodeAction::EdgeTick),
+                1 => Just(NodeAction::PullTelemetry),
+            ],
+            0..=28,
+        )
+        .prop_map(|mut generated| {
+            let mut actions = vec![NodeAction::Announce, NodeAction::Heartbeat];
+            actions.append(&mut generated);
+            actions.extend([NodeAction::Stop, NodeAction::Stop]);
+            actions
+        })
+    }
+
+    fn drive(backend: &SteppingBackend, steps: usize) {
+        for _ in 0..steps {
+            backend.step();
+        }
+    }
+
+    fn check_node_invariants(
+        expected_heartbeats: usize,
+        observed_heartbeats: usize,
+        active_actors: usize,
+        final_actors: usize,
+        worker_panics: u64,
+    ) -> Result<(), String> {
+        if observed_heartbeats != expected_heartbeats {
+            return Err(format!(
+                "heartbeat mismatch: expected={expected_heartbeats} observed={observed_heartbeats}"
+            ));
+        }
+        if active_actors != 2 {
+            return Err(format!(
+                "one node identity must own runtime+stop actors: observed={active_actors}"
+            ));
+        }
+        if final_actors != 0 {
+            return Err(format!(
+                "node actors did not return to baseline: observed={final_actors}"
+            ));
+        }
+        if worker_panics != 0 {
+            return Err(format!(
+                "node actor worker panicked {worker_panics} time(s)"
+            ));
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn generated_node_runtime_transitions_emit_heartbeats_and_stop_once(
+            actions in node_actions(),
+            attempt in any::<u64>(),
+        ) {
+            let mut config = RuntimeConfig::default();
+            config.worker_count = 1;
+            let parts = RuntimeParts::new(config);
+            let runtime = parts.runtime().clone();
+            let backend = SteppingBackend::new();
+            let engine =
+                Engine::new(parts, backend.clone()).expect("one-worker node stepping engine");
+            let driver = crate::demo::shared_test_driver();
+            let supervisor_addr = driver.endpoint_addr();
+            let endpoint = Arc::new(TelemetryEndpoint::with_descriptor(
+                telemetry::frame::StreamDescriptor {
+                    stream: telemetry::frame::StreamId::new(
+                        telemetry::frame::NodeId::new(format!("generated-node-{attempt}")),
+                        telemetry::frame::Lifetime(1),
+                    ),
+                    label: Some("generated demo node".to_owned()),
+                    origin: telemetry::frame::StreamOrigin::RemoteNode,
+                },
+                128,
+                64,
+            ));
+            let producer = endpoint.producer();
+            let status_channel = endpoint.register_channel(
+                "node.status",
+                ChannelContent::JsonRecord {
+                    schema: Some("demo.node.status.v1".to_owned()),
+                },
+            );
+            let status_frames = endpoint.subscribe_all("generated-node-property");
+            let edge_inbox = runtime
+                .new_inbox::<edge::NodeEdgeMsg>()
+                .expect("create generated node edge inbox");
+            let completion = ActorCompletion::new();
+            let runtime_actor = runtime
+                .spawn(NodeRuntimeActor {
+                    engine: engine.handle(),
+                    sender: runtime.create_sender(),
+                    attempt,
+                    edge_agent: *edge_inbox.addr(),
+                    driver: Arc::clone(&driver),
+                    supervisor_addr,
+                    logical_node: format!("node-{attempt}"),
+                    node_hex: format!("{attempt:016x}"),
+                    endpoint_addr_json: serde_json::to_string(&driver.endpoint_addr())
+                        .expect("serialize generated node endpoint"),
+                    endpoint: Arc::clone(&endpoint),
+                    producer,
+                    status_channel,
+                    beats: Vec::new(),
+                    heartbeat_seq: 0,
+                    completion: completion.clone(),
+                })
+                .expect("spawn generated node runtime actor");
+            let stop_actor = runtime
+                .spawn(NodeStopForwarder {
+                    sender: runtime.create_sender(),
+                    runtime_actor,
+                })
+                .expect("spawn generated node stop actor");
+            drive(&backend, 8);
+            let active_stats = runtime.stats();
+
+            let mut expected_heartbeats = 0;
+            for action in actions
+                .iter()
+                .take(actions.len().saturating_sub(2))
+            {
+                let message = match action {
+                    NodeAction::Announce => NodeRuntimeMsg::Announce,
+                    NodeAction::Heartbeat => {
+                        expected_heartbeats += 1;
+                        NodeRuntimeMsg::Heartbeat
+                    }
+                    NodeAction::EdgeTick => NodeRuntimeMsg::EdgeTick,
+                    NodeAction::PullTelemetry => NodeRuntimeMsg::PullTelemetry,
+                    NodeAction::Stop => unreachable!("stop actions are the bounded suffix"),
+                };
+                runtime
+                    .send_to(runtime_actor, message)
+                    .expect("send generated node action");
+                drive(&backend, 4);
+            }
+
+            runtime
+                .send_to(stop_actor, swactor_process::ProcessStopSignal)
+                .expect("send first generated OS stop signal");
+            runtime
+                .send_to(stop_actor, swactor_process::ProcessStopSignal)
+                .expect("send repeated generated OS stop signal");
+            drive(&backend, 32);
+            prop_assert!(
+                completion.complete(()).is_err(),
+                "node completion remained pending; actions={actions:?} active={active_stats:?}"
+            );
+            completion.wait();
+
+            endpoint.tick();
+            let observed_heartbeats = status_frames
+                .drain_available()
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        telemetry::frame::TelemetryEvent::Frame(delivery)
+                            if delivery.channel.channel == status_channel
+                    )
+                })
+                .count();
+            let final_stats = runtime.stats();
+            let worker_panics = final_stats
+                .workers
+                .iter()
+                .map(|worker| worker.panics)
+                .sum::<u64>();
+            prop_assert!(
+                check_node_invariants(
+                    expected_heartbeats,
+                    observed_heartbeats,
+                    active_stats.actors.len(),
+                    final_stats.actors.len(),
+                    worker_panics,
+                )
+                .is_ok(),
+                "node transition invariant failed; actions={actions:?} attempt={attempt} \
+                 expected_heartbeats={expected_heartbeats} observed_heartbeats={observed_heartbeats} \
+                 active={active_stats:?} final={final_stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_transition_oracle_rejects_duplicate_resources() {
+        let rejected = check_node_invariants(3, 3, 3, 0, 0);
+        assert!(
+            rejected.is_err(),
+            "node property oracle accepted a controlled duplicate actor resource"
+        );
+    }
 }

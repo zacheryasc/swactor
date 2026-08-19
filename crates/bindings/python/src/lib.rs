@@ -8,9 +8,8 @@ use ::swactor::actor::{
     Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest,
 };
 use ::swactor::config::RuntimeConfig;
-use ::swactor::runtime::{
-    Inbox, Runtime, RuntimeParts, SingleThreadRuntime as SingleThreadRuntimeHost,
-};
+use ::swactor::runtime::{Inbox, Runtime, RuntimeParts};
+use swactor_engine::{Engine, SteppingBackend};
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
 
@@ -279,7 +278,8 @@ impl From<PyRuntimeConfig> for RuntimeConfig {
 #[pyclass(name = "Runtime", unsendable)]
 pub struct PyRuntime {
     runtime: Runtime,
-    host: SingleThreadRuntimeHost,
+    _engine: Engine,
+    backend: SteppingBackend,
 }
 
 #[pymethods]
@@ -293,8 +293,13 @@ impl PyRuntime {
         };
         let parts = RuntimeParts::new(config);
         let runtime = parts.runtime().clone();
-        let host = SingleThreadRuntimeHost::new(parts);
-        Self { runtime, host }
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("create Python actor engine");
+        Self {
+            runtime,
+            _engine: engine,
+            backend,
+        }
     }
 
     fn spawn(&self, handler: PyObject) -> PyResult<PyActorAddress> {
@@ -316,7 +321,7 @@ impl PyRuntime {
     }
 
     fn tick(&mut self) -> PyResult<()> {
-        self.host.tick();
+        self.backend.step();
         Ok(())
     }
 

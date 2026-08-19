@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "actor-control-flow-lint-tests"
+version = "0.1.0"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,12 +904,15 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "swactor",
+ "swactor-engine",
  "telemetry",
  "tokio",
  "tokio-stream",
+ "tower",
 ]
 
 [[package]]
@@ -1131,6 +1138,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swactor",
+ "swactor-engine",
  "swactor-transport",
  "telemetry",
  "uuid",
@@ -2491,7 +2499,6 @@ dependencies = [
  "provisioning",
  "serde",
  "serde_json",
- "signal-hook",
  "swactor",
  "swactor-engine",
  "swactor-job-runner",
@@ -2503,7 +2510,6 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "ureq",
- "wiremock",
 ]
 
 [[package]]
@@ -3268,6 +3274,7 @@ dependencies = [
  "serde_json",
  "swactor",
  "swactor-engine",
+ "swactor-process",
 ]
 
 [[package]]
@@ -3339,6 +3346,7 @@ version = "0.1.0"
 dependencies = [
  "pyo3",
  "swactor",
+ "swactor-engine",
 ]
 
 [[package]]
@@ -4307,6 +4315,7 @@ name = "swactor-engine"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "proptest",
  "swactor",
  "tokio",
 ]
@@ -4333,11 +4342,16 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "libc",
+ "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "signal-hook",
  "swactor",
+ "swactor-engine",
  "telemetry",
+ "tokio",
 ]
 
 [[package]]
@@ -5181,6 +5195,7 @@ name = "wasm-runtime"
 version = "0.1.0"
 dependencies = [
  "swactor",
+ "swactor-engine",
  "wasm-bindgen",
 ]
 
@@ -5775,6 +5790,7 @@ dependencies = [
  "iroh-driver",
  "libc",
  "parking_lot",
+ "proptest",
  "provisioning",
  "serde",
  "serde_json",

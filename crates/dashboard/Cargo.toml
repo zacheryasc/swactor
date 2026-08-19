@@ -8,6 +8,7 @@ license = "AGPL-3.0-only"
 axum = "0.8"
 telemetry = { path = "../telemetry" }
 swactor = { path = "../..", features = ["serde"] }
+swactor-engine = { path = "../engine" }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,3 +19,7 @@ tokio-stream = "0.1"
 # Live control actions (kill processes, provision nodes) for the
 # provisioning-reconciler demo. Never enabled in shipping builds.
 demo-control = []
+
+[dev-dependencies]
+proptest = "1"
+tower = { version = "0.5", features = ["util"] }

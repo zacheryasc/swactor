@@ -220,11 +220,10 @@ fn prepare_node_image_inner(
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = swactor_process::command_output(&mut Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null()))
         .map_err(|e| format!("locate repository root with git: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -251,11 +250,10 @@ fn image_version_tag(root: &Path, image_content_hash: &str) -> Result<String, St
 }
 
 fn git_capture(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = swactor_process::command_output(&mut Command::new("git")
         .current_dir(root)
         .args(args)
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null()))
         .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -613,8 +611,6 @@ enum CommandOutputLine {
     Stderr(String),
 }
 
-// container image build is provisioning infrastructure, out of scope (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
 fn spawn_line_reader<R>(
     reader: R,
     to_line: fn(String) -> CommandOutputLine,
@@ -654,8 +650,6 @@ fn drain_command_lines(
     }
 }
 
-// container image build is provisioning infrastructure, out of scope (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
 fn run_status_command(
     root: &Path,
     program: &str,
@@ -667,13 +661,12 @@ fn run_status_command(
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     eprintln!("myelin-node-image: {label}");
     if progress.is_none() {
-        let status = Command::new(program)
+        let status = swactor_process::command_status(&mut Command::new(program)
             .current_dir(root)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
+            .stderr(Stdio::inherit()))
             .map_err(|e| format!("run {label}: {e}"))?;
         return if status.success() {
             Ok(())
@@ -693,13 +686,12 @@ fn run_status_command(
             args: args.to_vec(),
         },
     );
-    let mut child = match Command::new(program)
+    let mut child = match swactor_process::command_spawn(&mut Command::new(program)
         .current_dir(root)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped()))
     {
         Ok(child) => child,
         Err(error) => {
@@ -737,7 +729,7 @@ fn run_status_command(
     drop(tx);
 
     let status = loop {
-        match child.try_wait() {
+        match swactor_process::child_try_wait(&mut child) {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 drain_command_lines(&rx, progress, label, image_ref, started);
@@ -785,13 +777,12 @@ fn run_status_command(
 }
 
 fn docker_image_exists(root: &Path, image_ref: &str) -> bool {
-    Command::new("docker")
+    swactor_process::command_status(&mut Command::new("docker")
         .current_dir(root)
         .args(["image", "inspect", image_ref])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null()))
         .map(|status| status.success())
         .unwrap_or(false)
 }
@@ -800,7 +791,7 @@ fn docker_image_labels(
     root: &Path,
     image_ref: &str,
 ) -> Result<Option<BTreeMap<String, String>>, String> {
-    let output = Command::new("docker")
+    let output = swactor_process::command_output(&mut Command::new("docker")
         .current_dir(root)
         .args([
             "image",
@@ -809,8 +800,7 @@ fn docker_image_labels(
             "{{ json .Config.Labels }}",
             image_ref,
         ])
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null()))
         .map_err(|e| format!("inspect docker image {image_ref}: {e}"))?;
     if !output.status.success() {
         return Ok(None);
@@ -822,19 +812,18 @@ fn docker_image_labels(
 }
 
 fn docker_manifest_exists(root: &Path, image_ref: &str) -> bool {
-    Command::new("docker")
+    swactor_process::command_status(&mut Command::new("docker")
         .current_dir(root)
         .args(["manifest", "inspect", image_ref])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null()))
         .map(|status| status.success())
         .unwrap_or(false)
 }
 
 fn docker_image_has_container(root: &Path, image_ref: &str) -> bool {
-    Command::new("docker")
+    swactor_process::command_output(&mut Command::new("docker")
         .current_dir(root)
         .args([
             "ps",
@@ -844,14 +833,13 @@ fn docker_image_has_container(root: &Path, image_ref: &str) -> bool {
             "--format",
             "{{.ID}}",
         ])
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null()))
         .map(|output| output.status.success() && !output.stdout.is_empty())
         .unwrap_or(true)
 }
 
 fn docker_image_tags(root: &Path, repository: &str) -> Result<Vec<(String, String)>, String> {
-    let output = Command::new("docker")
+    let output = swactor_process::command_output(&mut Command::new("docker")
         .current_dir(root)
         .args([
             "image",
@@ -860,8 +848,7 @@ fn docker_image_tags(root: &Path, repository: &str) -> Result<Vec<(String, Strin
             "{{.Repository}}\t{{.Tag}}",
             repository,
         ])
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null()))
         .map_err(|error| format!("docker image ls failed: {error}"))?;
     if !output.status.success() {
         return Err(format!("docker image ls failed with {}", output.status));
@@ -877,13 +864,12 @@ fn docker_image_tags(root: &Path, repository: &str) -> Result<Vec<(String, Strin
 }
 
 fn docker_image_remove(root: &Path, image_ref: &str) -> Result<(), String> {
-    let status = Command::new("docker")
+    let status = swactor_process::command_status(&mut Command::new("docker")
         .current_dir(root)
         .args(["image", "rm", image_ref])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null()))
         .map_err(|error| format!("docker image rm failed: {error}"))?;
     if status.success() {
         Ok(())

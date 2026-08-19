@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 42f7016ceaa65ddef7717389b08c508eb30e22e8ade6e9cf0749088a258d7e8b # shrinks to actions = [Announce, Heartbeat, Heartbeat, Heartbeat, Heartbeat, Heartbeat, Heartbeat, Heartbeat, Heartbeat, Heartbeat, Stop, Stop], attempt = 0

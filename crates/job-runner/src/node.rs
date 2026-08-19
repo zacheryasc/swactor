@@ -20,6 +20,7 @@ use crate::wire::{
 };
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
+use swactor_engine::EngineHandle;
 use swactor_process::{
     ExitStatus, ProcessOutput, ProcessOutputConfig, ProcessSpec, spawn_local_process,
 };
@@ -31,6 +32,12 @@ pub enum JobPhase {
     Run,
 }
 
+struct PendingOutputs {
+    job_id: u64,
+    outputs: Vec<String>,
+    deadline: Instant,
+}
+
 /// The node-side executor. `Incoming` is the orchestrator↔node wire command.
 pub struct NodeJobActor {
     orchestrator: ActorAddress,
@@ -38,6 +45,9 @@ pub struct NodeJobActor {
     sender: ExternalSender,
     job_id: u64,
     workspace_buf: Vec<u8>,
+    actor_timers: Option<EngineHandle>,
+    workspace_wait: Option<(u64, Instant)>,
+    pending_outputs: Option<PendingOutputs>,
     /// Edge-mode workspace-ready flag. When set, the orchestrator pushed the
     /// workspace tar over EDGE_ALPN (drained + extracted by the integration
     /// layer); `MaterializeWorkspace` waits for it before emitting
@@ -70,9 +80,18 @@ impl NodeJobActor {
             sender,
             job_id,
             workspace_buf: Vec::new(),
+            actor_timers: None,
+            workspace_wait: None,
+            pending_outputs: None,
             workspace_ready: None,
             output_sink: None,
         }
+    }
+
+    /// Give edge-mode waits access only to engine-owned typed actor timers.
+    pub fn with_actor_timers(mut self, engine: EngineHandle) -> Self {
+        self.actor_timers = Some(engine);
+        self
     }
 
     /// Edge mode: workspace bytes arrive over EDGE_ALPN and are extracted by the
@@ -148,12 +167,8 @@ impl NodeJobActor {
         ctx: &Ctx,
         job_id: u64,
         outputs: &[String],
-        slot: Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>,
+        sink: Box<dyn JobEdgeSink>,
     ) {
-        let sink = match self.take_output_sink(ctx, job_id, &slot) {
-            Some(sink) => sink,
-            None => return, // already faulted while waiting for the sink
-        };
         let bytes = match pack_outputs_tar(&self.workdir, outputs) {
             Ok(b) => b,
             Err(e) => {
@@ -191,33 +206,106 @@ impl NodeJobActor {
         self.emit(ctx, NodeJobEvent::OutputsCollected { job_id });
     }
 
-    /// Take the edge output sink from the shared slot, waiting briefly for the
-    /// integration layer to arm it. Emits a fault and returns `None` on timeout.
-    fn take_output_sink(
-        &self,
-        ctx: &Ctx,
-        job_id: u64,
-        slot: &Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>,
-    ) -> Option<Box<dyn JobEdgeSink>> {
-        let deadline = Instant::now() + OUTPUT_EDGE_ARM_WAIT;
-        loop {
-            {
-                let mut guard = slot.lock();
-                if guard.is_some() {
-                    return guard.take();
-                }
-            }
-            if Instant::now() >= deadline {
-                self.emit(
-                    ctx,
-                    NodeJobEvent::NodeFault {
-                        job_id,
-                        reason: "output edge sink was never armed".to_owned(),
-                    },
-                );
-                return None;
-            }
-            std::thread::sleep(EDGE_SPIN);
+    fn schedule_edge_check(&self, ctx: &Ctx, job_id: u64, message: NodeJobCommand) -> bool {
+        let Some(engine) = &self.actor_timers else {
+            self.emit(
+                ctx,
+                NodeJobEvent::NodeFault {
+                    job_id,
+                    reason: "edge mode requires engine-owned actor timers".to_owned(),
+                },
+            );
+            return false;
+        };
+        engine.send_after(EDGE_SPIN, self.sender.clone(), ctx.self_addr(), message);
+        true
+    }
+
+    fn begin_workspace_wait(&mut self, ctx: &Ctx, job_id: u64) {
+        if self
+            .workspace_ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+        {
+            self.emit(ctx, NodeJobEvent::WorkspaceMaterialized { job_id });
+            return;
+        }
+        self.workspace_wait = Some((job_id, Instant::now() + WORKSPACE_EDGE_WAIT));
+        if !self.schedule_edge_check(ctx, job_id, NodeJobCommand::CheckWorkspaceReady { job_id }) {
+            self.workspace_wait = None;
+        }
+    }
+
+    fn check_workspace_ready(&mut self, ctx: &Ctx, job_id: u64) {
+        let Some((pending_job, deadline)) = self.workspace_wait else {
+            return;
+        };
+        if pending_job != job_id {
+            return;
+        }
+        if self
+            .workspace_ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+        {
+            self.workspace_wait = None;
+            self.emit(ctx, NodeJobEvent::WorkspaceMaterialized { job_id });
+        } else if Instant::now() >= deadline {
+            self.workspace_wait = None;
+            self.emit(
+                ctx,
+                NodeJobEvent::NodeFault {
+                    job_id,
+                    reason: "workspace edge transfer did not land".to_owned(),
+                },
+            );
+        } else {
+            self.schedule_edge_check(ctx, job_id, NodeJobCommand::CheckWorkspaceReady { job_id });
+        }
+    }
+
+    fn take_ready_output_sink(&self) -> Option<Box<dyn JobEdgeSink>> {
+        self.output_sink
+            .as_ref()
+            .and_then(|slot| slot.lock().take())
+    }
+
+    fn begin_output_wait(&mut self, ctx: &Ctx, job_id: u64, outputs: Vec<String>) {
+        if let Some(sink) = self.take_ready_output_sink() {
+            self.collect_outputs_edge(ctx, job_id, &outputs, sink);
+            return;
+        }
+        self.pending_outputs = Some(PendingOutputs {
+            job_id,
+            outputs,
+            deadline: Instant::now() + OUTPUT_EDGE_ARM_WAIT,
+        });
+        if !self.schedule_edge_check(ctx, job_id, NodeJobCommand::CheckOutputSink { job_id }) {
+            self.pending_outputs = None;
+        }
+    }
+
+    fn check_output_sink(&mut self, ctx: &Ctx, job_id: u64) {
+        let Some(pending) = self.pending_outputs.as_ref() else {
+            return;
+        };
+        if pending.job_id != job_id {
+            return;
+        }
+        if let Some(sink) = self.take_ready_output_sink() {
+            let pending = self.pending_outputs.take().expect("pending output state");
+            self.collect_outputs_edge(ctx, job_id, &pending.outputs, sink);
+        } else if Instant::now() >= pending.deadline {
+            self.pending_outputs = None;
+            self.emit(
+                ctx,
+                NodeJobEvent::NodeFault {
+                    job_id,
+                    reason: "output edge sink was never armed".to_owned(),
+                },
+            );
+        } else {
+            self.schedule_edge_check(ctx, job_id, NodeJobCommand::CheckOutputSink { job_id });
         }
     }
 }
@@ -229,25 +317,8 @@ impl ActorInterface for NodeJobActor {
     fn handle(&mut self, ctx: &Ctx, cmd: NodeJobCommand) {
         match cmd {
             NodeJobCommand::MaterializeWorkspace { job_id } => {
-                if let Some(flag) = self.workspace_ready.as_ref() {
-                    // Edge mode: the workspace tar traveled over EDGE_ALPN and
-                    // was extracted into `workdir` by the integration layer.
-                    // Wait for its readiness signal before announcing ready.
-                    let deadline = Instant::now() + WORKSPACE_EDGE_WAIT;
-                    while !flag.load(Ordering::Acquire) {
-                        if Instant::now() >= deadline {
-                            self.emit(
-                                ctx,
-                                NodeJobEvent::NodeFault {
-                                    job_id,
-                                    reason: "workspace edge transfer did not land".to_owned(),
-                                },
-                            );
-                            return;
-                        }
-                        std::thread::sleep(EDGE_SPIN);
-                    }
-                    self.emit(ctx, NodeJobEvent::WorkspaceMaterialized { job_id });
+                if self.workspace_ready.is_some() {
+                    self.begin_workspace_wait(ctx, job_id);
                 } else {
                     // Chunk mode: clear the buffer; bytes arrive as WorkspaceChunk.
                     self.workspace_buf.clear();
@@ -278,11 +349,8 @@ impl ActorInterface for NodeJobActor {
                 self.spawn_supervised(ctx, JobPhase::Run, command, &env);
             }
             NodeJobCommand::CollectOutputs { job_id, outputs } => {
-                if let Some(slot) = self.output_sink.clone() {
-                    // Edge mode: pack all outputs into one tar and ship over
-                    // EDGE_ALPN, then announce collection. Dropping the sink
-                    // finishes the stream so the orchestrator sees end-of-stream.
-                    self.collect_outputs_edge(ctx, job_id, &outputs, slot);
+                if self.output_sink.is_some() {
+                    self.begin_output_wait(ctx, job_id, outputs);
                 } else {
                     for name in &outputs {
                         let path = self.workdir.join(name);
@@ -303,6 +371,12 @@ impl ActorInterface for NodeJobActor {
                     }
                     self.emit(ctx, NodeJobEvent::OutputsCollected { job_id });
                 }
+            }
+            NodeJobCommand::CheckWorkspaceReady { job_id } => {
+                self.check_workspace_ready(ctx, job_id);
+            }
+            NodeJobCommand::CheckOutputSink { job_id } => {
+                self.check_output_sink(ctx, job_id);
             }
         }
     }

@@ -66,7 +66,7 @@ Constructing a swactor engine consumes configured `RuntimeParts` and the selecte
 | operation | meaning |
 |---|---|
 | `spawn(task)` | Schedule an async unit of work on the substrate. |
-| `spawn_blocking(work)` | Schedule blocking CPU / syscall work off the async path. |
+| `blocking_work_sender().submit(work)` | Route blocking I/O work to the substrate's dedicated blocking pool. |
 | `timer(delay)` / `interval(period)` | Schedule future or recurring work. |
 | `now()` | The engine's monotonic clock. |
 
@@ -88,7 +88,7 @@ The primitives an engine may provide. Capabilities are **per-implementation and 
 - **Tasks** — `spawn` of an async unit of work; the substrate's unit of concurrency.
 - **Timers** — one-shot delay and recurring interval.
 - **I/O** — streams, sockets, files, and protocol endpoints used by engine-hosted work. An engine may implement I/O through asynchronous operations, blocking operations on managed threads, callbacks, or host-native facilities. Integrations declare the I/O capabilities they require, and binding fails at construction when the selected engine cannot provide them.
-- **Blocking** — `spawn_blocking` for CPU-bound or syscall work that must not stall the executor.
+- **Blocking** — a `BlockingWorkSender` routes syscall work off actor and async workers.
 - **Time** — `now()`. In a test engine this is virtual, advanced by the test; this is what makes deterministic testing possible.
 
 An engine that provides only tasks + time is still valid. Blocking and I/O are additional capabilities declared by integrations that require them.

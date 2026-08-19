@@ -10,6 +10,7 @@ autobins = false
 [features]
 default = ["dashboard"]
 dashboard = []
+test-support = ["swactor-vastai/test-support"]
 
 [dependencies]
 telemetry = { path = "../../crates/telemetry" }
@@ -36,12 +37,16 @@ axum = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-wiremock = "0.6"
+swactor-vastai = { path = "../../tools/vastai", features = ["test-support"] }
 proptest = "1"
+
+[[test]]
+name = "stateful_vastai"
+path = "tests/stateful_vastai.rs"
+required-features = ["test-support"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
 
 [[bin]]
 name = "myelin-worker"

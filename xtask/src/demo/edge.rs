@@ -27,6 +27,9 @@ use data_plane::edge_wire::EdgeTransport;
 use data_plane::ids::{EdgeId, RunId};
 use data_plane::object_record::{self, ObjectRecord};
 use iroh::EndpointAddr;
+use swactor::actor::{ActorAddress, ActorInterface};
+use swactor::runtime::{Ctx, ExternalSender, Runtime};
+use swactor_engine::EngineHandle;
 use telemetry::TelemetryProducer;
 
 /// Wire tag of the edge-provision gossip frame (supervisor → node).
@@ -121,20 +124,8 @@ impl EdgeTransport for DriverTransport {
         edge_id: EdgeId,
         peer: &EndpointAddr,
     ) -> Result<Self::Writer, String> {
-        // The driver's send pump blocks its calling thread until the
-        // connect handshake completes — indefinitely for a dead peer.
-        // Bound it: run the spawn on a helper thread and give up after
-        // EDGE_CONNECT_TIMEOUT. (This runs on the edge pump thread, but a
-        // EDGE_CONNECT_TIMEOUT. (This runs on the edge pump thread, but a
-        // dead node must not wedge edge polling for the whole cluster.)
-        let driver = Arc::clone(&self.0);
-        let peer = peer.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(driver.spawn_edge_send_pump(peer, edge_id.0));
-        });
-        rx.recv_timeout(EDGE_CONNECT_TIMEOUT)
-            .map_err(|error| format!("edge {} connect handshake: {error}", edge_id.0))?
+        self.0
+            .spawn_edge_send_pump_timeout(peer.clone(), edge_id.0, EDGE_CONNECT_TIMEOUT)
     }
 
     fn drain_events(&mut self) -> Vec<data_plane::edge_wire::WireEvent> {
@@ -283,21 +274,21 @@ impl EdgeSession {
     }
 }
 
-/// Command from the supervisor actor into the edge pump thread. The pump
-/// thread solely owns the sessions: every mutation travels through this
-/// channel, so the actor never touches pump-owned state (and the pump's
-/// blocking connect handshakes can never stall the actor).
 pub enum EdgePumpCmd {
-    /// Adopt a freshly created session (replaces any session for the same
-    /// attempt).
     Establish(Box<EdgeSession>),
-    /// A node acked its inbound edge.
     Ack(EdgeAck),
-    /// The current set of live node attempts; sessions for other attempts
-    /// are torn down.
     LiveAttempts(Vec<u64>),
-    /// Tear everything down (supervisor shutdown).
     DropAll,
+    Tick,
+}
+
+#[derive(Clone)]
+pub struct EdgePumpMessage(Arc<std::sync::Mutex<Option<EdgePumpCmd>>>);
+
+impl EdgePumpMessage {
+    pub fn new(command: EdgePumpCmd) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(command))))
+    }
 }
 
 /// One pump→actor update: feed lines plus the full edge-state mirror for
@@ -308,73 +299,103 @@ pub struct EdgePumpUpdate {
     pub states: Vec<serde_json::Value>,
 }
 
-/// Start the edge pump on the engine's blocking pool. Every tick: apply
-/// pending commands, retry unacked provisions, poll each session's
-/// runtime (the blocking connect handshakes belong on this thread — see
-/// `control.rs` for the same constraint), and report an update to the
-/// supervisor actor.
-pub fn start_edge_pump(
-    engine: &swactor_engine::EngineHandle,
+struct EdgePumpActor {
+    engine: EngineHandle,
+    sender: ExternalSender,
     driver: Arc<iroh_driver::IrohDriver>,
-    cmds: std::sync::mpsc::Receiver<EdgePumpCmd>,
-    sender: swactor::runtime::ExternalSender,
-    supervisor: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>>,
-) {
-    let engine = engine.clone();
-    engine.spawn_blocking(move || {
-        let mut sessions: Vec<EdgeSession> = Vec::new();
-        let mut next_poll = std::time::Instant::now();
-        loop {
-            // Drain commands (blocking with the remaining tick budget).
-            loop {
-                let timeout = next_poll.saturating_duration_since(std::time::Instant::now());
-                match cmds.recv_timeout(timeout) {
-                    Ok(EdgePumpCmd::Establish(session)) => {
-                        let attempt = session.attempt;
-                        sessions.retain(|existing| existing.attempt != attempt);
-                        sessions.push(*session);
-                    }
-                    Ok(EdgePumpCmd::Ack(ack)) => {
-                        if let Some(session) = sessions
-                            .iter_mut()
-                            .find(|session| session.edge_id.0 == ack.edge_id)
-                        {
-                            session.acked = Some(ack.outcome.clone());
-                        }
-                    }
-                    Ok(EdgePumpCmd::LiveAttempts(live)) => {
-                        let mut i = 0;
-                        while i < sessions.len() {
-                            if live.contains(&sessions[i].attempt) {
-                                i += 1;
-                            } else {
-                                let dead = sessions.remove(i);
-                                // Dropping the session drops its writer,
-                                // finishing the edge stream.
-                                eprintln!("demo: edge {} torn down (node gone)", dead.edge_id.0);
-                            }
-                        }
-                    }
-                    Ok(EdgePumpCmd::DropAll) => sessions.clear(),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+    supervisor: Arc<std::sync::OnceLock<ActorAddress>>,
+    sessions: Vec<EdgeSession>,
+}
+
+impl EdgePumpActor {
+    fn schedule(&self, ctx: &Ctx) {
+        self.engine.send_after(
+            Duration::from_millis(250),
+            self.sender.clone(),
+            ctx.self_addr(),
+            EdgePumpMessage::new(EdgePumpCmd::Tick),
+        );
+    }
+}
+
+impl ActorInterface for EdgePumpActor {
+    type Incoming = EdgePumpMessage;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.schedule(ctx);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+        let Some(command) = message
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        match command {
+            EdgePumpCmd::Establish(session) => {
+                let attempt = session.attempt;
+                self.sessions.retain(|existing| existing.attempt != attempt);
+                self.sessions.push(*session);
+            }
+            EdgePumpCmd::Ack(ack) => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.edge_id.0 == ack.edge_id)
+                {
+                    session.acked = Some(ack.outcome);
                 }
             }
-            next_poll = std::time::Instant::now() + Duration::from_millis(250);
-
-            let mut update = EdgePumpUpdate::default();
-            for session in sessions.iter_mut() {
-                pump_one(session, &driver, &mut update);
+            EdgePumpCmd::LiveAttempts(live) => {
+                let mut index = 0;
+                while index < self.sessions.len() {
+                    if live.contains(&self.sessions[index].attempt) {
+                        index += 1;
+                    } else {
+                        let dead = self.sessions.remove(index);
+                        eprintln!("demo: edge {} torn down (node gone)", dead.edge_id.0);
+                    }
+                }
             }
-            update.states = sessions.iter().map(session_state_json).collect();
-            if let Some(addr) = supervisor.get() {
-                let _ = sender.send_to(
-                    addr.clone(),
-                    crate::demo::feed::SupervisorMsg::EdgeUpdate(update),
-                );
+            EdgePumpCmd::DropAll => self.sessions.clear(),
+            EdgePumpCmd::Tick => {
+                let mut update = EdgePumpUpdate::default();
+                for session in &mut self.sessions {
+                    pump_one(session, &self.driver, &mut update);
+                }
+                update.states = self.sessions.iter().map(session_state_json).collect();
+                if let Some(supervisor) = self.supervisor.get() {
+                    let _ = self.sender.send_to(
+                        *supervisor,
+                        crate::demo::feed::SupervisorMsg::EdgeUpdate(update),
+                    );
+                }
+                self.schedule(ctx);
             }
         }
-    });
+    }
+}
+
+pub fn start_edge_pump(
+    runtime: &Runtime,
+    engine: EngineHandle,
+    driver: Arc<iroh_driver::IrohDriver>,
+    sender: ExternalSender,
+    supervisor: Arc<std::sync::OnceLock<ActorAddress>>,
+) -> Result<ActorAddress, String> {
+    runtime
+        .spawn(EdgePumpActor {
+            engine,
+            sender,
+            driver,
+            supervisor,
+            sessions: Vec::new(),
+        })
+        .map_err(|error| format!("spawn edge pump actor: {error}"))
 }
 
 fn session_state_json(session: &EdgeSession) -> serde_json::Value {

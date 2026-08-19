@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorInterface, Ctx};
 use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts};
+use swactor_engine::SteppingBackend;
 
 pub fn runtime_parts(config: RuntimeConfig) -> (RuntimeParts, Runtime) {
     let parts = RuntimeParts::new(config);
@@ -110,4 +111,60 @@ pub async fn yield_once() {
         }
     })
     .await;
+}
+
+pub fn drive_steps(backend: &SteppingBackend, count: usize) {
+    for _ in 0..count {
+        backend.step();
+    }
+}
+
+pub fn advance_and_drive(backend: &SteppingBackend, duration: Duration, count: usize) {
+    backend.advance_time(duration);
+    drive_steps(backend, count);
+}
+
+pub fn assert_no_poison(runtime: &Runtime) {
+    let stats = runtime.stats();
+    let panics = stats
+        .workers
+        .iter()
+        .map(|worker| worker.panics)
+        .sum::<u64>();
+    let poisoned = stats
+        .actor_details
+        .iter()
+        .filter(|actor| actor.poisoned)
+        .collect::<Vec<_>>();
+    assert!(
+        panics == 0 && poisoned.is_empty(),
+        "runtime contains poisoned actors: worker_panics={panics}, poisoned={poisoned:?}, \
+         actors={:?}, details={:?}",
+        stats.actors,
+        stats.actor_details,
+    );
+}
+
+pub fn assert_actor_delta_at_most(runtime: &Runtime, baseline: usize, limit: usize) {
+    let stats = runtime.stats();
+    assert!(
+        stats.actors.len() <= baseline.saturating_add(limit),
+        "actor count grew from {baseline} to {}, limit={limit}: {:?}",
+        stats.actors.len(),
+        stats.actors,
+    );
+}
+
+pub fn assert_mailboxes_drained(runtime: &Runtime) {
+    let stats = runtime.stats();
+    let mailbox_depth = stats
+        .workers
+        .iter()
+        .map(|worker| worker.mailbox_depth)
+        .sum::<usize>();
+    assert_eq!(
+        mailbox_depth, 0,
+        "mailboxes did not drain: workers={:?}, details={:?}",
+        stats.workers, stats.actor_details,
+    );
 }

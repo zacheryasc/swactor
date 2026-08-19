@@ -12,3 +12,6 @@ tokio = ["dep:tokio"]
 swactor = { path = "../.." }
 parking_lot = "0.12"
 tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = "1"

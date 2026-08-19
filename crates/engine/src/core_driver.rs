@@ -57,7 +57,6 @@ struct CoreDriver {
 
 // Core drivers are the engine's sole core-progression path; this is the one
 // place permitted to call `Worker::try_tick` (ENGINE_SPEC.md §2).
-#[allow(clippy::disallowed_methods)]
 impl Future for CoreDriver {
     type Output = ();
 

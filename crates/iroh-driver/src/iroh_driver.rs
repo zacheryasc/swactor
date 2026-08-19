@@ -598,7 +598,29 @@ impl IrohDriver {
         peer: EndpointAddr,
         edge_id: u64,
     ) -> Result<EdgeSendHandle, String> {
-        spawn_edge_sender_task(self.engine.clone(), self.endpoint.clone(), peer, edge_id)
+        spawn_edge_sender_task(
+            self.engine.clone(),
+            self.endpoint.clone(),
+            peer,
+            edge_id,
+            None,
+        )
+    }
+
+    /// Start an EDGE_ALPN send pump with a bounded connection handshake.
+    pub fn spawn_edge_send_pump_timeout(
+        &self,
+        peer: EndpointAddr,
+        edge_id: u64,
+        timeout: std::time::Duration,
+    ) -> Result<EdgeSendHandle, String> {
+        spawn_edge_sender_task(
+            self.engine.clone(),
+            self.endpoint.clone(),
+            peer,
+            edge_id,
+            Some(timeout),
+        )
     }
 
     /// The node's identity.

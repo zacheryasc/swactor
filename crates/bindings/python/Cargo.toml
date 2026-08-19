@@ -10,4 +10,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 swactor = { path = "../../.." }
+swactor-engine = { path = "../../engine", default-features = false }
 pyo3 = { version = "0.23", features = ["extension-module"] }

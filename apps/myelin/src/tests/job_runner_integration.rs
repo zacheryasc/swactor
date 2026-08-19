@@ -26,7 +26,6 @@ use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 const POLL: Duration = Duration::from_millis(15);
 const DEADLINE: Duration = Duration::from_secs(20);
 
-#[allow(clippy::disallowed_methods)]
 fn recv_within<T: Message>(inbox: &Inbox<T>, deadline: Duration) -> Option<T> {
     let started = Instant::now();
     loop {

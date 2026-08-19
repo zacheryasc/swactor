@@ -45,6 +45,7 @@ pub(crate) fn spawn_edge_send_pump(
     endpoint: Endpoint,
     peer: EndpointAddr,
     edge_id: u64,
+    ready_timeout: Option<std::time::Duration>,
 ) -> Result<EdgeSendHandle, String> {
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -108,9 +109,14 @@ pub(crate) fn spawn_edge_send_pump(
             let _ = ready_tx.send(Err(error));
         }
     });
-    ready_rx
-        .recv()
-        .map_err(|e| format!("edge {edge_id} sender startup channel closed: {e}"))??;
+    match ready_timeout {
+        Some(timeout) => ready_rx
+            .recv_timeout(timeout)
+            .map_err(|error| format!("edge {edge_id} sender startup: {error}"))??,
+        None => ready_rx
+            .recv()
+            .map_err(|error| format!("edge {edge_id} sender startup channel closed: {error}"))??,
+    }
     Ok(EdgeSendHandle { tx })
 }
 

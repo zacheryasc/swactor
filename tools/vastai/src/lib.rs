@@ -4,6 +4,7 @@
 //! general-purpose actor runtime, while this utility rents, monitors, and tears
 //! down vast.ai machines for apps that choose to use it.
 
+mod blocking;
 pub mod client;
 pub mod config;
 pub mod filters;
@@ -15,8 +16,11 @@ pub mod provision;
 pub mod search;
 pub mod state;
 pub mod teardown;
+#[cfg(feature = "test-support")]
+pub mod test_http;
 pub mod types;
 
+pub use blocking::BlockingVastClient;
 pub use client::VastClient;
 pub use lease::{confirm_lease, provision_fleet};
 pub use logs::{fetch_logs, request_logs};

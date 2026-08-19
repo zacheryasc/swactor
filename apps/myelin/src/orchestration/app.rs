@@ -1,14 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
 use crate::codecs::register_myelin_actor_codecs;
@@ -22,8 +20,8 @@ use crate::orchestration::control;
 use crate::orchestration::daemon;
 use crate::orchestration::manual_control::{
     CONTROL_REGISTRY_NAME, ConfigValidator, ManualActorControl, ManualControl, ManualControlMsg,
-    NodePhase, OfferDto, OfferSearchRequest, OfferSearcher, ProviderConfigurationRequest,
-    ProviderFactory, ProviderReadiness, SpecBuilder,
+    ManualControlReply, NodePhase, OfferDto, OfferSearchRequest, OfferSearcher,
+    ProviderConfigurationRequest, ProviderFactory, ProviderReadiness, SpecBuilder,
 };
 
 use crate::node_provisioning::{ProviderKind, provider_kind};
@@ -52,8 +50,9 @@ use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN};
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use swactor::actor::ActorAddress;
-use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor::actor::{ActorAddress, ActorInterface};
+use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime};
+use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 const DEFAULT_IMAGE: &str = "myelin-node:latest";
 const MYELIN_RUNTIME_CONFIG_ENV: &str = "MYELIN_RUNTIME_CONFIG";
 const CACHED_MODEL_HOST_ENV: &str = "MYELIN_CACHED_MODEL_HOST_PATH";
@@ -66,6 +65,7 @@ const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_STATE_DIR: &str = "./.config";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEMETRY_FRAME_LOG_ENV: &str = "MYELIN_TELEMETRY_FRAME_LOG";
 
 pub(crate) fn run_with_options<I>(
@@ -103,7 +103,7 @@ where
             .flush()
             .map_err(|error| format!("flush dashboard URL to stdout: {error}"))?;
     }
-    let orch_stdio_rx = if capture_stdio {
+    let orch_stdio_capture = if capture_stdio {
         OrchStdioCapture::install()?
     } else {
         None
@@ -185,13 +185,6 @@ where
             }),
         );
     }
-    drain_orch_stdio_capture(
-        orch_stdio_rx.as_ref(),
-        &mut orch_telemetry,
-        None,
-        config.run_id,
-        config.node_id,
-    );
     let actors_channel = orch_telemetry.channel_by_name("runtime.actors");
     let orch_stats_hook = orch_telemetry.stats_hook_on(actors_channel);
 
@@ -284,6 +277,9 @@ where
         DistributedNodeConfig::default(),
         engine.handle(),
     );
+    let orch_stdio_rx = orch_stdio_capture
+        .map(|capture| capture.start(&stack.runtime))
+        .transpose()?;
     bootstrap(
         &mut orch_telemetry,
         None,
@@ -383,13 +379,15 @@ where
     }));
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let provider_runtime = stack.runtime.clone();
+    let provider_engine = engine.handle();
     let provider_config = Arc::clone(&shared_config);
     let provider_registry = state_dir.process_registry_path();
     let provider_factory: ProviderFactory = Arc::new(move || {
-        provider_config
-            .lock()
-            .clone()
-            .build_provisioner(provider_runtime.clone(), provider_registry.clone())
+        provider_config.lock().clone().build_provisioner(
+            provider_runtime.clone(),
+            provider_engine.clone(),
+            provider_registry.clone(),
+        )
     });
     let spec_config = Arc::clone(&shared_config);
     let spec_coordinator = coordinator_endpoint.clone();
@@ -403,6 +401,7 @@ where
     });
     let validation_config = Arc::clone(&shared_config);
     let validation_runtime = stack.runtime.clone();
+    let validation_engine = engine.handle();
     let validation_registry = state_dir.process_registry_path();
     let config_validator: ConfigValidator = Arc::new(move |request| {
         let mut candidate = validation_config.lock().clone();
@@ -423,8 +422,11 @@ where
             vastai.bootstrap_command = Some(command);
         }
         if vastai.provisioning_mode == VastAiProvisioningMode::Mock {
-            let _ = candidate
-                .build_provisioner(validation_runtime.clone(), validation_registry.clone())?;
+            let _ = candidate.build_provisioner(
+                validation_runtime.clone(),
+                validation_engine.clone(),
+                validation_registry.clone(),
+            )?;
             *validation_config.lock() = candidate;
             return Ok(());
         }
@@ -432,8 +434,11 @@ where
             return Err("Vast.ai API key is required for live offer search".to_owned());
         }
         candidate.prepare_vastai_ssh_key()?;
-        let _ =
-            candidate.build_provisioner(validation_runtime.clone(), validation_registry.clone())?;
+        let _ = candidate.build_provisioner(
+            validation_runtime.clone(),
+            validation_engine.clone(),
+            validation_registry.clone(),
+        )?;
         *validation_config.lock() = candidate;
         Ok(())
     });
@@ -500,8 +505,8 @@ where
         });
     let manual = ManualActorControl::new(
         ManualControl::new(snapshot, readiness),
-        engine.handle(),
         stack.runtime.clone(),
+        stack.engine.blocking_work_sender(),
         state_dir,
         sink,
         provider_factory,
@@ -550,7 +555,11 @@ where
     dashboard = DashboardSupport::start_with_plugins(
         config.dashboard,
         &engine.handle(),
-        vec![control::plugin(stack.runtime.clone(), orchestrator_actor)],
+        vec![control::plugin(
+            stack.runtime.clone(),
+            engine.handle(),
+            orchestrator_actor,
+        )],
     )?;
     bootstrap(
         &mut orch_telemetry,
@@ -563,8 +572,6 @@ where
             "transport":"direct_actor_message",
         }),
     );
-    let stop_signal = spawn_stop_listener(stop_rx);
-
     bootstrap(
         &mut orch_telemetry,
         dashboard.as_ref(),
@@ -572,38 +579,34 @@ where
         "started",
         json!({"mode":"daemon","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
     );
-    let mut result = serve_cluster(ServeCluster {
-        driver: &mut driver,
-        stack: &stack,
-        obs_rx: &obs_rx,
-        collector: &collector,
-        orchestrator_reports: &orchestrator_reports,
-        stop_signal: stop_signal.as_ref(),
-        dashboard: dashboard.as_ref(),
-        orch_telemetry: &mut orch_telemetry,
-        orch_stdio_rx: orch_stdio_rx.as_ref(),
-        run_id: config.run_id,
-        orchestrator_node_id: config.node_id,
-        provider: &config.provider,
-        orchestrator_actor,
-        engine: engine.handle(),
-        pending_readies: BTreeMap::new(),
-    });
-    if result.is_ok()
-        && let Err(error) = flush_manual_control(&stack.runtime, orchestrator_actor)
-    {
-        result = Err(error);
+
+    let runtime = stack.runtime.clone();
+    let completion = ActorCompletion::new();
+    let serve_actor = runtime
+        .spawn(ServeClusterActor {
+            driver,
+            stack,
+            obs_rx,
+            collector,
+            orchestrator_reports,
+            dashboard,
+            orch_telemetry,
+            orch_stdio_rx,
+            run_id: config.run_id,
+            orchestrator_node_id: config.node_id,
+            provider: config.provider.clone(),
+            orchestrator_actor,
+            engine: engine.handle(),
+            sender: runtime.create_sender(),
+            lifecycle: ServeClusterLifecycle::new(),
+            flush_reply_actor: None,
+            completion: completion.clone(),
+        })
+        .map_err(|error| format!("spawn daemon lifecycle actor: {error}"))?;
+    if let Err(error) = spawn_stop_listener(&runtime, stop_rx, serve_actor) {
+        let _ = runtime.send_to(serve_actor, ServeClusterMsg::Abort(error));
     }
-    if let Err(error) = &result {
-        bootstrap(
-            &mut orch_telemetry,
-            dashboard.as_ref(),
-            "serve_cluster",
-            "failed",
-            json!({"error":error}),
-        );
-    }
-    result
+    completion.wait()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1665,6 +1668,7 @@ impl Config {
     fn build_provisioner(
         &self,
         bootstrap_runtime: swactor::runtime::Runtime,
+        bootstrap_engine: EngineHandle,
         process_registry_path: PathBuf,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider.as_str() {
@@ -1672,10 +1676,12 @@ impl Config {
                 self.local_worker_bin()?,
                 process_registry_path,
                 "process",
+                bootstrap_runtime.clone(),
             ))),
             "docker" => Ok(Box::new(LocalDockerPlugin::new(
                 env_optional("MYELIN_DOCKER_CONTAINER_PREFIX")
                     .unwrap_or_else(|| "myelin-orchestrator".to_owned()),
+                bootstrap_runtime.clone(),
             ))),
             "vastai" => {
                 let vastai = self.vastai.as_ref().ok_or_else(|| {
@@ -1685,6 +1691,7 @@ impl Config {
                     return Ok(Box::new(MockVastAiPlugin::with_registry(
                         self.local_worker_bin()?,
                         process_registry_path,
+                        bootstrap_runtime.clone(),
                     )));
                 }
                 if vastai.bootstrap_command.is_none() {
@@ -1702,8 +1709,13 @@ impl Config {
                     .clone()
                     .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
                 Ok(Box::new(VastAiProvisioningPlugin::new(
-                    ToolsVastAiLeaseClient::from_api_key(api_key)?,
-                    SshCommandBootstrapLauncher::new(Some(ssh_identity), bootstrap_runtime),
+                    ToolsVastAiLeaseClient::from_api_key(api_key)?
+                        .with_actor_host(bootstrap_runtime.clone(), bootstrap_engine.clone()),
+                    SshCommandBootstrapLauncher::new(
+                        Some(ssh_identity),
+                        bootstrap_runtime,
+                        bootstrap_engine,
+                    ),
                     vastai.provisioning.clone(),
                 )))
             }
@@ -1738,6 +1750,7 @@ impl Config {
                 "MYELIN_LOGICAL_NODE_ID".to_owned(),
                 logical_node_id.to_string(),
             ),
+            ("MYELIN_NODE_ATTEMPT_ID".to_owned(), "0".to_owned()),
             ("MYELIN_STAGE_INDEX".to_owned(), stage_index.to_string()),
             (
                 MVP_IROH_ENDPOINT_ADDR_MASK_ENV.to_owned(),
@@ -1808,6 +1821,13 @@ fn runtime_ready_barrier_met(stack: &DistributionRuntimeStack, ready: &RuntimeRe
         && stack.route_owner(ready.node_actor) == Some(ready.swim_node_id)
 }
 
+#[cfg(target_os = "linux")]
+struct OrchStdioCapture {
+    stdout: File,
+    stderr: File,
+}
+
+#[cfg(not(target_os = "linux"))]
 struct OrchStdioCapture;
 
 struct OrchStdioLine {
@@ -1815,15 +1835,65 @@ struct OrchStdioLine {
     line: String,
 }
 
+struct OrchStdioRelay {
+    tx: mpsc::Sender<OrchStdioLine>,
+    closed: u8,
+}
+
+impl ActorInterface for OrchStdioRelay {
+    type Incoming = swactor_process::ProcessStreamObservation;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, observation: Self::Incoming) {
+        match observation {
+            swactor_process::ProcessStreamObservation::Line { stream, line } => {
+                let stream = match stream {
+                    swactor_process::ProcessStream::Stdout => ProvisionLogStream::Stdout,
+                    swactor_process::ProcessStream::Stderr => ProvisionLogStream::Stderr,
+                };
+                if self.tx.send(OrchStdioLine { stream, line }).is_err() {
+                    ctx.stop_self();
+                }
+            }
+            swactor_process::ProcessStreamObservation::Error { .. } => {}
+            swactor_process::ProcessStreamObservation::Closed { .. } => {
+                self.closed = self.closed.saturating_add(1);
+                if self.closed == 2 {
+                    ctx.stop_self();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl OrchStdioCapture {
-    fn install() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
-        let stdout_read = Self::redirect_stream(libc::STDOUT_FILENO, "stdout")?;
-        let stderr_read = Self::redirect_stream(libc::STDERR_FILENO, "stderr")?;
+    fn install() -> Result<Option<Self>, String> {
+        Ok(Some(Self {
+            stdout: Self::redirect_stream(libc::STDOUT_FILENO, "stdout")?,
+            stderr: Self::redirect_stream(libc::STDERR_FILENO, "stderr")?,
+        }))
+    }
+
+    fn start(self, runtime: &Runtime) -> Result<mpsc::Receiver<OrchStdioLine>, String> {
         let (tx, rx) = mpsc::channel();
-        Self::spawn_reader(stdout_read, ProvisionLogStream::Stdout, tx.clone());
-        Self::spawn_reader(stderr_read, ProvisionLogStream::Stderr, tx);
-        Ok(Some(rx))
+        let actor = runtime
+            .spawn(OrchStdioRelay { tx, closed: 0 })
+            .map_err(|error| format!("spawn orchestrator stdio relay actor: {error}"))?;
+        let sender = runtime.create_sender();
+        swactor_process::spawn_line_reader(
+            swactor_process::ProcessStream::Stdout,
+            self.stdout,
+            sender.clone(),
+            actor,
+        );
+        swactor_process::spawn_line_reader(
+            swactor_process::ProcessStream::Stderr,
+            self.stderr,
+            sender,
+            actor,
+        );
+        Ok(rx)
     }
 
     fn redirect_stream(fd: libc::c_int, name: &str) -> Result<File, String> {
@@ -1851,28 +1921,16 @@ impl OrchStdioCapture {
 
         Ok(unsafe { File::from_raw_fd(pipe_fds[0]) })
     }
-
-    // provider log capture is out of scope (ENGINE_SPEC.md §2)
-    #[allow(clippy::disallowed_methods)]
-    fn spawn_reader(file: File, stream: ProvisionLogStream, tx: mpsc::Sender<OrchStdioLine>) {
-        thread::spawn(move || {
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if tx.send(OrchStdioLine { stream, line }).is_err() {
-                    break;
-                }
-            }
-        });
-    }
 }
 
 #[cfg(not(target_os = "linux"))]
 impl OrchStdioCapture {
-    fn install() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
+    fn install() -> Result<Option<Self>, String> {
         Ok(None)
+    }
+
+    fn start(self, _runtime: &Runtime) -> Result<mpsc::Receiver<OrchStdioLine>, String> {
+        unreachable!("stdio capture is unavailable on this target")
     }
 }
 
@@ -1909,55 +1967,225 @@ impl PluginObservationSink for ChannelObservationSink {
     }
 }
 
-fn stop_requested(stop_signal: &AtomicBool) -> bool {
-    stop_signal.load(Ordering::Acquire)
+#[derive(Clone, Debug)]
+enum ServeClusterMsg {
+    Tick,
+    Stop,
+    Flushed,
+    FlushFailed(String),
+    FlushTimeout,
+    Abort(String),
 }
 
-// top-level OS signal handling is process control, out of scope (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn spawn_stop_listener(external: Option<mpsc::Receiver<()>>) -> Arc<AtomicBool> {
-    let requested = Arc::new(AtomicBool::new(false));
-    let listener_requested = Arc::clone(&requested);
-    if let Some(external) = external {
-        thread::spawn(move || {
-            if external.recv().is_ok() {
-                listener_requested.store(true, Ordering::Release);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeClusterState {
+    Running,
+    Flushing,
+    Finished,
+}
+
+struct PendingRuntimeReady<T> {
+    readiness_id: u64,
+    ready: T,
+}
+
+struct ServeClusterLifecycle<T> {
+    state: ServeClusterState,
+    pending_readies: BTreeMap<u64, PendingRuntimeReady<T>>,
+}
+
+#[derive(Debug)]
+enum ServeClusterEffect {
+    None,
+    Pump,
+    BeginFlush,
+    ProviderTerminalFailure { node_id: u64, error: String },
+    Complete(Result<(), String>),
+}
+
+impl<T> ServeClusterLifecycle<T> {
+    fn new() -> Self {
+        Self {
+            state: ServeClusterState::Running,
+            pending_readies: BTreeMap::new(),
+        }
+    }
+
+    fn apply_message(&mut self, message: ServeClusterMsg) -> ServeClusterEffect {
+        match message {
+            ServeClusterMsg::Tick if matches!(self.state, ServeClusterState::Running) => {
+                ServeClusterEffect::Pump
             }
-        });
-        return requested;
+            ServeClusterMsg::Stop if matches!(self.state, ServeClusterState::Running) => {
+                self.state = ServeClusterState::Flushing;
+                self.pending_readies.clear();
+                ServeClusterEffect::BeginFlush
+            }
+            ServeClusterMsg::Flushed if matches!(self.state, ServeClusterState::Flushing) => {
+                self.complete(Ok(()))
+            }
+            ServeClusterMsg::FlushFailed(error)
+                if matches!(self.state, ServeClusterState::Flushing) =>
+            {
+                self.complete(Err(error))
+            }
+            ServeClusterMsg::FlushTimeout if matches!(self.state, ServeClusterState::Flushing) => {
+                self.complete(Err(
+                    "timed out waiting for shutdown persistence flush".to_owned()
+                ))
+            }
+            ServeClusterMsg::Abort(error) if !matches!(self.state, ServeClusterState::Finished) => {
+                self.complete(Err(error))
+            }
+            ServeClusterMsg::Tick
+            | ServeClusterMsg::Stop
+            | ServeClusterMsg::Flushed
+            | ServeClusterMsg::FlushFailed(_)
+            | ServeClusterMsg::FlushTimeout
+            | ServeClusterMsg::Abort(_) => ServeClusterEffect::None,
+        }
+    }
+
+    fn track_runtime_ready(&mut self, node_id: u64, readiness_id: u64, ready: T) -> bool {
+        if !matches!(self.state, ServeClusterState::Running) {
+            return false;
+        }
+        if let Some(current) = self.pending_readies.get(&node_id)
+            && current.readiness_id >= readiness_id
+        {
+            return false;
+        }
+        self.pending_readies.insert(
+            node_id,
+            PendingRuntimeReady {
+                readiness_id,
+                ready,
+            },
+        );
+        true
+    }
+
+    fn acknowledge_runtime_ready(&mut self, node_id: u64, readiness_id: u64) -> bool {
+        let matching = self
+            .pending_readies
+            .get(&node_id)
+            .is_some_and(|ready| ready.readiness_id == readiness_id);
+        if matching {
+            self.pending_readies.remove(&node_id);
+        }
+        matching
+    }
+
+    fn remove_runtime_ready(&mut self, node_id: u64) {
+        self.pending_readies.remove(&node_id);
+    }
+
+    fn plugin_observation(&self, terminal: Option<(u64, String)>) -> ServeClusterEffect {
+        if !matches!(self.state, ServeClusterState::Running) {
+            return ServeClusterEffect::None;
+        }
+        match terminal {
+            Some((node_id, error)) => {
+                ServeClusterEffect::ProviderTerminalFailure { node_id, error }
+            }
+            None => ServeClusterEffect::None,
+        }
+    }
+
+    fn complete(&mut self, result: Result<(), String>) -> ServeClusterEffect {
+        self.state = ServeClusterState::Finished;
+        self.pending_readies.clear();
+        ServeClusterEffect::Complete(result)
+    }
+}
+
+struct StopSignalActor {
+    sender: ExternalSender,
+    serve_actor: ActorAddress,
+}
+
+impl ActorInterface for StopSignalActor {
+    type Incoming = swactor_process::ProcessStopSignal;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, _signal: Self::Incoming) {
+        let _ = self.sender.send_to(self.serve_actor, ServeClusterMsg::Stop);
+        ctx.stop_self();
+    }
+}
+
+fn spawn_stop_listener(
+    runtime: &Runtime,
+    external: Option<mpsc::Receiver<()>>,
+    serve_actor: ActorAddress,
+) -> Result<(), String> {
+    let actor = runtime
+        .spawn(StopSignalActor {
+            sender: runtime.create_sender(),
+            serve_actor,
+        })
+        .map_err(|error| format!("spawn stop signal actor: {error}"))?;
+    let sender = runtime.create_sender();
+    if let Some(external) = external {
+        swactor_process::spawn_stop_channel_wait(external, sender, actor);
+        return Ok(());
     }
 
     #[cfg(target_os = "linux")]
-    thread::spawn(move || {
-        let Ok(mut signals) = signal_hook::iterator::Signals::new([
-            signal_hook::consts::signal::SIGINT,
-            signal_hook::consts::signal::SIGTERM,
-        ]) else {
-            return;
-        };
-        if signals.forever().next().is_some() {
-            listener_requested.store(true, Ordering::Release);
-        }
-    });
-    requested
+    swactor_process::spawn_os_stop_signal_wait(sender, actor);
+    Ok(())
 }
 
-struct ServeCluster<'a> {
-    driver: &'a mut IrohDriver,
-    stack: &'a DistributionRuntimeStack,
-    obs_rx: &'a mpsc::Receiver<PluginObservation>,
-    collector: &'a FrameCollector,
-    orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
-    stop_signal: &'a AtomicBool,
-    dashboard: Option<&'a DashboardSupport>,
-    orch_telemetry: &'a mut OrchTelemetry,
-    orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
+struct ManualFlushForwarder {
+    sender: ExternalSender,
+    serve_actor: ActorAddress,
+}
+
+fn serve_cluster_flush_reply(reply: ManualControlReply) -> Option<ServeClusterMsg> {
+    match reply {
+        ManualControlReply::Flushed => Some(ServeClusterMsg::Flushed),
+        ManualControlReply::Rejected(error) => Some(ServeClusterMsg::FlushFailed(format!(
+            "shutdown persistence flush rejected: {error}"
+        ))),
+        ManualControlReply::TimedOut => Some(ServeClusterMsg::FlushTimeout),
+        ManualControlReply::Accepted(_)
+        | ManualControlReply::Provider(_)
+        | ManualControlReply::Status(_)
+        | ManualControlReply::Offers(_)
+        | ManualControlReply::Rejoined(_) => None,
+    }
+}
+
+impl ActorInterface for ManualFlushForwarder {
+    type Incoming = ManualControlReply;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, reply: Self::Incoming) {
+        if let Some(message) = serve_cluster_flush_reply(reply) {
+            let _ = self.sender.send_to(self.serve_actor, message);
+        }
+        ctx.stop_self();
+    }
+}
+
+struct ServeClusterActor {
+    driver: IrohDriver,
+    stack: DistributionRuntimeStack,
+    obs_rx: mpsc::Receiver<PluginObservation>,
+    collector: FrameCollector,
+    orchestrator_reports: Inbox<OrchestratorReport>,
+    dashboard: Option<DashboardSupport>,
+    orch_telemetry: OrchTelemetry,
+    orch_stdio_rx: Option<mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     orchestrator_node_id: u64,
-    provider: &'a ProviderKind,
+    provider: ProviderKind,
     orchestrator_actor: ActorAddress,
     engine: EngineHandle,
-    pending_readies: BTreeMap<u64, RuntimeReady>,
+    sender: ExternalSender,
+    lifecycle: ServeClusterLifecycle<RuntimeReady>,
+    flush_reply_actor: Option<ActorAddress>,
+    completion: ActorCompletion<Result<(), String>>,
 }
 
 fn daemon_label(config: &Config) -> String {
@@ -1973,7 +2201,7 @@ fn daemon_label(config: &Config) -> String {
     }
 }
 
-impl ServeCluster<'_> {
+impl ServeClusterActor {
     fn observe_report(&mut self, report: OrchestratorReport) {
         match report {
             OrchestratorReport::NodeRuntimeReady {
@@ -1981,26 +2209,36 @@ impl ServeCluster<'_> {
                 node_id,
                 endpoint,
                 node_actor,
+                readiness_id,
                 ..
             } if run_id == self.run_id => {
-                self.pending_readies.insert(
+                let tracked = self.lifecycle.track_runtime_ready(
                     node_id,
+                    readiness_id,
                     RuntimeReady {
                         node_actor,
                         swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
                     },
                 );
-                self.driver.join(std::slice::from_ref(&endpoint));
-                self.collector.subscribe_node(
-                    &self.engine,
-                    self.driver.endpoint(),
-                    endpoint,
-                    run_id,
-                    node_id,
-                );
+                if tracked {
+                    self.driver.join(std::slice::from_ref(&endpoint));
+                    self.collector.subscribe_node(
+                        &self.engine,
+                        self.driver.endpoint(),
+                        endpoint,
+                        run_id,
+                        node_id,
+                    );
+                }
             }
-            OrchestratorReport::NodeRuntimeReadyAck { node_id, .. } => {
-                self.pending_readies.remove(&node_id);
+            OrchestratorReport::NodeRuntimeReadyAck {
+                run_id,
+                node_id,
+                readiness_id,
+                ..
+            } if run_id == self.run_id => {
+                self.lifecycle
+                    .acknowledge_runtime_ready(node_id, readiness_id);
             }
             _ => {}
         }
@@ -2008,9 +2246,10 @@ impl ServeCluster<'_> {
 
     fn advance_join_barriers(&mut self) {
         let ready = self
+            .lifecycle
             .pending_readies
             .iter()
-            .filter(|(_, ready)| runtime_ready_barrier_met(self.stack, ready))
+            .filter(|(_, pending)| runtime_ready_barrier_met(&self.stack, &pending.ready))
             .map(|(node_id, _)| *node_id)
             .collect::<Vec<_>>();
         for node_id in ready {
@@ -2023,17 +2262,36 @@ impl ServeCluster<'_> {
                 )
                 .is_ok()
             {
-                self.pending_readies.remove(&node_id);
+                self.lifecycle.remove_runtime_ready(node_id);
             }
         }
     }
 
     fn drain_observations(&mut self) {
-        while let Ok(observation) = self.obs_rx.try_recv() {
+        loop {
+            let observation = match self.obs_rx.try_recv() {
+                Ok(observation) => observation,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let _ = self.lifecycle.plugin_observation(None);
+                    break;
+                }
+            };
+            match &observation {
+                PluginObservation::Exited {
+                    run_id, node_id, ..
+                }
+                | PluginObservation::Failed {
+                    run_id, node_id, ..
+                } if *run_id == self.run_id => {
+                    self.collector.unsubscribe_node(*run_id, *node_id);
+                }
+                _ => {}
+            }
             emit_plugin_observation(
-                self.orch_telemetry,
-                self.dashboard,
-                self.provider,
+                &mut self.orch_telemetry,
+                self.dashboard.as_ref(),
+                &self.provider,
                 &observation,
             );
             let terminal = match observation {
@@ -2048,7 +2306,9 @@ impl ServeCluster<'_> {
                 } => Some((node_id, reason)),
                 _ => None,
             };
-            if let Some((node_id, error)) = terminal {
+            if let ServeClusterEffect::ProviderTerminalFailure { node_id, error } =
+                self.lifecycle.plugin_observation(terminal)
+            {
                 let _ = self.stack.runtime.send_to(
                     self.orchestrator_actor,
                     OrchestratorMsg::Manual(ManualControlMsg::ProviderTerminalFailure {
@@ -2059,78 +2319,132 @@ impl ServeCluster<'_> {
             }
         }
     }
-}
 
-fn flush_manual_control(
-    runtime: &swactor::runtime::Runtime,
-    actor: ActorAddress,
-) -> Result<(), String> {
-    let replies = runtime
-        .new_inbox::<crate::orchestration::manual_control::ManualControlReply>()
-        .map_err(|error| format!("create shutdown flush inbox: {error}"))?;
-    runtime
-        .send_to(
-            actor,
-            OrchestratorMsg::Manual(ManualControlMsg::Flush {
-                reply_to: *replies.addr(),
-            }),
-        )
-        .map_err(|error| format!("request shutdown persistence flush: {error}"))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if matches!(
-            replies.try_recv(),
-            Some(crate::orchestration::manual_control::ManualControlReply::Flushed)
-        ) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    Err("timed out waiting for shutdown persistence flush".to_owned())
-}
-
-#[allow(clippy::disallowed_methods)]
-fn serve_cluster(mut ctx: ServeCluster<'_>) -> Result<(), String> {
-    loop {
-        ctx.collector.pump(ctx.driver);
-        ctx.collector.drain(|stream, descriptor, channel, frame| {
-            if let Some(dashboard) = ctx.dashboard {
+    fn pump_once(&mut self) {
+        self.collector.pump(&self.driver);
+        let dashboard = self.dashboard.as_ref();
+        let telemetry = &mut self.orch_telemetry;
+        self.collector.drain(|stream, descriptor, channel, frame| {
+            if let Some(dashboard) = dashboard {
                 dashboard.publish_frame(stream, descriptor, channel, frame);
             }
-            ctx.orch_telemetry
-                .archive_frame("node", stream, channel, frame);
+            telemetry.archive_frame("node", stream, channel, frame);
         });
-        ctx.drain_observations();
-        while let Some(report) = ctx.orchestrator_reports.try_recv() {
-            ctx.observe_report(report);
+        self.drain_observations();
+        while let Some(report) = self.orchestrator_reports.try_recv() {
+            self.observe_report(report);
         }
-        ctx.advance_join_barriers();
+        self.advance_join_barriers();
         emit_swim_transitions(
-            ctx.orch_telemetry,
-            ctx.dashboard,
-            ctx.run_id,
-            ctx.orchestrator_node_id,
-            ctx.stack,
+            &mut self.orch_telemetry,
+            self.dashboard.as_ref(),
+            self.run_id,
+            self.orchestrator_node_id,
+            &self.stack,
         );
         emit_swim_probe_events(
-            ctx.orch_telemetry,
-            ctx.dashboard,
-            ctx.stack,
+            &mut self.orch_telemetry,
+            self.dashboard.as_ref(),
+            &self.stack,
             "daemon_monitor",
         );
         drain_orch_stdio_capture(
-            ctx.orch_stdio_rx,
-            ctx.orch_telemetry,
-            ctx.dashboard,
-            ctx.run_id,
-            ctx.orchestrator_node_id,
+            self.orch_stdio_rx.as_ref(),
+            &mut self.orch_telemetry,
+            self.dashboard.as_ref(),
+            self.run_id,
+            self.orchestrator_node_id,
         );
-        if stop_requested(ctx.stop_signal) {
-            break;
-        }
-        thread::sleep(PUMP_INTERVAL);
+        self.orch_telemetry
+            .flush(self.dashboard.as_ref(), "orchestrator");
     }
-    Ok(())
+
+    fn schedule(&self, ctx: &Ctx, delay: Duration, message: ServeClusterMsg) {
+        self.engine
+            .send_after(delay, self.sender.clone(), ctx.self_addr(), message);
+    }
+
+    fn begin_flush(&mut self, ctx: &Ctx) -> Result<(), String> {
+        let reply_actor = self
+            .stack
+            .runtime
+            .spawn(ManualFlushForwarder {
+                sender: self.sender.clone(),
+                serve_actor: ctx.self_addr(),
+            })
+            .map_err(|error| format!("spawn shutdown flush reply actor: {error}"))?;
+        if let Err(error) = self.stack.runtime.send_to(
+            self.orchestrator_actor,
+            OrchestratorMsg::Manual(ManualControlMsg::Flush {
+                reply_to: reply_actor,
+            }),
+        ) {
+            let _ = self.stack.runtime.stop_actor(reply_actor);
+            return Err(format!("request shutdown persistence flush: {error}"));
+        }
+        self.flush_reply_actor = Some(reply_actor);
+        self.schedule(ctx, SHUTDOWN_FLUSH_TIMEOUT, ServeClusterMsg::FlushTimeout);
+        Ok(())
+    }
+
+    fn finish(&mut self, ctx: &Ctx, result: Result<(), String>) {
+        if let Some(reply_actor) = self.flush_reply_actor.take() {
+            let _ = self.stack.runtime.stop_actor(reply_actor);
+        }
+        if let Err(error) = &result {
+            self.orch_telemetry.emit_bootstrap(
+                self.dashboard.as_ref(),
+                self.run_id,
+                self.orchestrator_node_id,
+                "serve_cluster",
+                "failed",
+                json!({"error":error}),
+            );
+        }
+        assert!(
+            self.completion.complete(result).is_ok(),
+            "daemon lifecycle completed twice"
+        );
+        ctx.stop_self();
+    }
+}
+
+impl ActorInterface for ServeClusterActor {
+    type Incoming = ServeClusterMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        let _ = ctx.send(ctx.self_addr(), ServeClusterMsg::Tick);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+        let effect = self.lifecycle.apply_message(message);
+        match effect {
+            ServeClusterEffect::None => {}
+            ServeClusterEffect::Pump => {
+                self.pump_once();
+                self.schedule(ctx, PUMP_INTERVAL, ServeClusterMsg::Tick);
+            }
+            ServeClusterEffect::BeginFlush => {
+                if let Err(error) = self.begin_flush(ctx) {
+                    let failure = self.lifecycle.apply_message(ServeClusterMsg::Abort(error));
+                    if let ServeClusterEffect::Complete(result) = failure {
+                        self.finish(ctx, result);
+                    }
+                }
+            }
+            ServeClusterEffect::ProviderTerminalFailure { node_id, error } => {
+                let _ = self.stack.runtime.send_to(
+                    self.orchestrator_actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::ProviderTerminalFailure {
+                        node_id,
+                        error,
+                    }),
+                );
+            }
+            ServeClusterEffect::Complete(result) => self.finish(ctx, result),
+        }
+    }
 }
 
 fn emit_plugin_observation(
@@ -2304,17 +2618,15 @@ pub(crate) fn expand_home_path(value: &str) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
-    let output = Command::new("ssh-keygen")
-        .arg("-y")
-        .arg("-f")
-        .arg(identity)
-        .output()
-        .map_err(|e| {
-            format!(
-                "derive VastAI SSH public key from {}: {e}",
-                identity.display()
-            )
-        })?;
+    let output = swactor_process::command_output(
+        &mut Command::new("ssh-keygen").arg("-y").arg("-f").arg(identity),
+    )
+    .map_err(|e| {
+        format!(
+            "derive VastAI SSH public key from {}: {e}",
+            identity.display()
+        )
+    })?;
     let public_key = String::from_utf8_lossy(&output.stdout)
         .trim_end_matches(['\r', '\n'])
         .to_owned();
@@ -2336,12 +2648,10 @@ pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
     if std::fs::write(&path, format!("{public_key}\n")).is_err() {
         return UNAVAILABLE.to_owned();
     }
-    let output = Command::new("ssh-keygen")
-        .arg("-l")
-        .arg("-f")
-        .arg(&path)
-        .output()
-        .ok();
+    let output = swactor_process::command_output(
+        &mut Command::new("ssh-keygen").arg("-l").arg("-f").arg(&path),
+    )
+    .ok();
     let _ = std::fs::remove_file(&path);
     let Some(output) = output.filter(|output| output.status.success()) else {
         return UNAVAILABLE.to_owned();
@@ -2357,10 +2667,14 @@ pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
 }
 
 fn vastai_account_has_ssh_key(api_key: &str, public_key: &str) -> Result<bool, String> {
-    let output = Command::new("vastai")
-        .args(["show", "ssh-keys", "--raw", "--api-key", api_key])
-        .output()
-        .map_err(vastai_cli_error)?;
+    let output = swactor_process::command_output(&mut Command::new("vastai").args([
+        "show",
+        "ssh-keys",
+        "--raw",
+        "--api-key",
+        api_key,
+    ]))
+    .map_err(vastai_cli_error)?;
     if !output.status.success() {
         return Err(format!(
             "vastai show ssh-keys failed: {}",
@@ -2378,12 +2692,13 @@ pub(crate) fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> 
         return Ok(());
     }
 
-    let output = Command::new("vastai")
-        .args(["create", "ssh-key"])
-        .arg(public_key)
-        .args(["-y", "--api-key", api_key])
-        .output()
-        .map_err(vastai_cli_error)?;
+    let output = swactor_process::command_output(
+        &mut Command::new("vastai")
+            .args(["create", "ssh-key"])
+            .arg(public_key)
+            .args(["-y", "--api-key", api_key]),
+    )
+    .map_err(vastai_cli_error)?;
     if !output.status.success() {
         return Err(format!(
             "vastai create ssh-key failed: {}",
@@ -2445,6 +2760,656 @@ where
 }
 
 #[cfg(test)]
+mod serve_cluster_properties {
+    use proptest::prelude::*;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::RuntimeParts;
+    use swactor_engine::{ActorCompletion, Engine, SteppingBackend};
+
+    use super::*;
+    use crate::tests::fuzz_support::{actor_census, drive_steps};
+
+    const READY_NODE_DOMAIN: u8 = 8;
+    const STEPS_PER_ACTION: usize = 16;
+    const FINAL_STEPS: usize = 32;
+
+    #[derive(Clone, Debug)]
+    enum LifecycleAction {
+        Tick,
+        RuntimeReady { node_id: u8, readiness_id: u8 },
+        RuntimeReadyAck { node_id: u8, readiness_id: u8 },
+        PluginObserved { node_id: u8 },
+        PluginFailed { node_id: u8, code: u8 },
+        PluginDisconnected,
+        Stop,
+        ManualFlushed,
+        ManualRejected(u8),
+        ManualTimedOut,
+        FlushTimeout,
+        Abort(u8),
+    }
+
+    fn lifecycle_actions() -> impl Strategy<Value = Vec<LifecycleAction>> {
+        prop::collection::vec(
+            prop_oneof![
+                4 => Just(LifecycleAction::Tick),
+                4 => (0_u8..READY_NODE_DOMAIN, any::<u8>()).prop_map(
+                    |(node_id, readiness_id)| LifecycleAction::RuntimeReady {
+                        node_id,
+                        readiness_id,
+                    }
+                ),
+                3 => (0_u8..READY_NODE_DOMAIN, any::<u8>()).prop_map(
+                    |(node_id, readiness_id)| LifecycleAction::RuntimeReadyAck {
+                        node_id,
+                        readiness_id,
+                    }
+                ),
+                3 => (0_u8..READY_NODE_DOMAIN)
+                    .prop_map(|node_id| LifecycleAction::PluginObserved { node_id }),
+                3 => (0_u8..READY_NODE_DOMAIN, any::<u8>()).prop_map(
+                    |(node_id, code)| LifecycleAction::PluginFailed { node_id, code }
+                ),
+                2 => Just(LifecycleAction::PluginDisconnected),
+                3 => Just(LifecycleAction::Stop),
+                2 => Just(LifecycleAction::ManualFlushed),
+                2 => any::<u8>().prop_map(LifecycleAction::ManualRejected),
+                2 => Just(LifecycleAction::ManualTimedOut),
+                2 => Just(LifecycleAction::FlushTimeout),
+                2 => any::<u8>().prop_map(LifecycleAction::Abort),
+            ],
+            0..=32,
+        )
+    }
+
+    #[derive(Clone, Debug)]
+    enum LifecycleHarnessMsg {
+        Action(LifecycleAction),
+        ScheduledFlushTimeout,
+        Finalize,
+    }
+
+    #[derive(Clone, Debug)]
+    struct LifecycleTrace {
+        state: ServeClusterState,
+        pending_readies: Vec<(u64, u64)>,
+        max_pending_readies: usize,
+        completion_results: Vec<Result<(), String>>,
+        completion_publication_failures: usize,
+        pumps: usize,
+        readies_tracked: usize,
+        readies_acknowledged: usize,
+        provider_failures: Vec<(u64, String)>,
+        disconnected_observations: usize,
+        manual_replies: Vec<&'static str>,
+        flushes_started: usize,
+        flush_timers_scheduled: usize,
+    }
+
+    impl LifecycleTrace {
+        fn new() -> Self {
+            Self {
+                state: ServeClusterState::Running,
+                pending_readies: Vec::new(),
+                max_pending_readies: 0,
+                completion_results: Vec::new(),
+                completion_publication_failures: 0,
+                pumps: 0,
+                readies_tracked: 0,
+                readies_acknowledged: 0,
+                provider_failures: Vec::new(),
+                disconnected_observations: 0,
+                manual_replies: Vec::new(),
+                flushes_started: 0,
+                flush_timers_scheduled: 0,
+            }
+        }
+    }
+
+    struct ServeClusterLifecycleHarness {
+        lifecycle: ServeClusterLifecycle<()>,
+        completion: ActorCompletion<Result<(), String>>,
+        trace: Arc<Mutex<LifecycleTrace>>,
+        engine: EngineHandle,
+        sender: ExternalSender,
+    }
+
+    impl ServeClusterLifecycleHarness {
+        fn record_state(&self) {
+            let pending_readies = self
+                .lifecycle
+                .pending_readies
+                .iter()
+                .map(|(node_id, pending)| (*node_id, pending.readiness_id))
+                .collect::<Vec<_>>();
+            let mut trace = self.trace.lock();
+            trace.state = self.lifecycle.state;
+            trace.max_pending_readies = trace.max_pending_readies.max(pending_readies.len());
+            trace.pending_readies = pending_readies;
+        }
+
+        fn apply_effect(&mut self, ctx: &Ctx, effect: ServeClusterEffect) {
+            match effect {
+                ServeClusterEffect::None => {}
+                ServeClusterEffect::Pump => {
+                    self.trace.lock().pumps += 1;
+                }
+                ServeClusterEffect::BeginFlush => {
+                    {
+                        let mut trace = self.trace.lock();
+                        trace.flushes_started += 1;
+                        trace.flush_timers_scheduled += 1;
+                    }
+                    self.engine.send_after(
+                        SHUTDOWN_FLUSH_TIMEOUT,
+                        self.sender.clone(),
+                        ctx.self_addr(),
+                        LifecycleHarnessMsg::ScheduledFlushTimeout,
+                    );
+                }
+                ServeClusterEffect::ProviderTerminalFailure { node_id, error } => {
+                    self.trace.lock().provider_failures.push((node_id, error));
+                }
+                ServeClusterEffect::Complete(result) => {
+                    self.trace.lock().completion_results.push(result.clone());
+                    if self.completion.complete(result).is_err() {
+                        self.trace.lock().completion_publication_failures += 1;
+                    }
+                }
+            }
+        }
+
+        fn apply_action(&mut self, ctx: &Ctx, action: LifecycleAction) {
+            let effect = match action {
+                LifecycleAction::Tick => self.lifecycle.apply_message(ServeClusterMsg::Tick),
+                LifecycleAction::RuntimeReady {
+                    node_id,
+                    readiness_id,
+                } => {
+                    if self.lifecycle.track_runtime_ready(
+                        u64::from(node_id),
+                        u64::from(readiness_id),
+                        (),
+                    ) {
+                        self.trace.lock().readies_tracked += 1;
+                    }
+                    ServeClusterEffect::None
+                }
+                LifecycleAction::RuntimeReadyAck {
+                    node_id,
+                    readiness_id,
+                } => {
+                    if self
+                        .lifecycle
+                        .acknowledge_runtime_ready(u64::from(node_id), u64::from(readiness_id))
+                    {
+                        self.trace.lock().readies_acknowledged += 1;
+                    }
+                    ServeClusterEffect::None
+                }
+                LifecycleAction::PluginObserved { node_id } => {
+                    let _ = node_id;
+                    self.lifecycle.plugin_observation(None)
+                }
+                LifecycleAction::PluginFailed { node_id, code } => {
+                    self.lifecycle.plugin_observation(Some((
+                        u64::from(node_id),
+                        format!("plugin-failed-{code}"),
+                    )))
+                }
+                LifecycleAction::PluginDisconnected => {
+                    self.trace.lock().disconnected_observations += 1;
+                    self.lifecycle.plugin_observation(None)
+                }
+                LifecycleAction::Stop => self.lifecycle.apply_message(ServeClusterMsg::Stop),
+                LifecycleAction::ManualFlushed => {
+                    self.trace.lock().manual_replies.push("flushed");
+                    let message = serve_cluster_flush_reply(ManualControlReply::Flushed)
+                        .expect("flush reply must be forwarded");
+                    self.lifecycle.apply_message(message)
+                }
+                LifecycleAction::ManualRejected(code) => {
+                    self.trace.lock().manual_replies.push("rejected");
+                    let message = serve_cluster_flush_reply(ManualControlReply::Rejected(format!(
+                        "manual-rejected-{code}"
+                    )))
+                    .expect("rejected flush reply must be forwarded");
+                    self.lifecycle.apply_message(message)
+                }
+                LifecycleAction::ManualTimedOut => {
+                    self.trace.lock().manual_replies.push("timed-out");
+                    let message = serve_cluster_flush_reply(ManualControlReply::TimedOut)
+                        .expect("timed-out flush reply must be forwarded");
+                    self.lifecycle.apply_message(message)
+                }
+                LifecycleAction::FlushTimeout => {
+                    self.lifecycle.apply_message(ServeClusterMsg::FlushTimeout)
+                }
+                LifecycleAction::Abort(code) => self
+                    .lifecycle
+                    .apply_message(ServeClusterMsg::Abort(format!("abort-{code}"))),
+            };
+            self.apply_effect(ctx, effect);
+            self.record_state();
+        }
+    }
+
+    impl ActorInterface for ServeClusterLifecycleHarness {
+        type Incoming = LifecycleHarnessMsg;
+        type Response = ();
+
+        fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+            match message {
+                LifecycleHarnessMsg::Action(action) => self.apply_action(ctx, action),
+                LifecycleHarnessMsg::ScheduledFlushTimeout => {
+                    let effect = self.lifecycle.apply_message(ServeClusterMsg::FlushTimeout);
+                    self.apply_effect(ctx, effect);
+                    self.record_state();
+                }
+                LifecycleHarnessMsg::Finalize => {
+                    if !matches!(self.lifecycle.state, ServeClusterState::Finished) {
+                        let effect = self.lifecycle.apply_message(ServeClusterMsg::Abort(
+                            "generated sequence exhausted".to_owned(),
+                        ));
+                        self.apply_effect(ctx, effect);
+                    }
+                    self.record_state();
+                    ctx.stop_self();
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ExpectedLifecycle {
+        success: bool,
+        readies_tracked: usize,
+        readies_acknowledged: usize,
+        provider_failures: usize,
+        manual_replies: usize,
+        flushes_started: usize,
+    }
+
+    fn expected_lifecycle(actions: &[LifecycleAction]) -> ExpectedLifecycle {
+        let mut state = ServeClusterState::Running;
+        let mut pending_readies = BTreeMap::<u64, u64>::new();
+        let mut result = None;
+        let mut readies_tracked = 0;
+        let mut readies_acknowledged = 0;
+        let mut provider_failures = 0;
+        let mut manual_replies = 0;
+        let mut flushes_started = 0;
+
+        for action in actions {
+            match action {
+                LifecycleAction::Tick | LifecycleAction::PluginObserved { .. } => {}
+                LifecycleAction::RuntimeReady {
+                    node_id,
+                    readiness_id,
+                } if matches!(state, ServeClusterState::Running) => {
+                    let node_id = u64::from(*node_id);
+                    let readiness_id = u64::from(*readiness_id);
+                    let newer = pending_readies
+                        .get(&node_id)
+                        .is_none_or(|current| *current < readiness_id);
+                    if newer {
+                        pending_readies.insert(node_id, readiness_id);
+                        readies_tracked += 1;
+                    }
+                }
+                LifecycleAction::RuntimeReadyAck {
+                    node_id,
+                    readiness_id,
+                } => {
+                    let node_id = u64::from(*node_id);
+                    let readiness_id = u64::from(*readiness_id);
+                    if pending_readies.get(&node_id) == Some(&readiness_id) {
+                        pending_readies.remove(&node_id);
+                        readies_acknowledged += 1;
+                    }
+                }
+                LifecycleAction::PluginFailed { .. }
+                    if matches!(state, ServeClusterState::Running) =>
+                {
+                    provider_failures += 1;
+                }
+                LifecycleAction::PluginDisconnected
+                | LifecycleAction::PluginFailed { .. }
+                | LifecycleAction::RuntimeReady { .. } => {}
+                LifecycleAction::Stop if matches!(state, ServeClusterState::Running) => {
+                    state = ServeClusterState::Flushing;
+                    pending_readies.clear();
+                    flushes_started += 1;
+                }
+                LifecycleAction::ManualFlushed => {
+                    manual_replies += 1;
+                    if matches!(state, ServeClusterState::Flushing) {
+                        state = ServeClusterState::Finished;
+                        pending_readies.clear();
+                        result = Some(true);
+                    }
+                }
+                LifecycleAction::ManualRejected(_) | LifecycleAction::ManualTimedOut => {
+                    manual_replies += 1;
+                    if matches!(state, ServeClusterState::Flushing) {
+                        state = ServeClusterState::Finished;
+                        pending_readies.clear();
+                        result = Some(false);
+                    }
+                }
+                LifecycleAction::FlushTimeout if matches!(state, ServeClusterState::Flushing) => {
+                    state = ServeClusterState::Finished;
+                    pending_readies.clear();
+                    result = Some(false);
+                }
+                LifecycleAction::Abort(_) if !matches!(state, ServeClusterState::Finished) => {
+                    state = ServeClusterState::Finished;
+                    pending_readies.clear();
+                    result = Some(false);
+                }
+                LifecycleAction::Stop
+                | LifecycleAction::FlushTimeout
+                | LifecycleAction::Abort(_) => {}
+            }
+        }
+
+        if matches!(state, ServeClusterState::Flushing) {
+            result = Some(false);
+        }
+        ExpectedLifecycle {
+            success: result.unwrap_or(false),
+            readies_tracked,
+            readies_acknowledged,
+            provider_failures,
+            manual_replies,
+            flushes_started,
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct LifecycleResources {
+        baseline_actors: usize,
+        peak_actors: usize,
+        final_actors: usize,
+        baseline_tasks: usize,
+        peak_tasks: usize,
+        final_tasks: usize,
+        poisoned_actors: usize,
+        worker_panics: u64,
+        mailbox_depth: usize,
+    }
+
+    impl LifecycleResources {
+        fn new(baseline_actors: usize, baseline_tasks: usize) -> Self {
+            Self {
+                baseline_actors,
+                peak_actors: baseline_actors,
+                final_actors: baseline_actors,
+                baseline_tasks,
+                peak_tasks: baseline_tasks,
+                final_tasks: baseline_tasks,
+                poisoned_actors: 0,
+                worker_panics: 0,
+                mailbox_depth: 0,
+            }
+        }
+
+        fn observe(&mut self, runtime: &Runtime, backend: &SteppingBackend) {
+            let stats = runtime.stats();
+            self.peak_actors = self.peak_actors.max(stats.actors.len());
+            self.final_actors = stats.actors.len();
+            self.peak_tasks = self.peak_tasks.max(backend.pending_task_count());
+            self.final_tasks = backend.pending_task_count();
+            self.poisoned_actors = stats
+                .actor_details
+                .iter()
+                .filter(|actor| actor.poisoned)
+                .count();
+            self.worker_panics = stats.workers.iter().map(|worker| worker.panics).sum();
+            self.mailbox_depth = stats
+                .workers
+                .iter()
+                .map(|worker| worker.mailbox_depth)
+                .sum::<usize>()
+                + stats
+                    .actor_details
+                    .iter()
+                    .map(|actor| actor.mailbox_depth)
+                    .sum::<usize>();
+        }
+    }
+
+    fn lifecycle_invariant_errors(
+        trace: &LifecycleTrace,
+        resources: &LifecycleResources,
+        expected: &ExpectedLifecycle,
+        published_result: &Option<Result<(), String>>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if trace.state != ServeClusterState::Finished {
+            errors.push(format!(
+                "lifecycle did not converge: state={:?}",
+                trace.state
+            ));
+        }
+        if !trace.pending_readies.is_empty() {
+            errors.push(format!(
+                "pending readiness did not drain: {:?}",
+                trace.pending_readies
+            ));
+        }
+        if trace.max_pending_readies > usize::from(READY_NODE_DOMAIN) {
+            errors.push(format!(
+                "pending readiness exceeded node domain: max={} domain={}",
+                trace.max_pending_readies, READY_NODE_DOMAIN
+            ));
+        }
+        if trace.completion_results.len() != 1 {
+            errors.push(format!(
+                "expected one completion, observed {:?}",
+                trace.completion_results
+            ));
+        }
+        if trace.completion_publication_failures != 0 {
+            errors.push(format!(
+                "completion publication failed {} time(s)",
+                trace.completion_publication_failures
+            ));
+        }
+        if trace.completion_results.first().map(Result::is_ok) != Some(expected.success) {
+            errors.push(format!(
+                "completion/model mismatch: completion={:?} expected_success={}",
+                trace.completion_results, expected.success
+            ));
+        }
+        if published_result.as_ref() != trace.completion_results.first() {
+            errors.push(format!(
+                "published completion mismatch: published={published_result:?} trace={:?}",
+                trace.completion_results
+            ));
+        }
+        if trace.readies_tracked != expected.readies_tracked
+            || trace.readies_acknowledged != expected.readies_acknowledged
+        {
+            errors.push(format!(
+                "readiness model mismatch: tracked={}/{} acknowledged={}/{}",
+                trace.readies_tracked,
+                expected.readies_tracked,
+                trace.readies_acknowledged,
+                expected.readies_acknowledged
+            ));
+        }
+        if trace.provider_failures.len() != expected.provider_failures {
+            errors.push(format!(
+                "manual provider-failure forwarding mismatch: observed={:?} expected_count={}",
+                trace.provider_failures, expected.provider_failures
+            ));
+        }
+        if trace.manual_replies.len() != expected.manual_replies {
+            errors.push(format!(
+                "manual reply evidence mismatch: observed={:?} expected_count={}",
+                trace.manual_replies, expected.manual_replies
+            ));
+        }
+        if trace.flushes_started != expected.flushes_started
+            || trace.flush_timers_scheduled != trace.flushes_started
+            || trace.flushes_started > 1
+        {
+            errors.push(format!(
+                "flush state was not bounded: starts={} timers={} expected_starts={}",
+                trace.flushes_started, trace.flush_timers_scheduled, expected.flushes_started
+            ));
+        }
+        if resources.peak_actors > resources.baseline_actors.saturating_add(1) {
+            errors.push(format!(
+                "per-event actor growth: baseline={} peak={}",
+                resources.baseline_actors, resources.peak_actors
+            ));
+        }
+        if resources.final_actors != resources.baseline_actors {
+            errors.push(format!(
+                "actor census did not return to baseline: baseline={} final={}",
+                resources.baseline_actors, resources.final_actors
+            ));
+        }
+        if resources.peak_tasks > resources.baseline_tasks.saturating_add(1) {
+            errors.push(format!(
+                "pending tasks were unbounded: baseline={} peak={}",
+                resources.baseline_tasks, resources.peak_tasks
+            ));
+        }
+        if resources.final_tasks != resources.baseline_tasks {
+            errors.push(format!(
+                "pending tasks did not drain: baseline={} final={}",
+                resources.baseline_tasks, resources.final_tasks
+            ));
+        }
+        if resources.poisoned_actors != 0 || resources.worker_panics != 0 {
+            errors.push(format!(
+                "actor poison detected: poisoned={} worker_panics={}",
+                resources.poisoned_actors, resources.worker_panics
+            ));
+        }
+        if resources.mailbox_depth != 0 {
+            errors.push(format!(
+                "mailboxes did not drain: depth={}",
+                resources.mailbox_depth
+            ));
+        }
+        errors
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2_000,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn serve_cluster_production_transitions_converge_once_without_growth(
+            actions in lifecycle_actions()
+        ) {
+            let mut config = RuntimeConfig::default();
+            config.worker_count = 1;
+            let parts = RuntimeParts::new(config);
+            let runtime = parts.runtime().clone();
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
+            let baseline_actors = runtime.stats().actors.len();
+            let baseline_tasks = backend.pending_task_count();
+            let completion = ActorCompletion::new();
+            let trace = Arc::new(Mutex::new(LifecycleTrace::new()));
+            let actor = runtime
+                .spawn(ServeClusterLifecycleHarness {
+                    lifecycle: ServeClusterLifecycle::new(),
+                    completion: completion.clone(),
+                    trace: Arc::clone(&trace),
+                    engine: engine.handle(),
+                    sender: runtime.create_sender(),
+                })
+                .expect("spawn production lifecycle transition harness");
+            let mut resources = LifecycleResources::new(baseline_actors, baseline_tasks);
+            resources.observe(&runtime, &backend);
+
+            for action in &actions {
+                runtime
+                    .send_to(actor, LifecycleHarnessMsg::Action(action.clone()))
+                    .expect("queue generated serve-cluster action");
+                drive_steps(&backend, STEPS_PER_ACTION);
+                resources.observe(&runtime, &backend);
+            }
+
+            backend.advance_time(SHUTDOWN_FLUSH_TIMEOUT);
+            drive_steps(&backend, FINAL_STEPS);
+            resources.observe(&runtime, &backend);
+            runtime
+                .send_to(actor, LifecycleHarnessMsg::Finalize)
+                .expect("queue serve-cluster lifecycle finalizer");
+            drive_steps(&backend, FINAL_STEPS);
+            resources.observe(&runtime, &backend);
+
+            let trace = trace.lock().clone();
+            let published_result = if trace.completion_results.len() == 1
+                && trace.completion_publication_failures == 0
+            {
+                Some(completion.wait())
+            } else {
+                None
+            };
+            let expected = expected_lifecycle(&actions);
+            let errors =
+                lifecycle_invariant_errors(&trace, &resources, &expected, &published_result);
+            prop_assert!(
+                errors.is_empty(),
+                "serve-cluster lifecycle invariant failure\nerrors={errors:#?}\nactions={actions:#?}\nstate/replies={trace:#?}\nresources={resources:#?}\ncensus=\n{}",
+                actor_census(&runtime),
+            );
+        }
+    }
+
+    #[test]
+    fn serve_cluster_lifecycle_invariants_reject_injected_duplicate_and_growth() {
+        let mut trace = LifecycleTrace::new();
+        trace.state = ServeClusterState::Finished;
+        trace.completion_results = vec![
+            Err("injected-first".to_owned()),
+            Err("injected-duplicate".to_owned()),
+        ];
+        trace.completion_publication_failures = 1;
+        let expected = ExpectedLifecycle {
+            success: false,
+            readies_tracked: 0,
+            readies_acknowledged: 0,
+            provider_failures: 0,
+            manual_replies: 0,
+            flushes_started: 0,
+        };
+        let resources = LifecycleResources {
+            baseline_actors: 3,
+            peak_actors: 5,
+            final_actors: 3,
+            baseline_tasks: 0,
+            peak_tasks: 0,
+            final_tasks: 0,
+            poisoned_actors: 0,
+            worker_panics: 0,
+            mailbox_depth: 0,
+        };
+        let published_result = Some(Err("injected-first".to_owned()));
+
+        let errors = lifecycle_invariant_errors(&trace, &resources, &expected, &published_result);
+        assert!(
+            errors.iter().any(|error| error.contains("one completion"))
+                && errors
+                    .iter()
+                    .any(|error| error.contains("per-event actor growth")),
+            "controlled defects were not rejected by property invariants: {errors:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_policy_tests {
     use super::{ActorAddress, ConfigBuilder, EndpointAddr, VastAiProvisioningMode};
     #[test]
@@ -2469,6 +3434,13 @@ mod lifecycle_policy_tests {
             .node_spec_for_stage(coordinator, ActorAddress::default(), 1, 0)
             .unwrap();
         assert_eq!(spec.args, [crate::ORCHESTRATOR_WORKER_MODE_ARG]);
+        let attempt_id = spec.attempt_id.to_string();
+        assert_eq!(
+            spec.env.iter().find_map(
+                |(key, value)| (key == "MYELIN_NODE_ATTEMPT_ID").then_some(value.as_str())
+            ),
+            Some(attempt_id.as_str()),
+        );
         assert!(vastai.bootstrap_command.is_none());
     }
 

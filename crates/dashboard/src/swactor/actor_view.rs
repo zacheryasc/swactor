@@ -52,6 +52,7 @@ pub(crate) struct RuntimeState {
     pub(crate) uptime_ms: Option<u64>,
     pub(crate) actors: BTreeMap<String, ActorState>,
     pub(crate) history: VecDeque<HistorySample>,
+    actor_snapshot_generation: u64,
 }
 
 impl RuntimeState {
@@ -62,6 +63,7 @@ impl RuntimeState {
             uptime_ms: None,
             actors: BTreeMap::new(),
             history: VecDeque::with_capacity(HISTORY_CAP),
+            actor_snapshot_generation: 0,
         }
     }
 
@@ -79,28 +81,45 @@ impl RuntimeState {
     }
 
     fn apply_actors(&mut self, value: &Value, now: Instant) {
-        // Per-worker `worker_id` wrapper (TelemetryStatsHook shape) is the
-        // default placement for actors that do not carry one inline.
+        // A wrapped actor list is a complete snapshot for one worker. A list
+        // without a worker is a complete merged-runtime snapshot. Bare actor
+        // frames remain incremental.
         let wrapper_worker = u32_field(value, &["worker_id", "worker"]);
-        if let Some(actors) = value.get("actors").and_then(Value::as_array) {
-            for actor in actors {
-                self.apply_actor(actor, now, wrapper_worker);
-            }
-            return;
-        }
-        // A bare actor object per frame (no envelope).
-        self.apply_actor(value, now, wrapper_worker);
-    }
-
-    fn apply_actor(&mut self, value: &Value, now: Instant, default_worker: Option<u32>) {
-        let Some(address) = string_field(value, &["address", "addr", "actor_addr"]) else {
+        let Some(actors) = value.get("actors").and_then(Value::as_array) else {
+            let _ = self.apply_actor(value, now, wrapper_worker);
             return;
         };
+
+        self.actor_snapshot_generation = self.actor_snapshot_generation.wrapping_add(1);
+        let generation = self.actor_snapshot_generation;
+        for actor in actors {
+            if let Some(actor) = self.apply_actor(actor, now, wrapper_worker) {
+                actor.snapshot_generation = generation;
+            }
+        }
+        match wrapper_worker {
+            Some(worker_id) => self.actors.retain(|_, actor| {
+                actor.worker_id != Some(worker_id) || actor.snapshot_generation == generation
+            }),
+            None => self
+                .actors
+                .retain(|_, actor| actor.snapshot_generation == generation),
+        }
+    }
+
+    fn apply_actor(
+        &mut self,
+        value: &Value,
+        now: Instant,
+        default_worker: Option<u32>,
+    ) -> Option<&mut ActorState> {
+        let address = string_field(value, &["address", "addr", "actor_addr"])?;
         let actor = self
             .actors
             .entry(address.clone())
             .or_insert_with(|| ActorState::new(address));
         actor.apply_json(value, now, default_worker);
+        Some(actor)
     }
 
     fn apply_stats(&mut self, value: &Value, now: Instant) {
@@ -128,7 +147,7 @@ impl RuntimeState {
         // Some publishers carry full per-actor detail under `actor_details`.
         if let Some(details) = value.get("actor_details").and_then(Value::as_array) {
             for actor in details {
-                self.apply_actor(actor, now, None);
+                let _ = self.apply_actor(actor, now, None);
             }
         }
     }
@@ -185,6 +204,7 @@ pub(crate) struct ActorState {
     /// Messages folded away by the receipt sampling interval.
     pub(crate) sampled_out: u64,
     pub(crate) last_update: Option<Instant>,
+    snapshot_generation: u64,
 }
 
 impl ActorState {
@@ -206,6 +226,7 @@ impl ActorState {
             receipts: VecDeque::with_capacity(RECEIPT_CAP),
             sampled_out: 0,
             last_update: None,
+            snapshot_generation: 0,
         }
     }
 
@@ -432,4 +453,66 @@ fn parse_message_type_counts(value: Option<&Value>) -> Option<Vec<(String, u64)>
         return Some(out);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn per_worker_snapshots_remove_stopped_actors_without_touching_other_workers() {
+        let now = Instant::now();
+        let mut runtime = RuntimeState::new(now);
+
+        runtime.apply_actors(
+            &json!({
+                "worker_id": 0,
+                "actors": [
+                    {"address": "stable", "actor_type": "StableActor"},
+                    {"address": "observer", "actor_type": "ControlReplyObserver"},
+                ],
+            }),
+            now,
+        );
+        runtime.apply_actors(
+            &json!({
+                "worker_id": 1,
+                "actors": [
+                    {"address": "other-worker", "actor_type": "OtherActor"},
+                ],
+            }),
+            now,
+        );
+        assert_eq!(runtime.actors.len(), 3);
+
+        runtime.apply_actors(
+            &json!({
+                "worker_id": 0,
+                "actors": [
+                    {"address": "stable", "actor_type": "StableActor"},
+                ],
+            }),
+            now,
+        );
+        assert_eq!(
+            runtime
+                .actors
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["other-worker", "stable"]
+        );
+
+        runtime.apply_actors(&json!({"worker_id": 0, "actors": []}), now);
+        assert_eq!(
+            runtime
+                .actors
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["other-worker"]
+        );
+    }
 }

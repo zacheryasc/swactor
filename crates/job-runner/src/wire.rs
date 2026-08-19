@@ -66,6 +66,18 @@ pub enum NodeJobCommand {
         job_id: u64,
         outputs: Vec<String>,
     },
+    /// Engine-owned timer observation used while an edge workspace transfer is
+    /// pending. `job_id` rejects stale timer delivery.
+    #[doc(hidden)]
+    CheckWorkspaceReady {
+        job_id: u64,
+    },
+    /// Engine-owned timer observation used while an edge output sink is
+    /// pending. `job_id` rejects stale timer delivery.
+    #[doc(hidden)]
+    CheckOutputSink {
+        job_id: u64,
+    },
 }
 
 impl NetworkMessage for NodeJobCommand {

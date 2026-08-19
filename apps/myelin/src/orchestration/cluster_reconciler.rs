@@ -1,7 +1,9 @@
 //! Myelin integration for the provider-neutral cluster reconciler.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+#[cfg(test)]
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 
@@ -12,7 +14,9 @@ use provisioning::{
     NodeManagerCommand, NodeObservation, NodeStage, OperationOutcome, PlannedEffect,
     ProviderLeaseId, RetryPolicy, SshEndpoint, SwactorId,
 };
-use swactor_engine::EngineHandle;
+use swactor::actor::{ActorAddress, ActorInterface};
+use swactor::runtime::{Ctx, ExternalSender, Runtime};
+use swactor_engine::{BlockingWorkSender, EngineHandle};
 
 use crate::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
@@ -447,12 +451,14 @@ impl EffectBackend for MyelinEffectBackend {
 
 #[derive(Clone)]
 pub(crate) struct EngineEffectSpawner {
-    engine: EngineHandle,
+    blocking: BlockingWorkSender,
 }
 
 impl EngineEffectSpawner {
-    fn new(engine: EngineHandle) -> Self {
-        Self { engine }
+    fn new(engine: &EngineHandle) -> Self {
+        Self {
+            blocking: engine.blocking_work_sender(),
+        }
     }
 }
 
@@ -463,11 +469,9 @@ impl BlockingEffectSpawner for EngineEffectSpawner {
         &self,
         work: provisioning::BlockingEffectWork,
     ) -> Result<(), Self::SpawnError> {
-        if !self.engine.capabilities().blocking {
-            return Err("engine blocking work capability is unavailable".to_owned());
-        }
-        self.engine.spawn_blocking(work);
-        Ok(())
+        self.blocking
+            .submit(work)
+            .map_err(|_| "engine stopped before provider effect submission".to_owned())
     }
 }
 
@@ -476,14 +480,79 @@ enum ControllerWake {
     Periodic,
 }
 
+#[derive(Clone)]
+enum ControllerTimerMsg {
+    ScheduleDeadline(Option<SystemTime>),
+    DeadlineElapsed(SystemTime),
+    PeriodicElapsed,
+}
+
+struct ControllerTimerActor {
+    engine: EngineHandle,
+    sender: ExternalSender,
+    wake: Sender<ControllerWake>,
+    scheduled_deadline: Option<SystemTime>,
+}
+
+impl ControllerTimerActor {
+    fn schedule_periodic(&self, ctx: &Ctx) {
+        self.engine.send_after(
+            PERIODIC_RECONCILE,
+            self.sender.clone(),
+            ctx.self_addr(),
+            ControllerTimerMsg::PeriodicElapsed,
+        );
+    }
+}
+
+impl ActorInterface for ControllerTimerActor {
+    type Incoming = ControllerTimerMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.schedule_periodic(ctx);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+        match message {
+            ControllerTimerMsg::ScheduleDeadline(deadline) => {
+                self.scheduled_deadline = deadline;
+                if let Some(deadline) = deadline {
+                    self.engine.send_after(
+                        deadline
+                            .duration_since(SystemTime::now())
+                            .unwrap_or(Duration::ZERO),
+                        self.sender.clone(),
+                        ctx.self_addr(),
+                        ControllerTimerMsg::DeadlineElapsed(deadline),
+                    );
+                }
+            }
+            ControllerTimerMsg::DeadlineElapsed(deadline) => {
+                if self.scheduled_deadline == Some(deadline) {
+                    self.scheduled_deadline = None;
+                    let _ = self.wake.send(ControllerWake::Deadline(deadline));
+                }
+            }
+            ControllerTimerMsg::PeriodicElapsed => {
+                if self.wake.send(ControllerWake::Periodic).is_ok() {
+                    self.schedule_periodic(ctx);
+                } else {
+                    ctx.stop_self();
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct ProvisionedClusterGuard {
     driver: ClusterDriver,
     executor: IdempotentEffectExecutor<MyelinEffectBackend, EngineEffectSpawner>,
     external_nodes: BTreeMap<u64, LogicalNodeId>,
     failure_rx: Receiver<TaggedFailure>,
     deferred_failures: VecDeque<TaggedFailure>,
-    engine: EngineHandle,
-    wake_tx: Sender<ControllerWake>,
+    runtime: Runtime,
+    timer_actor: ActorAddress,
     wake_rx: Receiver<ControllerWake>,
     scheduled_deadline: Option<SystemTime>,
     stopped: bool,
@@ -495,6 +564,7 @@ impl ProvisionedClusterGuard {
         bindings: Vec<ReconcilerNodeBinding>,
         retry: RetryPolicy,
         engine: EngineHandle,
+        runtime: Runtime,
         sink: PluginSink,
     ) -> Result<Self, String> {
         let expanded = desired.expand().map_err(|error| error.to_string())?;
@@ -520,19 +590,25 @@ impl ProvisionedClusterGuard {
         }
         let (failure_tx, failure_rx) = mpsc::channel();
         let (backend, external_nodes) = MyelinEffectBackend::new(bindings, sink, failure_tx)?;
-        let executor =
-            IdempotentEffectExecutor::new(backend, EngineEffectSpawner::new(engine.clone()));
+        let executor = IdempotentEffectExecutor::new(backend, EngineEffectSpawner::new(&engine));
         let driver = ClusterDriver::new(desired, retry).map_err(|error| error.to_string())?;
         let (wake_tx, wake_rx) = mpsc::channel();
-        spawn_periodic_wake(&engine, wake_tx.clone());
+        let timer_actor = runtime
+            .spawn(ControllerTimerActor {
+                engine: engine.clone(),
+                sender: runtime.create_sender(),
+                wake: wake_tx,
+                scheduled_deadline: None,
+            })
+            .map_err(|error| format!("spawn cluster timer actor: {error}"))?;
         Ok(Self {
             driver,
             executor,
             external_nodes,
             failure_rx,
             deferred_failures: VecDeque::new(),
-            engine,
-            wake_tx,
+            runtime,
+            timer_actor,
             wake_rx,
             scheduled_deadline: None,
             stopped: false,
@@ -657,7 +733,7 @@ impl ProvisionedClusterGuard {
         Ok(submitted)
     }
 
-    fn begin_shutdown(&mut self) -> Result<(), String> {
+    pub(crate) fn begin_shutdown(&mut self) -> Result<(), String> {
         if self.stopped {
             return Ok(());
         }
@@ -673,31 +749,46 @@ impl ProvisionedClusterGuard {
         self.driver.state().nodes.is_empty()
     }
 
-    // Synchronous orchestration waits while all provider work remains engine-hosted.
-    #[allow(clippy::disallowed_methods)]
+    pub(crate) fn finish_shutdown(&mut self) -> Result<(), String> {
+        if !self.stopped {
+            self.executor.backend().stop_all()?;
+            self.stopped = true;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         self.begin_shutdown()?;
         while !self.is_stopped() {
             self.poll(SystemTime::now())
                 .map_err(|error| error.to_string())?;
-            std::thread::sleep(Duration::from_millis(10));
+            self.wait_for_work(Duration::from_millis(10));
         }
-        self.executor.backend().stop_all()?;
-        self.stopped = true;
-        Ok(())
+        self.finish_shutdown()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_work(&mut self, timeout: Duration) {
+        if let Ok(wake) = self.wake_rx.recv_timeout(timeout) {
+            self.apply_wake(wake, SystemTime::now());
+        }
     }
 
     fn drain_wakes(&mut self, now: SystemTime) {
-        loop {
-            match self.wake_rx.try_recv() {
-                Ok(ControllerWake::Periodic) => self.driver.trigger(),
-                Ok(ControllerWake::Deadline(deadline)) => {
-                    if self.scheduled_deadline == Some(deadline) {
-                        self.scheduled_deadline = None;
-                    }
-                    self.driver.trigger_if_due(now);
+        while let Ok(wake) = self.wake_rx.try_recv() {
+            self.apply_wake(wake, now);
+        }
+    }
+
+    fn apply_wake(&mut self, wake: ControllerWake, now: SystemTime) {
+        match wake {
+            ControllerWake::Periodic => self.driver.trigger(),
+            ControllerWake::Deadline(deadline) => {
+                if self.scheduled_deadline == Some(deadline) {
+                    self.scheduled_deadline = None;
                 }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+                self.driver.trigger_if_due(now);
             }
         }
     }
@@ -798,20 +889,19 @@ impl ProvisionedClusterGuard {
                 })
         {
             self.scheduled_deadline = None;
+            let _ = self
+                .runtime
+                .send_to(self.timer_actor, ControllerTimerMsg::ScheduleDeadline(None));
             return;
         }
-        if deadline.is_none() || deadline == self.scheduled_deadline {
+        if deadline == self.scheduled_deadline {
             return;
         }
-        let deadline = deadline.expect("checked deadline");
-        self.scheduled_deadline = Some(deadline);
-        let delay = deadline.duration_since(now).unwrap_or(Duration::ZERO);
-        let timer = self.engine.timer(delay);
-        let wake = self.wake_tx.clone();
-        self.engine.spawn(async move {
-            timer.await;
-            let _ = wake.send(ControllerWake::Deadline(deadline));
-        });
+        self.scheduled_deadline = deadline;
+        let _ = self.runtime.send_to(
+            self.timer_actor,
+            ControllerTimerMsg::ScheduleDeadline(deadline),
+        );
     }
 }
 
@@ -821,18 +911,6 @@ impl Drop for ProvisionedClusterGuard {
             let _ = self.executor.backend().stop_all();
         }
     }
-}
-
-fn spawn_periodic_wake(engine: &EngineHandle, wake: Sender<ControllerWake>) {
-    let mut interval = engine.interval(PERIODIC_RECONCILE);
-    engine.spawn(async move {
-        loop {
-            (&mut interval).await;
-            if wake.send(ControllerWake::Periodic).is_err() {
-                return;
-            }
-        }
-    });
 }
 
 fn lock_node(node: &Mutex<NodeEffects>) -> MutexGuard<'_, NodeEffects> {
@@ -1353,7 +1431,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::disallowed_methods)]
     fn engine_hosted_controller_converges_and_cleans_up_end_to_end() {
         let stats = Arc::new(PluginStats::default());
         let desired_node = desired();
@@ -1391,6 +1468,7 @@ mod tests {
             }),
         };
         let parts = swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
         let backend =
             swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap();
         let engine = swactor_engine::Engine::new(parts, backend).unwrap();
@@ -1400,6 +1478,7 @@ mod tests {
             vec![binding],
             RetryPolicy::default(),
             engine.handle(),
+            runtime,
             sink,
         )
         .unwrap();
@@ -1503,7 +1582,6 @@ mod tests {
         assert_eq!(scaled_stats.stops.load(Ordering::SeqCst), 1);
     }
     #[test]
-    #[allow(clippy::disallowed_methods)]
     fn ambiguous_create_timeout_retries_by_adoption_and_discards_late_success() {
         let stats = Arc::new(PluginStats::default());
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -1545,6 +1623,7 @@ mod tests {
             }),
         };
         let parts = swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
         let backend =
             swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap();
         let engine = swactor_engine::Engine::new(parts, backend).unwrap();
@@ -1556,6 +1635,7 @@ mod tests {
                 ..RetryPolicy::default()
             },
             engine.handle(),
+            runtime,
             PluginSink::new(Arc::new(NullSink)),
         )
         .unwrap();
