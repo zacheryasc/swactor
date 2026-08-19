@@ -17,8 +17,8 @@ use swactor::runtime::{
     Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
 };
 use swactor_vastai::{
-    CreateInstanceRequest, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedInstance,
-    SelectionPolicy, classify_vastai_error,
+    CreateInstanceRequest, LifecyclePolicy, Offer, OfferBrowseCriteria, ProvisionRequest,
+    ProvisionedInstance, SelectionPolicy, classify_vastai_error,
 };
 use telemetry::TelemetryProducer;
 
@@ -113,6 +113,16 @@ impl Drop for VastAiProviderMonitor {
 pub(crate) trait VastAiLeaseClient: Send {
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String>;
 
+    fn provision_exact(
+        &mut self,
+        _request: ProvisionRequest,
+        offer_id: u64,
+    ) -> Result<ProvisionedInstance, String> {
+        Err(format!(
+            "VastAI lease client does not support exact offer {offer_id}"
+        ))
+    }
+
     /// Resolves the live contract id carrying `label`, if any.
     fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String>;
 
@@ -153,6 +163,13 @@ impl ToolsVastAiLeaseClient {
 
     pub(crate) fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
         Self::new(swactor_vastai::VastClient::new(api_key))
+    }
+
+    pub(crate) fn browse_offers(
+        &mut self,
+        criteria: &OfferBrowseCriteria,
+    ) -> Result<Vec<Offer>, String> {
+        self.runtime.block_on(self.client.browse_offers(criteria))
     }
 
     fn create_request_for_offer(
@@ -505,6 +522,40 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
                 .map(|error| format!(" after create failure ({error})"))
                 .unwrap_or_default()
         ))
+    }
+
+    fn provision_exact(
+        &mut self,
+        request: ProvisionRequest,
+        offer_id: u64,
+    ) -> Result<ProvisionedInstance, String> {
+        if request.count != 1 {
+            return Err(format!(
+                "vastai provision_exact expected count=1, got {}",
+                request.count
+            ));
+        }
+        if let Some(label) = request.label.as_deref()
+            && let Some(contract_id) = self.contract_by_label(label)?
+        {
+            return Ok(adopted_instance(contract_id));
+        }
+        let offer = self
+            .candidate_pool(&request)?
+            .into_iter()
+            .find(|offer| offer.id == offer_id)
+            .ok_or_else(|| format!("selected offer {offer_id} is unavailable or ineligible"))?;
+        match self.create_from_offer(&request, &offer) {
+            Ok(instance) => Ok(instance),
+            Err(error) => {
+                if let Some(label) = request.label.as_deref()
+                    && let Some(contract_id) = self.contract_by_label(label)?
+                {
+                    return Ok(adopted_instance(contract_id));
+                }
+                Err(format!("selected offer {offer_id}: {error}"))
+            }
+        }
     }
 
     fn ssh_endpoint(
@@ -1057,13 +1108,10 @@ fn spawn_ssh_bootstrap_attempt(
     endpoint: &VastAiSshEndpoint,
     ssh_identity: Option<&Path>,
 ) -> Result<(Child, std::process::ChildStdout, std::process::ChildStderr), String> {
+    let remote_command = idempotent_ssh_bootstrap_command(spec);
     let mut command = Command::new("ssh");
     command
-        .args(ssh_bootstrap_args(
-            endpoint,
-            &spec.args.join(" "),
-            ssh_identity,
-        ))
+        .args(ssh_bootstrap_args(endpoint, &remote_command, ssh_identity))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1079,6 +1127,33 @@ fn spawn_ssh_bootstrap_attempt(
         .take()
         .ok_or_else(|| format!("VastAI node {} SSH stderr missing", spec.node_id))?;
     Ok((child, stdout, stderr))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn idempotent_ssh_bootstrap_command(spec: &NodeProvisionSpec) -> String {
+    let command = shell_single_quote(&spec.args.join(" "));
+    let lock = format!(
+        "/tmp/myelin-bootstrap-{}-{}-{}",
+        spec.run_id, spec.node_id, spec.attempt_id
+    );
+    format!(
+        "lock={lock}; command={command}; while :; do \
+         if mkdir \"$lock\" 2>/dev/null; then \
+           echo $$ > \"$lock/pid\"; sh -lc \"$command\"; status=$?; \
+           if [ \"$status\" -eq 0 ]; then touch \"$lock/complete\"; else rm -rf \"$lock\"; fi; \
+           exit \"$status\"; \
+         fi; \
+         if [ -f \"$lock/complete\" ]; then echo 'myelin bootstrap already complete'; exit 0; fi; \
+         pid=$(cat \"$lock/pid\" 2>/dev/null || true); \
+         if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then \
+           echo 'myelin bootstrap already running'; exit 0; \
+         fi; \
+         rm -rf \"$lock\"; \
+         done"
+    )
 }
 
 fn ssh_bootstrap_args(
@@ -1209,22 +1284,11 @@ where
             Err(cleanup) => format!("{reason}; cleanup destroy {contract_id} failed: {cleanup}"),
         }
     }
-}
-
-fn classified_start_error(reason: String) -> String {
-    let class = classify_vastai_error(&reason).as_str();
-    format!("{reason} [class={class}]")
-}
-
-impl<C, B> ProvisionPlugin for VastAiProvisioningPlugin<C, B>
-where
-    C: VastAiLeaseClient + Clone + 'static,
-    B: VastAiBootstrapLauncher + 'static,
-{
-    fn create_node(
+    fn create_node_with_offer(
         &mut self,
         spec: NodeProvisionSpec,
         sink: PluginSink,
+        selected_offer_id: Option<u64>,
     ) -> Result<PluginNodeHandle, String> {
         if !spec.mounts.is_empty() {
             return Err("vastai provider does not support host file mounts".to_owned());
@@ -1239,7 +1303,11 @@ where
         );
 
         let request = self.build_request(&spec, label.clone());
-        let instance = self.client.provision_one(request).map_err(|error| {
+        let instance = match selected_offer_id {
+            Some(offer_id) => self.client.provision_exact(request, offer_id),
+            None => self.client.provision_one(request),
+        }
+        .map_err(|error| {
             classified_start_error(format!("vastai provision node {}: {error}", spec.node_id))
         })?;
         emit_node_line(
@@ -1352,7 +1420,34 @@ where
         );
         Ok(handle)
     }
+}
 
+fn classified_start_error(reason: String) -> String {
+    let class = classify_vastai_error(&reason).as_str();
+    format!("{reason} [class={class}]")
+}
+
+impl<C, B> ProvisionPlugin for VastAiProvisioningPlugin<C, B>
+where
+    C: VastAiLeaseClient + Clone + 'static,
+    B: VastAiBootstrapLauncher + 'static,
+{
+    fn create_node(
+        &mut self,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<PluginNodeHandle, String> {
+        self.create_node_with_offer(spec, sink, None)
+    }
+
+    fn create_node_selected(
+        &mut self,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+        selected_offer_id: Option<u64>,
+    ) -> Result<PluginNodeHandle, String> {
+        self.create_node_with_offer(spec, sink, selected_offer_id)
+    }
     fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
         let node = self
             .nodes
@@ -1476,12 +1571,21 @@ where
         sink: PluginSink,
     ) -> Result<Option<AdoptedNode>, String> {
         let label = self.label_for(spec);
-        if self.client.contract_by_label(&label)?.is_none() {
+        let mut contract = None;
+        for attempt in 0..10 {
+            contract = self.client.contract_by_label(&label)?;
+            if contract.is_some() {
+                break;
+            }
+            if attempt < 9 {
+                thread::sleep(self.config.lifecycle.lease_pace);
+            }
+        }
+        if contract.is_none() {
             return Ok(None);
         }
-        // create_node's provision path adopts an existing labeled contract;
-        // the provider status monitor resumes and no agent restart occurs
-        // (start_bootstrap is deliberately not called).
+        // Reattach monitoring to the existing lease. The recovery state machine
+        // re-enters the idempotent bootstrap only for pre-joining snapshots.
         let handle = self.create_node(spec.clone(), sink)?;
         Ok(Some(AdoptedNode {
             handle,
@@ -1516,16 +1620,6 @@ where
         );
         result.map(|_| true)
     }
-
-    fn detach_all(&mut self) {
-        // Stop provider monitors (engine-hosted actors) without destroying
-        // leases: daemon exit must leave instances running.
-        for (_, mut node) in std::mem::take(&mut self.nodes) {
-            if let Some(mut monitor) = node.provider_monitor.take() {
-                monitor.stop();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1535,6 +1629,27 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn bootstrap_command_has_stable_remote_idempotency_guard() {
+        let spec = NodeProvisionSpec {
+            run_id: 5,
+            node_id: 7,
+            attempt_id: 9,
+            stage_index: Some(0),
+            image: "node:v1".to_owned(),
+            env: Vec::new(),
+            args: vec!["printf '%s' \"ready\"".to_owned()],
+            mounts: Vec::new(),
+        };
+
+        let command = idempotent_ssh_bootstrap_command(&spec);
+
+        assert!(command.contains("/tmp/myelin-bootstrap-5-7-9"));
+        assert!(command.contains("kill -0"));
+        assert!(command.contains("myelin bootstrap already running"));
+        assert!(command.contains("printf"));
+    }
 
     #[test]
     fn provision_one_adopts_stable_label_before_offer_search() {
@@ -1598,11 +1713,12 @@ mod tests {
     struct RetryDestroyClient {
         destroy_calls: Arc<AtomicUsize>,
         destroy_failures: Arc<AtomicUsize>,
+        existing_contract: Option<u64>,
     }
 
     impl VastAiLeaseClient for RetryDestroyClient {
         fn contract_by_label(&mut self, _label: &str) -> Result<Option<u64>, String> {
-            Ok(None)
+            Ok(self.existing_contract)
         }
 
         fn provision_one(
@@ -1685,6 +1801,7 @@ mod tests {
             RetryDestroyClient {
                 destroy_calls: Arc::clone(&destroy_calls),
                 destroy_failures,
+                existing_contract: None,
             },
             CountingBootstrap {
                 starts: Arc::clone(&starts),
@@ -1721,5 +1838,202 @@ mod tests {
         assert!(!plugin.leased_host_ids.contains(&44));
         assert_eq!(destroy_calls.load(Ordering::SeqCst), 2);
         assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn plugin_adopts_existing_contract_without_starting_bootstrap() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut plugin = VastAiProvisioningPlugin::new(
+            RetryDestroyClient {
+                destroy_calls: Arc::new(AtomicUsize::new(0)),
+                destroy_failures: Arc::new(AtomicUsize::new(0)),
+                existing_contract: Some(73),
+            },
+            CountingBootstrap {
+                starts: Arc::clone(&starts),
+                stops: Arc::new(AtomicUsize::new(0)),
+            },
+            VastAiProvisioningConfig::default(),
+        );
+        let spec = NodeProvisionSpec {
+            run_id: 5,
+            node_id: 7,
+            attempt_id: 9,
+            stage_index: Some(0),
+            image: "node:v1".to_owned(),
+            env: Vec::new(),
+            args: vec!["run-worker".to_owned()],
+            mounts: Vec::new(),
+        };
+
+        let adopted = plugin
+            .adopt_by_spec(&spec, PluginSink::new(Arc::new(NullSink)))
+            .unwrap()
+            .expect("labeled contract must be adopted");
+
+        assert_eq!(adopted.provider_ref, plugin.label_for(&spec));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    fn exact_request() -> ProvisionRequest {
+        ProvisionRequest {
+            count: 1,
+            image: "node:v1".to_owned(),
+            label: Some("exact-node".to_owned()),
+            disk_gb: 10,
+            env: BTreeMap::new(),
+            per_instance_env: vec![BTreeMap::new()],
+            preferred_offer_id: None,
+            onstart: None,
+            selection: SelectionPolicy {
+                drop_cheap_frac: 0.0,
+                ..SelectionPolicy::default()
+            },
+            lifecycle: LifecyclePolicy::default(),
+            confirm_lease: false,
+        }
+    }
+
+    #[test]
+    fn offer_search_is_read_only() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/v0/bundles/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "offers": [{
+                        "id": 41,
+                        "gpu_name": "A",
+                        "dph_total": 0.2,
+                        "host_id": 1,
+                        "compute_cap": 800,
+                        "reliability2": 0.99,
+                        "inet_down": 500.0,
+                        "inet_up": 500.0,
+                        "geolocation": "US"
+                    }]
+                })))
+                .mount(&server)
+                .await;
+        });
+        let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
+            server.uri(),
+            "secret",
+        ))
+        .unwrap();
+
+        let offers = client
+            .browse_offers(&OfferBrowseCriteria::default())
+            .unwrap();
+
+        assert_eq!(
+            offers.iter().map(|offer| offer.id).collect::<Vec<_>>(),
+            [41]
+        );
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(requests[0].url.path(), "/api/v0/bundles/");
+    }
+
+    #[test]
+    fn exact_offer_creation_never_requests_an_alternative() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/v0/instances/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instances": []})))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v0/bundles/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "offers": [
+                        {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                         "geolocation": "US"},
+                        {"id": 42, "gpu_name": "B", "dph_total": 0.3, "host_id": 2,
+                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                         "geolocation": "US"}
+                    ]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/api/v0/asks/42/"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"new_contract": 700})),
+                )
+                .mount(&server)
+                .await;
+        });
+        let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
+            server.uri(),
+            "secret",
+        ))
+        .unwrap();
+        let instance = client.provision_exact(exact_request(), 42).unwrap();
+        assert_eq!(instance.offer_id, 42);
+        assert_eq!(instance.contract_id, 700);
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "PUT")
+                .map(|request| request.url.path().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["/api/v0/asks/42/"]
+        );
+    }
+
+    #[test]
+    fn unavailable_exact_offer_fails_without_any_create_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = runtime.block_on(MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/api/v0/instances/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instances": []})))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v0/bundles/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "offers": [{
+                        "id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                        "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                        "geolocation": "US"
+                    }]
+                })))
+                .mount(&server)
+                .await;
+        });
+        let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
+            server.uri(),
+            "secret",
+        ))
+        .unwrap();
+        assert!(
+            client
+                .provision_exact(exact_request(), 42)
+                .unwrap_err()
+                .contains("selected offer 42")
+        );
+        let requests = runtime.block_on(server.received_requests()).unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "PUT")
+        );
     }
 }

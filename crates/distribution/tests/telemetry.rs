@@ -13,12 +13,12 @@ mod telemetry_records {
     //! Distribution-owned telemetry records keep their channels and JSON payloads stable through
     //! the mux.
 
-    use telemetry::frame::{Lifetime, NodeId, StreamId};
-    use telemetry::{ChannelId, Mux, Position, Record};
     use distribution::telemetry::{
         CacheEntryRec, DIST_STATE, DistributionState, MEMBERSHIP, MembershipTransition,
         RegistryEntryRec, SWIM_PROBES, SwimProbeEvent, TRANSPORT_INTERNALS, TransportInternals,
     };
+    use telemetry::frame::{Lifetime, NodeId, StreamId};
+    use telemetry::{ChannelId, Mux, Position, Record};
 
     #[test]
     fn distribution_state_record_round_trips_from_owner_crate() {

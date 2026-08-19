@@ -2,6 +2,128 @@ use crate::filters::reachable_offers;
 use crate::pricing::{CostModel, rank_survivors};
 use crate::types::{Offer, SearchResponse, SelectionPolicy};
 use std::collections::HashSet;
+/// Operator-entered filters for marketplace browsing.
+///
+/// Unlike [`SelectionPolicy`], these criteria carry no automatic-provisioning
+/// defaults: an unset field does not constrain the listing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OfferBrowseCriteria {
+    pub gpu_name_contains: Option<String>,
+    pub min_gpu_ram_mb: Option<u64>,
+    pub min_compute_cap: Option<u64>,
+    pub min_reliability: Option<f64>,
+    pub require_verified: bool,
+    pub min_down_mbps: Option<f64>,
+    pub min_up_mbps: Option<f64>,
+    pub max_dph_total: Option<f64>,
+    pub blacklist_hosts: Vec<u64>,
+}
+
+/// Lists selectable marketplace offers using only operator-entered filters.
+pub async fn browse_offers(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    criteria: &OfferBrowseCriteria,
+) -> Result<Vec<Offer>, String> {
+    // These are technical eligibility gates, not provisioning preferences.
+    let mut query = serde_json::json!({
+        "rentable": {"eq": true},
+        "rented": {"eq": false},
+        "cuda_max_good": {"gte": 12.6},
+        "direct_port_count": {"gte": 1},
+        "num_gpus": {"eq": 1},
+        "limit": 5000,
+    });
+    if let Some(value) = criteria.min_reliability {
+        query["reliability2"] = serde_json::json!({"gte": value});
+    }
+    if criteria.require_verified {
+        query["verified"] = serde_json::json!({"eq": true});
+    }
+    if let Some(value) = criteria.min_gpu_ram_mb {
+        query["gpu_ram"] = serde_json::json!({"gte": value});
+    }
+    if let Some(value) = criteria.min_compute_cap {
+        query["compute_cap"] = serde_json::json!({"gte": value});
+    }
+    if let Some(value) = criteria.min_down_mbps {
+        query["inet_down"] = serde_json::json!({"gte": value});
+    }
+    if let Some(value) = criteria.min_up_mbps {
+        query["inet_up"] = serde_json::json!({"gte": value});
+    }
+    if let Some(value) = criteria.max_dph_total {
+        query["dph_total"] = serde_json::json!({"lte": value});
+    }
+
+    let blocked = criteria
+        .blacklist_hosts
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let gpu_query = criteria
+        .gpu_name_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty());
+    let mut offers = fetch_offers(client, base_url, api_key, &query, "browse_offers")
+        .await?
+        .into_iter()
+        .filter(|offer| {
+            offer
+                .host_id
+                .is_none_or(|host_id| !blocked.contains(&host_id))
+        })
+        .filter(|offer| {
+            gpu_query.is_none_or(|query| contains_ascii_case_insensitive(&offer.gpu_name, query))
+        })
+        .collect::<Vec<_>>();
+    offers.sort_by(|left, right| {
+        left.dph_total
+            .total_cmp(&right.dph_total)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(offers)
+}
+
+fn contains_ascii_case_insensitive(value: &str, query: &str) -> bool {
+    query.is_empty()
+        || value
+            .as_bytes()
+            .windows(query.len())
+            .any(|candidate| candidate.eq_ignore_ascii_case(query.as_bytes()))
+}
+
+async fn fetch_offers(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    query: &serde_json::Value,
+    operation: &str,
+) -> Result<Vec<Offer>, String> {
+    let url = format!(
+        "{base_url}/api/v0/bundles/?q={}",
+        urlencoding::encode(&query.to_string())
+    );
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|error| format!("{operation} request failed: {error}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{operation} HTTP {status}: {body}"));
+    }
+
+    resp.json::<SearchResponse>()
+        .await
+        .map(|body| body.offers)
+        .map_err(|error| format!("{operation} parse failed: {error}"))
+}
 
 /// Choose the first batch of offers from one ranked pool, preferring different
 /// hosts whenever the filtered pool can satisfy that.
@@ -111,29 +233,8 @@ pub async fn select_offer_pool_with_policy(
         query["gpu_name"] = serde_json::json!({"eq": gpu_name});
     }
 
-    let url = format!(
-        "{base_url}/api/v0/bundles/?q={}",
-        urlencoding::encode(&query.to_string())
-    );
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await
-        .map_err(|e| format!("select_offer_pool request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("select_offer_pool HTTP {status}: {body}"));
-    }
-
-    let body: SearchResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("select_offer_pool parse failed: {e}"))?;
-
-    let reachable = reachable_offers(body.offers, policy);
+    let offers = fetch_offers(client, base_url, api_key, &query, "select_offer_pool").await?;
+    let reachable = reachable_offers(offers, policy);
     let cost = CostModel::from_policy(policy);
     let pool = rank_survivors(reachable, &cost, policy.drop_cheap_frac);
 
@@ -161,6 +262,9 @@ pub async fn select_offer_pool_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn offer(id: u64, host_id: Option<u64>) -> Offer {
         Offer {
@@ -174,7 +278,54 @@ mod tests {
             inet_up_cost_per_tb: 0.0,
             host_id,
             verification: Some("verified".to_owned()),
+            reliability2: Some(0.99),
+            inet_down: Some(500.0),
+            inet_up: Some(250.0),
         }
+    }
+
+    #[test]
+    fn gpu_browse_text_matches_ascii_substrings_case_insensitively() {
+        assert!(contains_ascii_case_insensitive("RTX 4090", "4090"));
+        assert!(contains_ascii_case_insensitive(
+            "NVIDIA GeForce RTX 4090",
+            "rtx 4090"
+        ));
+        assert!(contains_ascii_case_insensitive("A100 SXM4", "a100"));
+        assert!(!contains_ascii_case_insensitive("RTX 4080", "4090"));
+    }
+
+    #[tokio::test]
+    async fn browsing_matches_partial_models_without_provisioning_filters() {
+        let server = MockServer::start().await;
+        let mut matching = offer(1, Some(10));
+        matching.geolocation = Some("CN".to_owned());
+        matching.verification = Some("deverified".to_owned());
+        matching.reliability2 = Some(0.1);
+        matching.inet_down = Some(1.0);
+        let mut other = offer(2, Some(20));
+        other.gpu_name = "RTX 4080".to_owned();
+        Mock::given(method("GET"))
+            .and(path("/api/v0/bundles/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"offers": [matching, other]})),
+            )
+            .mount(&server)
+            .await;
+
+        let offers = browse_offers(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "secret",
+            &OfferBrowseCriteria {
+                gpu_name_contains: Some("4090".to_owned()),
+                ..OfferBrowseCriteria::default()
+            },
+        )
+        .await
+        .expect("browse offers");
+
+        assert_eq!(offers.iter().map(|offer| offer.id).collect::<Vec<_>>(), [1]);
     }
 
     #[test]

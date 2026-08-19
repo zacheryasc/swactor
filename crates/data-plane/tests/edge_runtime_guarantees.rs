@@ -22,8 +22,7 @@ use data_plane::edge_runtime::{EdgeRuntime, LoadedObject, Observation, WorkerPor
 use data_plane::edge_wire::{EdgeTransport, EdgeWriter, WireEvent};
 use data_plane::ids::{EdgeId, RingId, StreamId};
 use data_plane::object_record::{
-    ObjectFlags, ObjectId, ObjectLayout, ObjectRecord, ObjectRecordBuilder,
-    ObjectSpec as ParseSpec,
+    ObjectFlags, ObjectId, ObjectLayout, ObjectRecord, ObjectRecordBuilder, ObjectSpec as ParseSpec,
 };
 
 // ─── Mock transport ─────────────────────────────────────────────────────────
@@ -171,7 +170,9 @@ fn record_bytes(object_id: u64, sequence: u64) -> Vec<u8> {
         .encode()
 }
 
-fn arena_runtime(events: Vec<WireEvent>) -> (
+fn arena_runtime(
+    events: Vec<WireEvent>,
+) -> (
     EdgeRuntime<MockTransport>,
     MockTransport,
     ArenaManager,
@@ -213,7 +214,9 @@ fn inbound_edge_reaches_ready_and_delivers_objects() {
     ]);
     runtime.establish_inbound(provision_rx(7001), parse_spec());
 
-    runtime.poll(&mut transport, &mut arena, &mut worker).expect("poll");
+    runtime
+        .poll(&mut transport, &mut arena, &mut worker)
+        .expect("poll");
     let observations = runtime.take_observations();
 
     assert_eq!(worker.installed.len(), 1, "worker ring must be installed");
@@ -223,7 +226,10 @@ fn inbound_edge_reaches_ready_and_delivers_objects() {
     .expect("edge ready observation") else {
         unreachable!()
     };
-    assert_eq!(*direction, data_plane::edge_lifecycle::RingDirection::Ingress);
+    assert_eq!(
+        *direction,
+        data_plane::edge_lifecycle::RingDirection::Ingress
+    );
 
     let Observation::ObjectLoaded { object, .. } = find_observation(&observations, |obs| {
         matches!(obs, Observation::ObjectLoaded { .. })
@@ -256,7 +262,9 @@ fn outbound_edge_opens_writer_and_allocates_object_ids() {
     let (mut runtime, mut transport, mut arena, mut worker) = arena_runtime(Vec::new());
     runtime.establish_outbound(provision_tx(7002), ());
 
-    runtime.poll(&mut transport, &mut arena, &mut worker).expect("poll");
+    runtime
+        .poll(&mut transport, &mut arena, &mut worker)
+        .expect("poll");
     let observations = runtime.take_observations();
 
     assert!(matches!(
@@ -277,13 +285,16 @@ fn outbound_edge_opens_writer_and_allocates_object_ids() {
 // still becomes Ready once establishment completes.
 #[test]
 fn early_stream_waits_for_recv_establishment() {
-    let (mut runtime, mut transport, mut arena, mut worker) = arena_runtime(vec![WireEvent::StreamArrived {
-        edge_id: EdgeId(7003),
-        stream_id: StreamId(9),
-    }]);
+    let (mut runtime, mut transport, mut arena, mut worker) =
+        arena_runtime(vec![WireEvent::StreamArrived {
+            edge_id: EdgeId(7003),
+            stream_id: StreamId(9),
+        }]);
     runtime.establish_inbound(provision_rx(7003), parse_spec());
 
-    runtime.poll(&mut transport, &mut arena, &mut worker).expect("poll");
+    runtime
+        .poll(&mut transport, &mut arena, &mut worker)
+        .expect("poll");
     let observations = runtime.take_observations();
     assert!(matches!(
         find_observation(&observations, |obs| matches!(
@@ -299,11 +310,12 @@ fn early_stream_waits_for_recv_establishment() {
 #[test]
 fn malformed_ingress_record_is_fatal_and_reported() {
     let garbage = vec![0xDE; 64];
-    let (mut runtime, mut transport, mut arena, mut worker) = arena_runtime(vec![WireEvent::BytesRead {
-        edge_id: EdgeId(7004),
-        stream_id: StreamId(1),
-        bytes: garbage,
-    }]);
+    let (mut runtime, mut transport, mut arena, mut worker) =
+        arena_runtime(vec![WireEvent::BytesRead {
+            edge_id: EdgeId(7004),
+            stream_id: StreamId(1),
+            bytes: garbage,
+        }]);
     runtime.establish_inbound(provision_rx(7004), parse_spec());
 
     let result = runtime.poll(&mut transport, &mut arena, &mut worker);
@@ -313,7 +325,10 @@ fn malformed_ingress_record_is_fatal_and_reported() {
         find_observation(&observations, |obs| {
             matches!(
                 obs,
-                Observation::ObjectFailed { object_id: None, .. }
+                Observation::ObjectFailed {
+                    object_id: None,
+                    ..
+                }
             )
         }),
         Some(_)
@@ -324,11 +339,12 @@ fn malformed_ingress_record_is_fatal_and_reported() {
 // remain fatal.
 #[test]
 fn worker_load_failure_reports_object_and_is_fatal() {
-    let (mut runtime, mut transport, mut arena, mut worker) = arena_runtime(vec![WireEvent::BytesRead {
-        edge_id: EdgeId(7005),
-        stream_id: StreamId(1),
-        bytes: record_bytes(9002, 1),
-    }]);
+    let (mut runtime, mut transport, mut arena, mut worker) =
+        arena_runtime(vec![WireEvent::BytesRead {
+            edge_id: EdgeId(7005),
+            stream_id: StreamId(1),
+            bytes: record_bytes(9002, 1),
+        }]);
     worker.fail_load = true;
     runtime.establish_inbound(provision_rx(7005), parse_spec());
 

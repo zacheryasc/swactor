@@ -281,11 +281,7 @@ impl SupervisorActor {
     /// Handle a spawn request from the provider (runs in actor context):
     /// spawn the per-attempt bootstrap actor through the registry — the
     /// supervision never launches nodes directly.
-    fn spawn_node(
-        &mut self,
-        ctx: &Ctx,
-        request: crate::demo::provider::SpawnNodeRequest,
-    ) {
+    fn spawn_node(&mut self, ctx: &Ctx, request: crate::demo::provider::SpawnNodeRequest) {
         let attempt = request.attempt;
 
         // Supervisor-authored lifecycle stream (kept alive independent of
@@ -318,11 +314,7 @@ impl SupervisorActor {
                     "--label".to_owned(),
                     format!("{}=1", crate::demo::docker::SWEEP_LABEL),
                     "--label".to_owned(),
-                    format!(
-                        "{}={}",
-                        crate::demo::docker::RUN_LABEL,
-                        docker.run_token
-                    ),
+                    format!("{}={}", crate::demo::docker::RUN_LABEL, docker.run_token),
                     "--network".to_owned(),
                     docker.network.clone(),
                     docker.image.clone(),
@@ -1094,36 +1086,38 @@ impl SupervisorActor {
         // pump owns the sessions; replacement happens on its thread).
         self.next_edge_id += 1;
         let edge_id = data_plane::ids::EdgeId(self.next_edge_id);
-        let session = EdgeSession::new(
-            edge_id,
-            runtime.attempt,
-            node.to_owned(),
-            peer.clone(),
-        );
+        let session = EdgeSession::new(edge_id, runtime.attempt, node.to_owned(), peer.clone());
         let provision = session.provision();
         if self
             .edge_states
             .iter()
             .any(|state| state.get("node").and_then(|v| v.as_str()) == Some(node))
         {
-            self.emit_event("edge", node, "previous edge torn down (replaced)".to_owned());
+            self.emit_event(
+                "edge",
+                node,
+                "previous edge torn down (replaced)".to_owned(),
+            );
         }
-        if self.edge_cmd.send(EdgePumpCmd::Establish(Box::new(session))).is_err() {
+        if self
+            .edge_cmd
+            .send(EdgePumpCmd::Establish(Box::new(session)))
+            .is_err()
+        {
             self.emit_event("edge", node, "edge: pump gone".to_owned());
             return;
         }
         if let Ok(bytes) = serde_json::to_vec(&provision) {
-            self.driver_handle
-                .driver
-                .send_tagged_gossip(peer, edge::EDGE_PROVISION_TAG.as_bytes(), bytes);
+            self.driver_handle.driver.send_tagged_gossip(
+                peer,
+                edge::EDGE_PROVISION_TAG.as_bytes(),
+                bytes,
+            );
         }
         self.emit_event(
             "edge",
             node,
-            format!(
-                "edge {}: provision sent (outbound provisioning)",
-                edge_id.0
-            ),
+            format!("edge {}: provision sent (outbound provisioning)", edge_id.0),
         );
     }
 

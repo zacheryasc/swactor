@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "linux")]
@@ -8,22 +8,25 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
 use crate::codecs::register_myelin_actor_codecs;
-use crate::node_actor::NodeAgentMsg;
 use crate::observability::frame_collector::FrameCollector;
 use crate::observability::orch_telemetry::{
     DashboardSupport, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
 };
-use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
+use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
+use crate::orchestration::control;
 use crate::orchestration::daemon;
-use dashboard::control::ControlCommand;
+use crate::orchestration::manual_control::{
+    CONTROL_REGISTRY_NAME, ConfigValidator, ManualActorControl, ManualControl, ManualControlMsg,
+    NodePhase, OfferDto, OfferSearchRequest, OfferSearcher, ProviderConfigurationRequest,
+    ProviderFactory, ProviderReadiness, SpecBuilder,
+};
 
 use crate::node_provisioning::{ProviderKind, provider_kind};
-use crate::orchestration::cluster_reconciler::{ProvisionedClusterGuard, ReconcilerNodeBinding};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
 use crate::orchestration::provider_adapters::relay::{
     MYELIN_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV,
@@ -34,18 +37,14 @@ use crate::orchestration::provider_adapters::vastai::{
     VastAiProvisioningPlugin,
 };
 use crate::provisioning::{
-    LocalDockerPlugin, LocalProcessPlugin, NodeProvisionSpec, PluginObservation,
+    LocalDockerPlugin, LocalProcessPlugin, MockVastAiPlugin, NodeProvisionSpec, PluginObservation,
     PluginObservationSink, PluginSink, ProvisionEvent, ProvisionEventKind, ProvisionLogLine,
     ProvisionLogStream, ProvisionPlugin,
 };
 use crate::run_fsm::{RunConfig, RunId};
-use crate::run_plan::{self, GgufSource, TokenizerSource};
-use ::provisioning::{
-    BootSpec, ClusterShape, DesiredNodeShape, LogicalNodeId as ReconcilerLogicalNodeId,
-    NodeGroupId, ProviderKind as ReconcilerProviderKind, RetryPolicy, RoleId,
-    RunId as ClusterRunId, RunNodeGroupSpec, SwarmJoinTemplate,
-};
+use crate::run_plan::{GgufSource, TokenizerSource};
 use distribution::node::DistributedNodeConfig;
+use distribution::registry_actor::RegistryIn;
 use distribution::swim::telemetry::ObservedTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
@@ -67,9 +66,6 @@ const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_STATE_DIR: &str = "./.config";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
-const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-const STAGE_PROVISION_ACTIVE_RESEND_AFTER: Duration = Duration::from_secs(60);
-const PIPELINE_PROMPT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
 const TELEMETRY_FRAME_LOG_ENV: &str = "MYELIN_TELEMETRY_FRAME_LOG";
 
 pub(crate) fn run_with_options<I>(
@@ -88,7 +84,6 @@ where
         .overlay_env()?
         .overlay_cli(args)?
         .finalize()?;
-    config.prepare_vastai_ssh_key()?;
     let state_dir = daemon::StateDir::new(config.state_dir.clone());
     if config.reset_state {
         state_dir.reset()?;
@@ -312,6 +307,29 @@ where
         stack.route_view.clone(),
         stack.outbox.clone(),
     );
+    let recovery_nodes = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !matches!(node.phase, NodePhase::Stopped))
+        .filter_map(|node| {
+            node.runtime
+                .as_ref()
+                .map(|runtime| (node.logical_node_id, runtime))
+        })
+        .map(|(node_id, runtime)| {
+            serde_json::from_str::<EndpointAddr>(&runtime.endpoint)
+                .map(|endpoint| (node_id, endpoint))
+                .map_err(|error| format!("parse persisted endpoint for node {node_id}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !recovery_nodes.is_empty() {
+        driver.join(
+            &recovery_nodes
+                .iter()
+                .map(|(_, endpoint)| endpoint.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
     // Engine owns protocol tick injection and core progression; the application
     // loop only drains integration-owned queues (ENGINE_SPEC.md).
     stack.spawn_protocol_ticker(PUMP_INTERVAL);
@@ -325,6 +343,15 @@ where
     );
 
     let collector = FrameCollector::new();
+    for (node_id, endpoint) in &recovery_nodes {
+        collector.subscribe_node(
+            &engine.handle(),
+            driver.endpoint(),
+            endpoint.clone(),
+            snapshot.run_id,
+            *node_id,
+        );
+    }
     bootstrap(
         &mut orch_telemetry,
         None,
@@ -332,21 +359,14 @@ where
         "ready",
         json!({"alpn":String::from_utf8_lossy(TELEMETRY_ALPN)}),
     );
-    let dashboard = DashboardSupport::start(config.dashboard, &engine.handle())?;
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "dashboard",
-        "ready",
-        json!({"enabled":dashboard.is_some()}),
-    );
+    let dashboard: Option<DashboardSupport>;
 
     let orchestrator_reports = match stack.runtime.new_inbox::<OrchestratorReport>() {
         Ok(inbox) => inbox,
         Err(error) => {
             bootstrap(
                 &mut orch_telemetry,
-                dashboard.as_ref(),
+                None,
                 "orchestrator_report_actor",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -356,63 +376,182 @@ where
     };
     let orchestrator_report_actor = *orchestrator_reports.addr();
     stack.register_local_actor(driver.register_actor(orchestrator_report_actor, 1));
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "orchestrator_report_actor",
-        "ready",
-        json!({"actor":orchestrator_report_actor}),
-    );
-    let orchestrator_actor = match stack.runtime.spawn(OrchestratorActor::new(
-        RunConfig {
-            run_id: RunId(config.run_id),
-            max_tokens: u64::from(config.default_max_tokens),
-            prompt: Vec::new(),
-        },
-        Some(orchestrator_report_actor),
-    )) {
-        Ok(actor) => actor,
-        Err(error) => {
-            bootstrap(
-                &mut orch_telemetry,
-                dashboard.as_ref(),
-                "orchestrator_actor",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("spawn orchestrator actor: {error}"));
-        }
-    };
-    stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "orchestrator_actor",
-        "ready",
-        json!({"actor":orchestrator_actor}),
-    );
 
-    let stop_signal = spawn_stop_listener(stop_rx);
-
-    let provisioner = config.build_provisioner(stack.runtime.clone())?;
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "node_provisioner",
-        "ready",
-        json!({
-            "provider":config.provider.as_str(),
-            "owner":"myelin-orchestrator",
-            "config":config.provider_telemetry_detail(),
-        }),
-    );
     let (obs_tx, obs_rx) = mpsc::channel::<PluginObservation>();
     let sink = PluginSink::new(Arc::new(ChannelObservationSink {
         tx: Mutex::new(obs_tx),
     }));
-
-    let (control_tx, control_rx) = mpsc::channel::<ControlCommand>();
-    dashboard::control::set_control_sender(control_tx);
+    let shared_config = Arc::new(Mutex::new(config.clone()));
+    let provider_runtime = stack.runtime.clone();
+    let provider_config = Arc::clone(&shared_config);
+    let provider_registry = state_dir.process_registry_path();
+    let provider_factory: ProviderFactory = Arc::new(move || {
+        provider_config
+            .lock()
+            .clone()
+            .build_provisioner(provider_runtime.clone(), provider_registry.clone())
+    });
+    let spec_config = Arc::clone(&shared_config);
+    let spec_coordinator = coordinator_endpoint.clone();
+    let spec_builder: SpecBuilder = Arc::new(move |node_id, orchestrator_actor| {
+        spec_config.lock().node_spec_for_stage(
+            spec_coordinator.clone(),
+            orchestrator_actor,
+            node_id,
+            0,
+        )
+    });
+    let validation_config = Arc::clone(&shared_config);
+    let validation_runtime = stack.runtime.clone();
+    let validation_registry = state_dir.process_registry_path();
+    let config_validator: ConfigValidator = Arc::new(move |request| {
+        let mut candidate = validation_config.lock().clone();
+        if candidate.provider.as_str() != "vastai" {
+            return Ok(());
+        }
+        let vastai = candidate
+            .vastai
+            .as_mut()
+            .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
+        if let Some(api_key) = request.api_key {
+            vastai.api_key = Some(api_key);
+        }
+        if let Some(path) = request.ssh_identity {
+            vastai.ssh_identity = Some(expand_home_path(&path)?);
+        }
+        if let Some(command) = request.bootstrap_command {
+            vastai.bootstrap_command = Some(command);
+        }
+        if vastai.provisioning_mode == VastAiProvisioningMode::Mock {
+            let _ = candidate
+                .build_provisioner(validation_runtime.clone(), validation_registry.clone())?;
+            *validation_config.lock() = candidate;
+            return Ok(());
+        }
+        if vastai.api_key.as_deref().is_none_or(str::is_empty) {
+            return Err("Vast.ai API key is required for live offer search".to_owned());
+        }
+        candidate.prepare_vastai_ssh_key()?;
+        let _ =
+            candidate.build_provisioner(validation_runtime.clone(), validation_registry.clone())?;
+        *validation_config.lock() = candidate;
+        Ok(())
+    });
+    let offer_searcher: Option<OfferSearcher> = if config.provider.as_str() == "vastai" {
+        let search_config = Arc::clone(&shared_config);
+        Some(Arc::new(move |request: OfferSearchRequest| {
+            request.validate()?;
+            let criteria = request.browse_criteria();
+            let config = search_config.lock().clone();
+            let vastai = config
+                .vastai
+                .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
+            let api_key = vastai
+                .api_key
+                .ok_or_else(|| "Vast.ai API key is not configured".to_owned())?;
+            let mut client = ToolsVastAiLeaseClient::from_api_key(api_key)?;
+            Ok(client
+                .browse_offers(&criteria)?
+                .into_iter()
+                .map(|offer| OfferDto {
+                    offer_id: offer.id,
+                    host_id: offer.host_id,
+                    gpu_model: offer.gpu_name,
+                    gpu_ram_mb: offer.gpu_ram,
+                    compute_cap: offer.compute_cap,
+                    verification: offer.verification,
+                    reliability: offer.reliability2,
+                    download_mbps: offer.inet_down,
+                    upload_mbps: offer.inet_up,
+                    location: offer.geolocation,
+                    hourly_price: offer.dph_total,
+                    download_cost_per_tb: offer.inet_down_cost_per_tb,
+                    upload_cost_per_tb: offer.inet_up_cost_per_tb,
+                })
+                .collect())
+        }) as OfferSearcher)
+    } else {
+        None
+    };
+    let vastai_provisioning_mode = config
+        .vastai
+        .as_ref()
+        .map_or("real", |vastai| vastai.provisioning_mode.as_str());
+    let readiness = if config.provider.as_str() == "vastai" && vastai_provisioning_mode != "mock" {
+        ProviderReadiness::unconfigured_for(
+            config.provider.as_str(),
+            "submit a Vast.ai API key, SSH identity, and bootstrap command",
+        )
+        .with_provisioning_mode(vastai_provisioning_mode)
+    } else {
+        ProviderReadiness::ready_for(config.provider.as_str())
+            .with_provisioning_mode(vastai_provisioning_mode)
+    };
+    let initial_configuration = config
+        .vastai
+        .as_ref()
+        .map(|vastai| ProviderConfigurationRequest {
+            api_key: vastai.api_key.clone(),
+            ssh_identity: vastai
+                .ssh_identity
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            bootstrap_command: vastai.bootstrap_command.clone(),
+        });
+    let manual = ManualActorControl::new(
+        ManualControl::new(snapshot, readiness),
+        engine.handle(),
+        stack.runtime.clone(),
+        state_dir,
+        sink,
+        provider_factory,
+        spec_builder,
+        Some(config_validator),
+        offer_searcher,
+        daemon::unix_ms_now(),
+    );
+    let orchestrator_actor = match stack.runtime.spawn(
+        OrchestratorActor::new(
+            RunConfig {
+                run_id: RunId(config.run_id),
+                max_tokens: u64::from(config.default_max_tokens),
+                prompt: Vec::new(),
+            },
+            Some(orchestrator_report_actor),
+        )
+        .with_manual_control(manual),
+    ) {
+        Ok(actor) => actor,
+        Err(error) => return Err(format!("spawn orchestrator actor: {error}")),
+    };
+    stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
+    stack
+        .runtime
+        .send_to(
+            stack.actors.registry,
+            RegistryIn::RegisterName {
+                name: CONTROL_REGISTRY_NAME.to_owned(),
+                actor_addr: orchestrator_actor,
+            },
+        )
+        .map_err(|error| format!("register manual control actor: {error}"))?;
+    if let Some(request) = initial_configuration {
+        stack
+            .runtime
+            .send_to(
+                orchestrator_actor,
+                OrchestratorMsg::Manual(ManualControlMsg::Configure {
+                    request,
+                    reply_to: None,
+                }),
+            )
+            .map_err(|error| format!("route initial provider validation: {error}"))?;
+    }
+    dashboard = DashboardSupport::start_with_plugins(
+        config.dashboard,
+        &engine.handle(),
+        vec![control::plugin(stack.runtime.clone(), orchestrator_actor)],
+    )?;
     bootstrap(
         &mut orch_telemetry,
         dashboard.as_ref(),
@@ -420,10 +559,11 @@ where
         "started",
         json!({
             "mode":"manual",
-            "commands":["add","kill","destroy"],
-            "transport":"dashboard",
+            "commands":["provision","kill"],
+            "transport":"direct_actor_message",
         }),
     );
+    let stop_signal = spawn_stop_listener(stop_rx);
 
     bootstrap(
         &mut orch_telemetry,
@@ -432,7 +572,7 @@ where
         "started",
         json!({"mode":"daemon","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
     );
-    let result = serve_cluster(ServeCluster {
+    let mut result = serve_cluster(ServeCluster {
         driver: &mut driver,
         stack: &stack,
         obs_rx: &obs_rx,
@@ -446,18 +586,14 @@ where
         orchestrator_node_id: config.node_id,
         provider: &config.provider,
         orchestrator_actor,
-        coordinator_endpoint,
         engine: engine.handle(),
-        runtime: stack.runtime.clone(),
-        config: config.clone(),
-        provisioner,
-        live_clusters: BTreeMap::new(),
-        sink,
-        state_dir,
-        snapshot,
-        control_rx: &control_rx,
-        destroy_on_exit: config.destroy_on_exit,
+        pending_readies: BTreeMap::new(),
     });
+    if result.is_ok()
+        && let Err(error) = flush_manual_control(&stack.runtime, orchestrator_actor)
+    {
+        result = Err(error);
+    }
     if let Err(error) = &result {
         bootstrap(
             &mut orch_telemetry,
@@ -470,9 +606,35 @@ where
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VastAiProvisioningMode {
+    Real,
+    Mock,
+}
+
+impl VastAiProvisioningMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "real" => Ok(Self::Real),
+            "mock" | "simulated" => Ok(Self::Mock),
+            other => Err(format!(
+                "unsupported Vast.ai provisioning mode {other:?}; use real or mock"
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Mock => "mock",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct VastAiRuntimeConfig {
     api_key: Option<String>,
+    provisioning_mode: VastAiProvisioningMode,
     provisioning: VastAiProvisioningConfig,
     bootstrap_command: Option<String>,
     ssh_identity: Option<PathBuf>,
@@ -579,6 +741,7 @@ impl VastAiRuntimeConfig {
             .transpose()?;
         Ok(Self {
             api_key: builder.vastai_api_key.clone(),
+            provisioning_mode: builder.vastai_provisioning_mode,
             provisioning,
             bootstrap_command: builder.vastai_bootstrap_command.clone(),
             ssh_identity,
@@ -588,6 +751,7 @@ impl VastAiRuntimeConfig {
 
     fn telemetry_detail(&self) -> Value {
         json!({
+            "provisioning_mode": self.provisioning_mode.as_str(),
             "disk_gb": self.provisioning.disk_gb,
             "ssh_user": &self.provisioning.ssh_user,
             "gpu_name": &self.provisioning.selection.gpu_name,
@@ -705,14 +869,10 @@ struct Config {
     layer_end_exclusive: Option<u32>,
     pipeline_stages: u32,
     model_id: String,
-    gguf_source: GgufSource,
-    tokenizer: TokenizerSource,
     default_max_tokens: u32,
     dashboard: bool,
     state_dir: PathBuf,
-    destroy_on_exit: bool,
     reset_state: bool,
-    max_context: Option<u32>,
     relay: RelayRuntimeConfig,
     endpoint_addr_mask: EndpointAddrMask,
     vastai: Option<VastAiRuntimeConfig>,
@@ -740,13 +900,13 @@ struct ConfigBuilder {
     default_max_tokens: u32,
     dashboard: bool,
     state_dir: Option<PathBuf>,
-    destroy_on_exit: bool,
     reset_state: bool,
     max_context: Option<u32>,
     relay_mode: Option<String>,
     relay_url: Option<String>,
     endpoint_addr_mask: Option<String>,
     vastai_api_key: Option<String>,
+    vastai_provisioning_mode: VastAiProvisioningMode,
     vastai_bootstrap_command: Option<String>,
     vastai_disk_gb: Option<u32>,
     vastai_disk_gb_raw: Option<String>,
@@ -800,13 +960,13 @@ impl ConfigBuilder {
             default_max_tokens: DEFAULT_MAX_TOKENS,
             dashboard: true,
             state_dir: None,
-            destroy_on_exit: false,
             reset_state: false,
             max_context: None,
             relay_mode: None,
             relay_url: None,
             endpoint_addr_mask: None,
             vastai_api_key: None,
+            vastai_provisioning_mode: VastAiProvisioningMode::Real,
             vastai_bootstrap_command: None,
             vastai_disk_gb: None,
             vastai_disk_gb_raw: None,
@@ -900,6 +1060,9 @@ impl ConfigBuilder {
         });
         apply!(overlay.vastai.image, |image| {
             self.toml_vastai_image = Some(image)
+        });
+        apply!(overlay.vastai.provisioning_mode, |mode| {
+            self.vastai_provisioning_mode = VastAiProvisioningMode::parse(&mode)?
         });
         apply!(overlay.vastai.api_key, |api_key| {
             self.vastai_api_key = Some(api_key)
@@ -1014,9 +1177,6 @@ impl ConfigBuilder {
         env_apply!("MYELIN_STATE_DIR", |state_dir| {
             self.state_dir = Some(PathBuf::from(state_dir))
         });
-        env_apply!("MYELIN_DESTROY_ON_EXIT", |destroy_on_exit| {
-            self.destroy_on_exit = Self::parse_bool("MYELIN_DESTROY_ON_EXIT", &destroy_on_exit)?;
-        });
 
         env_apply!(TELEMETRY_FRAME_LOG_ENV, |path| {
             self.telemetry_frame_log = Some(PathBuf::from(path))
@@ -1061,6 +1221,9 @@ impl ConfigBuilder {
                 self.vastai_api_key = Some(api_key);
             }
         );
+        env_apply!("MYELIN_VASTAI_PROVISIONING_MODE", |mode| {
+            self.vastai_provisioning_mode = VastAiProvisioningMode::parse(&mode)?
+        });
         env_apply!("MYELIN_VASTAI_BOOTSTRAP_COMMAND", |command| {
             self.vastai_bootstrap_command = Some(command)
         });
@@ -1125,6 +1288,12 @@ impl ConfigBuilder {
                         "--provider",
                     )?)?)
                 }
+                "--vastai-provisioning" => {
+                    self.vastai_provisioning_mode = VastAiProvisioningMode::parse(&next_arg(
+                        &mut args,
+                        "--vastai-provisioning",
+                    )?)?
+                }
                 "--worker-bin" => {
                     self.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
                 }
@@ -1146,7 +1315,6 @@ impl ConfigBuilder {
                 "--state-dir" => {
                     self.state_dir = Some(PathBuf::from(next_arg(&mut args, "--state-dir")?))
                 }
-                "--destroy-on-exit" => self.destroy_on_exit = true,
                 "--reset-state" => self.reset_state = true,
                 "--telemetry-frame-log" => {
                     self.telemetry_frame_log =
@@ -1306,16 +1474,6 @@ impl ConfigBuilder {
         let cached_model = cached_model_host_path
             .map(|path| CachedModelConfig::from_host_path(provider_name, path))
             .transpose()?;
-        let mut gguf_source = self.gguf_source.clone();
-        if let Some(cached_model) = &cached_model {
-            if provider_name != "vastai" {
-                gguf_source = GgufSource::LocalPath(if provider_name == "process" {
-                    cached_model.host_path.to_string_lossy().to_string()
-                } else {
-                    cached_model.container_path.clone()
-                });
-            }
-        }
         let relay = relay_runtime_config_from_settings(
             self.run_id,
             self.relay_mode.as_deref(),
@@ -1339,17 +1497,13 @@ impl ConfigBuilder {
             layer_end_exclusive: self.layer_end_exclusive,
             pipeline_stages: self.pipeline_stages,
             model_id: self.model_id,
-            gguf_source,
-            tokenizer: self.tokenizer,
             default_max_tokens: self.default_max_tokens,
             dashboard: self.dashboard,
             state_dir: self
                 .state_dir
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
-            destroy_on_exit: self.destroy_on_exit,
             reset_state: self.reset_state,
-            max_context: self.max_context,
             relay,
             endpoint_addr_mask,
             vastai,
@@ -1423,10 +1577,6 @@ impl ConfigBuilder {
 }
 
 impl Config {
-    fn uses_planned_execution(&self) -> bool {
-        self.cached_model.is_some() || self.pipeline_stages > 1
-    }
-
     fn provider_telemetry_detail(&self) -> Value {
         match self.provider.as_str() {
             "process" => json!({
@@ -1445,127 +1595,16 @@ impl Config {
         }
     }
 
-    fn build_run_plan(&self) -> Result<run_plan::RunPlan, String> {
-        let host_path = self.local_planning_gguf_path()?;
-        let metadata = crate::staging::gguf_metadata::read_gguf_planning_metadata(&host_path)?;
-        let model = metadata.to_model_facts(
-            self.model_id.clone(),
-            self.gguf_source.clone(),
-            self.tokenizer.clone(),
-            self.max_context,
-        )?;
-        if self.pipeline_stages > model.num_layers {
-            return Err(format!(
-                "--pipeline-stages={} exceeds GGUF layer count {}; choose N <= {}",
-                self.pipeline_stages, model.num_layers, model.num_layers
-            ));
-        }
-
-        let activation_extent = model
-            .max_seq_len
-            .checked_mul(model.hidden_dim)
-            .and_then(|value| value.checked_mul(model.dtype_width_bytes))
-            .ok_or_else(|| "activation ring size overflow while planning pipeline".to_owned())?;
-        let activation_data_capacity = run_plan::MO01_HEADER_BYTES
-            .checked_add(activation_extent)
-            .ok_or_else(|| {
-            "activation ring data capacity overflow while planning pipeline".to_owned()
-        })?;
-        let token_extent = model
-            .max_seq_len
-            .checked_mul(4)
-            .ok_or_else(|| "token ring size overflow while planning pipeline".to_owned())?;
-        let token_data_capacity = run_plan::MO01_HEADER_BYTES
-            .checked_add(token_extent)
-            .ok_or_else(|| {
-                "token ring data capacity overflow while planning pipeline".to_owned()
-            })?;
-        let candidate_pool = (0..self.pipeline_stages)
-            .map(|stage_index| run_plan::NodeId(self.node_id + 1 + u64::from(stage_index)))
-            .collect::<Vec<_>>();
-        let placement = run_plan::PlacementInput::FixedLinear(
-            candidate_pool
-                .iter()
-                .enumerate()
-                .map(|(stage_index, node_id)| run_plan::StagePlacement {
-                    stage_index: stage_index as u32,
-                    node_id: *node_id,
-                })
-                .collect(),
-        );
-
-        run_plan::plan_run(run_plan::PlannerInput {
-            run_id: run_plan::RunId(self.run_id),
-            orchestrator_node_id: run_plan::NodeId(self.node_id),
-            model,
-            runtime: run_plan::RuntimeConfig {
-                max_tokens: self.default_max_tokens,
-                sampling: run_plan::SamplingPolicy {
-                    temperature_millis: 0,
-                    top_k: 1,
-                },
-            },
-            candidate_pool,
-            stage_count: self.pipeline_stages,
-            placement,
-            activation_ring: run_plan::RingSpec {
-                data_capacity: activation_data_capacity,
-                alignment: 64,
-                direction: run_plan::RingDirection::Egress,
-                host_pinning: run_plan::HostPinning::Pageable,
-                wake_coalescing: run_plan::WakeCoalescing::PendingBit,
-            },
-            token_ring: run_plan::RingSpec {
-                data_capacity: token_data_capacity,
-                alignment: 8,
-                direction: run_plan::RingDirection::Egress,
-                host_pinning: run_plan::HostPinning::Pageable,
-                wake_coalescing: run_plan::WakeCoalescing::PendingBit,
-            },
-        })
-        .map_err(|e| format!("plan pipeline run: {:?}", e.kind()))
-    }
-
-    fn local_planning_gguf_path(&self) -> Result<PathBuf, String> {
-        if let Some(cached_model) = &self.cached_model {
-            return Ok(cached_model.host_path.clone());
-        }
-        match &self.gguf_source {
-            GgufSource::LocalPath(path) => {
-                let host_path = PathBuf::from(path);
-                if host_path.is_file() {
-                    Ok(host_path)
-                } else {
-                    Err(format!(
-                        "local pipeline requires a locally inspectable GGUF before provisioning; {path:?} is not a host file, so use --cached-model-host-path"
-                    ))
-                }
-            }
-            GgufSource::HuggingFaceGguf {
-                repo,
-                file,
-                revision: None,
-            } if self.provider.as_str() == "vastai"
-                && file == DEFAULT_PIPELINE_CACHED_MODEL_FILE =>
-            {
-                let host_path = default_pipeline_cached_model_path();
-                if host_path.is_file() {
-                    Ok(host_path)
-                } else {
-                    Err(format!(
-                        "VastAI pipeline planning requires local GGUF metadata at {}; selected remote source is {repo}/{file}",
-                        host_path.display()
-                    ))
-                }
-            }
-            GgufSource::HuggingFaceGguf { repo, file, .. } => Err(format!(
-                "local pipeline requires a locally inspectable GGUF before provisioning; selected source {repo}/{file} is remote, so use --cached-model-host-path"
-            )),
-        }
-    }
-
     fn prepare_vastai_ssh_key(&mut self) -> Result<(), String> {
         if self.provider.as_str() != "vastai" {
+            return Ok(());
+        }
+
+        if self
+            .vastai
+            .as_ref()
+            .is_some_and(|vastai| vastai.provisioning_mode == VastAiProvisioningMode::Mock)
+        {
             return Ok(());
         }
 
@@ -1609,24 +1648,31 @@ impl Config {
         Ok(())
     }
 
+    fn local_worker_bin(&self) -> Result<PathBuf, String> {
+        let worker_bin = match &self.worker_bin {
+            Some(worker_bin) => worker_bin.clone(),
+            None => std::env::current_exe().map_err(|error| format!("current exe: {error}"))?,
+        };
+        if !worker_bin.is_file() {
+            return Err(format!(
+                "local process worker binary does not exist: {}",
+                worker_bin.display()
+            ));
+        }
+        Ok(worker_bin)
+    }
+
     fn build_provisioner(
         &self,
         bootstrap_runtime: swactor::runtime::Runtime,
+        process_registry_path: PathBuf,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider.as_str() {
-            "process" => {
-                let worker_bin = match &self.worker_bin {
-                    Some(worker_bin) => worker_bin.clone(),
-                    None => std::env::current_exe().map_err(|e| format!("current exe: {e}"))?,
-                };
-                if !worker_bin.is_file() {
-                    return Err(format!(
-                        "local process worker binary does not exist: {}",
-                        worker_bin.display()
-                    ));
-                }
-                Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
-            }
+            "process" => Ok(Box::new(LocalProcessPlugin::with_registry(
+                self.local_worker_bin()?,
+                process_registry_path,
+                "process",
+            ))),
             "docker" => Ok(Box::new(LocalDockerPlugin::new(
                 env_optional("MYELIN_DOCKER_CONTAINER_PREFIX")
                     .unwrap_or_else(|| "myelin-orchestrator".to_owned()),
@@ -1635,6 +1681,12 @@ impl Config {
                 let vastai = self.vastai.as_ref().ok_or_else(|| {
                     "VastAI config was not resolved for provider vastai".to_owned()
                 })?;
+                if vastai.provisioning_mode == VastAiProvisioningMode::Mock {
+                    return Ok(Box::new(MockVastAiPlugin::with_registry(
+                        self.local_worker_bin()?,
+                        process_registry_path,
+                    )));
+                }
                 if vastai.bootstrap_command.is_none() {
                     return Err(
                         "MYELIN_VASTAI_BOOTSTRAP_COMMAND is required when MYELIN_NODE_PROVIDER=vastai"
@@ -1657,26 +1709,6 @@ impl Config {
             }
             _ => Err("mock provider cannot build a runtime provisioner".to_owned()),
         }
-    }
-
-    fn node_spec_env_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = vec![
-            "MYELIN_RUN_ID",
-            "MYELIN_LOGICAL_NODE_ID",
-            "MYELIN_NODE_ATTEMPT_ID",
-            "MYELIN_NODE_PROVIDER",
-            "MYELIN_AGENT_ONLY",
-            "MYELIN_STAGE_INDEX",
-            "MYELIN_COORDINATOR_ENDPOINT",
-            "MYELIN_ORCHESTRATOR_ACTOR",
-            "MYELIN_IROH_RELAY_MODE",
-            MVP_IROH_ENDPOINT_ADDR_MASK_ENV,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        keys.extend(self.extra_worker_env().into_iter().map(|(k, _)| k));
-        keys
     }
 
     /// Provider-specific environment shared by filter and launch paths.
@@ -1729,6 +1761,17 @@ impl Config {
         ];
         env.extend(self.extra_worker_env());
         let args = match provider_name {
+            "vastai"
+                if self.vastai.as_ref().is_some_and(|vastai| {
+                    vastai.provisioning_mode == VastAiProvisioningMode::Mock
+                }) =>
+            {
+                self.worker_bin
+                    .is_none()
+                    .then(|| crate::ORCHESTRATOR_WORKER_MODE_ARG.to_owned())
+                    .into_iter()
+                    .collect()
+            }
             "vastai" => self
                 .vastai
                 .as_ref()
@@ -1756,413 +1799,13 @@ impl Config {
 
 #[derive(Clone)]
 struct RuntimeReady {
-    endpoint: EndpointAddr,
     node_actor: ActorAddress,
-    stage_index: u32,
-    readiness_id: u64,
     swim_node_id: DistNodeId,
-}
-
-#[derive(Clone)]
-struct RuntimeReadyAckTarget {
-    node_id: u64,
-    ready: RuntimeReady,
 }
 
 fn runtime_ready_barrier_met(stack: &DistributionRuntimeStack, ready: &RuntimeReady) -> bool {
     stack.member_state(ready.swim_node_id) == Some(MemberState::Alive)
         && stack.route_owner(ready.node_actor) == Some(ready.swim_node_id)
-}
-
-fn enqueue_runtime_ready_ack(
-    stack: &DistributionRuntimeStack,
-    ready: &RuntimeReady,
-    run_id: u64,
-    node_id: u64,
-) -> Result<(), String> {
-    stack
-        .runtime
-        .send_to(
-            ready.node_actor,
-            NodeAgentMsg::RuntimeReadyAck {
-                run_id,
-                node_id,
-                stage_index: ready.stage_index,
-                readiness_id: ready.readiness_id,
-            },
-        )
-        .map_err(|e| format!("send runtime ready ack: {e}"))
-}
-
-struct RuntimeReadyAckLoop<'a> {
-    driver: &'a mut IrohDriver,
-    stack: &'a DistributionRuntimeStack,
-    obs_rx: &'a mpsc::Receiver<PluginObservation>,
-    collector: &'a FrameCollector,
-    orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
-    stop_signal: &'a AtomicBool,
-    dashboard: Option<&'a DashboardSupport>,
-    orch_telemetry: &'a mut OrchTelemetry,
-    orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
-    run_id: u64,
-    orchestrator_node_id: u64,
-    provider: &'a ProviderKind,
-    engine: EngineHandle,
-}
-
-// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn wait_for_runtime_ready_acks(
-    ctx: RuntimeReadyAckLoop<'_>,
-    targets: &[RuntimeReadyAckTarget],
-    cluster: &mut ProvisionedClusterGuard,
-) -> Result<bool, String> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack,
-        obs_rx,
-        collector,
-        orchestrator_reports,
-        stop_signal,
-        dashboard,
-        orch_telemetry,
-        orch_stdio_rx,
-        run_id,
-        orchestrator_node_id,
-        provider,
-        ..
-    } = ctx;
-    let bootstrap = |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
-        ds.emit_bootstrap(
-            dashboard,
-            run_id,
-            orchestrator_node_id,
-            phase,
-            status,
-            detail,
-        );
-    };
-    let mut pending = targets
-        .iter()
-        .cloned()
-        .map(|target| {
-            (
-                (
-                    target.node_id,
-                    target.ready.stage_index,
-                    target.ready.readiness_id,
-                ),
-                target,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut attempts = BTreeMap::<(u64, u32, u64), u64>::new();
-    let mut last_send = None::<Instant>;
-
-    while !pending.is_empty() {
-        cluster
-            .poll(SystemTime::now())
-            .map_err(|error| format!("cluster reconcile while awaiting ready ack: {error}"))?;
-        if targets.iter().any(|target| {
-            cluster.current_attempt(target.node_id)
-                != Some(::provisioning::NodeAttemptId(target.ready.readiness_id))
-        }) {
-            return Ok(false);
-        }
-        collector.pump(driver);
-        drain_orch_stdio_capture(
-            orch_stdio_rx,
-            orch_telemetry,
-            dashboard,
-            run_id,
-            orchestrator_node_id,
-        );
-        if stop_requested(stop_signal) {
-            return Err(
-                "shutdown requested while waiting for runtime-ready acknowledgements".to_owned(),
-            );
-        }
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
-        }
-        collector.drain(|stream, descriptor, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_collected_frame(stream, descriptor, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        while let Some(report) = orchestrator_reports.try_recv() {
-            let OrchestratorReport::NodeRuntimeReadyAck {
-                run_id: ack_run_id,
-                node_id,
-                stage_index,
-                readiness_id,
-            } = report
-            else {
-                continue;
-            };
-            if ack_run_id != run_id {
-                continue;
-            }
-            let key = (node_id, stage_index, readiness_id);
-            let Some(target) = pending.remove(&key) else {
-                continue;
-            };
-            bootstrap(
-                orch_telemetry,
-                "runtime_ready_ack",
-                "ready",
-                json!({
-                    "node_id":node_id,
-                    "node_actor":target.ready.node_actor,
-                    "readiness_id":readiness_id,
-                    "attempts":attempts.get(&key).copied().unwrap_or(0),
-                }),
-            );
-        }
-        if pending.is_empty() {
-            return Ok(true);
-        }
-        if last_send.is_none_or(|sent_at| sent_at.elapsed() >= RUNTIME_READY_ACK_RETRY_INTERVAL) {
-            for (key, target) in &pending {
-                enqueue_runtime_ready_ack(stack, &target.ready, run_id, target.node_id)?;
-                let attempt = attempts.entry(*key).or_default();
-                *attempt += 1;
-                let attempt = *attempt;
-                bootstrap(
-                    orch_telemetry,
-                    "runtime_ready_ack",
-                    "sent",
-                    json!({
-                        "node_id":target.node_id,
-                        "node_actor":target.ready.node_actor,
-                        "readiness_id":target.ready.readiness_id,
-                        "attempt":attempt,
-                    }),
-                );
-            }
-            last_send = Some(Instant::now());
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
-    Ok(true)
-}
-
-fn reconciler_group(config: &Config, spec: &NodeProvisionSpec) -> RunNodeGroupSpec {
-    let group_id = NodeGroupId(format!("node-{}", spec.node_id));
-    let ssh_user = config
-        .vastai
-        .as_ref()
-        .map(|vastai| vastai.provisioning.ssh_user.clone())
-        .unwrap_or_else(|| "root".to_owned());
-    let disk_gb = config
-        .vastai
-        .as_ref()
-        .map(|vastai| vastai.provisioning.disk_gb)
-        .unwrap_or_default();
-    let orchestrator = spec
-        .env
-        .iter()
-        .find(|(name, _)| name == "MYELIN_ORCHESTRATOR_ACTOR")
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default();
-    RunNodeGroupSpec {
-        run_id: ClusterRunId(config.run_id),
-        group_id,
-        role: RoleId(format!(
-            "stage-{}",
-            spec.stage_index.unwrap_or(config.stage_index)
-        )),
-        count: 1,
-        provider: ReconcilerProviderKind::new(config.provider.as_str()),
-        shape: DesiredNodeShape {
-            image: spec.image.clone(),
-            disk_gb,
-            gpu_name: None,
-            min_gpu_ram_mb: None,
-            min_down_mbps: None,
-            min_up_mbps: None,
-            min_reliability: None,
-            require_verified: false,
-            provider_labels: BTreeMap::from([(
-                "myelin.provider_config".to_owned(),
-                config.provider_telemetry_detail().to_string(),
-            )]),
-        },
-        boot: BootSpec {
-            ssh_user,
-            verify_commands: Vec::new(),
-            start_swactor_command: spec.args.join(" "),
-            stdout_sources: Vec::new(),
-            stderr_sources: Vec::new(),
-            env: spec.env.clone(),
-            args: spec.args.clone(),
-            mounts: spec.mounts.clone(),
-        },
-        swarm_join: SwarmJoinTemplate {
-            orch_swactor_addr: orchestrator,
-            join_token_ref: "myelin-runtime-ready".to_owned(),
-        },
-    }
-}
-
-fn build_reconciled_cluster(
-    provisioner: Box<dyn ProvisionPlugin>,
-    config: &Config,
-    stage_specs: &[NodeProvisionSpec],
-    runtime: swactor::runtime::Runtime,
-    engine: EngineHandle,
-    sink: PluginSink,
-) -> Result<ProvisionedClusterGuard, String> {
-    let groups = stage_specs
-        .iter()
-        .map(|spec| reconciler_group(config, spec))
-        .collect::<Vec<_>>();
-    let desired = ClusterShape {
-        run_id: ClusterRunId(config.run_id),
-        generation: 1,
-        groups,
-    };
-    let expanded = desired.expand().map_err(|error| error.to_string())?;
-    let mut first = Some(provisioner);
-    let mut bindings = Vec::with_capacity(stage_specs.len());
-    for spec in stage_specs {
-        let logical_node_id = ReconcilerLogicalNodeId(format!("node-{}-0", spec.node_id));
-        if !expanded.contains_key(&logical_node_id) {
-            return Err(format!(
-                "reconciler shape did not expand node {}",
-                logical_node_id.0
-            ));
-        }
-        let plugin = match first.take() {
-            Some(plugin) => plugin,
-            None => config.build_provisioner(runtime.clone())?,
-        };
-        bindings.push(ReconcilerNodeBinding {
-            logical_node_id,
-            provision: spec.clone(),
-            plugin,
-        });
-    }
-    ProvisionedClusterGuard::new(desired, bindings, RetryPolicy::default(), engine, sink)
-}
-
-// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn wait_for_runtime_readies(
-    ctx: RuntimeReadyAckLoop<'_>,
-    expected_node_ids: &[u64],
-    cluster: &mut ProvisionedClusterGuard,
-) -> Result<BTreeMap<u64, RuntimeReady>, String> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack,
-        obs_rx,
-        collector,
-        orchestrator_reports,
-        stop_signal,
-        dashboard,
-        orch_telemetry,
-        orch_stdio_rx,
-        run_id,
-        engine,
-        provider,
-        ..
-    } = ctx;
-    let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
-    let mut pending = BTreeMap::<u64, RuntimeReady>::new();
-    loop {
-        cluster
-            .poll(SystemTime::now())
-            .map_err(|error| format!("cluster reconcile while awaiting runtime: {error}"))?;
-        pending.retain(|node_id, ready| {
-            cluster.current_attempt(*node_id)
-                == Some(::provisioning::NodeAttemptId(ready.readiness_id))
-        });
-        collector.pump(driver);
-        emit_swim_transitions(
-            orch_telemetry,
-            dashboard,
-            run_id,
-            expected_node_ids.first().copied().unwrap_or(0),
-            stack,
-        );
-        emit_swim_probe_events(orch_telemetry, dashboard, stack, "runtime_ready_wait");
-        collector.drain(|stream, descriptor, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_collected_frame(stream, descriptor, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        drain_orch_stdio_capture(
-            orch_stdio_rx,
-            orch_telemetry,
-            dashboard,
-            run_id,
-            expected_node_ids.first().copied().unwrap_or(0),
-        );
-        if stop_requested(stop_signal) {
-            return Err("shutdown requested while waiting for pipeline nodes ready".to_owned());
-        }
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
-            match observation {
-                PluginObservation::TelemetryFrame { .. }
-                | PluginObservation::ProviderLine { .. }
-                | PluginObservation::StdoutLine { .. }
-                | PluginObservation::StderrLine { .. }
-                | PluginObservation::Failed { .. }
-                | PluginObservation::Exited { .. } => {}
-            }
-        }
-        while let Some(report) = orchestrator_reports.try_recv() {
-            if let OrchestratorReport::NodeRuntimeReady {
-                run_id: report_run_id,
-                node_id,
-                stage_index,
-                endpoint,
-                node_actor,
-                readiness_id,
-            } = report
-                && report_run_id == run_id
-                && expected.contains(&node_id)
-                && cluster.current_attempt(node_id)
-                    == Some(::provisioning::NodeAttemptId(readiness_id))
-            {
-                // Bootstrap-owned telemetry: the first runtime-ready report
-                // for a node dials its pull server and retains the live
-                // subscription for the node's lifetime — the same contract
-                // as the xtask demo's NodeTelemetryCollector.
-                if !pending.contains_key(&node_id) {
-                    collector.subscribe_node(
-                        &engine,
-                        driver.endpoint(),
-                        endpoint.clone(),
-                        run_id,
-                        node_id,
-                    );
-                }
-                pending.insert(
-                    node_id,
-                    RuntimeReady {
-                        endpoint: endpoint.clone(),
-                        node_actor,
-                        stage_index,
-                        readiness_id,
-                        swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
-                    },
-                );
-            }
-        }
-        if expected.iter().all(|node_id| {
-            pending
-                .get(node_id)
-                .is_some_and(|ready| runtime_ready_barrier_met(stack, ready))
-        }) {
-            return Ok(pending);
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
 }
 
 struct OrchStdioCapture;
@@ -2313,17 +1956,8 @@ struct ServeCluster<'a> {
     orchestrator_node_id: u64,
     provider: &'a ProviderKind,
     orchestrator_actor: ActorAddress,
-    coordinator_endpoint: EndpointAddr,
     engine: EngineHandle,
-    runtime: swactor::runtime::Runtime,
-    config: Config,
-    provisioner: Box<dyn ProvisionPlugin>,
-    live_clusters: BTreeMap<u64, ProvisionedClusterGuard>,
-    sink: PluginSink,
-    state_dir: daemon::StateDir,
-    snapshot: daemon::ClusterSnapshot,
-    control_rx: &'a mpsc::Receiver<ControlCommand>,
-    destroy_on_exit: bool,
+    pending_readies: BTreeMap<u64, RuntimeReady>,
 }
 
 fn daemon_label(config: &Config) -> String {
@@ -2339,604 +1973,138 @@ fn daemon_label(config: &Config) -> String {
     }
 }
 
-fn parse_control_node_id(value: &str) -> Result<u64, String> {
-    value
-        .parse::<u64>()
-        .ok()
-        .or_else(|| {
-            value
-                .split(|ch: char| !ch.is_ascii_digit())
-                .filter(|part| !part.is_empty())
-                .next_back()
-                .and_then(|part| part.parse::<u64>().ok())
-        })
-        .ok_or_else(|| format!("control node id {value:?} contains no numeric logical id"))
-}
-
-fn destroys_provider_resources_on_exit(provider: &str, explicitly_requested: bool) -> bool {
-    explicitly_requested || provider == "process"
-}
 impl ServeCluster<'_> {
-    fn ack_context(&mut self) -> RuntimeReadyAckLoop<'_> {
-        RuntimeReadyAckLoop {
-            driver: self.driver,
-            stack: self.stack,
-            obs_rx: self.obs_rx,
-            collector: self.collector,
-            orchestrator_reports: self.orchestrator_reports,
-            stop_signal: self.stop_signal,
-            dashboard: self.dashboard,
-            orch_telemetry: self.orch_telemetry,
-            orch_stdio_rx: self.orch_stdio_rx,
-            run_id: self.run_id,
-            orchestrator_node_id: self.orchestrator_node_id,
-            provider: self.provider,
-            engine: self.engine.clone(),
-        }
-    }
-
-    fn save_snapshot(&self) -> Result<(), String> {
-        self.state_dir.save_snapshot(&self.snapshot)
-    }
-
-    fn emit_command_event(
-        &mut self,
-        node_id: u64,
-        kind: ProvisionEventKind,
-        message: impl Into<String>,
-    ) {
-        self.orch_telemetry.emit_event(
-            self.dashboard,
-            ProvisionEvent {
-                run_id: self.run_id,
-                node_id,
-                kind,
-                provider: Some(self.provider.as_str().to_owned()),
-                message: Some(message.into()),
-            },
-        );
-    }
-
-    fn adopt_snapshot(&mut self) -> Result<(), String> {
-        let mut accounted = BTreeSet::new();
-        let ids = self
-            .snapshot
-            .nodes
-            .iter()
-            .filter_map(|node| node.spec.as_ref().map(|_| node.logical_node_id))
-            .collect::<Vec<_>>();
-        for node_id in ids {
-            let spec = self
-                .snapshot
-                .node(node_id)
-                .and_then(|node| node.spec.clone())
-                .expect("filtered snapshot node has spec");
-            match self.provisioner.adopt_by_spec(&spec, self.sink.clone()) {
-                Ok(Some(adopted)) => {
-                    accounted.insert(adopted.provider_ref.clone());
-                    if let Some(node) = self.snapshot.node_mut(node_id) {
-                        node.provider_ref = Some(adopted.provider_ref);
-                        node.status = daemon::NodeStatus::Running;
-                        node.last_seen_unix_ms = daemon::unix_ms_now();
-                    }
-                    if let Some(runtime) = self
-                        .snapshot
-                        .node(node_id)
-                        .and_then(|node| node.runtime.as_ref())
-                    {
-                        let endpoint = serde_json::from_str::<EndpointAddr>(&runtime.endpoint)
-                            .map_err(|error| {
-                                format!(
-                                    "snapshot node {node_id} telemetry endpoint is invalid: {error}"
-                                )
-                            })?;
-                        // The daemon identity survives restart but its direct
-                        // socket addresses do not. Dial the worker from the
-                        // fresh endpoint so SWIM and actor routing can
-                        // converge over the new connection.
-                        self.driver.join(std::slice::from_ref(&endpoint));
-                        self.collector.subscribe_node(
-                            &self.engine,
-                            self.driver.endpoint(),
-                            endpoint,
-                            self.run_id,
-                            node_id,
-                        );
-                    }
-                    self.emit_command_event(
-                        node_id,
-                        ProvisionEventKind::NodeLive,
-                        "adopted provider resource after daemon restart",
-                    );
-                }
-                Ok(None) => {
-                    if let Some(node) = self.snapshot.node_mut(node_id) {
-                        node.status = daemon::NodeStatus::Dead;
-                    }
-                    self.emit_command_event(
-                        node_id,
-                        ProvisionEventKind::NodeStopped,
-                        "snapshot node is absent from provider",
-                    );
-                }
-                Err(error) => {
-                    if let Some(node) = self.snapshot.node_mut(node_id) {
-                        node.status = daemon::NodeStatus::Dead;
-                    }
-                    self.emit_command_event(
-                        node_id,
-                        ProvisionEventKind::ProvisionFailed,
-                        format!("provider adoption failed: {error}"),
-                    );
-                }
-            }
-        }
-
-        let provider_only = self
-            .provisioner
-            .list_managed_refs()?
-            .into_iter()
-            .filter(|provider_ref| !accounted.contains(provider_ref))
-            .collect::<Vec<_>>();
-        for provider_ref in self.snapshot.sync_orphans(provider_only) {
-            self.emit_command_event(
-                0,
-                ProvisionEventKind::NodeLive,
-                format!("unmanaged provider resource discovered: {provider_ref}"),
-            );
-        }
-        self.save_snapshot()
-    }
-
-    fn add_node(&mut self) -> Result<u64, String> {
-        let logical_node_id = self.snapshot.allocate_node_id();
-        // Persist allocation before any provider side effect so a crash never
-        // reuses the id or ambiguously attributes a lease.
-        self.save_snapshot()?;
-        let spec = self.config.node_spec_for_stage(
-            self.coordinator_endpoint.clone(),
-            self.orchestrator_actor,
-            logical_node_id,
-            0,
-        )?;
-        // Persist the complete provider intent before creating anything. If
-        // the daemon dies during bootstrap, restart can recover the labeled
-        // resource by run/node identity even before its attempt is known.
-        self.snapshot.upsert_node(daemon::SnapshotNode {
-            logical_node_id,
-            spec: Some(spec.clone()),
-            provider_ref: Some(self.provisioner.provider_ref_for(&spec)),
-            status: daemon::NodeStatus::Running,
-            runtime: None,
-            last_seen_unix_ms: daemon::unix_ms_now(),
-        });
-        self.save_snapshot()?;
-        self.emit_command_event(
-            logical_node_id,
-            ProvisionEventKind::ProvisionStart,
-            "manual add-node command accepted",
-        );
-        let mut cluster = build_reconciled_cluster(
-            self.config.build_provisioner(self.runtime.clone())?,
-            &self.config,
-            std::slice::from_ref(&spec),
-            self.runtime.clone(),
-            self.engine.clone(),
-            self.sink.clone(),
-        )?;
-        let readies =
-            match wait_for_runtime_readies(self.ack_context(), &[logical_node_id], &mut cluster) {
-                Ok(readies) => readies,
-                Err(error) => {
-                    if stop_requested(self.stop_signal)
-                        && !destroys_provider_resources_on_exit(
-                            self.provider.as_str(),
-                            self.destroy_on_exit,
-                        )
-                    {
-                        cluster.detach();
-                    }
-                    return Err(error);
-                }
-            };
-        let ready = readies
-            .get(&logical_node_id)
-            .cloned()
-            .ok_or_else(|| format!("node {logical_node_id} did not announce runtime ready"))?;
-        let acknowledged = match wait_for_runtime_ready_acks(
-            self.ack_context(),
-            &[RuntimeReadyAckTarget {
-                node_id: logical_node_id,
-                ready: ready.clone(),
-            }],
-            &mut cluster,
-        ) {
-            Ok(acknowledged) => acknowledged,
-            Err(error) => {
-                if stop_requested(self.stop_signal)
-                    && !destroys_provider_resources_on_exit(
-                        self.provider.as_str(),
-                        self.destroy_on_exit,
-                    )
-                {
-                    cluster.detach();
-                }
-                return Err(error);
-            }
-        };
-        if !acknowledged {
-            return Err(format!(
-                "node {logical_node_id} changed attempt before runtime-ready acknowledgement"
-            ));
-        }
-        let attempt_id = cluster
-            .current_attempt(logical_node_id)
-            .ok_or_else(|| format!("node {logical_node_id} has no live reconciler attempt"))?
-            .0;
-        let mut persisted_spec = spec;
-        persisted_spec.attempt_id = attempt_id;
-        persisted_spec
-            .env
-            .retain(|(name, _)| name != "MYELIN_NODE_ATTEMPT_ID");
-        persisted_spec
-            .env
-            .push(("MYELIN_NODE_ATTEMPT_ID".to_owned(), attempt_id.to_string()));
-        let provider_ref = self.provisioner.provider_ref_for(&persisted_spec);
-        if self.provider.as_str() == "process" {
-            self.live_clusters.insert(logical_node_id, cluster);
-        } else {
-            cluster.detach();
-        }
-        self.snapshot.upsert_node(daemon::SnapshotNode {
-            logical_node_id,
-            spec: Some(persisted_spec),
-            provider_ref: Some(provider_ref),
-            status: daemon::NodeStatus::Running,
-            runtime: Some(daemon::RuntimeFacts {
-                endpoint: serde_json::to_string(&ready.endpoint)
-                    .map_err(|error| format!("serialize node endpoint: {error}"))?,
-                node_actor: ready.node_actor,
-                swim_node_id: ready.swim_node_id,
-                stage_index: ready.stage_index,
-                readiness_id: ready.readiness_id,
-            }),
-            last_seen_unix_ms: daemon::unix_ms_now(),
-        });
-        self.save_snapshot()?;
-        self.emit_command_event(
-            logical_node_id,
-            ProvisionEventKind::NodeLive,
-            "manual add-node command completed",
-        );
-        Ok(logical_node_id)
-    }
-
-    fn kill_node(&mut self, logical_node_id: u64) -> Result<bool, String> {
-        let Some(node) = self.snapshot.node(logical_node_id) else {
-            return Ok(false);
-        };
-        if node.status == daemon::NodeStatus::Dead {
-            return Ok(true);
-        }
-        let Some(spec) = node.spec.clone() else {
-            return Ok(false);
-        };
-        if let Some(mut cluster) = self.live_clusters.remove(&logical_node_id) {
-            cluster.stop()?;
-        } else {
-            let _ = self.provisioner.stop_by_spec(&spec, self.sink.clone())?;
-        }
-        if let Some(node) = self.snapshot.node_mut(logical_node_id) {
-            node.status = daemon::NodeStatus::Dead;
-            node.last_seen_unix_ms = daemon::unix_ms_now();
-        }
-        self.save_snapshot()?;
-        self.emit_command_event(
-            logical_node_id,
-            ProvisionEventKind::NodeStopped,
-            "manual kill command completed",
-        );
-        Ok(true)
-    }
-
-    fn destroy_node(&mut self, logical_node_id: u64) -> Result<bool, String> {
-        let Some(node) = self.snapshot.node(logical_node_id).cloned() else {
-            return Ok(false);
-        };
-        if let Some(mut cluster) = self.live_clusters.remove(&logical_node_id) {
-            cluster.stop()?;
-        } else if let Some(spec) = node.spec {
-            let _ = self.provisioner.stop_by_spec(&spec, self.sink.clone())?;
-        }
-        self.snapshot.remove_node(logical_node_id);
-        self.save_snapshot()?;
-        self.emit_command_event(
-            logical_node_id,
-            ProvisionEventKind::NodeStopped,
-            "manual destroy command completed",
-        );
-        Ok(true)
-    }
-
-    fn handle_dashboard_command(&mut self, command: ControlCommand) {
-        let command_id = command.command_id().to_owned();
-        match self.snapshot.accept_command(&command_id) {
-            Ok(false) => {
-                self.emit_command_event(
-                    0,
-                    ProvisionEventKind::NodeLive,
-                    format!("duplicate dashboard command ignored: {command_id}"),
-                );
-                return;
-            }
-            Err(error) => {
-                self.emit_command_event(0, ProvisionEventKind::ProvisionFailed, error);
-                return;
-            }
-            Ok(true) => {}
-        }
-        if let Err(error) = self.save_snapshot() {
-            self.emit_command_event(
-                0,
-                ProvisionEventKind::ProvisionFailed,
-                format!("persist dashboard command {command_id}: {error}"),
-            );
-            return;
-        }
-        let result = match command {
-            ControlCommand::Provision { count: 0, .. } => {
-                Err("provision count must be at least 1".to_owned())
-            }
-            ControlCommand::Provision { count, .. } if count > 8 => {
-                Err(format!("provision count {count} exceeds maximum 8"))
-            }
-            ControlCommand::Provision { count, .. } => {
-                (0..count).try_for_each(|_| self.add_node().map(|_| ()))
-            }
-            ControlCommand::Kill { node, .. } => parse_control_node_id(&node).and_then(|node_id| {
-                self.kill_node(node_id)?.then_some(()).ok_or_else(|| {
-                    format!("node {node_id} is not tracked or has no provision intent")
-                })
-            }),
-            ControlCommand::Remove { count: 0, .. } => {
-                Err("remove count must be at least 1".to_owned())
-            }
-            ControlCommand::Remove { count, .. } if count > 8 => {
-                Err(format!("remove count {count} exceeds maximum 8"))
-            }
-            ControlCommand::Remove { count, .. } => {
-                let mut ids = self
-                    .snapshot
-                    .nodes
-                    .iter()
-                    .filter(|node| node.spec.is_some())
-                    .map(|node| node.logical_node_id)
-                    .collect::<Vec<_>>();
-                ids.sort_unstable_by(|left, right| right.cmp(left));
-                ids.into_iter()
-                    .take(count as usize)
-                    .try_for_each(|node_id| self.destroy_node(node_id).map(|_| ()))
-            }
-            ControlCommand::EstablishEdge { node, .. } => {
-                Err(format!("edge establishment for node {node} is deferred"))
-            }
-        };
-        if let Err(error) = result {
-            self.emit_command_event(
-                0,
-                ProvisionEventKind::ProvisionFailed,
-                format!("dashboard control {command_id} failed: {error}"),
-            );
-        }
-    }
-
     fn observe_report(&mut self, report: OrchestratorReport) {
-        if let OrchestratorReport::NodeRuntimeReady {
-            run_id,
-            node_id,
-            stage_index,
-            endpoint,
-            node_actor,
-            readiness_id,
-        } = report
-            && run_id == self.run_id
-        {
-            // Bootstrap-owned telemetry: a new runtime generation announces a
-            // fresh pull server, so re-dial and retain the live subscription.
-            let known_readiness = self
-                .snapshot
-                .node(node_id)
-                .and_then(|node| node.runtime.as_ref())
-                .map(|runtime| runtime.readiness_id);
-            if known_readiness != Some(readiness_id) {
+        match report {
+            OrchestratorReport::NodeRuntimeReady {
+                run_id,
+                node_id,
+                endpoint,
+                node_actor,
+                ..
+            } if run_id == self.run_id => {
+                self.pending_readies.insert(
+                    node_id,
+                    RuntimeReady {
+                        node_actor,
+                        swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                    },
+                );
+                self.driver.join(std::slice::from_ref(&endpoint));
                 self.collector.subscribe_node(
                     &self.engine,
                     self.driver.endpoint(),
-                    endpoint.clone(),
+                    endpoint,
                     run_id,
                     node_id,
                 );
             }
-            if let Some(node) = self.snapshot.node_mut(node_id) {
-                node.status = daemon::NodeStatus::Running;
-                node.runtime = Some(daemon::RuntimeFacts {
-                    endpoint: serde_json::to_string(&endpoint).unwrap_or_default(),
-                    node_actor,
-                    swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
-                    stage_index,
-                    readiness_id,
-                });
-                node.last_seen_unix_ms = daemon::unix_ms_now();
+            OrchestratorReport::NodeRuntimeReadyAck { node_id, .. } => {
+                self.pending_readies.remove(&node_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn advance_join_barriers(&mut self) {
+        let ready = self
+            .pending_readies
+            .iter()
+            .filter(|(_, ready)| runtime_ready_barrier_met(self.stack, ready))
+            .map(|(node_id, _)| *node_id)
+            .collect::<Vec<_>>();
+        for node_id in ready {
+            if self
+                .stack
+                .runtime
+                .send_to(
+                    self.orchestrator_actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::JoinBarrierSatisfied { node_id }),
+                )
+                .is_ok()
+            {
+                self.pending_readies.remove(&node_id);
             }
         }
     }
 
-    fn recover_runtime_from_bootstrap(
-        &mut self,
-        observation: &PluginObservation,
-    ) -> Result<bool, String> {
-        let PluginObservation::TelemetryFrame {
-            run_id,
-            node_id,
-            channel,
-            payload,
-        } = observation
-        else {
-            return Ok(false);
-        };
-        if *run_id != self.run_id
-            || channel != "myelin.node.bootstrap"
-            || self
-                .snapshot
-                .node(*node_id)
-                .is_none_or(|node| node.runtime.is_some())
-        {
-            return Ok(false);
-        }
-        let event: Value = serde_json::from_str(payload)
-            .map_err(|error| format!("parse node {node_id} bootstrap telemetry: {error}"))?;
-        if event.get("phase").and_then(Value::as_str) != Some("runtime_ready_local")
-            || event.get("status").and_then(Value::as_str) != Some("ready")
-        {
-            return Ok(false);
-        }
-        let detail = event
-            .get("detail")
-            .ok_or_else(|| format!("node {node_id} runtime-ready event has no detail"))?;
-        let endpoint: EndpointAddr = serde_json::from_value(
-            detail
-                .get("endpoint")
-                .cloned()
-                .ok_or_else(|| format!("node {node_id} runtime-ready event has no endpoint"))?,
-        )
-        .map_err(|error| format!("parse node {node_id} runtime-ready endpoint: {error}"))?;
-        let node_actor = serde_json::from_value(
-            detail
-                .get("node_actor")
-                .cloned()
-                .ok_or_else(|| format!("node {node_id} runtime-ready event has no actor"))?,
-        )
-        .map_err(|error| format!("parse node {node_id} runtime-ready actor: {error}"))?;
-        let stage_index = detail
-            .get("stage_index")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| format!("node {node_id} runtime-ready event has no stage index"))?;
-        let readiness_id = detail
-            .get("readiness_id")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("node {node_id} runtime-ready event has no readiness id"))?;
-
-        self.driver.join(std::slice::from_ref(&endpoint));
-        self.collector.subscribe_node(
-            &self.engine,
-            self.driver.endpoint(),
-            endpoint.clone(),
-            *run_id,
-            *node_id,
-        );
-        if let Some(node) = self.snapshot.node_mut(*node_id) {
-            node.status = daemon::NodeStatus::Running;
-            node.runtime = Some(daemon::RuntimeFacts {
-                endpoint: serde_json::to_string(&endpoint)
-                    .map_err(|error| format!("serialize node {node_id} endpoint: {error}"))?,
-                node_actor,
-                swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
-                stage_index,
-                readiness_id,
-            });
-            node.last_seen_unix_ms = daemon::unix_ms_now();
-        }
-        Ok(true)
-    }
-
-    fn drain_observations(&mut self) -> Result<(), String> {
-        let mut dirty = false;
+    fn drain_observations(&mut self) {
         while let Ok(observation) = self.obs_rx.try_recv() {
-            dirty |= self.recover_runtime_from_bootstrap(&observation)?;
             emit_plugin_observation(
                 self.orch_telemetry,
                 self.dashboard,
                 self.provider,
                 &observation,
             );
-            match observation {
-                PluginObservation::Exited { node_id, .. }
-                | PluginObservation::Failed { node_id, .. } => {
-                    if let Some(node) = self.snapshot.node_mut(node_id) {
-                        node.status = daemon::NodeStatus::Dead;
-                        node.last_seen_unix_ms = daemon::unix_ms_now();
-                        dirty = true;
-                    }
-                }
-                _ => {}
+            let terminal = match observation {
+                PluginObservation::Exited {
+                    node_id, status, ..
+                } => Some((
+                    node_id,
+                    format!("provider process exited with status {status:?}"),
+                )),
+                PluginObservation::Failed {
+                    node_id, reason, ..
+                } => Some((node_id, reason)),
+                _ => None,
+            };
+            if let Some((node_id, error)) = terminal {
+                let _ = self.stack.runtime.send_to(
+                    self.orchestrator_actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::ProviderTerminalFailure {
+                        node_id,
+                        error,
+                    }),
+                );
             }
         }
-        if dirty {
-            self.save_snapshot()?;
-        }
-        Ok(())
-    }
-
-    fn teardown_if_requested(&mut self) -> Result<(), String> {
-        // Process-provider children cannot be adopted. Durable provider
-        // resources survive unless teardown was explicitly requested.
-        if destroys_provider_resources_on_exit(self.provider.as_str(), self.destroy_on_exit) {
-            for (_, mut cluster) in std::mem::take(&mut self.live_clusters) {
-                cluster.stop()?;
-            }
-            let specs = self
-                .snapshot
-                .nodes
-                .iter()
-                .filter_map(|node| node.spec.clone())
-                .collect::<Vec<_>>();
-            for spec in specs {
-                let _ = self.provisioner.stop_by_spec(&spec, self.sink.clone())?;
-            }
-            self.snapshot.nodes.clear();
-            self.save_snapshot()?;
-        } else {
-            for (_, mut cluster) in std::mem::take(&mut self.live_clusters) {
-                cluster.detach();
-            }
-            self.provisioner.detach_all();
-        }
-        Ok(())
     }
 }
 
-impl Drop for ServeCluster<'_> {
-    fn drop(&mut self) {
-        if self.provider.as_str() == "process" {
-            for cluster in self.live_clusters.values_mut() {
-                let _ = cluster.stop();
-            }
-        } else {
-            for cluster in self.live_clusters.values_mut() {
-                cluster.detach();
-            }
+fn flush_manual_control(
+    runtime: &swactor::runtime::Runtime,
+    actor: ActorAddress,
+) -> Result<(), String> {
+    let replies = runtime
+        .new_inbox::<crate::orchestration::manual_control::ManualControlReply>()
+        .map_err(|error| format!("create shutdown flush inbox: {error}"))?;
+    runtime
+        .send_to(
+            actor,
+            OrchestratorMsg::Manual(ManualControlMsg::Flush {
+                reply_to: *replies.addr(),
+            }),
+        )
+        .map_err(|error| format!("request shutdown persistence flush: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if matches!(
+            replies.try_recv(),
+            Some(crate::orchestration::manual_control::ManualControlReply::Flushed)
+        ) {
+            return Ok(());
         }
-        self.provisioner.detach_all();
+        thread::sleep(Duration::from_millis(10));
     }
+    Err("timed out waiting for shutdown persistence flush".to_owned())
 }
 
 #[allow(clippy::disallowed_methods)]
 fn serve_cluster(mut ctx: ServeCluster<'_>) -> Result<(), String> {
-    ctx.adopt_snapshot()?;
     loop {
         ctx.collector.pump(ctx.driver);
         ctx.collector.drain(|stream, descriptor, channel, frame| {
             if let Some(dashboard) = ctx.dashboard {
-                dashboard.publish_collected_frame(stream, descriptor, channel, frame);
+                dashboard.publish_frame(stream, descriptor, channel, frame);
             }
             ctx.orch_telemetry
                 .archive_frame("node", stream, channel, frame);
         });
-        ctx.drain_observations()?;
+        ctx.drain_observations();
         while let Some(report) = ctx.orchestrator_reports.try_recv() {
             ctx.observe_report(report);
         }
+        ctx.advance_join_barriers();
         emit_swim_transitions(
             ctx.orch_telemetry,
             ctx.dashboard,
@@ -2957,37 +2125,10 @@ fn serve_cluster(mut ctx: ServeCluster<'_>) -> Result<(), String> {
             ctx.run_id,
             ctx.orchestrator_node_id,
         );
-        while let Ok(command) = ctx.control_rx.try_recv() {
-            ctx.handle_dashboard_command(command);
-        }
         if stop_requested(ctx.stop_signal) {
             break;
         }
         thread::sleep(PUMP_INTERVAL);
-    }
-    ctx.save_snapshot()?;
-    ctx.teardown_if_requested()
-}
-
-fn drain_observations_with_exit(
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    dashboard: Option<&DashboardSupport>,
-    orch_telemetry: &mut OrchTelemetry,
-    provider: &ProviderKind,
-    exit_message: impl Fn(u64, Option<i32>) -> String,
-) -> Result<(), String> {
-    while let Ok(observation) = obs_rx.try_recv() {
-        emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
-        match observation {
-            PluginObservation::Failed { reason, .. } => return Err(reason),
-            PluginObservation::Exited {
-                node_id, status, ..
-            } => return Err(exit_message(node_id, status)),
-            PluginObservation::TelemetryFrame { .. }
-            | PluginObservation::ProviderLine { .. }
-            | PluginObservation::StdoutLine { .. }
-            | PluginObservation::StderrLine { .. } => {}
-        }
     }
     Ok(())
 }
@@ -3135,49 +2276,6 @@ pub(crate) fn env_optional(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-}
-
-fn local_tinygrad_worker_env(provider: &str) -> Option<(String, String)> {
-    env_optional("MYELIN_TINYGRAD_WORKER")
-        .map(|value| ("MYELIN_TINYGRAD_WORKER".to_owned(), value))
-        .or_else(|| {
-            (provider == "process")
-                .then(default_local_tinygrad_worker_path)
-                .flatten()
-                .map(|path| {
-                    (
-                        "MYELIN_TINYGRAD_WORKER".to_owned(),
-                        path.to_string_lossy().to_string(),
-                    )
-                })
-        })
-}
-
-fn default_local_tinygrad_worker_path() -> Option<PathBuf> {
-    // The tinygrad worker script ships in the node-image build context at
-    // `apps/myelin/node-image/tinygrad_worker.py` (see `chat/node_image.rs` and
-    // the node-image Dockerfile). The process provider runs it directly via
-    // `python3`, so resolve that path from the workspace cwd or this crate's
-    // manifest dir. (Previously looked in `apps/myelin-node/`, a path left stale
-    // by the `mvp-system` -> `myelin` app refactor and never present on disk.)
-    let cwd_candidate = std::env::current_dir().ok().map(|cwd| {
-        cwd.join("apps")
-            .join("myelin")
-            .join("node-image")
-            .join("tinygrad_worker.py")
-    });
-    if let Some(candidate) = cwd_candidate.filter(|path| path.is_file()) {
-        return Some(candidate.canonicalize().unwrap_or(candidate));
-    }
-
-    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("node-image")
-        .join("tinygrad_worker.py");
-    manifest_candidate.is_file().then(|| {
-        manifest_candidate
-            .canonicalize()
-            .unwrap_or(manifest_candidate)
-    })
 }
 
 pub(crate) fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -3348,13 +2446,44 @@ where
 
 #[cfg(test)]
 mod lifecycle_policy_tests {
-    use super::destroys_provider_resources_on_exit;
+    use super::{ActorAddress, ConfigBuilder, EndpointAddr, VastAiProvisioningMode};
+    #[test]
+    fn vastai_mock_mode_needs_no_ssh_or_bootstrap_configuration() {
+        let mut config = ConfigBuilder::hardcoded_defaults()
+            .overlay_cli([
+                "--provider".to_owned(),
+                "vastai".to_owned(),
+                "--vastai-provisioning".to_owned(),
+                "mock".to_owned(),
+            ])
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        config.prepare_vastai_ssh_key().unwrap();
+        let vastai = config.vastai.as_ref().unwrap();
+        assert_eq!(vastai.provisioning_mode, VastAiProvisioningMode::Mock);
+        assert!(vastai.ssh_identity.is_none());
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[7; 32]).public());
+        let spec = config
+            .node_spec_for_stage(coordinator, ActorAddress::default(), 1, 0)
+            .unwrap();
+        assert_eq!(spec.args, [crate::ORCHESTRATOR_WORKER_MODE_ARG]);
+        assert!(vastai.bootstrap_command.is_none());
+    }
 
     #[test]
-    fn durable_providers_survive_unrequested_daemon_shutdown() {
-        assert!(!destroys_provider_resources_on_exit("docker", false));
-        assert!(!destroys_provider_resources_on_exit("vastai", false));
-        assert!(destroys_provider_resources_on_exit("process", false));
-        assert!(destroys_provider_resources_on_exit("docker", true));
+    fn vastai_provisioning_mode_rejects_unknown_values() {
+        let error = ConfigBuilder::hardcoded_defaults()
+            .overlay_cli([
+                "--provider".to_owned(),
+                "vastai".to_owned(),
+                "--vastai-provisioning".to_owned(),
+                "imaginary".to_owned(),
+            ])
+            .err()
+            .unwrap();
+        assert!(error.contains("imaginary"));
+        assert!(error.contains("mock"));
     }
 }

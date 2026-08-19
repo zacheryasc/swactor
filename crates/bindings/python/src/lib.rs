@@ -326,7 +326,6 @@ impl PyRuntime {
     }
 }
 
-
 // ─── ActorInfo / RuntimeStats ────────────────────────────────────────────────
 
 #[pyclass(name = "ActorInfo")]

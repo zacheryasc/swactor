@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::Value;
+use telemetry::frame::{Frame, StreamId};
 
 use crate::FrameEvent;
 

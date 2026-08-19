@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor_transport::NetworkMessage;
 
-use crate::fsm::{transition, JobCommand, JobEvent, JobState, TransitionCtx};
+use crate::fsm::{JobCommand, JobEvent, JobState, TransitionCtx, transition};
 use crate::model::Job;
-use crate::wire::{NodeJobCommand, NodeJobEvent, OutputChunk, CHUNK_SIZE};
+use crate::wire::{CHUNK_SIZE, NodeJobCommand, NodeJobEvent, OutputChunk};
 
 /// Reports a terminal job state to an observer address.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,21 +106,35 @@ impl OrchestratorJobActor {
                 }
             }
             JobCommand::RunSetup => {
-                let _ = ctx.send(node, NodeJobCommand::RunSetup {
-                    job_id,
-                    command: self.job.as_ref().and_then(|j| j.setup.clone()).unwrap_or_default(),
-                    env: self.job.as_ref().map(|j| j.env.clone()).unwrap_or_default(),
-                });
+                let _ = ctx.send(
+                    node,
+                    NodeJobCommand::RunSetup {
+                        job_id,
+                        command: self
+                            .job
+                            .as_ref()
+                            .and_then(|j| j.setup.clone())
+                            .unwrap_or_default(),
+                        env: self.job.as_ref().map(|j| j.env.clone()).unwrap_or_default(),
+                    },
+                );
             }
             JobCommand::RunJob => {
-                let _ = ctx.send(node, NodeJobCommand::RunJob {
-                    job_id,
-                    command: self.job.as_ref().map(|j| j.run.clone()).unwrap_or_default(),
-                    env: self.job.as_ref().map(|j| j.env.clone()).unwrap_or_default(),
-                });
+                let _ = ctx.send(
+                    node,
+                    NodeJobCommand::RunJob {
+                        job_id,
+                        command: self.job.as_ref().map(|j| j.run.clone()).unwrap_or_default(),
+                        env: self.job.as_ref().map(|j| j.env.clone()).unwrap_or_default(),
+                    },
+                );
             }
             JobCommand::CollectOutputs => {
-                let outputs = self.job.as_ref().map(|j| j.outputs.clone()).unwrap_or_default();
+                let outputs = self
+                    .job
+                    .as_ref()
+                    .map(|j| j.outputs.clone())
+                    .unwrap_or_default();
                 self.outputs_collected = false;
                 if !self.edge_mode {
                     // Chunk mode: track each output until its eof chunk lands.
@@ -270,7 +284,9 @@ fn append_dir_filtered(
         if file_type.is_dir() {
             append_dir_filtered(builder, root, &path, exclude)?;
         } else if file_type.is_file() {
-            builder.append_path_with_name(&path, rel).map_err(|e| e.to_string())?;
+            builder
+                .append_path_with_name(&path, rel)
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -278,8 +294,14 @@ fn append_dir_filtered(
 
 fn is_excluded(rel: &Path, exclude: &[String]) -> bool {
     let rel_text = path_slash(rel);
-    let name = rel.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let components = rel.iter().map(|c| c.to_string_lossy().to_string()).collect::<Vec<_>>();
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let components = rel
+        .iter()
+        .map(|c| c.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
     for raw in exclude {
         let pattern = raw.trim();
         if pattern.is_empty() {
@@ -302,7 +324,10 @@ fn is_excluded(rel: &Path, exclude: &[String]) -> bool {
 }
 
 fn path_slash(path: &Path) -> String {
-    path.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")
+    path.iter()
+        .map(|c| c.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn wildcard_matches(pattern: &str, text: &str) -> bool {
@@ -332,7 +357,9 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
 
 fn extract_tar(bytes: &[u8], dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    tar::Archive::new(Cursor::new(bytes)).unpack(dst).map_err(|e| e.to_string())
+    tar::Archive::new(Cursor::new(bytes))
+        .unpack(dst)
+        .map_err(|e| e.to_string())
 }
 
 fn stream_workspace(ctx: &Ctx, node: ActorAddress, job_id: u64, bytes: &[u8]) {
@@ -351,11 +378,14 @@ fn stream_workspace(ctx: &Ctx, node: ActorAddress, job_id: u64, bytes: &[u8]) {
     let chunks: Vec<&[u8]> = bytes.chunks(CHUNK_SIZE).collect();
     let total = chunks.len() as u64;
     for (i, chunk) in chunks.iter().enumerate() {
-        let _ = ctx.send(node, NodeJobCommand::WorkspaceChunk {
-            job_id,
-            seq: i as u64,
-            data: chunk.to_vec(),
-            eof: i as u64 + 1 == total,
-        });
+        let _ = ctx.send(
+            node,
+            NodeJobCommand::WorkspaceChunk {
+                job_id,
+                seq: i as u64,
+                data: chunk.to_vec(),
+                eof: i as u64 + 1 == total,
+            },
+        );
     }
 }

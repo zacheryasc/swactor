@@ -27,8 +27,7 @@ use crate::arena::{
 };
 use crate::edge_lifecycle::{
     EdgeCommand, EdgeEstablisher, EdgeEvent, EdgeFaultReason, EdgeLifecycleEvent, NodeId,
-    ObjectSpec, ProvisionRx, ProvisionTx, RingDirection, RingLeaseRejection,
-    StreamFaultReason,
+    ObjectSpec, ProvisionRx, ProvisionTx, RingDirection, RingLeaseRejection, StreamFaultReason,
 };
 use crate::edge_wire::EdgeTransport;
 use crate::ids::{EdgeId, LeaseRequestId, RingId, StreamId};
@@ -231,9 +230,14 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
             match event {
                 crate::edge_wire::WireEvent::StreamArrived { edge_id, stream_id } => {
                     self.incoming_stream(edge_id, stream_id);
-                    self.observations.push(Observation::StreamArrived { edge_id, stream_id });
+                    self.observations
+                        .push(Observation::StreamArrived { edge_id, stream_id });
                 }
-                crate::edge_wire::WireEvent::BytesRead { edge_id, stream_id, bytes } => {
+                crate::edge_wire::WireEvent::BytesRead {
+                    edge_id,
+                    stream_id,
+                    bytes,
+                } => {
                     self.observations.push(Observation::BytesRead {
                         edge_id,
                         stream_id,
@@ -242,10 +246,8 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
                     self.ingress_bytes(arena, worker, edge_id, stream_id, bytes)?;
                 }
                 crate::edge_wire::WireEvent::StreamEnded { edge_id, stream_id } => {
-                    if let Some(inbound) = self
-                        .inbound
-                        .as_mut()
-                        .filter(|edge| edge.edge_id == edge_id)
+                    if let Some(inbound) =
+                        self.inbound.as_mut().filter(|edge| edge.edge_id == edge_id)
                     {
                         inbound.buffers.remove(&stream_id);
                     }
@@ -407,8 +409,8 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
         worker: &mut dyn WorkerPort,
     ) -> Result<(), String> {
         loop {
-            let progressed = self.execute_commands(transport, arena, worker)?
-                || self.drain_lifecycle()?;
+            let progressed =
+                self.execute_commands(transport, arena, worker)? || self.drain_lifecycle()?;
             if !progressed {
                 break;
             }
@@ -473,11 +475,10 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
                                     RingLeaseRejection::ArenaShuttingDown
                                 }
                             };
-                            self.establisher
-                                .observe(EdgeEvent::RingLeaseRejected {
-                                    request_id: LeaseRequestId(request_id.0),
-                                    reason,
-                                });
+                            self.establisher.observe(EdgeEvent::RingLeaseRejected {
+                                request_id: LeaseRequestId(request_id.0),
+                                reason,
+                            });
                         }
                         ArenaEvent::RingLeaseQueued { .. }
                         | ArenaEvent::RingReleased { .. }
@@ -500,10 +501,8 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
                 worker.install_ring(edge_id, ring_id, direction, &layout, &object_spec)?;
                 match direction {
                     RingDirection::Ingress => {
-                        if let Some(inbound) = self
-                            .inbound
-                            .as_mut()
-                            .filter(|edge| edge.edge_id == edge_id)
+                        if let Some(inbound) =
+                            self.inbound.as_mut().filter(|edge| edge.edge_id == edge_id)
                         {
                             inbound.ring_id = Some(ring_id);
                         }
@@ -530,7 +529,10 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
                     .map(|outbound| outbound.peer.clone())
                     .ok_or_else(|| "outbound edge missing".to_owned())?;
                 let writer = transport.open_writer(edge_id, &peer)?;
-                if let Some(outbound) = self.outbound.as_mut().filter(|edge| edge.edge_id == edge_id)
+                if let Some(outbound) = self
+                    .outbound
+                    .as_mut()
+                    .filter(|edge| edge.edge_id == edge_id)
                 {
                     outbound.writer = Some(writer);
                 }
@@ -600,8 +602,7 @@ impl<T: EdgeTransport> EdgeRuntime<T> {
                     return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
                 }
                 EdgeLifecycleEvent::EdgeStopped { edge_id } => {
-                    self.observations
-                        .push(Observation::EdgeStopped { edge_id });
+                    self.observations.push(Observation::EdgeStopped { edge_id });
                 }
             }
         }
@@ -694,10 +695,5 @@ fn edge_layout(layout: &ArenaRingLayout) -> crate::edge_lifecycle::RingLayout {
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
-    started
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
-

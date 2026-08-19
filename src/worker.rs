@@ -225,9 +225,9 @@ impl Worker {
                 worker_requests: &worker_requests,
                 stats: &self.stats,
             };
-            processed = self
-                .pool
-                .tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget);
+            processed =
+                self.pool
+                    .tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget);
             if processed > 0 {
                 did_work = true;
             }
@@ -437,11 +437,7 @@ impl Worker {
         }
     }
 
-    fn should_defer_admin_command(
-        pool: &ActorPool,
-        tc: &TickContext,
-        cmd: &AdminCommand,
-    ) -> bool {
+    fn should_defer_admin_command(pool: &ActorPool, tc: &TickContext, cmd: &AdminCommand) -> bool {
         Self::admin_target(cmd).is_some_and(|actor| {
             !pool.contains(&actor) && tc.worker_of(&actor) == Some(tc.worker_id())
         })
@@ -607,17 +603,14 @@ impl Worker {
                 }
             }
 
-            tc.worker_stats.num_actors.store(pool.len(), Ordering::Relaxed);
+            tc.worker_stats
+                .num_actors
+                .store(pool.len(), Ordering::Relaxed);
         }
 
         // Deliver any messages sent during on_stop callbacks.
         for (addr, msg) in cleanup_pending.into_inner() {
-            Self::deliver_or_defer_transfer(
-                pool,
-                tc,
-                deferred_transfers,
-                Envelope::new(addr, msg),
-            );
+            Self::deliver_or_defer_transfer(pool, tc, deferred_transfers, Envelope::new(addr, msg));
         }
 
         // GC per-worker extension state for dead actors
@@ -668,7 +661,9 @@ impl ContextInner for WorkerContext<'_> {
 
     fn spawn_any(&self, request: SpawnRequest) {
         // ctx.spawn pins the child to the current worker.
-        self.tc.address_map.insert(request.addr, self.tc.worker_id());
+        self.tc
+            .address_map
+            .insert(request.addr, self.tc.worker_id());
         self.tc.spawn_tx(self.tc.worker_id()).send(request);
     }
 
@@ -811,7 +806,11 @@ impl ActorPool {
         self.actors.get_mut(&addr).map(|slot| slot.actor.as_mut())
     }
 
-    fn actor_summary_from_slot(address: ActorAddress, slot: &ActorSlot, worker: WorkerId) -> ActorSummary {
+    fn actor_summary_from_slot(
+        address: ActorAddress,
+        slot: &ActorSlot,
+        worker: WorkerId,
+    ) -> ActorSummary {
         let metadata = slot.actor.metadata();
         ActorSummary {
             address,
@@ -889,12 +888,7 @@ impl ActorPool {
     ///
     /// Each actor processes up to `budget` messages per tick (0 = unlimited).
     /// This prevents a single hot actor from starving others on the same worker.
-    fn tick_all(
-        &mut self,
-        wctx: &WorkerContext<'_>,
-        stats: &WorkerStats,
-        budget: usize,
-    ) -> usize {
+    fn tick_all(&mut self, wctx: &WorkerContext<'_>, stats: &WorkerStats, budget: usize) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
             if should_skip_actor(slot.poisoned, slot.stopping, slot.suspended) {

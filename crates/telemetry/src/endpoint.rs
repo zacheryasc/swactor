@@ -17,8 +17,8 @@ use swactor::process_observer::ProcessOutputObserver;
 use swactor::stats::{ActorSnapshot, StatsHook};
 
 use crate::frame::{
-    ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, TelemetryEvent,
-    FrameDelivery, SourceFilter, StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest,
+    ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, FrameDelivery,
+    SourceFilter, StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest, TelemetryEvent,
 };
 use crate::mux::Mux;
 use crate::record::Record;

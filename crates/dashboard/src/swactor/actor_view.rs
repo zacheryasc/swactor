@@ -54,8 +54,6 @@ pub(crate) struct RuntimeState {
     pub(crate) history: VecDeque<HistorySample>,
 }
 
-
-
 impl RuntimeState {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
@@ -222,7 +220,8 @@ impl ActorState {
         if let Some(actor_type) = string_field(value, &["actor_type"]).filter(|t| !t.is_empty()) {
             self.actor_type = Some(actor_type);
         }
-        if let Some(message_type) = string_field(value, &["message_type"]).filter(|t| !t.is_empty()) {
+        if let Some(message_type) = string_field(value, &["message_type"]).filter(|t| !t.is_empty())
+        {
             self.message_type = Some(message_type);
         }
         if let Some(worker_id) = u32_field(value, &["worker_id", "worker"]) {
@@ -254,7 +253,10 @@ impl ActorState {
             self.message_type_counts = counts;
         }
         self.last_update = Some(now);
-        self.fold_receipt(now, self.messages_processed.saturating_sub(processed_before));
+        self.fold_receipt(
+            now,
+            self.messages_processed.saturating_sub(processed_before),
+        );
         self.push_history(now);
         self.recompute_growth();
     }
@@ -276,10 +278,7 @@ impl ActorState {
         if self.receipts.len() == RECEIPT_CAP {
             self.receipts.pop_front();
         }
-        let ty = self
-            .last_msg_type
-            .clone()
-            .unwrap_or_else(|| "?".to_owned());
+        let ty = self.last_msg_type.clone().unwrap_or_else(|| "?".to_owned());
         self.receipts.push_back(ActorReceipt {
             at: now,
             ty,
@@ -345,8 +344,6 @@ pub(crate) struct Totals {
     pub(crate) msg_per_sec: f64,
     pub(crate) poisoned: u32,
 }
-
-
 
 // --- tolerant JSON helpers (publisher-shape-agnostic readers) ---------------
 
@@ -436,4 +433,3 @@ fn parse_message_type_counts(value: Option<&Value>) -> Option<Vec<(String, u64)>
     }
     None
 }
-

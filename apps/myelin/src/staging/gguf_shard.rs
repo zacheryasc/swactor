@@ -12,7 +12,6 @@ use crate::staging::gguf_metadata::{
 
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
-const STAGE_SHARD_CACHE_FORMAT_VERSION: &str = "stage-shard-cache-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ByteRange {
@@ -75,87 +74,16 @@ impl StageShardPlan {
         self.merged_tensor_ranges.len() + if self.metadata_end > 0 { 1 } else { 0 }
     }
 }
-
 #[derive(Clone, Debug)]
 struct GgufTensorEntry {
     name: String,
     dims: Vec<u64>,
     ggml_type: u32,
-    source_offset: u64,
-    byte_len: u64,
 }
-
 #[derive(Clone, Debug)]
 struct GgufDirectory {
-    metadata_count: u64,
-    metadata_end: u64,
-    data_start: u64,
     alignment: u32,
-    total_bytes: u64,
     tensors: Vec<GgufTensorEntry>,
-}
-
-pub(crate) fn plan_stage_shard(
-    planning_gguf: &Path,
-    source: GgufSource,
-    stage_index: u32,
-    stage_count: u32,
-    layer_start: u32,
-    layer_end_exclusive: u32,
-) -> Result<StageShardPlan, String> {
-    if layer_start >= layer_end_exclusive {
-        return Err(format!(
-            "stage {stage_index} has empty layer range {layer_start}..{layer_end_exclusive}"
-        ));
-    }
-    if stage_count == 0 || stage_index >= stage_count {
-        return Err(format!(
-            "invalid stage index/count: stage {stage_index}, count {stage_count}"
-        ));
-    }
-
-    let directory = read_gguf_directory(planning_gguf)?;
-    let tensors = select_stage_tensors(
-        &directory.tensors,
-        stage_index,
-        stage_count,
-        layer_start,
-        layer_end_exclusive,
-    )?;
-    let merged_tensor_ranges = merge_tensor_ranges(directory.data_start, &tensors)?;
-    let cache_key = shard_cache_key(
-        &source,
-        stage_index,
-        stage_count,
-        layer_start,
-        layer_end_exclusive,
-        &tensors,
-    );
-
-    Ok(StageShardPlan {
-        source,
-        stage_index,
-        stage_count,
-        layer_start,
-        layer_end_exclusive,
-        metadata_count: directory.metadata_count,
-        metadata_end: directory.metadata_end,
-        data_start: directory.data_start,
-        alignment: directory.alignment,
-        source_total_bytes: directory.total_bytes,
-        tensors: tensors
-            .into_iter()
-            .map(|tensor| StageShardTensor {
-                name: tensor.name,
-                dims: tensor.dims,
-                ggml_type: tensor.ggml_type,
-                source_offset: tensor.source_offset,
-                byte_len: tensor.byte_len,
-            })
-            .collect(),
-        merged_tensor_ranges,
-        cache_key,
-    })
 }
 
 pub(crate) fn validate_stage_shard_cache(path: &Path, plan: &StageShardPlan) -> Result<(), String> {
@@ -265,9 +193,6 @@ fn read_gguf_directory(path: &Path) -> Result<GgufDirectory, String> {
             skip_value(&mut file, value_type)?;
         }
     }
-    let metadata_end = file
-        .stream_position()
-        .map_err(|e| format!("locate GGUF metadata end: {e}"))?;
 
     let mut tensor_infos = Vec::new();
     for _ in 0..tensor_count {
@@ -291,14 +216,12 @@ fn read_gguf_directory(path: &Path) -> Result<GgufDirectory, String> {
         ));
     }
 
-    let mut order = tensor_infos
+    let order = tensor_infos
         .iter()
         .enumerate()
         .map(|(index, (_, _, _, offset))| (*offset, index))
         .collect::<Vec<_>>();
-    order.sort_by_key(|(offset, _)| *offset);
-    let mut byte_lens = vec![0_u64; tensor_infos.len()];
-    for (position, (offset, tensor_index)) in order.iter().copied().enumerate() {
+    for (offset, _) in order {
         let absolute = data_start
             .checked_add(offset)
             .ok_or_else(|| format!("tensor offset overflow at {offset}"))?;
@@ -308,151 +231,22 @@ fn read_gguf_directory(path: &Path) -> Result<GgufDirectory, String> {
                 path.display()
             ));
         }
-        let next_absolute = if let Some((next_offset, _)) = order.get(position + 1) {
-            data_start
-                .checked_add(*next_offset)
-                .ok_or_else(|| format!("next tensor offset overflow at {next_offset}"))?
-        } else {
-            total_bytes
-        };
-        if next_absolute < absolute {
-            return Err("GGUF tensor offsets are not monotonic".to_owned());
-        }
-        byte_lens[tensor_index] = next_absolute - absolute;
     }
 
     let tensors = tensor_infos
         .into_iter()
-        .enumerate()
-        .map(
-            |(index, (name, dims, ggml_type, source_offset))| GgufTensorEntry {
-                name,
-                dims,
-                ggml_type,
-                source_offset,
-                byte_len: byte_lens[index],
-            },
-        )
+        .map(|(name, dims, ggml_type, _)| GgufTensorEntry {
+            name,
+            dims,
+            ggml_type,
+        })
         .collect();
 
     Ok(GgufDirectory {
-        metadata_count,
-        metadata_end,
-        data_start,
         alignment: u32::try_from(alignment)
             .map_err(|_| format!("GGUF alignment {alignment} exceeds u32"))?,
-        total_bytes,
         tensors,
     })
-}
-
-fn select_stage_tensors(
-    tensors: &[GgufTensorEntry],
-    stage_index: u32,
-    stage_count: u32,
-    layer_start: u32,
-    layer_end_exclusive: u32,
-) -> Result<Vec<GgufTensorEntry>, String> {
-    let first_stage = layer_start == 0;
-    let final_stage = stage_index + 1 == stage_count;
-    let has_output_weight = tensors.iter().any(|tensor| tensor.name == "output.weight");
-    let mut selected = Vec::new();
-    for tensor in tensors {
-        if tensor.name == "token_embd.weight" && (first_stage || final_stage && !has_output_weight)
-        {
-            selected.push(tensor.clone());
-            continue;
-        }
-        if final_stage && matches!(tensor.name.as_str(), "output.weight" | "output_norm.weight") {
-            selected.push(tensor.clone());
-            continue;
-        }
-        if let Some(layer) = tensor_layer_index(&tensor.name)
-            && layer_start <= layer
-            && layer < layer_end_exclusive
-        {
-            selected.push(tensor.clone());
-        }
-    }
-    if selected.is_empty() {
-        return Err(format!(
-            "stage {stage_index} selected no tensors for layer range {layer_start}..{layer_end_exclusive}"
-        ));
-    }
-    selected.sort_by_key(|tensor| tensor.source_offset);
-    Ok(selected)
-}
-
-fn tensor_layer_index(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("blk.")?;
-    let (raw, _) = rest.split_once('.')?;
-    raw.parse().ok()
-}
-
-fn merge_tensor_ranges(
-    data_start: u64,
-    tensors: &[GgufTensorEntry],
-) -> Result<Vec<ByteRange>, String> {
-    let mut ranges = tensors
-        .iter()
-        .map(|tensor| {
-            let start = data_start
-                .checked_add(tensor.source_offset)
-                .ok_or_else(|| format!("range start overflow for tensor {}", tensor.name))?;
-            Ok(ByteRange {
-                start,
-                len: tensor.byte_len,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<ByteRange> = Vec::new();
-    for range in ranges {
-        if range.len == 0 {
-            continue;
-        }
-        let range_end = range
-            .end_exclusive()
-            .ok_or_else(|| format!("range end overflow at {}", range.start))?;
-        if let Some(last) = merged.last_mut() {
-            let last_end = last
-                .end_exclusive()
-                .ok_or_else(|| format!("range end overflow at {}", last.start))?;
-            if range.start <= last_end {
-                last.len = range_end.saturating_sub(last.start).max(last.len);
-                continue;
-            }
-        }
-        merged.push(range);
-    }
-    Ok(merged)
-}
-
-fn shard_cache_key(
-    source: &GgufSource,
-    stage_index: u32,
-    stage_count: u32,
-    layer_start: u32,
-    layer_end_exclusive: u32,
-    tensors: &[GgufTensorEntry],
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(format!("format:{STAGE_SHARD_CACHE_FORMAT_VERSION}\n").as_bytes());
-    hasher.update(format!("source:{source:?}\n").as_bytes());
-    hasher.update(
-        format!("stage:{stage_index}/{stage_count}:{layer_start}-{layer_end_exclusive}\n")
-            .as_bytes(),
-    );
-    for tensor in tensors {
-        hasher.update(
-            format!(
-                "{}:{}:{}:{:?}\n",
-                tensor.name, tensor.source_offset, tensor.byte_len, tensor.dims
-            )
-            .as_bytes(),
-        );
-    }
-    hasher.finalize().to_hex()[..24].to_owned()
 }
 
 pub(crate) fn materialize_stage_shard_http<F>(

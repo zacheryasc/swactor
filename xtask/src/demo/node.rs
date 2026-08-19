@@ -33,8 +33,8 @@ use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, spawn_pull_server};
 use telemetry::{ChannelContent, TelemetryEndpoint, TelemetryProducer};
 
-use crate::demo::edge;
 use crate::demo::HEARTBEAT_PERIOD;
+use crate::demo::edge;
 
 /// Wire tag of the announce gossip frame (`CodecRegistry` decode key on the
 /// supervisor side; raw tag bytes on the node side).
@@ -98,10 +98,7 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
             relay_mode: RelayMode::Disabled,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
-            additional_alpns: vec![
-                TELEMETRY_ALPN.to_vec(),
-                iroh_driver::EDGE_ALPN.to_vec(),
-            ],
+            additional_alpns: vec![TELEMETRY_ALPN.to_vec(), iroh_driver::EDGE_ALPN.to_vec()],
         },
     )
     .map_err(|error| format!("iroh driver: {error}"))?;

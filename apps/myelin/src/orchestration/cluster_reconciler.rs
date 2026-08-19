@@ -219,23 +219,6 @@ impl MyelinEffectBackend {
         (external_id, logical_id)
     }
 
-    fn detach_all(&self) {
-        let nodes = lock_nodes_read(&self.nodes)
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for effects in nodes {
-            let mut effects = lock_node(&effects);
-            if let Some(live) = effects.live.take() {
-                live.failure_sink.discard();
-            }
-            effects.plugin.detach_all();
-            if let Some(staged) = effects.staged.as_mut() {
-                staged.plugin.detach_all();
-            }
-        }
-    }
-
     fn stop_all(&self) -> Result<(), String> {
         let mut first_error = None;
         let nodes = lock_nodes_read(&self.nodes)
@@ -626,6 +609,9 @@ impl ProvisionedClusterGuard {
             .map(|node| node.attempt)
     }
 
+    // Readiness predicate: exercised only by reconciler guarantee tests today;
+    // no production caller yet.
+    #[cfg(test)]
     pub(crate) fn awaiting_runtime(&self) -> bool {
         !self.driver.state().nodes.is_empty()
             && self.driver.state().nodes.values().all(|node| {
@@ -699,14 +685,6 @@ impl ProvisionedClusterGuard {
         self.executor.backend().stop_all()?;
         self.stopped = true;
         Ok(())
-    }
-
-    /// Releases the guard without touching any provider resource: no
-    /// shutdown shape, no stop_all. The daemon exits; nodes keep running and
-    /// are adopted by spec on the next boot.
-    pub(crate) fn detach(&mut self) {
-        self.executor.backend().detach_all();
-        self.stopped = true;
     }
 
     fn drain_wakes(&mut self, now: SystemTime) {

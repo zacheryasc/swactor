@@ -4,4 +4,4 @@
 //! only wire entrypoints into it.
 
 pub(super) mod prompt_wire;
-pub(super) mod worker_node_runtime;
+pub(crate) mod worker_node_runtime;

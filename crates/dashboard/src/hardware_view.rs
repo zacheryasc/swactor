@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-
+use telemetry::Record;
 use telemetry::hardware::cpu::{
     CpuCoreSample, CpuHostSample, CpuProcessSample, HOST_CPU_CHANNEL, HostCpuSample,
 };
@@ -9,11 +9,8 @@ use telemetry::hardware::gpu::{
     GpuDeviceSample, GpuProcessSample, HOST_GPU_CHANNEL, HostGpuSample,
 };
 use telemetry::hardware::net::{HOST_NET_CHANNEL, HostNetSample, NetInterfaceSample};
-use telemetry::Record;
 
 use serde::Serialize;
-
-
 
 const HISTORY_CAP: usize = 300;
 const HISTORY_MIN_INTERVAL: Duration = Duration::from_millis(900);
@@ -112,8 +109,8 @@ impl NodeHardwareState {
                     gpu_max_percent =
                         Some(gpu_max_percent.map_or(percent, |current: u64| current.max(percent)));
                 }
-                gpu_memory_used_mib = gpu_memory_used_mib
-                    .saturating_add(device.memory_used_mib.unwrap_or_default());
+                gpu_memory_used_mib =
+                    gpu_memory_used_mib.saturating_add(device.memory_used_mib.unwrap_or_default());
                 gpu_memory_total_mib = gpu_memory_total_mib
                     .saturating_add(device.memory_total_mib.unwrap_or_default());
             }
@@ -333,7 +330,6 @@ pub(crate) struct HardwareHistoryState {
     pub(crate) net_tx_bps: f64,
 }
 
-
 #[derive(Serialize)]
 pub(crate) struct CpuSnapshot {
     pub(crate) seq: u64,
@@ -394,7 +390,6 @@ pub(crate) struct HardwareHistorySnapshot {
     pub(crate) net_tx_bps: f64,
 }
 
-
 pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -402,4 +397,3 @@ pub(crate) fn duration_ms(duration: Duration) -> u64 {
 pub(crate) fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
-

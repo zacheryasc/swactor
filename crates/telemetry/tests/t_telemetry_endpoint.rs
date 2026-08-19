@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use telemetry::{
-    ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, TelemetryEndpoint,
-    Lifetime, NodeId, Position, Record, SourceFilter, StreamId, SubscriptionRequest,
-};
-use telemetry::frame::{TelemetryEvent, FrameDelivery};
 use serde_json::Value;
 use swactor::actor::ActorAddress;
 use swactor::stats::ActorSnapshot;
+use telemetry::frame::{FrameDelivery, TelemetryEvent};
+use telemetry::{
+    ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, Lifetime, NodeId, Position,
+    Record, SourceFilter, StreamId, SubscriptionRequest, TelemetryEndpoint,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RuntimeRecord {

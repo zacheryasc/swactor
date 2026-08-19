@@ -21,10 +21,10 @@ use data_plane::arena::{ArenaConfig, ArenaManager};
 use data_plane::edge_lifecycle::{
     DType, NodeId, ObjectKind, ObjectSpec as EdgeObjectSpec, ProvisionRx, ProvisionTx, RingSpec,
 };
+pub use data_plane::edge_runtime::Observation;
 use data_plane::edge_runtime::{EdgeRuntime, LoadedObject, WorkerPort};
 use data_plane::edge_wire::EdgeTransport;
 use data_plane::ids::{EdgeId, RunId};
-pub use data_plane::edge_runtime::Observation;
 use data_plane::object_record::{self, ObjectRecord};
 use iroh::EndpointAddr;
 use telemetry::TelemetryProducer;
@@ -116,7 +116,11 @@ impl EdgeTransport for DriverTransport {
     type Writer = iroh_driver::EdgeSendHandle;
     type PeerAddr = EndpointAddr;
 
-    fn open_writer(&mut self, edge_id: EdgeId, peer: &EndpointAddr) -> Result<Self::Writer, String> {
+    fn open_writer(
+        &mut self,
+        edge_id: EdgeId,
+        peer: &EndpointAddr,
+    ) -> Result<Self::Writer, String> {
         // The driver's send pump blocks its calling thread until the
         // connect handshake completes — indefinitely for a dead peer.
         // Bound it: run the spawn on a helper thread and give up after
@@ -201,12 +205,7 @@ pub struct EdgeSession {
 }
 
 impl EdgeSession {
-    pub fn new(
-        edge_id: EdgeId,
-        attempt: u64,
-        logical_node: String,
-        peer: EndpointAddr,
-    ) -> Self {
+    pub fn new(edge_id: EdgeId, attempt: u64, logical_node: String, peer: EndpointAddr) -> Self {
         let mut runtime = EdgeRuntime::new(NodeId(0));
         runtime.establish_outbound(
             ProvisionTx {
@@ -236,7 +235,10 @@ impl EdgeSession {
     }
 
     /// One poll: drive the lifecycle; return new observations.
-    pub fn poll(&mut self, driver: &Arc<iroh_driver::IrohDriver>) -> (Vec<Observation>, Option<String>) {
+    pub fn poll(
+        &mut self,
+        driver: &Arc<iroh_driver::IrohDriver>,
+    ) -> (Vec<Observation>, Option<String>) {
         let mut transport = DriverTransport(Arc::clone(driver));
         let result = self
             .runtime
@@ -349,10 +351,7 @@ pub fn start_edge_pump(
                                 let dead = sessions.remove(i);
                                 // Dropping the session drops its writer,
                                 // finishing the edge stream.
-                                eprintln!(
-                                    "demo: edge {} torn down (node gone)",
-                                    dead.edge_id.0
-                                );
+                                eprintln!("demo: edge {} torn down (node gone)", dead.edge_id.0);
                             }
                         }
                     }
@@ -410,7 +409,10 @@ fn pump_one(
             session.faulted = true;
             update.feed.push((
                 session.logical_node.clone(),
-                format!("edge {}: faulted (provision ack timeout)", session.edge_id.0),
+                format!(
+                    "edge {}: faulted (provision ack timeout)",
+                    session.edge_id.0
+                ),
             ));
         } else if since_send >= PROVISION_RETRY_PERIOD.as_millis() as u64 {
             if let Ok(bytes) = serde_json::to_vec(&session.provision()) {
@@ -517,11 +519,7 @@ impl NodeEdgeAgent {
         let Ok(bytes) = serde_json::to_vec(&ack) else {
             return;
         };
-        driver.send_tagged_gossip(
-            self.supervisor_addr.clone(),
-            EDGE_ACK_TAG.as_bytes(),
-            bytes,
-        );
+        driver.send_tagged_gossip(self.supervisor_addr.clone(), EDGE_ACK_TAG.as_bytes(), bytes);
     }
 
     fn submit_observation(&self, observation: &Observation) {
@@ -671,9 +669,7 @@ impl swactor::actor::ActorInterface for NodeEdgeAgent {
                     }
                     Some(current) => {
                         // Supervisor replaced the session: rebuild inbound.
-                        self.submit_observation(&Observation::EdgeStopped {
-                            edge_id: current,
-                        });
+                        self.submit_observation(&Observation::EdgeStopped { edge_id: current });
                         self.edge_id = Some(EdgeId(provision.edge_id));
                         self.runtime = EdgeRuntime::new(NodeId(self.attempt));
                         self.arena = boot_arena(NodeId(self.attempt));
@@ -727,10 +723,7 @@ impl EdgeAckRelay {
         sender: swactor::runtime::ExternalSender,
         supervisor: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>>,
     ) -> Self {
-        Self {
-            sender,
-            supervisor,
-        }
+        Self { sender, supervisor }
     }
 }
 
@@ -740,10 +733,9 @@ impl swactor::actor::ActorInterface for EdgeAckRelay {
 
     fn handle(&mut self, _ctx: &swactor::actor::Ctx, ack: EdgeAck) {
         if let Some(addr) = self.supervisor.get() {
-            let _ = self.sender.send_to(
-                addr.clone(),
-                crate::demo::feed::SupervisorMsg::EdgeAck(ack),
-            );
+            let _ = self
+                .sender
+                .send_to(addr.clone(), crate::demo::feed::SupervisorMsg::EdgeAck(ack));
         }
     }
 }

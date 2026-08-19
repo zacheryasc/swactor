@@ -4,8 +4,8 @@
 //! actor messages; `setup`/`run` execute as supervised processes via
 //! `swactor-process`; the exit code is authoritative. No SSH, no shell-out.
 
-use std::collections::BTreeMap;
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,9 @@ fn tar_file(name: &str, contents: &str) -> Vec<u8> {
     header.set_size(contents.len() as u64);
     header.set_cksum();
     let mut reader = std::io::Cursor::new(contents.as_bytes());
-    builder.append_data(&mut header, name, &mut reader).expect("append tar file");
+    builder
+        .append_data(&mut header, name, &mut reader)
+        .expect("append tar file");
     builder.finish().expect("finish tar");
     drop(builder);
     buf
@@ -65,22 +67,36 @@ fn job_runs_through_actor_plane_and_swactor_process() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
     let sender = runtime.create_sender();
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio backend"))
-        .expect("engine");
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+    )
+    .expect("engine");
 
     let done = runtime.new_inbox::<JobDone>().expect("done inbox");
     let orch = runtime
-        .spawn(OrchestratorJobActor::new(*done.addr(), landing.path().to_path_buf()))
+        .spawn(OrchestratorJobActor::new(
+            *done.addr(),
+            landing.path().to_path_buf(),
+        ))
         .expect("spawn orchestrator");
     let node = runtime
-        .spawn(NodeJobActor::new(orch, node_workdir.path().to_path_buf(), sender, 0))
+        .spawn(NodeJobActor::new(
+            orch,
+            node_workdir.path().to_path_buf(),
+            sender,
+            0,
+        ))
         .expect("spawn node");
 
     let job = Job {
         name: "probe".to_owned(),
         setup: Some("echo setup-ok > setup_done.txt".to_owned()),
         run: "echo hello-from-swactor > greeting.txt".to_owned(),
-        workspace: Some(Workspace { workdir: ws.path().to_path_buf(), exclude: vec![] }),
+        workspace: Some(Workspace {
+            workdir: ws.path().to_path_buf(),
+            exclude: vec![],
+        }),
         outputs: vec![
             "greeting.txt".to_owned(),
             "setup_done.txt".to_owned(),
@@ -90,23 +106,41 @@ fn job_runs_through_actor_plane_and_swactor_process() {
     };
 
     runtime
-        .send_to(orch, OrchestratorJobMsg::Submit { job, node_actor: node })
+        .send_to(
+            orch,
+            OrchestratorJobMsg::Submit {
+                job,
+                node_actor: node,
+            },
+        )
         .expect("submit job");
 
     let result = recv_within(&done, DEADLINE);
     drop(engine);
     let done = result.expect("job did not reach a terminal state within deadline");
-    assert_eq!(done.state, JobState::Completed, "expected COMPLETED, got {:?}", done);
+    assert_eq!(
+        done.state,
+        JobState::Completed,
+        "expected COMPLETED, got {:?}",
+        done
+    );
     assert_eq!(done.exit_code, Some(0), "expected exit code 0");
 
     let greeting = std::fs::read_to_string(landing.path().join("greeting.txt"))
         .expect("collected greeting.txt");
-    assert!(greeting.contains("hello-from-swactor"), "greeting content: {greeting}");
+    assert!(
+        greeting.contains("hello-from-swactor"),
+        "greeting content: {greeting}"
+    );
     let setup = std::fs::read_to_string(landing.path().join("setup_done.txt"))
         .expect("collected setup_done.txt");
     assert!(setup.contains("setup-ok"), "setup content: {setup}");
-    let seed = std::fs::read_to_string(landing.path().join("seed.txt")).expect("collected seed.txt");
-    assert_eq!(seed, "seed-value", "workspace materialized + collected through swactor");
+    let seed =
+        std::fs::read_to_string(landing.path().join("seed.txt")).expect("collected seed.txt");
+    assert_eq!(
+        seed, "seed-value",
+        "workspace materialized + collected through swactor"
+    );
 }
 
 #[test]
@@ -122,15 +156,26 @@ fn workspace_excludes_are_not_materialized() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
     let sender = runtime.create_sender();
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio backend"))
-        .expect("engine");
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+    )
+    .expect("engine");
 
     let done = runtime.new_inbox::<JobDone>().expect("done inbox");
     let orch = runtime
-        .spawn(OrchestratorJobActor::new(*done.addr(), landing.path().to_path_buf()))
+        .spawn(OrchestratorJobActor::new(
+            *done.addr(),
+            landing.path().to_path_buf(),
+        ))
         .expect("spawn orchestrator");
     let node = runtime
-        .spawn(NodeJobActor::new(orch, node_workdir.path().to_path_buf(), sender, 0))
+        .spawn(NodeJobActor::new(
+            orch,
+            node_workdir.path().to_path_buf(),
+            sender,
+            0,
+        ))
         .expect("spawn node");
 
     let job = Job {
@@ -147,7 +192,13 @@ fn workspace_excludes_are_not_materialized() {
     };
 
     runtime
-        .send_to(orch, OrchestratorJobMsg::Submit { job, node_actor: node })
+        .send_to(
+            orch,
+            OrchestratorJobMsg::Submit {
+                job,
+                node_actor: node,
+            },
+        )
         .expect("submit job");
 
     let result = recv_within(&done, DEADLINE);
@@ -155,8 +206,8 @@ fn workspace_excludes_are_not_materialized() {
     let done = result.expect("job did not reach terminal state");
     assert_eq!(done.state, JobState::Completed);
     assert_eq!(done.exit_code, Some(0));
-    let result = std::fs::read_to_string(landing.path().join("result.txt"))
-        .expect("collected result.txt");
+    let result =
+        std::fs::read_to_string(landing.path().join("result.txt")).expect("collected result.txt");
     assert_eq!(result, "kept");
 }
 
@@ -169,26 +220,48 @@ fn nonzero_exit_marks_job_failed_after_best_effort_collect() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
     let sender = runtime.create_sender();
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio backend"))
-        .expect("engine");
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+    )
+    .expect("engine");
 
     let done = runtime.new_inbox::<JobDone>().expect("done inbox");
     let orch = runtime
-        .spawn(OrchestratorJobActor::new(*done.addr(), landing.path().to_path_buf()))
+        .spawn(OrchestratorJobActor::new(
+            *done.addr(),
+            landing.path().to_path_buf(),
+        ))
         .expect("orch");
     let node = runtime
-        .spawn(NodeJobActor::new(orch, node_workdir.path().to_path_buf(), sender, 0))
+        .spawn(NodeJobActor::new(
+            orch,
+            node_workdir.path().to_path_buf(),
+            sender,
+            0,
+        ))
         .expect("node");
 
     let job = Job {
         name: "fail-probe".to_owned(),
         setup: None,
         run: "echo partial > partial.txt; exit 3".to_owned(),
-        workspace: Some(Workspace { workdir: ws.path().to_path_buf(), exclude: vec![] }),
+        workspace: Some(Workspace {
+            workdir: ws.path().to_path_buf(),
+            exclude: vec![],
+        }),
         outputs: vec!["partial.txt".to_owned()],
         env: BTreeMap::new(),
     };
-    runtime.send_to(orch, OrchestratorJobMsg::Submit { job, node_actor: node }).expect("submit");
+    runtime
+        .send_to(
+            orch,
+            OrchestratorJobMsg::Submit {
+                job,
+                node_actor: node,
+            },
+        )
+        .expect("submit");
 
     let result = recv_within(&done, DEADLINE);
     drop(engine);
@@ -196,7 +269,10 @@ fn nonzero_exit_marks_job_failed_after_best_effort_collect() {
     assert_eq!(done.state, JobState::Failed, "expected FAILED");
     assert_eq!(done.exit_code, Some(3), "expected exit code 3");
     let partial = std::fs::read_to_string(landing.path().join("partial.txt"));
-    assert!(partial.is_ok(), "best-effort collect should gather partial.txt");
+    assert!(
+        partial.is_ok(),
+        "best-effort collect should gather partial.txt"
+    );
 }
 
 #[test]
@@ -205,12 +281,18 @@ fn job_done_waits_for_output_eof_after_outputs_collected_event() {
 
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio backend"))
-        .expect("engine");
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+    )
+    .expect("engine");
 
     let done = runtime.new_inbox::<JobDone>().expect("done inbox");
     let orch = runtime
-        .spawn(OrchestratorJobActor::new(*done.addr(), landing.path().to_path_buf()))
+        .spawn(OrchestratorJobActor::new(
+            *done.addr(),
+            landing.path().to_path_buf(),
+        ))
         .expect("orch");
     let node = runtime.spawn(CommandSink).expect("node command sink");
 
@@ -223,7 +305,13 @@ fn job_done_waits_for_output_eof_after_outputs_collected_event() {
         env: BTreeMap::new(),
     };
     runtime
-        .send_to(orch, OrchestratorJobMsg::Submit { job, node_actor: node })
+        .send_to(
+            orch,
+            OrchestratorJobMsg::Submit {
+                job,
+                node_actor: node,
+            },
+        )
         .expect("submit");
     runtime
         .send_to(
@@ -308,32 +396,47 @@ fn node_actor_edge_mode_ships_outputs_through_sink() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
     let sender = runtime.create_sender();
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio"))
-        .expect("engine");
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio"),
+    )
+    .expect("engine");
 
     let events = Arc::new(Mutex::new(Vec::new()));
-    let orch = runtime.spawn(EventSink { events: events.clone() }).expect("spawn event sink");
+    let orch = runtime
+        .spawn(EventSink {
+            events: events.clone(),
+        })
+        .expect("spawn event sink");
 
     let sent = Arc::new(Mutex::new(Vec::new()));
     let slot: Arc<Mutex<Option<Box<dyn JobEdgeSink>>>> =
         Arc::new(Mutex::new(Some(Box::new(RecordingSink(sent.clone())))));
 
     let node = runtime
-        .spawn(NodeJobActor::new(orch, workdir.path().to_path_buf(), sender, 0).with_output_sink_slot(slot))
+        .spawn(
+            NodeJobActor::new(orch, workdir.path().to_path_buf(), sender, 0)
+                .with_output_sink_slot(slot),
+        )
         .expect("spawn node");
 
     runtime
         .send_to(
             node,
-            NodeJobCommand::CollectOutputs { job_id: 0, outputs: vec!["out.txt".to_owned()] },
+            NodeJobCommand::CollectOutputs {
+                job_id: 0,
+                outputs: vec!["out.txt".to_owned()],
+            },
         )
         .expect("collect outputs");
 
     let started = Instant::now();
     while started.elapsed() < DEADLINE {
-        if events.lock().iter().any(|ev| {
-            matches!(ev, NodeJobEvent::OutputsCollected { job_id: 0 })
-        }) {
+        if events
+            .lock()
+            .iter()
+            .any(|ev| matches!(ev, NodeJobEvent::OutputsCollected { job_id: 0 }))
+        {
             break;
         }
         std::thread::sleep(POLL);
@@ -341,7 +444,11 @@ fn node_actor_edge_mode_ships_outputs_through_sink() {
     drop(engine);
 
     let recorded = sent.lock();
-    assert_eq!(recorded.len(), 1, "edge sink received exactly one byte record");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "edge sink received exactly one byte record"
+    );
     // The record is a tar containing out.txt; extracting it round-trips the bytes.
     let mut archive = tar::Archive::new(std::io::Cursor::new(&recorded[0]));
     let mut entries = archive.entries().expect("tar entries");
@@ -350,12 +457,18 @@ fn node_actor_edge_mode_ships_outputs_through_sink() {
 
     let collected = events.lock();
     assert!(
-        collected.iter().any(|ev| matches!(ev, NodeJobEvent::OutputsCollected { job_id: 0 })),
-        "edge collect emitted OutputsCollected, got {:?}", collected
+        collected
+            .iter()
+            .any(|ev| matches!(ev, NodeJobEvent::OutputsCollected { job_id: 0 })),
+        "edge collect emitted OutputsCollected, got {:?}",
+        collected
     );
     assert!(
-        !collected.iter().any(|ev| matches!(ev, NodeJobEvent::NodeFault { .. })),
-        "no fault expected, got {:?}", collected
+        !collected
+            .iter()
+            .any(|ev| matches!(ev, NodeJobEvent::NodeFault { .. })),
+        "no fault expected, got {:?}",
+        collected
     );
 }
 
@@ -366,11 +479,18 @@ fn node_actor_edge_mode_workspace_announces_on_ready_flag() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
     let sender = runtime.create_sender();
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio"))
-        .expect("engine");
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio"),
+    )
+    .expect("engine");
 
     let events = Arc::new(Mutex::new(Vec::new()));
-    let orch = runtime.spawn(EventSink { events: events.clone() }).expect("spawn event sink");
+    let orch = runtime
+        .spawn(EventSink {
+            events: events.clone(),
+        })
+        .expect("spawn event sink");
 
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let node = runtime
@@ -386,9 +506,11 @@ fn node_actor_edge_mode_workspace_announces_on_ready_flag() {
 
     let started = Instant::now();
     while started.elapsed() < DEADLINE {
-        if events.lock().iter().any(|ev| {
-            matches!(ev, NodeJobEvent::WorkspaceMaterialized { job_id: 0 })
-        }) {
+        if events
+            .lock()
+            .iter()
+            .any(|ev| matches!(ev, NodeJobEvent::WorkspaceMaterialized { job_id: 0 }))
+        {
             break;
         }
         std::thread::sleep(POLL);
@@ -400,6 +522,7 @@ fn node_actor_edge_mode_workspace_announces_on_ready_flag() {
         collected
             .iter()
             .any(|ev| matches!(ev, NodeJobEvent::WorkspaceMaterialized { job_id: 0 })),
-        "edge workspace emitted WorkspaceMaterialized, got {:?}", collected
+        "edge workspace emitted WorkspaceMaterialized, got {:?}",
+        collected
     );
 }

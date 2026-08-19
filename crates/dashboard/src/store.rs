@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use telemetry::frame::{Frame, StreamId};
 use parking_lot::Mutex;
+use telemetry::frame::{Frame, StreamId};
 
 use crate::FrameEvent;
 use crate::view::ViewRegistry;

@@ -4,13 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use telemetry::frame::Frame;
 use telemetry::ingest::Consumer;
 use telemetry::mux::Mux;
 use telemetry::transport::Delivery;
 use telemetry::wire::{decode_delivery, encode_delivery};
 use telemetry::{ChannelId, Lifetime, NodeId, Position, Record, StreamId};
-use serde::{Deserialize, Serialize};
 
 const RESOURCE_CHANNEL: ChannelId = ChannelId(1);
 const LOG_CHANNEL: ChannelId = ChannelId(2);

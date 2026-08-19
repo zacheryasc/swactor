@@ -10,8 +10,6 @@
 extern crate self as myelin;
 
 const DEFAULT_PIPELINE_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
-const DEFAULT_PIPELINE_CACHED_MODEL_REPO: &str = "QuantFactory/SmolLM2-135M-Instruct-GGUF";
-const DEFAULT_PIPELINE_CACHED_MODEL_ID: &str = "smollm2-135m-instruct-q4";
 #[doc(hidden)]
 pub const ORCHESTRATOR_WORKER_MODE_ARG: &str = "--myelin-worker-node";
 pub fn run_orchestrator_from_args<I>(args: I) -> Result<(), String>

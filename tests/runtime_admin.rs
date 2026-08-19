@@ -74,7 +74,6 @@ impl ActorInterface for StopProbe {
     }
 }
 
-
 fn operation_applied() -> OperationResult {
     OperationResult { applied: true }
 }
@@ -129,7 +128,8 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
     let response = rt
         .admin()
         .list_actors()
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
 
     assert_eq!(
@@ -171,7 +171,8 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
     let inspect = rt
         .admin()
         .inspect_actor(counter)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(inspect.summary, *counter_summary);
 
@@ -179,7 +180,8 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
     let missing_result = rt
         .admin()
         .inspect_actor(missing)
-        .unwrap().recv_ticking(&mut host, 5);
+        .unwrap()
+        .recv_ticking(&mut host, 5);
     assert!(
         matches!(missing_result, Err(AdminError::ActorNotFound { actor }) if actor == missing),
         "missing actor is reported through AdminResult"
@@ -217,7 +219,8 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
     let state = rt
         .admin()
         .get_actor_state::<ReplaceProbe>(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap()
         .state;
     assert_eq!(state.actor, addr);
@@ -236,7 +239,8 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
     let replace_result = rt
         .admin()
         .replace_actor_state::<ReplaceProbe>(addr, replacement)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(replace_result, operation_applied());
     assert_eq!(
@@ -258,12 +262,16 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
         },
     )
     .unwrap();
-    assert_eq!(tick_until_recv(&mut host, &count_inbox, 5), Some(Count(101)));
+    assert_eq!(
+        tick_until_recv(&mut host, &count_inbox, 5),
+        Some(Count(101))
+    );
 
     let summary = rt
         .admin()
         .inspect_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap()
         .summary;
     assert_eq!(summary.address, addr);
@@ -276,7 +284,8 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
     let stop_result = rt
         .admin()
         .stop_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(stop_result, operation_applied());
     host.try_tick();
@@ -301,7 +310,8 @@ fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
     let wrong_type = rt
         .admin()
         .replace_actor_state::<WrongProbe>(addr, wrong_type_snapshot)
-        .unwrap().recv_ticking(&mut host, 5);
+        .unwrap()
+        .recv_ticking(&mut host, 5);
     assert!(
         matches!(wrong_type, Err(AdminError::TypeMismatch { .. })),
         "wrong concrete actor type is rejected"
@@ -319,7 +329,8 @@ fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
     let wrong_address = rt
         .admin()
         .replace_actor_state::<ReplaceProbe>(addr, wrong_addr_snapshot)
-        .unwrap().recv_ticking(&mut host, 5);
+        .unwrap()
+        .recv_ticking(&mut host, 5);
     assert!(
         matches!(wrong_address, Err(AdminError::AddressMismatch { requested, snapshot }) if requested == addr && snapshot == wrong_addr),
         "snapshot address must match the target address"
@@ -355,7 +366,8 @@ fn admin_suspend_queues_messages_until_resume() {
     let suspend_result = rt
         .admin()
         .suspend_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(suspend_result, operation_applied());
 
@@ -376,7 +388,8 @@ fn admin_suspend_queues_messages_until_resume() {
     let suspended = rt
         .admin()
         .inspect_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap()
         .summary;
     assert!(suspended.status.suspended);
@@ -385,7 +398,8 @@ fn admin_suspend_queues_messages_until_resume() {
     let resume_result = rt
         .admin()
         .resume_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(resume_result, operation_applied());
     for _ in 0..3 {
@@ -396,7 +410,8 @@ fn admin_suspend_queues_messages_until_resume() {
     let resumed = rt
         .admin()
         .inspect_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap()
         .summary;
     assert!(!resumed.status.suspended);
@@ -434,7 +449,8 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
     let stop_result = rt
         .admin()
         .stop_actor(addr)
-        .unwrap().recv_ticking(&mut host, 5)
+        .unwrap()
+        .recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(stop_result, operation_applied());
     host.try_tick();
@@ -453,7 +469,11 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
         "admin-stopped actor is removed from normal send routing"
     );
 
-    let inspect = rt.admin().inspect_actor(addr).unwrap().recv_ticking(&mut host, 5);
+    let inspect = rt
+        .admin()
+        .inspect_actor(addr)
+        .unwrap()
+        .recv_ticking(&mut host, 5);
     assert!(
         matches!(inspect, Err(AdminError::ActorNotFound { actor }) if actor == addr),
         "admin-stopped actor is no longer inspectable"
@@ -486,10 +506,7 @@ fn admin_suspend_resume() {
     )
     .unwrap();
     tick_n(&mut host, 3);
-    assert!(
-        pong_inbox.try_recv().is_none(),
-        "no pong while suspended"
-    );
+    assert!(pong_inbox.try_recv().is_none(), "no pong while suspended");
     assert_eq!(counter.load(Ordering::SeqCst), 0);
 
     // Resume
@@ -520,7 +537,8 @@ fn admin_list_actors() {
     host.try_tick(); // process spawns
 
     let admin = rt.admin().list_actors().unwrap();
-    let list = admin.recv_ticking(&mut host, 5)
+    let list = admin
+        .recv_ticking(&mut host, 5)
         .expect("list_actors timed out");
 
     let expected: HashSet<_> = addrs.iter().copied().collect();

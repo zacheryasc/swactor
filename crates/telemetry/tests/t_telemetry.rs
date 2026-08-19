@@ -1,14 +1,16 @@
 use std::sync::Arc;
 use std::thread;
 
+use serde::{Deserialize, Serialize};
 use telemetry::frame::Frame;
 use telemetry::ingest::Consumer;
 use telemetry::mux::Mux;
 use telemetry::transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 use telemetry::views::{self, Body, LogEntry};
 use telemetry::wire::{decode_delivery, encode_delivery};
-use telemetry::{ChannelId, ChannelKind, ChannelRegistry, Lifetime, NodeId, Position, Record, StreamId};
-use serde::{Deserialize, Serialize};
+use telemetry::{
+    ChannelId, ChannelKind, ChannelRegistry, Lifetime, NodeId, Position, Record, StreamId,
+};
 
 const RESOURCE_CHANNEL: ChannelId = ChannelId(1);
 const LOG_CHANNEL: ChannelId = ChannelId(2);

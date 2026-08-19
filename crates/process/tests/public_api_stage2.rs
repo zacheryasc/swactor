@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use telemetry::frame::TelemetryEvent;
-use telemetry::{TelemetryEndpoint, Lifetime, NodeId, StreamId};
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::{
@@ -13,6 +11,8 @@ use swactor_process::{
     ExitStatus, ProcessCommand, ProcessOutput, ProcessOutputConfig, ProcessSpec,
     send_process_command, spawn_local_process,
 };
+use telemetry::frame::TelemetryEvent;
+use telemetry::{Lifetime, NodeId, StreamId, TelemetryEndpoint};
 
 #[derive(Clone)]
 struct SpawnRequest {
@@ -263,9 +263,13 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_telemetry() {
     assert_ne!(process_addr, ActorAddress::default());
 
     let mut telemetry_events = subscription.drain_available();
-    drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
-        has_exited(outputs, ExitStatus::Code(0))
-    });
+    drive_until(
+        &mut host,
+        Some(&endpoint),
+        &upstream,
+        &mut outputs,
+        |outputs| has_exited(outputs, ExitStatus::Code(0)),
+    );
     for _ in 0..5 {
         drive_once(&mut host, Some(&endpoint), &upstream, &mut outputs);
         telemetry_events.extend(subscription.drain_available());
@@ -415,9 +419,13 @@ fn command_basename_is_default_lifecycle_label_source() {
         &mut outputs,
         &reply,
     ));
-    drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
-        has_exited(outputs, ExitStatus::Code(0))
-    });
+    drive_until(
+        &mut host,
+        Some(&endpoint),
+        &upstream,
+        &mut outputs,
+        |outputs| has_exited(outputs, ExitStatus::Code(0)),
+    );
 
     let names = channel_names(&endpoint);
     assert!(
@@ -486,11 +494,17 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
         },
     )
     .unwrap();
-    drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
-        outputs
-            .iter()
-            .any(|output| matches!(output, ProcessOutput::Exited { .. }))
-    });
+    drive_until(
+        &mut host,
+        Some(&endpoint),
+        &upstream,
+        &mut outputs,
+        |outputs| {
+            outputs
+                .iter()
+                .any(|output| matches!(output, ProcessOutput::Exited { .. }))
+        },
+    );
     assert_no_errors(&outputs);
 }
 

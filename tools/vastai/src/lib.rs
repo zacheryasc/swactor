@@ -26,7 +26,10 @@ pub use monitor::{
 };
 pub use pricing::CostModel;
 pub use provision::create_instance;
-pub use search::{plan_distinct_host_first_wave, select_offer_pool, select_offer_pool_with_policy};
+pub use search::{
+    OfferBrowseCriteria, browse_offers, plan_distinct_host_first_wave, select_offer_pool,
+    select_offer_pool_with_policy,
+};
 pub use teardown::{
     destroy_all_instances, destroy_instance, destroy_instance_with_retry, list_instances_by_label,
 };

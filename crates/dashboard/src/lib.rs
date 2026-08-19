@@ -1,8 +1,8 @@
 #[cfg(feature = "demo-control")]
 pub mod control;
+mod control_plane;
 #[cfg(feature = "demo-control")]
 mod demo_control;
-mod control_plane;
 mod hardware_view;
 mod live_explorer;
 mod server;
@@ -21,6 +21,51 @@ use tokio::sync::broadcast;
 use crate::store::DashboardStore;
 use crate::view::{DashboardView, ViewRegistry};
 
+/// An application-owned page rendered inside the dashboard shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPage {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub path: &'static str,
+    pub html: &'static str,
+}
+
+impl PluginPage {
+    pub const fn new(
+        id: &'static str,
+        title: &'static str,
+        path: &'static str,
+        html: &'static str,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            path,
+            html,
+        }
+    }
+}
+
+/// Application routes and their dashboard-visible pages.
+pub struct DashboardPlugin {
+    pub pages: Vec<PluginPage>,
+    pub routes: axum::Router,
+}
+
+impl DashboardPlugin {
+    pub fn new(routes: axum::Router) -> Self {
+        Self {
+            pages: Vec::new(),
+            routes,
+        }
+    }
+
+    pub fn with_page(mut self, page: PluginPage) -> Self {
+        self.pages.push(page);
+        self
+    }
+}
+
 /// Configuration for the telemetry dashboard server.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
@@ -29,6 +74,9 @@ pub struct DashboardConfig {
     pub frame_buffer: usize,
     /// Number of recent raw frames retained for `/api/frames`.
     pub raw_frame_history: usize,
+    /// Embedding-owned scripts appended to dashboard pages. The dashboard does
+    /// not define their behavior or gain mutation capabilities from them.
+    pub page_script_urls: Vec<String>,
 }
 
 impl Default for DashboardConfig {
@@ -37,6 +85,7 @@ impl Default for DashboardConfig {
             port: 9090,
             frame_buffer: 1024,
             raw_frame_history: 1024,
+            page_script_urls: Vec::new(),
         }
     }
 }
@@ -106,6 +155,7 @@ pub struct DashboardHandle {
     frames: broadcast::Sender<FrameEvent>,
     store: Arc<DashboardStore>,
     views: Arc<ViewRegistry>,
+    page_script_urls: Arc<Vec<String>>,
     shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -129,6 +179,7 @@ impl DashboardHandle {
             port: config.port,
             frames,
             store,
+            page_script_urls: Arc::new(config.page_script_urls),
             views,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -163,6 +214,8 @@ impl DashboardHandle {
             frames: self.frames.clone(),
             store: Arc::clone(&self.store),
             views: Arc::clone(&self.views),
+            plugin_pages: Arc::new(Vec::new()),
+            page_script_urls: Arc::clone(&self.page_script_urls),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
         };
         let port = self.port;
@@ -171,6 +224,52 @@ impl DashboardHandle {
         }
     }
 
+    /// Build the dashboard server with application-owned routes on the same
+    /// origin. The dashboard router remains read-only; mutation handlers stay
+    /// in the embedding application.
+    pub fn http_server_with_routes(
+        &self,
+        routes: axum::Router,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let state = server::AppState {
+            frames: self.frames.clone(),
+            store: Arc::clone(&self.store),
+            views: Arc::clone(&self.views),
+            plugin_pages: Arc::new(Vec::new()),
+            page_script_urls: Arc::clone(&self.page_script_urls),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
+        };
+        let port = self.port;
+        async move {
+            server::run_server_with_routes(state, port, routes).await;
+        }
+    }
+
+    /// Build the dashboard with application plugins. Plugin pages are served
+    /// by the dashboard and automatically participate in shared navigation.
+    pub fn http_server_with_plugins(
+        &self,
+        plugins: Vec<DashboardPlugin>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let mut routes = axum::Router::new();
+        let mut plugin_pages = Vec::new();
+        for plugin in plugins {
+            routes = routes.merge(plugin.routes);
+            plugin_pages.extend(plugin.pages);
+        }
+        let state = server::AppState {
+            frames: self.frames.clone(),
+            store: Arc::clone(&self.store),
+            views: Arc::clone(&self.views),
+            plugin_pages: Arc::new(plugin_pages),
+            page_script_urls: Arc::clone(&self.page_script_urls),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
+        };
+        let port = self.port;
+        async move {
+            server::run_server_with_routes(state, port, routes).await;
+        }
+    }
 }
 
 /// Create the telemetry dashboard state.

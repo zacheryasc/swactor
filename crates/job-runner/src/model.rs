@@ -35,7 +35,10 @@ impl Job {
         self.workspace.is_some()
     }
     pub fn has_setup(&self) -> bool {
-        self.setup.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        self.setup
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
     }
 }
 
@@ -97,7 +100,11 @@ fn default_gpu_count() -> u32 {
 
 impl Default for GpuSpec {
     fn default() -> Self {
-        Self { name: default_gpu_name(), count: default_gpu_count(), min_vram_gb: None }
+        Self {
+            name: default_gpu_name(),
+            count: default_gpu_count(),
+            min_vram_gb: None,
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use swactor::Error;
 use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 
-use crate::frame::{ChannelId, TelemetryEvent, Frame, Lifetime, NodeId, Position, StreamId};
+use crate::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId, TelemetryEvent};
 
 /// Why a buffer could not be decoded as an envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]

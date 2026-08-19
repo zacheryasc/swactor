@@ -1,3 +1,8 @@
+// NOTE: This module is currently excluded from compilation (its `mod` entry
+// was removed from orchestration/mod.rs). Backburner code — deprecated for
+// now but not yet staged for pruning. Re-wire or delete when node-image
+// provisioning is revisited.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};

@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::actor::{
-    Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment,
-    Message, SpawnRequest, StopSignal,
+    Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment, Message,
+    SpawnRequest, StopSignal,
 };
 use crate::admin::{
     ActorStateSnapshot, Admin, AdminCommand, AdminError, AdminResult, GetActorStateResponse,
@@ -90,7 +90,8 @@ pub(crate) struct RuntimeShared {
     /// Round-robin cursor for runtime-handle spawns.
     pub(crate) rr_worker: AtomicUsize,
     pub(crate) stats_hook: OnceLock<Arc<dyn StatsHook>>,
-    pub(crate) process_output_observer: OnceLock<Arc<dyn crate::process_observer::ProcessOutputObserver>>,
+    pub(crate) process_output_observer:
+        OnceLock<Arc<dyn crate::process_observer::ProcessOutputObserver>>,
     pub(crate) created_at: Instant,
     #[cfg(feature = "transport")]
     pub(crate) remote_sink: OnceLock<Arc<dyn RemoteSink>>,
@@ -740,13 +741,13 @@ impl RuntimeAdmin<'_> {
     }
 
     pub fn resume_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-    let Some(tx) = self.admin_tx_for(actor) else {
-        return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-    };
-    let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-    tx.send(AdminCommand::ResumeActor { actor, reply_to });
-    Ok(admin)
-}
+        let Some(tx) = self.admin_tx_for(actor) else {
+            return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<OperationResult>()?;
+        tx.send(AdminCommand::ResumeActor { actor, reply_to });
+        Ok(admin)
+    }
 }
 
 // ─── SingleThreadRuntime ────────────────────────────────────────────────────

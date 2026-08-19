@@ -6,21 +6,23 @@
 //! path is used is decided by which optional edge capabilities the constructor is
 //! given. Lifecycle stays on the actor plane either way.
 
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::orchestrator::OrchestratorJobMsg;
+use crate::wire::{
+    CHUNK_SIZE, EDGE_RECORD_SIZE, JobEdgeSink, NodeJobCommand, NodeJobEvent, OutputChunk,
+};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
 use swactor_process::{
     ExitStatus, ProcessOutput, ProcessOutputConfig, ProcessSpec, spawn_local_process,
 };
-use crate::orchestrator::OrchestratorJobMsg;
-use crate::wire::{EDGE_RECORD_SIZE, JobEdgeSink, NodeJobCommand, NodeJobEvent, OutputChunk, CHUNK_SIZE};
 
 /// Which supervised phase a process exit belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,10 +84,7 @@ impl NodeJobActor {
 
     /// Edge mode: ship collected outputs over EDGE_ALPN through `slot`, which the
     /// integration layer fills with a byte sink once the connection is up.
-    pub fn with_output_sink_slot(
-        mut self,
-        slot: Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>,
-    ) -> Self {
+    pub fn with_output_sink_slot(mut self, slot: Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>) -> Self {
         self.output_sink = Some(slot);
         self
     }
@@ -94,7 +93,13 @@ impl NodeJobActor {
         let _ = ctx.send(self.orchestrator, OrchestratorJobMsg::NodeEvent(event));
     }
 
-    fn spawn_supervised(&self, ctx: &Ctx, phase: JobPhase, command: String, env: &BTreeMap<String, String>) {
+    fn spawn_supervised(
+        &self,
+        ctx: &Ctx,
+        phase: JobPhase,
+        command: String,
+        env: &BTreeMap<String, String>,
+    ) {
         let relay = match ctx.spawn(ProcessExitRelay {
             orchestrator: self.orchestrator,
             phase,
@@ -102,10 +107,13 @@ impl NodeJobActor {
         }) {
             Ok(addr) => addr,
             Err(e) => {
-                self.emit(ctx, NodeJobEvent::NodeFault {
-                    job_id: self.job_id,
-                    reason: format!("spawn relay: {e}"),
-                });
+                self.emit(
+                    ctx,
+                    NodeJobEvent::NodeFault {
+                        job_id: self.job_id,
+                        reason: format!("spawn relay: {e}"),
+                    },
+                );
                 return;
             }
         };
@@ -116,11 +124,19 @@ impl NodeJobActor {
             working_dir: Some(self.workdir.clone()),
             label: Some(format!("job-runner-{:?}", phase).to_lowercase()),
         };
-        if let Err(e) = spawn_local_process(ctx, &self.sender, spec, ProcessOutputConfig::disabled(relay)) {
-            self.emit(ctx, NodeJobEvent::NodeFault {
-                job_id: self.job_id,
-                reason: format!("spawn process: {e}"),
-            });
+        if let Err(e) = spawn_local_process(
+            ctx,
+            &self.sender,
+            spec,
+            ProcessOutputConfig::disabled(relay),
+        ) {
+            self.emit(
+                ctx,
+                NodeJobEvent::NodeFault {
+                    job_id: self.job_id,
+                    reason: format!("spawn process: {e}"),
+                },
+            );
         }
     }
 
@@ -204,7 +220,6 @@ impl NodeJobActor {
             std::thread::sleep(EDGE_SPIN);
         }
     }
-
 }
 
 impl ActorInterface for NodeJobActor {
@@ -238,13 +253,21 @@ impl ActorInterface for NodeJobActor {
                     self.workspace_buf.clear();
                 }
             }
-            NodeJobCommand::WorkspaceChunk { job_id, data, eof, .. } => {
+            NodeJobCommand::WorkspaceChunk {
+                job_id, data, eof, ..
+            } => {
                 self.workspace_buf.extend_from_slice(&data);
                 if eof {
                     let buf = std::mem::take(&mut self.workspace_buf);
                     match extract_tar(&buf, &self.workdir) {
                         Ok(()) => self.emit(ctx, NodeJobEvent::WorkspaceMaterialized { job_id }),
-                        Err(e) => self.emit(ctx, NodeJobEvent::NodeFault { job_id, reason: format!("untar workspace: {e}") }),
+                        Err(e) => self.emit(
+                            ctx,
+                            NodeJobEvent::NodeFault {
+                                job_id,
+                                reason: format!("untar workspace: {e}"),
+                            },
+                        ),
                     }
                 }
             }
@@ -266,7 +289,13 @@ impl ActorInterface for NodeJobActor {
                         let bytes = match pack_path(&path) {
                             Ok(b) => b,
                             Err(e) => {
-                                self.emit(ctx, NodeJobEvent::NodeFault { job_id, reason: format!("pack output {name}: {e}") });
+                                self.emit(
+                                    ctx,
+                                    NodeJobEvent::NodeFault {
+                                        job_id,
+                                        reason: format!("pack output {name}: {e}"),
+                                    },
+                                );
                                 continue;
                             }
                         };
@@ -293,7 +322,9 @@ impl ActorInterface for ProcessExitRelay {
     fn handle(&mut self, ctx: &Ctx, output: ProcessOutput) {
         if let ProcessOutput::Exited { status } = output {
             let event = match (self.phase, status) {
-                (JobPhase::Setup, ExitStatus::Code(0)) => NodeJobEvent::SetupCompleted { job_id: self.job_id },
+                (JobPhase::Setup, ExitStatus::Code(0)) => NodeJobEvent::SetupCompleted {
+                    job_id: self.job_id,
+                },
                 (JobPhase::Setup, ExitStatus::Code(c)) => NodeJobEvent::NodeFault {
                     job_id: self.job_id,
                     reason: format!("setup exited {c}"),
@@ -302,8 +333,14 @@ impl ActorInterface for ProcessExitRelay {
                     job_id: self.job_id,
                     reason: "setup exited without a code".to_owned(),
                 },
-                (JobPhase::Run, ExitStatus::Code(c)) => NodeJobEvent::JobExited { job_id: self.job_id, code: c },
-                (JobPhase::Run, _) => NodeJobEvent::JobExited { job_id: self.job_id, code: 1 },
+                (JobPhase::Run, ExitStatus::Code(c)) => NodeJobEvent::JobExited {
+                    job_id: self.job_id,
+                    code: c,
+                },
+                (JobPhase::Run, _) => NodeJobEvent::JobExited {
+                    job_id: self.job_id,
+                    code: 1,
+                },
             };
             let _ = ctx.send(self.orchestrator, OrchestratorJobMsg::NodeEvent(event));
         }
@@ -319,12 +356,19 @@ pub fn extract_tar(bytes: &[u8], dst: &std::path::Path) -> Result<(), String> {
 fn pack_path(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     let mut builder = tar::Builder::new(&mut buf);
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "output".into());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
     if path.is_dir() {
-        builder.append_dir_all(&name, path).map_err(|e| e.to_string())?;
+        builder
+            .append_dir_all(&name, path)
+            .map_err(|e| e.to_string())?;
     } else if path.is_file() {
         let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        builder.append_file(&name, &mut f).map_err(|e| e.to_string())?;
+        builder
+            .append_file(&name, &mut f)
+            .map_err(|e| e.to_string())?;
     } else {
         // Missing outputs are skipped (best-effort): emit an empty eof chunk.
     }
@@ -343,10 +387,14 @@ fn pack_outputs_tar(workdir: &Path, outputs: &[String]) -> Result<Vec<u8>, Strin
     for name in outputs {
         let path = workdir.join(name);
         if path.is_dir() {
-            builder.append_dir_all(name, &path).map_err(|e| e.to_string())?;
+            builder
+                .append_dir_all(name, &path)
+                .map_err(|e| e.to_string())?;
         } else if path.is_file() {
             let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            builder.append_file(name, &mut f).map_err(|e| e.to_string())?;
+            builder
+                .append_file(name, &mut f)
+                .map_err(|e| e.to_string())?;
         }
         // Missing outputs are skipped (best-effort).
     }

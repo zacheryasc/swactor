@@ -1,8 +1,6 @@
 mod engine_composition;
 mod harness;
 mod job_runner_iroh;
-mod local_e2e_guarantees;
-mod local_mock;
 mod node_guarantees;
 mod observability_guarantees;
 mod orchestration_guarantees;

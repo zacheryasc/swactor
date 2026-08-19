@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::{
     Arc,
@@ -30,7 +30,11 @@ use crate::node_actor::{
     StageObjectSpecWire, StageOutboundEdgeWire,
 };
 use crate::observability::benchmark;
+use crate::orchestration::actor::OrchestratorMsg;
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
+use crate::orchestration::manual_control::{
+    CONTROL_REGISTRY_NAME, ManualControlMsg, ManualControlReply, RejoinHello, SELECTED_OFFER_ID_ENV,
+};
 use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
 use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
@@ -47,7 +51,7 @@ use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{Ctx, ExternalSender};
+use swactor::runtime::{Ctx, ExternalSender, Inbox};
 use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -162,7 +166,11 @@ fn emit_node_event(
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type")]
 enum DebugJoinRequestWire {
-    JoinEndpoint { endpoint: EndpointAddr },
+    JoinEndpoint {
+        endpoint: EndpointAddr,
+        #[serde(default)]
+        orchestrator_actor: Option<ActorAddress>,
+    },
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -182,6 +190,7 @@ enum DebugJoinResponseWire {
 enum DebugJoinCommand {
     JoinEndpoint {
         endpoint: EndpointAddr,
+        orchestrator_actor: Option<ActorAddress>,
         reply: tokio::sync::oneshot::Sender<DebugJoinResponseWire>,
     },
 }
@@ -272,35 +281,58 @@ fn run_debug_join_client(args: Vec<String>) -> Result<DebugJoinResponseWire, Deb
     };
     let endpoint = serde_json::from_str::<EndpointAddr>(&endpoint_json)
         .map_err(|e| DebugJoinClientError::Cli(format!("parse endpoint JSON: {e}")))?;
-    let request = debug_join_request_line(endpoint).map_err(DebugJoinClientError::Runtime)?;
-    let mut stream = std::os::unix::net::UnixStream::connect(&socket)
-        .map_err(|e| DebugJoinClientError::Runtime(format!("connect {}: {e}", socket.display())))?;
+    send_debug_join_request(&socket, endpoint, None).map_err(DebugJoinClientError::Runtime)
+}
+
+pub(crate) fn request_debug_join(
+    socket: &Path,
+    endpoint: EndpointAddr,
+    orchestrator_actor: ActorAddress,
+) -> Result<(), String> {
+    match send_debug_join_request(socket, endpoint, Some(orchestrator_actor))? {
+        DebugJoinResponseWire::JoinQueued { .. } => Ok(()),
+        DebugJoinResponseWire::JoinRejected { error, detail } => {
+            Err(format!("worker join rejected: {error}: {detail}"))
+        }
+    }
+}
+
+fn send_debug_join_request(
+    socket: &Path,
+    endpoint: EndpointAddr,
+    orchestrator_actor: Option<ActorAddress>,
+) -> Result<DebugJoinResponseWire, String> {
+    let request = debug_join_request_line(endpoint, orchestrator_actor)?;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
     stream
         .write_all(request.as_bytes())
-        .map_err(|e| DebugJoinClientError::Runtime(format!("write request: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| DebugJoinClientError::Runtime(format!("flush request: {e}")))?;
+        .map_err(|e| format!("write request: {e}"))?;
+    stream.flush().map_err(|e| format!("flush request: {e}"))?;
     let mut response_line = String::new();
     BufReader::new(stream)
         .read_line(&mut response_line)
-        .map_err(|e| DebugJoinClientError::Runtime(format!("read response: {e}")))?;
+        .map_err(|e| format!("read response: {e}"))?;
     if response_line.trim().is_empty() {
-        return Err(DebugJoinClientError::Runtime(
-            "debug join socket closed without response".to_owned(),
-        ));
+        return Err("debug join socket closed without response".to_owned());
     }
     serde_json::from_str::<DebugJoinResponseWire>(&response_line)
-        .map_err(|e| DebugJoinClientError::Runtime(format!("parse response JSON: {e}")))
+        .map_err(|e| format!("parse response JSON: {e}"))
 }
 
-fn debug_join_request_line(endpoint: EndpointAddr) -> Result<String, String> {
-    serde_json::to_string(&DebugJoinRequestWire::JoinEndpoint { endpoint })
-        .map(|mut line| {
-            line.push('\n');
-            line
-        })
-        .map_err(|e| format!("serialize debug join request: {e}"))
+fn debug_join_request_line(
+    endpoint: EndpointAddr,
+    orchestrator_actor: Option<ActorAddress>,
+) -> Result<String, String> {
+    serde_json::to_string(&DebugJoinRequestWire::JoinEndpoint {
+        endpoint,
+        orchestrator_actor,
+    })
+    .map(|mut line| {
+        line.push('\n');
+        line
+    })
+    .map_err(|e| format!("serialize debug join request: {e}"))
 }
 
 fn spawn_debug_join_listener(
@@ -376,10 +408,17 @@ async fn handle_debug_join_stream(
             detail: "empty request".to_owned(),
         },
         Ok(_) => match parse_debug_join_request(&line) {
-            Ok(DebugJoinRequestWire::JoinEndpoint { endpoint }) => {
+            Ok(DebugJoinRequestWire::JoinEndpoint {
+                endpoint,
+                orchestrator_actor,
+            }) => {
                 let (reply, response_rx) = tokio::sync::oneshot::channel();
                 if command_tx
-                    .send(DebugJoinCommand::JoinEndpoint { endpoint, reply })
+                    .send(DebugJoinCommand::JoinEndpoint {
+                        endpoint,
+                        orchestrator_actor,
+                        reply,
+                    })
                     .is_err()
                 {
                     DebugJoinResponseWire::JoinRejected {
@@ -436,17 +475,25 @@ fn drain_debug_join_commands(
     driver: &mut IrohDriver,
     config: &DeploymentConfig,
     telemetry: &mut NodeTelemetry,
+    pending_control_rejoin: &mut PendingControlRejoin,
 ) {
     let Some(rx) = debug_join_rx else {
         return;
     };
     while let Ok(command) = rx.try_recv() {
         match command {
-            DebugJoinCommand::JoinEndpoint { endpoint, reply } => {
+            DebugJoinCommand::JoinEndpoint {
+                endpoint,
+                orchestrator_actor,
+                reply,
+            } => {
                 let peer_node_id = endpoint.id.to_string();
                 let has_relay = endpoint.relay_urls().next().is_some();
                 let direct_addr_count = endpoint.ip_addrs().count();
                 driver.join(std::slice::from_ref(&endpoint));
+                if let Some(orchestrator_actor) = orchestrator_actor {
+                    pending_control_rejoin.set_recovery_actor(orchestrator_actor);
+                }
                 emit_node_event(
                     telemetry,
                     config,
@@ -1686,6 +1733,10 @@ fn run() -> Result<(), String> {
             return Err(format!("node report inbox: {error}"));
         }
     };
+    let rejoin_replies = stack
+        .runtime
+        .new_inbox::<ManualControlReply>()
+        .map_err(|error| format!("rejoin reply inbox: {error}"))?;
     let orchestrator = config.orchestrator_actor.ok_or_else(|| {
         "MYELIN_ORCHESTRATOR_ACTOR is required for runtime readiness signaling".to_owned()
     })?;
@@ -1719,6 +1770,14 @@ fn run() -> Result<(), String> {
         }
     };
     stack.register_local_actor(driver.register_actor(node_actor, 1));
+    stack.register_local_actor(driver.register_actor(*rejoin_replies.addr(), 1));
+    let mut pending_control_rejoin = PendingControlRejoin::new(
+        &config,
+        &advertised_self_endpoint,
+        driver.node_id(),
+        node_actor,
+        orchestrator,
+    )?;
     boot(
         "node_actor_registration",
         "ready",
@@ -1764,8 +1823,15 @@ fn run() -> Result<(), String> {
             }),
         );
         loop {
+            pending_control_rejoin.drive(&stack, node_actor, &rejoin_replies)?;
             emit_swim_telemetry(&mut telemetry, &stack, "agent_loop");
-            drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut telemetry);
+            drain_debug_join_commands(
+                &mut debug_join_rx,
+                &mut driver,
+                &config,
+                &mut telemetry,
+                &mut pending_control_rejoin,
+            );
             telemetry.tick();
             serve_telemetry_pulls(&driver, &engine.handle(), &telemetry.endpoint);
             while let Some(report) = reports.try_recv() {
@@ -1928,8 +1994,15 @@ fn run() -> Result<(), String> {
         }),
     );
     loop {
+        pending_control_rejoin.drive(&stack, node_actor, &rejoin_replies)?;
         emit_swim_telemetry(&mut telemetry, &stack, "main_loop");
-        drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut telemetry);
+        drain_debug_join_commands(
+            &mut debug_join_rx,
+            &mut driver,
+            &config,
+            &mut telemetry,
+            &mut pending_control_rejoin,
+        );
         telemetry.tick();
         serve_telemetry_pulls(&driver, &engine.handle(), &telemetry.endpoint);
         drain_worker_stderr(&worker.stderr_rx, &config, &mut telemetry);
@@ -2315,6 +2388,131 @@ enum NodeReportOutcome {
         stage_index: u32,
         readiness_id: u64,
     },
+}
+
+struct PendingControlRejoin {
+    hello: RejoinHello,
+    last_bound_actor: ActorAddress,
+    pending_actor: Option<ActorAddress>,
+    next_attempt_at: Instant,
+    recovery_actor: Option<ActorAddress>,
+    backoff: Duration,
+}
+
+impl PendingControlRejoin {
+    fn new(
+        config: &DeploymentConfig,
+        endpoint: &EndpointAddr,
+        swim_node_id: DistNodeId,
+        node_actor: ActorAddress,
+        orchestrator_actor: ActorAddress,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            hello: RejoinHello {
+                run_id: config.run_id,
+                logical_node_id: config.logical_node_id,
+                attempt_id: config.attempt_id,
+                selected_offer_id: config.selected_offer_id,
+                endpoint: serde_json::to_string(endpoint)
+                    .map_err(|error| format!("serialize rejoin endpoint: {error}"))?,
+                swim_node_id,
+                stage_index: config.stage_index,
+                node_actor,
+            },
+            last_bound_actor: orchestrator_actor,
+            pending_actor: None,
+            next_attempt_at: Instant::now(),
+            backoff: RUNTIME_READY_RETRY_INITIAL,
+            recovery_actor: None,
+        })
+    }
+
+    fn set_recovery_actor(&mut self, actor: ActorAddress) {
+        self.recovery_actor = Some(actor);
+        self.pending_actor = None;
+        self.next_attempt_at = Instant::now();
+        self.backoff = RUNTIME_READY_RETRY_INITIAL;
+    }
+
+    fn current_actor(&self, stack: &DistributionRuntimeStack) -> Option<ActorAddress> {
+        self.recovery_actor.or_else(|| {
+            stack
+                .registry_view
+                .read()
+                .ok()?
+                .entries
+                .iter()
+                .find(|entry| entry.name == CONTROL_REGISTRY_NAME && !entry.tombstone)
+                .map(|entry| entry.actor_addr)
+        })
+    }
+
+    fn drive(
+        &mut self,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        replies: &Inbox<ManualControlReply>,
+    ) -> Result<(), String> {
+        while let Some(reply) = replies.try_recv() {
+            match reply {
+                ManualControlReply::Rejoined(binding)
+                    if self.current_actor(stack) == Some(binding.orchestrator_actor) =>
+                {
+                    stack
+                        .runtime
+                        .send_to(
+                            node_actor,
+                            NodeAgentMsg::RebindOrchestrator {
+                                orchestrator_actor: binding.orchestrator_actor,
+                                control_generation: binding.control_generation,
+                            },
+                        )
+                        .map_err(|error| format!("apply orchestrator rebind: {error}"))?;
+                    self.last_bound_actor = binding.orchestrator_actor;
+                    self.pending_actor = None;
+                    self.backoff = RUNTIME_READY_RETRY_INITIAL;
+                }
+                ManualControlReply::Rejected(_) => {
+                    self.pending_actor = None;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(orchestrator_actor) = self.current_actor(stack) else {
+            return Ok(());
+        };
+        if orchestrator_actor == self.last_bound_actor {
+            self.pending_actor = None;
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now < self.next_attempt_at {
+            return Ok(());
+        }
+        if stack
+            .runtime
+            .send_to(
+                orchestrator_actor,
+                OrchestratorMsg::Manual(ManualControlMsg::Rejoin {
+                    hello: self.hello.clone(),
+                    reply_to: *replies.addr(),
+                }),
+            )
+            .is_ok()
+        {
+            self.pending_actor = Some(orchestrator_actor);
+        } else {
+            self.pending_actor = None;
+        }
+        self.next_attempt_at = now + self.backoff;
+        self.backoff = self
+            .backoff
+            .checked_mul(2)
+            .unwrap_or(RUNTIME_READY_RETRY_MAX)
+            .min(RUNTIME_READY_RETRY_MAX);
+        Ok(())
+    }
 }
 
 struct PendingRuntimeReady {
@@ -3541,6 +3739,7 @@ struct DeploymentConfig {
     run_id: u64,
     logical_node_id: u64,
     attempt_id: u64,
+    selected_offer_id: Option<u64>,
     stage_index: u32,
     coordinator_endpoint: Option<EndpointAddr>,
     orchestrator_actor: Option<ActorAddress>,
@@ -3600,6 +3799,13 @@ impl DeploymentConfig {
             run_id,
             logical_node_id,
             attempt_id,
+            selected_offer_id: env_optional(SELECTED_OFFER_ID_ENV)
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        format!("invalid {SELECTED_OFFER_ID_ENV}={value:?}: {error}")
+                    })
+                })
+                .transpose()?,
             stage_index: env_parse!("MYELIN_STAGE_INDEX", 0)?,
             coordinator_endpoint: env_optional("MYELIN_COORDINATOR_ENDPOINT")
                 .map(|value| {
@@ -3623,7 +3829,8 @@ impl DeploymentConfig {
                 .unwrap_or_default(),
             agent_only: env_optional("MYELIN_AGENT_ONLY")
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on")),
-            exit_on_stdin_eof: provider == "process",
+            // Provider workers outlive the orchestrator process and rejoin it after restart.
+            exit_on_stdin_eof: false,
             worker_script: env_optional("MYELIN_TINYGRAD_WORKER")
                 .unwrap_or_else(|| DEFAULT_WORKER_SCRIPT.to_owned()),
             device: env_optional("DEV").unwrap_or_else(|| default_device.to_owned()),

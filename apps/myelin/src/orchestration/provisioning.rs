@@ -5,13 +5,13 @@
 //! that know about bootstrap telemetry plumbing and local runtime execution.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
@@ -21,7 +21,10 @@ pub use ::provisioning::plugin::{
     PluginSink, ProviderMount, ProvisionEvent, ProvisionEventKind, ProvisionLogLine,
     ProvisionLogStream, ProvisionPlugin,
 };
+use iroh::EndpointAddr;
+use swactor::actor::ActorAddress;
 
+use crate::node::worker_node_runtime::request_debug_join;
 use crate::observability::provisioning_logs::BootstrapTelemetryBridge;
 
 pub(crate) struct LocalDockerPlugin {
@@ -38,13 +41,24 @@ struct LocalDockerNode {
 
 pub(crate) struct LocalProcessPlugin {
     program: PathBuf,
+    registry_path: Option<PathBuf>,
+    provider_prefix: String,
     next_handle_id: u64,
     nodes: BTreeMap<u64, LocalProcessNode>,
+}
+
+/// Safe Vast.ai provisioning simulator. Marketplace selection remains real;
+/// the selected offer is recorded here and a local worker stands in for the
+/// rented machine.
+pub(crate) struct MockVastAiPlugin {
+    inner: LocalProcessPlugin,
+    selected_offers: BTreeMap<u64, u64>,
 }
 
 struct LocalProcessNode {
     spec: NodeProvisionSpec,
     sink: PluginSink,
+    pid: Option<u32>,
     runtime: Option<LocalProcessRuntime>,
 }
 
@@ -53,14 +67,314 @@ struct LocalProcessRuntime {
     child: Arc<Mutex<Option<Child>>>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct LocalProcessRecord {
+    pid: u32,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    run_id: u64,
+    node_id: u64,
+    attempt_id: u64,
+}
+
+static PROCESS_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
 impl LocalProcessPlugin {
+    #[cfg(test)]
     pub(crate) fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            registry_path: None,
+            provider_prefix: "process".to_owned(),
             next_handle_id: 1,
             nodes: BTreeMap::new(),
         }
     }
+
+    pub(crate) fn with_registry(
+        program: impl Into<PathBuf>,
+        registry_path: impl Into<PathBuf>,
+        provider_prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            registry_path: Some(registry_path.into()),
+            provider_prefix: provider_prefix.into(),
+            next_handle_id: 1,
+            nodes: BTreeMap::new(),
+        }
+    }
+}
+
+impl MockVastAiPlugin {
+    #[cfg(test)]
+    pub(crate) fn new(program: impl Into<PathBuf>) -> Self {
+        let mut inner = LocalProcessPlugin::new(program);
+        inner.provider_prefix = "mock-vastai".to_owned();
+        Self {
+            inner,
+            selected_offers: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn with_registry(
+        program: impl Into<PathBuf>,
+        registry_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            inner: LocalProcessPlugin::with_registry(program, registry_path, "mock-vastai"),
+            selected_offers: BTreeMap::new(),
+        }
+    }
+}
+fn local_process_provider_ref(prefix: &str, spec: &NodeProvisionSpec) -> String {
+    format!(
+        "{prefix}-{}-{}-attempt-{}",
+        spec.run_id, spec.node_id, spec.attempt_id
+    )
+}
+
+fn process_output_paths(registry_path: Option<&Path>, provider_ref: &str) -> (PathBuf, PathBuf) {
+    let output_root = registry_path
+        .and_then(Path::parent)
+        .map(|parent| parent.join("process-output"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("myelin-process-output-{}", std::process::id()))
+        });
+    (
+        output_root.join(format!("{provider_ref}.stdout.log")),
+        output_root.join(format!("{provider_ref}.stderr.log")),
+    )
+}
+
+fn read_process_registry(path: &Path) -> Result<BTreeMap<String, LocalProcessRecord>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|error| format!("parse process registry {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(format!("read process registry {}: {error}", path.display())),
+    }
+}
+
+fn write_process_registry(
+    path: &Path,
+    registry: &BTreeMap<String, LocalProcessRecord>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("create process registry dir {}: {error}", parent.display())
+        })?;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(registry)
+        .map_err(|error| format!("serialize process registry: {error}"))?;
+    fs::write(&tmp, bytes)
+        .map_err(|error| format!("write process registry temp {}: {error}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "replace process registry {} from {}: {error}",
+            path.display(),
+            tmp.display()
+        )
+    })
+}
+
+fn update_process_registry<T>(
+    path: &Path,
+    update: impl FnOnce(&mut BTreeMap<String, LocalProcessRecord>) -> T,
+) -> Result<T, String> {
+    let _guard = PROCESS_REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut registry = read_process_registry(path)?;
+    let result = update(&mut registry);
+    write_process_registry(path, &registry)?;
+    Ok(result)
+}
+
+fn process_record_matches(record: &LocalProcessRecord) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", record.pid)) else {
+            return false;
+        };
+        let Some((_, tail)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let mut fields = tail.split_whitespace();
+        let state = fields.next();
+        let _parent_pid = fields.next();
+        let process_group = fields.next().and_then(|value| value.parse::<u32>().ok());
+        if state == Some("Z") || process_group != Some(record.pid) {
+            return false;
+        }
+        let Ok(environ) = fs::read(format!("/proc/{}/environ", record.pid)) else {
+            return false;
+        };
+        let expected = [
+            ("MYELIN_RUN_ID", record.run_id.to_string()),
+            ("MYELIN_LOGICAL_NODE_ID", record.node_id.to_string()),
+        ];
+        return expected.iter().all(|(key, value)| {
+            environ.split(|byte| *byte == 0).any(|entry| {
+                entry
+                    .strip_prefix(format!("{key}=").as_bytes())
+                    .is_some_and(|actual| actual == value.as_bytes())
+            })
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = record;
+        false
+    }
+}
+
+struct FollowProcessFile {
+    file: File,
+    record: LocalProcessRecord,
+}
+
+impl Read for FollowProcessFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let count = self.file.read(buffer)?;
+            if count > 0 || !process_record_matches(&self.record) {
+                return Ok(count);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+fn discover_process_record(
+    spec: &NodeProvisionSpec,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+) -> Result<Option<LocalProcessRecord>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let entries =
+            fs::read_dir("/proc").map_err(|error| format!("scan /proc for worker: {error}"))?;
+        let mut matches = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let record = LocalProcessRecord {
+                pid,
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+                run_id: spec.run_id,
+                node_id: spec.node_id,
+                attempt_id: spec.attempt_id,
+            };
+            if process_record_matches(&record) {
+                matches.push(record);
+            }
+        }
+        return match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.pop()),
+            count => Err(format!(
+                "{count} local worker processes match run {} node {}",
+                spec.run_id, spec.node_id
+            )),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (spec, stdout_path, stderr_path);
+        Ok(None)
+    }
+}
+
+fn request_process_rejoin(spec: &NodeProvisionSpec) -> Result<(), String> {
+    let Some(endpoint_json) = spec
+        .env
+        .iter()
+        .find_map(|(key, value)| (key == "MYELIN_COORDINATOR_ENDPOINT").then_some(value.as_str()))
+    else {
+        return Ok(());
+    };
+    let endpoint = serde_json::from_str::<EndpointAddr>(endpoint_json)
+        .map_err(|error| format!("parse recovery coordinator endpoint: {error}"))?;
+    let actor_json = spec
+        .env
+        .iter()
+        .find_map(|(key, value)| (key == "MYELIN_ORCHESTRATOR_ACTOR").then_some(value.as_str()))
+        .ok_or_else(|| "recovery spec has no orchestrator actor".to_owned())?;
+    let orchestrator_actor = serde_json::from_str::<ActorAddress>(actor_json)
+        .map_err(|error| format!("parse recovery orchestrator actor: {error}"))?;
+    let socket = spec
+        .env
+        .iter()
+        .find_map(|(key, value)| {
+            (key == "MYELIN_DEBUG_JOIN_SOCKET").then_some(PathBuf::from(value))
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "/tmp/myelin-node-debug-join-{}-{}.sock",
+                spec.run_id, spec.node_id
+            ))
+        });
+    let mut last_error = None;
+    for _ in 0..40 {
+        match request_debug_join(&socket, endpoint.clone(), orchestrator_actor) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "rejoin local worker through {}: {}",
+        socket.display(),
+        last_error.unwrap_or_else(|| "unknown error".to_owned())
+    ))
+}
+
+fn observe_process_files(
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    record: LocalProcessRecord,
+) -> Result<(), String> {
+    let stdout = File::open(&record.stdout_path).map_err(|error| {
+        format!(
+            "open local process stdout {}: {error}",
+            record.stdout_path.display()
+        )
+    })?;
+    let stderr = File::open(&record.stderr_path).map_err(|error| {
+        format!(
+            "open local process stderr {}: {error}",
+            record.stderr_path.display()
+        )
+    })?;
+    spawn_stdout_reader(
+        spec.clone(),
+        sink.clone(),
+        FollowProcessFile {
+            file: stdout,
+            record: record.clone(),
+        },
+    );
+    spawn_stderr_reader(
+        spec,
+        sink,
+        FollowProcessFile {
+            file: stderr,
+            record,
+        },
+    );
+    Ok(())
 }
 
 impl LocalDockerPlugin {
@@ -382,6 +696,106 @@ fn lock_process_child(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+fn stop_owned_process(runtime: &mut LocalProcessRuntime) -> Result<Option<i32>, String> {
+    let _ = runtime.stdin.write_all(b"shutdown\n");
+    let _ = runtime.stdin.flush();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let mut slot = lock_process_child(&runtime.child);
+        let Some(child) = slot.as_mut() else {
+            return Ok(None);
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *slot = None;
+                return Ok(status.code());
+            }
+            Ok(None) => {
+                drop(slot);
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(format!("wait local process node: {error}")),
+        }
+    }
+
+    let mut slot = lock_process_child(&runtime.child);
+    let Some(child) = slot.as_mut() else {
+        return Ok(None);
+    };
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let kill_error = child.kill().err();
+    match child.wait() {
+        Ok(status) => {
+            *slot = None;
+            Ok(status.code())
+        }
+        Err(error) => Err(match kill_error {
+            Some(kill_error) => {
+                format!("kill local process node: {kill_error}; wait failed: {error}")
+            }
+            None => format!("wait for killed local process node: {error}"),
+        }),
+    }
+}
+
+fn stop_adopted_process(record: &LocalProcessRecord) -> Result<(), String> {
+    if !process_record_matches(record) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::kill(-(record.pid as i32), libc::SIGTERM) != 0 {
+            return Err(format!(
+                "terminate adopted local process {}: {}",
+                record.pid,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !process_record_matches(record) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::kill(-(record.pid as i32), libc::SIGKILL) != 0 && process_record_matches(record) {
+            return Err(format!(
+                "kill adopted local process {}: {}",
+                record.pid,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn observe_adopted_process(
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    registry_path: PathBuf,
+    provider_ref: String,
+    record: LocalProcessRecord,
+) {
+    thread::spawn(move || {
+        while process_record_matches(&record) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = update_process_registry(&registry_path, |registry| {
+            registry.remove(&provider_ref);
+        });
+        sink.observe(PluginObservation::Exited {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            status: None,
+        });
+    });
+}
 
 impl ProvisionPlugin for LocalProcessPlugin {
     fn create_node(
@@ -399,6 +813,7 @@ impl ProvisionPlugin for LocalProcessPlugin {
             LocalProcessNode {
                 spec,
                 sink,
+                pid: None,
                 runtime: None,
             },
         );
@@ -408,24 +823,61 @@ impl ProvisionPlugin for LocalProcessPlugin {
     // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
     #[allow(clippy::disallowed_methods)]
     fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        let registry_path = self.registry_path.clone();
+        let provider_prefix = self.provider_prefix.clone();
+        let program = self.program.clone();
         let node = self
             .nodes
             .get_mut(&handle.id)
             .ok_or_else(|| format!("local process node handle {} is absent", handle.id))?;
-        if node.runtime.is_some() {
+        if node.pid.is_some() {
             return Ok(());
         }
         let spec = node.spec.clone();
         let sink = node.sink.clone();
-        let mut command = Command::new(&self.program);
+        let provider_ref = local_process_provider_ref(&provider_prefix, &spec);
+        let (stdout_path, stderr_path) =
+            process_output_paths(registry_path.as_deref(), &provider_ref);
+        let output_root = stdout_path
+            .parent()
+            .expect("local process output path has a parent");
+        fs::create_dir_all(output_root).map_err(|error| {
+            format!(
+                "create local process output dir {}: {error}",
+                output_root.display()
+            )
+        })?;
+        let stdout = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&stdout_path)
+            .map_err(|error| {
+                format!(
+                    "create local process stdout {}: {error}",
+                    stdout_path.display()
+                )
+            })?;
+        let stderr = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&stderr_path)
+            .map_err(|error| {
+                format!(
+                    "create local process stderr {}: {error}",
+                    stderr_path.display()
+                )
+            })?;
+        let mut command = Command::new(&program);
         for (key, value) in &spec.env {
             command.env(key, value);
         }
         command.args(&spec.args);
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
         #[cfg(target_os = "linux")]
         unsafe {
             command.pre_exec(|| {
@@ -437,31 +889,51 @@ impl ProvisionPlugin for LocalProcessPlugin {
             });
         }
 
-        let mut child = command.spawn().map_err(|e| {
+        let mut child = command.spawn().map_err(|error| {
             format!(
-                "spawn local process node {} with {}: {e}",
+                "spawn local process node {} with {}: {error}",
                 spec.node_id,
-                self.program.display()
+                program.display()
             )
         })?;
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
+        let pid = child.id();
+        let Some(stdin) = child.stdin.take() else {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "local process node {} did not expose piped stdio",
+                "local process node {} did not expose piped stdin",
                 spec.node_id
             ));
         };
+        let record = LocalProcessRecord {
+            pid,
+            stdout_path,
+            stderr_path,
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            attempt_id: spec.attempt_id,
+        };
+        if let Some(path) = registry_path.as_deref()
+            && let Err(error) = update_process_registry(path, |registry| {
+                registry.insert(provider_ref.clone(), record.clone());
+            })
+        {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
 
         let child = Arc::new(Mutex::new(Some(child)));
+        node.pid = Some(pid);
         node.runtime = Some(LocalProcessRuntime {
             stdin,
             child: Arc::clone(&child),
         });
-        spawn_stdout_reader(spec.clone(), sink.clone(), stdout);
-        spawn_stderr_reader(spec.clone(), sink.clone(), stderr);
+        observe_process_files(spec.clone(), sink.clone(), record)?;
         thread::spawn(move || {
             loop {
                 let observation = {
@@ -487,6 +959,11 @@ impl ProvisionPlugin for LocalProcessPlugin {
                     }
                 };
                 if let Some(observation) = observation {
+                    if let Some(path) = registry_path.as_deref() {
+                        let _ = update_process_registry(path, |registry| {
+                            registry.remove(&provider_ref);
+                        });
+                    }
                     sink.observe(observation);
                     return;
                 }
@@ -506,76 +983,27 @@ impl ProvisionPlugin for LocalProcessPlugin {
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
-        let Some(mut runtime) = node.runtime.take() else {
-            return Ok(());
+        let provider_ref = local_process_provider_ref(&self.provider_prefix, &node.spec);
+        let record = self
+            .registry_path
+            .as_deref()
+            .map(read_process_registry)
+            .transpose()?
+            .and_then(|registry| registry.get(&provider_ref).cloned());
+        let result = match node.runtime.as_mut() {
+            Some(runtime) => stop_owned_process(runtime),
+            None => match record.as_ref() {
+                Some(record) => stop_adopted_process(record).map(|()| None),
+                None => Ok(None),
+            },
         };
-        let _ = runtime.stdin.write_all(b"shutdown\n");
-        let _ = runtime.stdin.flush();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let status = {
-                let mut slot = lock_process_child(&runtime.child);
-                let Some(child) = slot.as_mut() else {
-                    return Ok(());
-                };
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        *slot = None;
-                        Ok(Some(status.code()))
-                    }
-                    Ok(None) => Ok(None),
-                    Err(error) => Err(format!("wait local process node: {error}")),
-                }
-            };
-            match status {
-                Ok(Some(status)) => {
-                    node.sink.observe(PluginObservation::Exited {
-                        run_id: node.spec.run_id,
-                        node_id: node.spec.node_id,
-                        status,
-                    });
-                    return Ok(());
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(reason) => {
-                    node.sink.observe(PluginObservation::Failed {
-                        run_id: node.spec.run_id,
-                        node_id: node.spec.node_id,
-                        reason: reason.clone(),
-                    });
-                    node.runtime = Some(runtime);
-                    self.nodes.insert(handle.id, node);
-                    return Err(reason);
-                }
-            }
-        }
-
-        let status = {
-            let mut slot = lock_process_child(&runtime.child);
-            let Some(child) = slot.as_mut() else {
-                return Ok(());
-            };
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let kill_error = child.kill().err();
-            match child.wait() {
-                Ok(status) => {
-                    *slot = None;
-                    Ok(status.code())
-                }
-                Err(error) => Err(match kill_error {
-                    Some(kill_error) => {
-                        format!("kill local process node: {kill_error}; wait failed: {error}")
-                    }
-                    None => format!("wait for killed local process node: {error}"),
-                }),
-            }
-        };
-        match status {
+        match result {
             Ok(status) => {
+                if let Some(path) = self.registry_path.as_deref() {
+                    update_process_registry(path, |registry| {
+                        registry.remove(&provider_ref);
+                    })?;
+                }
                 node.sink.observe(PluginObservation::Exited {
                     run_id: node.spec.run_id,
                     node_id: node.spec.node_id,
@@ -589,36 +1017,208 @@ impl ProvisionPlugin for LocalProcessPlugin {
                     node_id: node.spec.node_id,
                     reason: reason.clone(),
                 });
-                node.runtime = Some(runtime);
                 self.nodes.insert(handle.id, node);
                 Err(reason)
             }
         }
     }
 
-    fn detach_all(&mut self) {
-        // Leak the children deliberately: daemon exit must not kill nodes.
-        // Children become unmanageable (process provider has no cross-process
-        // adoption surface); explicit destroy happened before this call or
-        // not at all.
-        self.nodes.clear();
+    fn prepare_missing_bootstrap(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        let handle = self.create_node(spec.clone(), sink)?;
+        Ok(Some(AdoptedNode {
+            handle,
+            provider_ref: self.provider_ref_for(spec),
+        }))
+    }
+
+    fn adopt_by_spec(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        let Some(registry_path) = self.registry_path.clone() else {
+            return Ok(None);
+        };
+        let provider_ref = local_process_provider_ref(&self.provider_prefix, spec);
+        let mut record = read_process_registry(&registry_path)?
+            .get(&provider_ref)
+            .cloned();
+        if record
+            .as_ref()
+            .is_some_and(|record| !process_record_matches(record))
+        {
+            update_process_registry(&registry_path, |registry| {
+                registry.remove(&provider_ref);
+            })?;
+            record = None;
+        }
+        if record.is_none() {
+            let (stdout_path, stderr_path) =
+                process_output_paths(Some(&registry_path), &provider_ref);
+            for _ in 0..40 {
+                record = discover_process_record(spec, stdout_path.clone(), stderr_path.clone())?;
+                if record.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if let Some(discovered) = record.as_ref() {
+                update_process_registry(&registry_path, |registry| {
+                    registry.insert(provider_ref.clone(), discovered.clone());
+                })?;
+            }
+        }
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        request_process_rejoin(spec)?;
+        observe_process_files(spec.clone(), sink.clone(), record.clone())?;
+        observe_adopted_process(
+            spec.clone(),
+            sink.clone(),
+            registry_path,
+            provider_ref.clone(),
+            record.clone(),
+        );
+        let handle = PluginNodeHandle {
+            id: self.next_handle_id,
+            provider_process_id: Some(record.pid),
+        };
+        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
+        self.nodes.insert(
+            handle.id,
+            LocalProcessNode {
+                spec: spec.clone(),
+                sink,
+                pid: Some(record.pid),
+                runtime: None,
+            },
+        );
+        Ok(Some(AdoptedNode {
+            handle,
+            provider_ref,
+        }))
+    }
+
+    fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
+        local_process_provider_ref(&self.provider_prefix, spec)
+    }
+
+    fn list_managed_refs(&self) -> Result<Vec<String>, String> {
+        let Some(path) = self.registry_path.as_deref() else {
+            return Ok(Vec::new());
+        };
+        update_process_registry(path, |registry| {
+            registry.retain(|_, record| process_record_matches(record));
+            registry.keys().cloned().collect()
+        })
+    }
+
+    fn stop_by_spec(&mut self, spec: &NodeProvisionSpec, sink: PluginSink) -> Result<bool, String> {
+        let Some(path) = self.registry_path.as_deref() else {
+            return Ok(false);
+        };
+        let provider_ref = local_process_provider_ref(&self.provider_prefix, spec);
+        let record = read_process_registry(path)?.get(&provider_ref).cloned();
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        stop_adopted_process(&record)?;
+        update_process_registry(path, |registry| {
+            registry.remove(&provider_ref);
+        })?;
+        sink.observe(PluginObservation::Exited {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            status: None,
+        });
+        Ok(true)
     }
 }
 
-impl Drop for LocalProcessPlugin {
-    fn drop(&mut self) {
-        let handles = self
-            .nodes
-            .keys()
-            .copied()
-            .map(|id| PluginNodeHandle {
-                id,
-                provider_process_id: None,
+impl ProvisionPlugin for MockVastAiPlugin {
+    fn create_node(
+        &mut self,
+        _spec: NodeProvisionSpec,
+        _sink: PluginSink,
+    ) -> Result<PluginNodeHandle, String> {
+        Err("mock Vast.ai provisioning requires an exact selected offer".to_owned())
+    }
+
+    fn create_node_selected(
+        &mut self,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+        selected_offer_id: Option<u64>,
+    ) -> Result<PluginNodeHandle, String> {
+        let offer_id = selected_offer_id
+            .filter(|offer_id| *offer_id > 0)
+            .ok_or_else(|| {
+                "mock Vast.ai provisioning requires an exact selected offer".to_owned()
+            })?;
+        sink.observe(PluginObservation::ProviderLine {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            line: serde_json::json!({
+                "type": "MockVastAiContractCreated",
+                "simulated": true,
+                "selected_offer_id": offer_id,
             })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            let _ = self.stop_node(&handle);
-        }
+            .to_string(),
+        });
+        let handle = self.inner.create_node(spec, sink)?;
+        self.selected_offers.insert(handle.id, offer_id);
+        Ok(handle)
+    }
+
+    fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        self.inner.start_bootstrap(handle)
+    }
+
+    fn cancel_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        self.inner.cancel_bootstrap(handle)
+    }
+
+    fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        self.inner.complete_bootstrap(handle)
+    }
+
+    fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        self.inner.stop_node(handle)?;
+        self.selected_offers.remove(&handle.id);
+        Ok(())
+    }
+
+    fn adopt_by_spec(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        self.inner.adopt_by_spec(spec, sink)
+    }
+
+    fn prepare_missing_bootstrap(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        self.inner.prepare_missing_bootstrap(spec, sink)
+    }
+
+    fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
+        self.inner.provider_ref_for(spec)
+    }
+
+    fn list_managed_refs(&self) -> Result<Vec<String>, String> {
+        self.inner.list_managed_refs()
+    }
+
+    fn stop_by_spec(&mut self, spec: &NodeProvisionSpec, sink: PluginSink) -> Result<bool, String> {
+        self.inner.stop_by_spec(spec, sink)
     }
 }
 
@@ -652,10 +1252,14 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .get(&handle.id)
             .ok_or_else(|| format!("Docker node handle {} is absent", handle.id))?;
         if !docker_container_is_absent(&node.container_name)? {
-            return Err(format!(
-                "Docker container {} already exists before bootstrap",
-                node.container_name
-            ));
+            return if docker_container_is_running(&node.container_name)? {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Docker container {} exists but is not running",
+                    node.container_name
+                ))
+            };
         }
         let spec = node.spec.clone();
         let sink = node.sink.clone();
@@ -785,6 +1389,17 @@ impl ProvisionPlugin for LocalDockerPlugin {
     fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
         docker_container_name(&self.container_name_prefix, spec)
     }
+    fn prepare_missing_bootstrap(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        let handle = self.create_node(spec.clone(), sink)?;
+        Ok(Some(AdoptedNode {
+            handle,
+            provider_ref: self.provider_ref_for(spec),
+        }))
+    }
 
     fn list_managed_refs(&self) -> Result<Vec<String>, String> {
         docker_labeled_containers(&self.container_name_prefix)
@@ -810,10 +1425,6 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .to_string(),
         });
         Ok(true)
-    }
-
-    fn detach_all(&mut self) {
-        self.nodes.clear();
     }
 }
 
@@ -935,6 +1546,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mock_vastai_preserves_exact_offer_identity_without_starting_a_lease() {
+        let (tx, rx) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let mut plugin = MockVastAiPlugin::new("/not/executed");
+        let spec = test_spec();
+
+        let handle = plugin
+            .create_node_selected(spec.clone(), sink, Some(8_675_309))
+            .unwrap();
+
+        assert_eq!(plugin.provider_ref_for(&spec), "mock-vastai-5-7-attempt-11");
+        assert_eq!(plugin.selected_offers.get(&handle.id), Some(&8_675_309));
+        assert_eq!(plugin.inner.nodes.len(), 1);
+        let PluginObservation::ProviderLine { line, .. } = rx.try_recv().unwrap() else {
+            panic!("mock lease must emit a provider event");
+        };
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["type"], "MockVastAiContractCreated");
+        assert_eq!(event["simulated"], true);
+        assert_eq!(event["selected_offer_id"], 8_675_309);
+
+        plugin.stop_node(&handle).unwrap();
+        assert!(plugin.selected_offers.is_empty());
+        assert!(plugin.inner.nodes.is_empty());
+    }
+
+    #[test]
+    fn mock_vastai_rejects_create_without_an_exact_offer() {
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let mut plugin = MockVastAiPlugin::new("/not/executed");
+
+        let error = plugin.create_node(test_spec(), sink).unwrap_err();
+
+        assert!(error.contains("exact selected offer"));
+        assert!(plugin.selected_offers.is_empty());
+        assert!(plugin.inner.nodes.is_empty());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn mock_vastai_handle_state_survives_random_create_and_stop_sequences(
+            operations in proptest::collection::vec(
+                (
+                    proptest::prelude::any::<u64>(),
+                    proptest::prelude::any::<bool>(),
+                ),
+                1..128,
+            )
+        ) {
+            let (tx, _) = mpsc::channel();
+            let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+            let mut plugin = MockVastAiPlugin::new("/not/executed");
+            let mut handles = Vec::new();
+
+            for (offer_id, should_stop) in operations {
+                let mut spec = test_spec();
+                spec.node_id = handles.len() as u64 + 1;
+                let handle = plugin
+                    .create_node_selected(spec, sink.clone(), Some(offer_id))
+                    .unwrap();
+                handles.push(handle.clone());
+                if should_stop {
+                    plugin.stop_node(&handle).unwrap();
+                } else {
+                    plugin.complete_bootstrap(&handle).unwrap();
+                }
+                proptest::prop_assert_eq!(
+                    plugin.selected_offers.keys().copied().collect::<Vec<_>>(),
+                    plugin.inner.nodes.keys().copied().collect::<Vec<_>>()
+                );
+            }
+
+            for handle in handles {
+                plugin.stop_node(&handle).unwrap();
+            }
+            proptest::prop_assert!(plugin.selected_offers.is_empty());
+            proptest::prop_assert!(plugin.inner.nodes.is_empty());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn local_process_creation_does_not_start_bootstrap() {
@@ -961,6 +1654,202 @@ mod tests {
         };
         assert_eq!(line, "started");
         plugin.stop_node(&handle).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_process_is_adopted_after_plugin_drop() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "myelin-process-registry-test-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let mut spec = test_spec();
+        spec.env
+            .push(("MYELIN_RUN_ID".to_owned(), spec.run_id.to_string()));
+        spec.env.push((
+            "MYELIN_LOGICAL_NODE_ID".to_owned(),
+            spec.node_id.to_string(),
+        ));
+        spec.args = vec![
+            "-c".to_owned(),
+            "trap 'exit 0' TERM; while :; do sleep 1; done".to_owned(),
+        ];
+        let provider_ref = local_process_provider_ref("process", &spec);
+
+        let record = {
+            let mut plugin =
+                LocalProcessPlugin::with_registry("/bin/sh", &registry_path, "process");
+            let handle = plugin.create_node(spec.clone(), sink.clone()).unwrap();
+            plugin.start_bootstrap(&handle).unwrap();
+            read_process_registry(&registry_path)
+                .unwrap()
+                .get(&provider_ref)
+                .cloned()
+                .unwrap()
+        };
+        assert!(process_record_matches(&record));
+        // Model a crash after spawn but before the parent commits its registry update.
+        fs::remove_file(&registry_path).unwrap();
+
+        let mut restarted = LocalProcessPlugin::with_registry("/bin/sh", &registry_path, "process");
+        let adopted = restarted
+            .adopt_by_spec(&spec, sink)
+            .unwrap()
+            .expect("running process must be adopted");
+        assert_eq!(adopted.provider_ref, provider_ref);
+        assert_eq!(adopted.handle.provider_process_id, Some(record.pid));
+        restarted.stop_node(&adopted.handle).unwrap();
+        assert!(!process_record_matches(&record));
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mock_vastai_process_is_adopted_after_plugin_drop() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "myelin-mock-registry-test-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let mut spec = test_spec();
+        spec.env
+            .push(("MYELIN_RUN_ID".to_owned(), spec.run_id.to_string()));
+        spec.env.push((
+            "MYELIN_LOGICAL_NODE_ID".to_owned(),
+            spec.node_id.to_string(),
+        ));
+        spec.args = vec![
+            "-c".to_owned(),
+            "trap 'exit 0' TERM; while :; do sleep 1; done".to_owned(),
+        ];
+
+        let record = {
+            let mut plugin = MockVastAiPlugin::with_registry("/bin/sh", &registry_path);
+            let handle = plugin
+                .create_node_selected(spec.clone(), sink.clone(), Some(42))
+                .unwrap();
+            plugin.start_bootstrap(&handle).unwrap();
+            read_process_registry(&registry_path)
+                .unwrap()
+                .values()
+                .next()
+                .cloned()
+                .unwrap()
+        };
+        let mut restarted = MockVastAiPlugin::with_registry("/bin/sh", &registry_path);
+        let adopted = restarted
+            .adopt_by_spec(&spec, sink)
+            .unwrap()
+            .expect("mock worker must be adopted");
+        assert_eq!(adopted.handle.provider_process_id, Some(record.pid));
+        restarted.stop_node(&adopted.handle).unwrap();
+        assert!(!process_record_matches(&record));
+        let _ = fs::remove_file(registry_path);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mixed_mock_processes_survive_kill_provision_and_restart() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "myelin-mixed-mock-test-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let make_spec = |node_id: u64| {
+            let mut spec = test_spec();
+            spec.node_id = node_id;
+            spec.env
+                .push(("MYELIN_RUN_ID".to_owned(), spec.run_id.to_string()));
+            spec.env.push((
+                "MYELIN_LOGICAL_NODE_ID".to_owned(),
+                spec.node_id.to_string(),
+            ));
+            spec.args = vec![
+                "-c".to_owned(),
+                "trap 'exit 0' TERM; while :; do sleep 1; done".to_owned(),
+            ];
+            spec
+        };
+
+        {
+            let mut plugin = MockVastAiPlugin::with_registry("/bin/sh", &registry_path);
+            for node_id in 1..=3 {
+                let handle = plugin
+                    .create_node_selected(make_spec(node_id), sink.clone(), Some(node_id))
+                    .unwrap();
+                plugin.start_bootstrap(&handle).unwrap();
+            }
+        }
+        {
+            let mut restarted = MockVastAiPlugin::with_registry("/bin/sh", &registry_path);
+            let killed = restarted
+                .adopt_by_spec(&make_spec(2), sink.clone())
+                .unwrap()
+                .expect("node 2");
+            restarted.stop_node(&killed.handle).unwrap();
+            let new_node = restarted
+                .create_node_selected(make_spec(4), sink.clone(), Some(4))
+                .unwrap();
+            restarted.start_bootstrap(&new_node).unwrap();
+        }
+
+        let mut final_restart = MockVastAiPlugin::with_registry("/bin/sh", &registry_path);
+        assert_eq!(
+            final_restart.list_managed_refs().unwrap(),
+            [
+                "mock-vastai-5-1-attempt-11",
+                "mock-vastai-5-3-attempt-11",
+                "mock-vastai-5-4-attempt-11",
+            ]
+        );
+        for node_id in [1, 3, 4] {
+            let adopted = final_restart
+                .adopt_by_spec(&make_spec(node_id), sink.clone())
+                .unwrap()
+                .expect("surviving mock process");
+            final_restart.stop_node(&adopted.handle).unwrap();
+        }
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn missing_local_bootstrap_recreates_only_the_provider_handle() {
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let spec = test_spec();
+        let mut process = LocalProcessPlugin::new("/not/executed");
+        let process_node = process
+            .prepare_missing_bootstrap(&spec, sink.clone())
+            .unwrap()
+            .expect("process bootstrap handle");
+        assert_eq!(process_node.provider_ref, "process-5-7-attempt-11");
+        assert_eq!(
+            process.nodes.get(&process_node.handle.id).unwrap().pid,
+            None
+        );
+
+        let mut docker = LocalDockerPlugin::new("myelin");
+        let docker_node = docker
+            .prepare_missing_bootstrap(&spec, sink)
+            .unwrap()
+            .expect("docker bootstrap handle");
+        assert_eq!(docker_node.provider_ref, "myelin-5-7-attempt-11");
+        assert_eq!(docker.nodes.len(), 1);
     }
 
     #[test]

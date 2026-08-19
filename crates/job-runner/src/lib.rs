@@ -12,11 +12,11 @@ pub mod node;
 pub mod orchestrator;
 pub mod wire;
 
-pub use fsm::{transition, JobCommand, JobEvent, JobState, TransitionCtx};
+pub use fsm::{JobCommand, JobEvent, JobState, TransitionCtx, transition};
 pub use model::{ClusterConfig, Job, ProviderConfig, Workspace};
-pub use node::{extract_tar, JobPhase, NodeJobActor, ProcessExitRelay};
-pub use orchestrator::{pack_workspace, JobDone, OrchestratorJobActor, OrchestratorJobMsg};
+pub use node::{JobPhase, NodeJobActor, ProcessExitRelay, extract_tar};
+pub use orchestrator::{JobDone, OrchestratorJobActor, OrchestratorJobMsg, pack_workspace};
 pub use wire::{
-    register_job_codecs, EDGE_RECORD_SIZE, JobEdgeSink, NodeJobCommand, NodeJobEvent, OutputChunk,
-    CHUNK_SIZE, OUTPUTS_EDGE_ID, WORKSPACE_EDGE_ID,
+    CHUNK_SIZE, EDGE_RECORD_SIZE, JobEdgeSink, NodeJobCommand, NodeJobEvent, OUTPUTS_EDGE_ID,
+    OutputChunk, WORKSPACE_EDGE_ID, register_job_codecs,
 };
