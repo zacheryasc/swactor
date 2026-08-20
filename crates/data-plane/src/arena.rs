@@ -289,6 +289,15 @@ impl ArenaManager {
         }
     }
 
+    /// True backing length of the arena in bytes.
+    ///
+    /// This is the ground truth the bootstrap header's `arena_size` must
+    /// match; it equals `config.reservation_ceiling` because the backing is
+    /// created with exactly that length.
+    pub fn arena_len(&self) -> u64 {
+        self.config.reservation_ceiling
+    }
+
     #[cfg(target_os = "linux")]
     pub fn arena_fd(&self) -> std::os::fd::RawFd {
         self._backing.fd()

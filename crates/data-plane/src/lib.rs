@@ -6,6 +6,7 @@
 //! ([`edge_wire`]), the arena ([`arena`]), and an application worker port.
 
 pub mod arena;
+pub mod bootstrap;
 pub mod edge_lifecycle;
 pub mod edge_runtime;
 pub mod edge_wire;

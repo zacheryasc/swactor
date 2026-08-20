@@ -1,5 +1,8 @@
 use std::any::Any;
 use std::cell::RefCell;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -10,6 +13,8 @@ use ::swactor::actor::{
 use ::swactor::config::RuntimeConfig;
 use ::swactor::runtime::{Inbox, Runtime, RuntimeParts};
 use swactor_engine::{Engine, SteppingBackend};
+
+use data_plane::bootstrap as dp_bootstrap;
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
 
@@ -445,9 +450,188 @@ fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
     }
 }
 
+// ─── Job entrypoint: swactor.run ─────────────────────────────────────────────
+
+pyo3::create_exception!(swactor, SwactorError, pyo3::exceptions::PyException);
+pyo3::create_exception!(swactor, BootstrapError, SwactorError);
+
+/// Read-only shared mapping of the inherited arena.
+///
+/// The mapping is immutable for the process lifetime once created, which is
+/// what makes the `Send + Sync` impls sound; `Drop` unmaps exactly once.
+struct ArenaMap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for ArenaMap {}
+unsafe impl Sync for ArenaMap {}
+
+impl ArenaMap {
+    fn map(fd: std::os::fd::RawFd, len: usize) -> std::io::Result<Self> {
+        // SAFETY: mmap with a validated length and live descriptor; the
+        // mapping is checked against MAP_FAILED immediately.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                ptr: ptr.cast(),
+                len,
+            })
+        }
+    }
+
+    fn header(&self) -> &[u8] {
+        let len = self.len.min(dp_bootstrap::HEADER_LEN);
+        // SAFETY: `ptr..ptr+len` is inside the mapping by construction.
+        unsafe { std::slice::from_raw_parts(self.ptr, len) }
+    }
+}
+
+impl Drop for ArenaMap {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly the mapping created in `ArenaMap::map`.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+/// The job's data plane. Carries the resolved bootstrap state; the four path
+/// primitives (`read_blob`, `write_blob`, `read_stream`, `write_stream`)
+/// arrive with path resolution.
+#[pyclass(name = "DataPlane")]
+pub struct PyDataPlane {
+    // Held (never read) to keep the arena mapping alive for the process
+    // lifetime; dropping it unmaps.
+    #[allow(dead_code)]
+    arena: Arc<ArenaMap>,
+    // Consumed by the path-resolution primitives (read_blob & co., next
+    // slice); carried now so the bootstrap result lives with its owner.
+    #[allow(dead_code)]
+    resolved: dp_bootstrap::ResolvedBootstrap,
+}
+
+/// The job context handed to `main` by [`run`].
+#[pyclass(name = "Context")]
+pub struct PyContext {
+    data: Py<PyDataPlane>,
+}
+
+#[pymethods]
+impl PyContext {
+    #[getter]
+    fn data(&self, py: Python<'_>) -> Py<PyDataPlane> {
+        self.data.clone_ref(py)
+    }
+}
+
+fn bootstrap_error(message: impl Into<String>) -> PyErr {
+    PyErr::new::<BootstrapError, _>(message.into())
+}
+
+fn bootstrap_env_fd(name: &str) -> PyResult<std::os::fd::RawFd> {
+    let value = std::env::var_os(name).ok_or_else(|| {
+        bootstrap_error(format!("bootstrap environment variable {name} is not set"))
+    })?;
+    let text = value.to_string_lossy();
+    text.parse::<std::os::fd::RawFd>()
+        .map_err(|_| bootstrap_error(format!("{name}={text:?} is not a descriptor number")))
+}
+
+/// Arm `FD_CLOEXEC` on the wake descriptor. Failing also proves the
+/// descriptor exists at all.
+fn arm_cloexec(fd: std::os::fd::RawFd) -> PyResult<()> {
+    // SAFETY: fcntl on a borrowed descriptor number.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if rc < 0 {
+        Err(bootstrap_error(format!(
+            "wake descriptor {fd} is unusable: {}",
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Job-process entrypoint: consume the bootstrap handoff, construct the
+/// application [`Context`](crate::PyContext), and drive `main` to completion
+/// on the ambient asyncio loop.
+///
+/// Bootstrap is fail-fast: if the inherited descriptors or the arena header
+/// are absent or malformed, `main` is never invoked and `BootstrapError`
+/// propagates (the process should exit non-zero).
+#[pyfunction]
+fn run(py: Python<'_>, main: Bound<'_, PyAny>) -> PyResult<()> {
+    let arena_fd = bootstrap_env_fd(dp_bootstrap::ENV_ARENA_FD)?;
+    let wake_fd = bootstrap_env_fd(dp_bootstrap::ENV_WAKE_FD)?;
+    if arena_fd < 0 || wake_fd < 0 {
+        return Err(bootstrap_error(
+            "bootstrap descriptor numbers must be non-negative",
+        ));
+    }
+
+    // Take ownership of both inherited descriptors for the process lifetime.
+    // SAFETY: the environment contract hands us sole ownership of these.
+    let arena_file = unsafe { File::from_raw_fd(arena_fd) };
+    let wake_owned = unsafe { OwnedFd::from_raw_fd(wake_fd) };
+
+    // Ground truth for the header's arena-size claim is the descriptor's own
+    // length, never the header.
+    let backing_len = arena_file
+        .metadata()
+        .map_err(|error| bootstrap_error(format!("stat arena descriptor: {error}")))?
+        .len();
+    if backing_len < dp_bootstrap::HEADER_LEN as u64 {
+        return Err(bootstrap_error(format!(
+            "arena backing is {backing_len} bytes, shorter than the {}-byte bootstrap header",
+            dp_bootstrap::HEADER_LEN
+        )));
+    }
+    let map = ArenaMap::map(arena_fd, usize::try_from(backing_len).expect("usize arena"))
+        .map_err(|error| bootstrap_error(format!("map arena: {error}")))?;
+
+    // The mapping keeps the arena alive; dropping the descriptor both stops
+    // grandchild leakage and makes a second `run` fail loudly.
+    drop(arena_file);
+
+    // B5: the wake descriptor is the only bootstrap fd left open; arm
+    // CLOEXEC so nothing this process spawns inherits it.
+    arm_cloexec(wake_owned.as_raw_fd())?;
+
+    let resolved = dp_bootstrap::parse_bootstrap(map.header(), backing_len)
+        .map_err(|error| bootstrap_error(error.to_string()))?;
+
+    let data = Py::new(
+        py,
+        PyDataPlane {
+            arena: Arc::new(map),
+            resolved,
+        },
+    )?;
+    let context = Py::new(py, PyContext { data })?;
+    let coroutine = main.call1((context,))?;
+    let asyncio = PyModule::import(py, "asyncio")?;
+    asyncio.call_method1("run", (coroutine,))?;
+    Ok(())
+}
+
 // ─── Module registration ─────────────────────────────────────────────────────
 
+
 fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("SwactorError", m.py().get_type::<SwactorError>())?;
+    m.add("BootstrapError", m.py().get_type::<BootstrapError>())?;
     m.add_class::<PyActorAddress>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyInbox>()?;
@@ -455,7 +639,9 @@ fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyActorInfo>()?;
     m.add_class::<PyWorkerInfo>()?;
-    m.add_class::<PyRuntimeStats>()?;
+    m.add_class::<PyDataPlane>()?;
+    m.add_class::<PyContext>()?;
+    m.add_function(wrap_pyfunction!(run, m)?)?;
     Ok(())
 }
 

@@ -11,4 +11,8 @@ crate-type = ["cdylib"]
 [dependencies]
 swactor = { path = "../../.." }
 swactor-engine = { path = "../../engine", default-features = false }
+data-plane = { path = "../../data-plane" }
+libc = "0.2"
 pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+tokio.workspace = true
