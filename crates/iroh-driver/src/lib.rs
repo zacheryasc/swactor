@@ -18,8 +18,8 @@ pub use endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 pub use iroh_driver::{
-    ConnType, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus, TelemetryPublishHandle,
-    conn_type_of, discover_lan_ips,
+    ConnType, EdgeConnector, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus,
+    TelemetryPublishHandle, conn_type_of, discover_lan_ips,
 };
 
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};

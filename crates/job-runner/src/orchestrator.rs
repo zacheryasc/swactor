@@ -26,7 +26,16 @@ pub struct JobDone {
 /// cross runtime boundaries (the node reports events/chunks back over iroh).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OrchestratorJobMsg {
-    Submit { job: Job, node_actor: ActorAddress },
+    Submit {
+        job: Job,
+        node_actor: ActorAddress,
+    },
+    SubmitDataPlane {
+        job: Job,
+        node_actor: ActorAddress,
+        result_peer: String,
+    },
+    ControllerRegistered,
     NodeEvent(NodeJobEvent),
     OutputChunk(OutputChunk),
 }
@@ -52,6 +61,8 @@ pub struct OrchestratorJobActor {
     /// driven by the integration layer, not as actor messages. `false` keeps the
     /// in-process chunk path (what the tests exercise).
     edge_mode: bool,
+    controller_node: Option<[u8; 32]>,
+    waiting_for_controller: bool,
 }
 
 impl OrchestratorJobActor {
@@ -70,6 +81,8 @@ impl OrchestratorJobActor {
             pending_outputs: HashSet::new(),
             outputs_collected: false,
             edge_mode: false,
+            controller_node: None,
+            waiting_for_controller: false,
         }
     }
 
@@ -81,6 +94,74 @@ impl OrchestratorJobActor {
     pub fn with_edge_mode(mut self, edge: bool) -> Self {
         self.edge_mode = edge;
         self
+    }
+
+    pub fn with_controller_node(mut self, node: [u8; 32]) -> Self {
+        self.controller_node = Some(node);
+        self
+    }
+
+    fn reset_for_next_job(&mut self) {
+        self.node = None;
+        self.state = JobState::Pending;
+        self.ctx_fsm = TransitionCtx::new(false, false);
+        self.job = None;
+        self.exit_code = None;
+        self.output_bufs.clear();
+        self.pending_outputs.clear();
+        self.outputs_collected = false;
+        self.waiting_for_controller = false;
+    }
+
+    fn submit(
+        &mut self,
+        ctx: &Ctx,
+        job: Job,
+        node_actor: ActorAddress,
+        result_peer: Option<String>,
+    ) {
+        if matches!(self.state, JobState::Completed | JobState::Failed) {
+            self.reset_for_next_job();
+        }
+        let wait_for_assignment = result_peer.is_some();
+        self.node = Some(node_actor);
+        if result_peer.is_some() {
+            let _ = ctx.send(
+                node_actor,
+                NodeJobCommand::Assign {
+                    job_id: Self::JOB_ID,
+                    orchestrator: ctx.self_addr(),
+                    result_peer,
+                },
+            );
+        }
+        self.ctx_fsm = TransitionCtx::new(job.has_workspace(), job.has_setup());
+        self.job = Some(job);
+        let (state, _) = transition(self.state, &JobEvent::JobSubmitted, self.ctx_fsm);
+        self.state = state;
+        if wait_for_assignment {
+            return;
+        }
+        if let Some(node) = self.controller_node {
+            self.waiting_for_controller = true;
+            let _ = ctx.send(
+                node_actor,
+                NodeJobCommand::RegisterController {
+                    controller: ctx.self_addr(),
+                    node,
+                },
+            );
+            return;
+        }
+        self.begin_job(ctx);
+    }
+
+    fn begin_job(&mut self, ctx: &Ctx) {
+        let (state, command) = transition(self.state, &JobEvent::NodeReady, self.ctx_fsm);
+        self.state = state;
+        if let Some(command) = command {
+            self.emit_command(ctx, command);
+        }
     }
 
     fn emit_command(&mut self, ctx: &Ctx, cmd: JobCommand) {
@@ -186,15 +267,19 @@ impl ActorInterface for OrchestratorJobActor {
     fn handle(&mut self, ctx: &Ctx, msg: OrchestratorJobMsg) {
         match msg {
             OrchestratorJobMsg::Submit { job, node_actor } => {
-                self.node = Some(node_actor);
-                self.ctx_fsm = TransitionCtx::new(job.has_workspace(), job.has_setup());
-                self.job = Some(job);
-                let (s, _) = transition(self.state, &JobEvent::JobSubmitted, self.ctx_fsm);
-                self.state = s;
-                let (s, cmd) = transition(self.state, &JobEvent::NodeReady, self.ctx_fsm);
-                self.state = s;
-                if let Some(cmd) = cmd {
-                    self.emit_command(ctx, cmd);
+                self.submit(ctx, job, node_actor, None);
+            }
+            OrchestratorJobMsg::SubmitDataPlane {
+                job,
+                node_actor,
+                result_peer,
+            } => {
+                self.submit(ctx, job, node_actor, Some(result_peer));
+            }
+            OrchestratorJobMsg::ControllerRegistered => {
+                if self.waiting_for_controller {
+                    self.waiting_for_controller = false;
+                    self.begin_job(ctx);
                 }
             }
             OrchestratorJobMsg::NodeEvent(ev) => {
@@ -203,6 +288,7 @@ impl ActorInterface for OrchestratorJobActor {
                     self.ctx_fsm.prior_exit = Some(code);
                 }
                 let Some(fsm_ev) = (match ev {
+                    NodeJobEvent::Assigned { .. } => Some(JobEvent::NodeReady),
                     NodeJobEvent::WorkspaceMaterialized { .. } => {
                         Some(JobEvent::WorkspaceMaterialized)
                     }

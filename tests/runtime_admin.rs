@@ -4,8 +4,10 @@ mod common;
 use common::*;
 
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 
 use swactor::admin::{ActorStateSnapshot, AdminError, OperationResult};
 use swactor::config::RuntimeConfig;
@@ -96,6 +98,140 @@ fn ask_recv_ticking_delivers_reply_through_runtime_inbox() {
         ask.recv_ticking(&mut host, 5).unwrap(),
         MyAddr(actor),
         "recv_ticking drives the runtime inbox reply path"
+    );
+}
+
+#[derive(Default)]
+struct WakeCounter(AtomicUsize);
+
+impl WakeCounter {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn ask_future_wakes_after_actor_reply() {
+    let (rt, mut host) = std_host(RuntimeConfig::default());
+    let actor = rt.spawn(SelfAddrActor).unwrap();
+    let mut ask = rt
+        .ask::<WhoAreYou, MyAddr>(actor, |reply_to| WhoAreYou { reply_to })
+        .unwrap();
+    let wakes = Arc::new(WakeCounter::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(Pin::new(&mut ask).poll(&mut cx), Poll::Pending));
+
+    for _ in 0..5 {
+        host.try_tick();
+        if wakes.count() > 0 {
+            break;
+        }
+    }
+
+    assert!(wakes.count() > 0, "reply wakes the pending ask future");
+    assert_eq!(Pin::new(&mut ask).poll(&mut cx), Poll::Ready(MyAddr(actor)));
+}
+
+#[test]
+fn inbox_recv_handles_send_before_and_after_waker_registration() {
+    let (rt, _host) = std_host(RuntimeConfig::default());
+
+    let before = rt.new_inbox::<Count>().unwrap();
+    rt.send_to(*before.addr(), Count(1)).unwrap();
+    let mut before_recv = Box::pin(before.recv());
+    let before_wakes = Arc::new(WakeCounter::default());
+    let before_waker = Waker::from(before_wakes.clone());
+    let mut before_cx = Context::from_waker(&before_waker);
+    assert_eq!(
+        before_recv.as_mut().poll(&mut before_cx),
+        Poll::Ready(Count(1))
+    );
+
+    let after = rt.new_inbox::<Count>().unwrap();
+    let after_addr = *after.addr();
+    let mut after_recv = Box::pin(after.recv());
+    let after_wakes = Arc::new(WakeCounter::default());
+    let after_waker = Waker::from(after_wakes.clone());
+    let mut after_cx = Context::from_waker(&after_waker);
+    assert!(matches!(
+        after_recv.as_mut().poll(&mut after_cx),
+        Poll::Pending
+    ));
+
+    rt.send_to(after_addr, Count(2)).unwrap();
+    assert!(after_wakes.count() > 0);
+    assert_eq!(
+        after_recv.as_mut().poll(&mut after_cx),
+        Poll::Ready(Count(2))
+    );
+}
+
+#[test]
+fn inbox_recv_survives_spurious_polls_and_coalesced_progress() {
+    let (rt, _host) = std_host(RuntimeConfig::default());
+    let inbox = rt.new_inbox::<Count>().unwrap();
+    let addr = *inbox.addr();
+    let mut recv = Box::pin(inbox.recv());
+    let first_wakes = Arc::new(WakeCounter::default());
+    let second_wakes = Arc::new(WakeCounter::default());
+    let first_waker = Waker::from(first_wakes.clone());
+    let second_waker = Waker::from(second_wakes.clone());
+    let mut first_cx = Context::from_waker(&first_waker);
+    let mut second_cx = Context::from_waker(&second_waker);
+
+    assert!(matches!(recv.as_mut().poll(&mut first_cx), Poll::Pending));
+    assert!(matches!(recv.as_mut().poll(&mut second_cx), Poll::Pending));
+
+    rt.send_to(addr, Count(3)).unwrap();
+    rt.send_to(addr, Count(4)).unwrap();
+
+    assert_eq!(
+        first_wakes.count(),
+        0,
+        "latest registration replaces stale waker"
+    );
+    assert!(second_wakes.count() > 0);
+    assert_eq!(recv.as_mut().poll(&mut second_cx), Poll::Ready(Count(3)));
+    drop(recv);
+    assert_eq!(inbox.try_recv(), Some(Count(4)));
+}
+
+#[test]
+fn dropping_inbox_or_cancelled_ask_unregisters_address() {
+    let (rt, _host) = std_host(RuntimeConfig::default());
+    let inbox = rt.new_inbox::<Count>().unwrap();
+    let inbox_addr = *inbox.addr();
+    drop(inbox);
+    assert!(
+        rt.send_to(inbox_addr, Count(1)).is_err(),
+        "dropped inbox address is removed from the registry"
+    );
+
+    let actor = rt.spawn(SelfAddrActor).unwrap();
+    let mut ask_addr = None;
+    let ask = rt
+        .ask::<WhoAreYou, MyAddr>(actor, |reply_to| {
+            ask_addr = Some(reply_to);
+            WhoAreYou { reply_to }
+        })
+        .unwrap();
+    let ask_addr = ask_addr.unwrap();
+    drop(ask);
+    assert!(
+        rt.send_to(ask_addr, MyAddr(actor)).is_err(),
+        "cancelled ask address is removed from the registry"
     );
 }
 

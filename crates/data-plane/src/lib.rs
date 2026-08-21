@@ -6,10 +6,17 @@
 //! ([`edge_wire`]), the arena ([`arena`]), and an application worker port.
 
 pub mod arena;
+pub mod blob;
 pub mod bootstrap;
+pub mod byte_ring;
+pub mod data_plane;
 pub mod edge_lifecycle;
 pub mod edge_runtime;
 pub mod edge_wire;
+pub mod host;
 pub mod ids;
+pub mod mapped_arena;
 pub mod object_record;
+pub mod path;
+pub mod protocol;
 pub mod ring;

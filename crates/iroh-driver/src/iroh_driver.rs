@@ -253,6 +253,31 @@ struct ConnCache {
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
 }
 
+/// Cloneable capability for opening application-owned data-plane edge streams
+/// without sharing the complete driver.
+#[derive(Clone)]
+pub struct EdgeConnector {
+    engine: EngineHandle,
+    endpoint: Endpoint,
+}
+
+impl EdgeConnector {
+    pub fn connect(
+        &self,
+        peer: EndpointAddr,
+        edge_id: u64,
+        timeout: Duration,
+    ) -> Result<EdgeSendHandle, String> {
+        spawn_edge_sender_task(
+            self.engine.clone(),
+            self.endpoint.clone(),
+            peer,
+            edge_id,
+            Some(timeout),
+        )
+    }
+}
+
 /// iroh P2P network transport bridge.
 ///
 /// Bridges the actorized distribution protocol (running on a swactor runtime)
@@ -590,6 +615,13 @@ impl IrohDriver {
     /// thread/task without going through `&self`.
     pub fn edge_events_handle(&self) -> Arc<Mutex<Vec<WireEvent>>> {
         Arc::clone(&self.edge_events)
+    }
+
+    pub fn edge_connector(&self) -> EdgeConnector {
+        EdgeConnector {
+            engine: self.engine.clone(),
+            endpoint: self.endpoint.clone(),
+        }
     }
 
     /// Start a driver-owned EDGE_ALPN send pump and return its logical byte input handle.

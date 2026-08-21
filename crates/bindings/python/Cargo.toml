@@ -10,9 +10,16 @@ crate-type = ["cdylib"]
 
 [dependencies]
 swactor = { path = "../../.." }
-swactor-engine = { path = "../../engine", default-features = false }
+swactor-engine = { path = "../../engine", features = ["tokio"] }
+swactor-transport = { path = "../../transport" }
 data-plane = { path = "../../data-plane" }
+distribution = { path = "../../distribution" }
+iroh-driver = { path = "../../iroh-driver" }
 libc = "0.2"
+futures-lite = "2"
+iroh = "0.98"
+parking_lot = "0.12"
+serde_json = "1"
 pyo3 = { version = "0.23", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio.workspace = true

@@ -20,7 +20,7 @@ use crate::wire::{
 };
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
-use swactor_engine::EngineHandle;
+use swactor_engine::{BlockingWorkSender, EngineHandle};
 use swactor_process::{
     ExitStatus, ProcessOutput, ProcessOutputConfig, ProcessSpec, spawn_local_process,
 };
@@ -37,6 +37,25 @@ struct PendingOutputs {
     outputs: Vec<String>,
     deadline: Instant,
 }
+struct PendingRun {
+    job_id: u64,
+    command: String,
+    env: BTreeMap<String, String>,
+}
+
+/// Application-owned bridge between a supervised job process and the shared
+/// cluster data plane. The job-runner remains transport agnostic; the embedding
+/// application returns only the local environment needed by the process.
+pub trait JobRouteRegistrar: Send + Sync + 'static {
+    fn register(&self, actor: ActorAddress, node: [u8; 32]) -> Result<(), String>;
+}
+
+pub trait JobDataPlanePort: Send + Sync + 'static {
+    fn configure(&self, job_id: u64, result_peer: &str)
+    -> Result<BTreeMap<String, String>, String>;
+
+    fn session_ended(&self, _job_id: u64) {}
+}
 
 /// The node-side executor. `Incoming` is the orchestrator↔node wire command.
 pub struct NodeJobActor {
@@ -46,6 +65,7 @@ pub struct NodeJobActor {
     job_id: u64,
     workspace_buf: Vec<u8>,
     actor_timers: Option<EngineHandle>,
+    blocking_work: Option<BlockingWorkSender>,
     workspace_wait: Option<(u64, Instant)>,
     pending_outputs: Option<PendingOutputs>,
     /// Edge-mode workspace-ready flag. When set, the orchestrator pushed the
@@ -57,6 +77,13 @@ pub struct NodeJobActor {
     /// connection to the orchestrator is up. `None` ⇒ chunk path (outputs stream
     /// back as `OutputChunk` actor messages).
     output_sink: Option<Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>>,
+    data_plane: Option<Arc<dyn JobDataPlanePort>>,
+    route_registrar: Option<Arc<dyn JobRouteRegistrar>>,
+    data_plane_env: BTreeMap<String, String>,
+    data_plane_error: Option<String>,
+    data_plane_pending: bool,
+    pending_run: Option<PendingRun>,
+    assignment_pending: bool,
 }
 
 /// How long the node waits for an edge-mode workspace transfer to land before
@@ -81,16 +108,36 @@ impl NodeJobActor {
             job_id,
             workspace_buf: Vec::new(),
             actor_timers: None,
+            blocking_work: None,
             workspace_wait: None,
             pending_outputs: None,
             workspace_ready: None,
             output_sink: None,
+            data_plane: None,
+            route_registrar: None,
+            data_plane_env: BTreeMap::new(),
+            data_plane_error: None,
+            data_plane_pending: false,
+            pending_run: None,
+            assignment_pending: false,
         }
+    }
+
+    /// Construct an embedded executor whose orchestrator is assigned over the
+    /// wire before the first job command.
+    pub fn unbound(workdir: PathBuf, sender: ExternalSender) -> Self {
+        Self::new(ActorAddress::default(), workdir, sender, 0)
     }
 
     /// Give edge-mode waits access only to engine-owned typed actor timers.
     pub fn with_actor_timers(mut self, engine: EngineHandle) -> Self {
+        self.blocking_work = Some(engine.blocking_work_sender());
         self.actor_timers = Some(engine);
+        self
+    }
+
+    pub fn with_route_registrar(mut self, registrar: Arc<dyn JobRouteRegistrar>) -> Self {
+        self.route_registrar = Some(registrar);
         self
     }
 
@@ -108,8 +155,59 @@ impl NodeJobActor {
         self
     }
 
+    pub fn with_data_plane(mut self, data_plane: Arc<dyn JobDataPlanePort>) -> Self {
+        self.data_plane = Some(data_plane);
+        self
+    }
+
+    fn begin_data_plane_config(&mut self, ctx: &Ctx, job_id: u64, result_peer: String) {
+        let Some(data_plane) = self.data_plane.clone() else {
+            self.data_plane_error = Some("job data-plane bridge is unavailable".to_owned());
+            return;
+        };
+        let Some(blocking_work) = self.blocking_work.clone() else {
+            self.data_plane_error =
+                Some("job data-plane bridge has no blocking-I/O owner".to_owned());
+            return;
+        };
+        let sender = self.sender.clone();
+        let actor = ctx.self_addr();
+        self.data_plane_pending = true;
+        if blocking_work
+            .submit(Box::new(move || {
+                let (env, error) = match data_plane.configure(job_id, &result_peer) {
+                    Ok(env) => (env, None),
+                    Err(error) => (BTreeMap::new(), Some(error)),
+                };
+                let _ = sender.send_to(
+                    actor,
+                    NodeJobCommand::DataPlaneConfigured { job_id, env, error },
+                );
+            }))
+            .is_err()
+        {
+            self.data_plane_pending = false;
+            self.data_plane_error =
+                Some("job data-plane blocking-I/O owner is unavailable".to_owned());
+        }
+    }
+
     fn emit(&self, ctx: &Ctx, event: NodeJobEvent) {
         let _ = ctx.send(self.orchestrator, OrchestratorJobMsg::NodeEvent(event));
+    }
+
+    fn acknowledge_assignment(&self, ctx: &Ctx, job_id: u64) {
+        self.emit(ctx, NodeJobEvent::Assigned { job_id });
+        if self.assignment_pending
+            && let Some(engine) = &self.actor_timers
+        {
+            engine.send_after(
+                EDGE_SPIN,
+                self.sender.clone(),
+                ctx.self_addr(),
+                NodeJobCommand::CheckAssignment { job_id },
+            );
+        }
     }
 
     fn spawn_supervised(
@@ -123,6 +221,9 @@ impl NodeJobActor {
             orchestrator: self.orchestrator,
             phase,
             job_id: self.job_id,
+            data_plane: (phase == JobPhase::Run)
+                .then(|| self.data_plane.clone())
+                .flatten(),
         }) {
             Ok(addr) => addr,
             Err(e) => {
@@ -316,7 +417,56 @@ impl ActorInterface for NodeJobActor {
 
     fn handle(&mut self, ctx: &Ctx, cmd: NodeJobCommand) {
         match cmd {
+            NodeJobCommand::RegisterController { controller, node } => {
+                if let Some(registrar) = &self.route_registrar
+                    && registrar.register(controller, node).is_ok()
+                {
+                    self.orchestrator = controller;
+                    let _ = ctx.send(controller, OrchestratorJobMsg::ControllerRegistered);
+                }
+            }
+            NodeJobCommand::Assign {
+                job_id,
+                orchestrator,
+                result_peer,
+            } => {
+                self.job_id = job_id;
+                self.orchestrator = orchestrator;
+                self.data_plane_env.clear();
+                self.data_plane_error = None;
+                self.data_plane_pending = false;
+                self.pending_run = None;
+                self.assignment_pending = true;
+                if let Some(result_peer) = result_peer {
+                    self.begin_data_plane_config(ctx, job_id, result_peer);
+                }
+                self.acknowledge_assignment(ctx, job_id);
+            }
+            NodeJobCommand::DataPlaneConfigured { job_id, env, error } => {
+                if job_id != self.job_id {
+                    return;
+                }
+                self.data_plane_pending = false;
+                self.data_plane_env = env;
+                self.data_plane_error = error;
+                if let Some(pending) = self.pending_run.take() {
+                    let _ = ctx.send(
+                        ctx.self_addr(),
+                        NodeJobCommand::RunJob {
+                            job_id: pending.job_id,
+                            command: pending.command,
+                            env: pending.env,
+                        },
+                    );
+                }
+            }
+            NodeJobCommand::CheckAssignment { job_id } => {
+                if self.assignment_pending && job_id == self.job_id {
+                    self.acknowledge_assignment(ctx, job_id);
+                }
+            }
             NodeJobCommand::MaterializeWorkspace { job_id } => {
+                self.assignment_pending = false;
                 if self.workspace_ready.is_some() {
                     self.begin_workspace_wait(ctx, job_id);
                 } else {
@@ -343,9 +493,39 @@ impl ActorInterface for NodeJobActor {
                 }
             }
             NodeJobCommand::RunSetup { command, env, .. } => {
+                self.assignment_pending = false;
                 self.spawn_supervised(ctx, JobPhase::Setup, command, &env);
             }
-            NodeJobCommand::RunJob { command, env, .. } => {
+            NodeJobCommand::RunJob {
+                job_id,
+                command,
+                mut env,
+            } => {
+                self.assignment_pending = false;
+                if self.data_plane_pending {
+                    if self.pending_run.is_some() {
+                        self.emit(
+                            ctx,
+                            NodeJobEvent::NodeFault {
+                                job_id,
+                                reason: "duplicate run command while data-plane setup is pending"
+                                    .to_owned(),
+                            },
+                        );
+                    } else {
+                        self.pending_run = Some(PendingRun {
+                            job_id,
+                            command,
+                            env,
+                        });
+                    }
+                    return;
+                }
+                if let Some(reason) = self.data_plane_error.clone() {
+                    self.emit(ctx, NodeJobEvent::NodeFault { job_id, reason });
+                    return;
+                }
+                env.extend(self.data_plane_env.clone());
                 self.spawn_supervised(ctx, JobPhase::Run, command, &env);
             }
             NodeJobCommand::CollectOutputs { job_id, outputs } => {
@@ -387,6 +567,7 @@ pub struct ProcessExitRelay {
     pub orchestrator: ActorAddress,
     pub phase: JobPhase,
     pub job_id: u64,
+    pub data_plane: Option<Arc<dyn JobDataPlanePort>>,
 }
 
 impl ActorInterface for ProcessExitRelay {
@@ -395,6 +576,9 @@ impl ActorInterface for ProcessExitRelay {
 
     fn handle(&mut self, ctx: &Ctx, output: ProcessOutput) {
         if let ProcessOutput::Exited { status } = output {
+            if let Some(data_plane) = &self.data_plane {
+                data_plane.session_ended(self.job_id);
+            }
             let event = match (self.phase, status) {
                 (JobPhase::Setup, ExitStatus::Code(0)) => NodeJobEvent::SetupCompleted {
                     job_id: self.job_id,

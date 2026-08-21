@@ -8,10 +8,15 @@ publish = false
 [dependencies]
 telemetry = { path = "../telemetry" }
 serde = { version = "1", features = ["derive"] }
-swactor = { path = "../.." }
+sha2 = "0.10"
+swactor = { path = "../..", features = ["serde", "transport"] }
+swactor-transport = { path = "../transport" }
+swactor-engine = { path = "../engine" }
 
 
 [dev-dependencies]
 parking_lot = "0.12"
+futures-lite = "2"
+tokio.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

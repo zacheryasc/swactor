@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,15 +8,21 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use futures_lite::future;
+use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
-use swactor_engine::EngineHandle;
+use swactor_engine::{BlockingWorkSender, EngineHandle};
+use swactor_job_runner::{Job, JobDone, JobState, OrchestratorJobMsg};
 use swactor_vastai::VastClient;
+
+use distribution::transport_bridge::{OutboxRouteBinder, RouteBinder, RouteView};
+use iroh::EndpointAddr;
+use swactor_transport::NodeId;
 
 use crate::orchestration::actor::OrchestratorMsg;
 use crate::orchestration::manual_control::{
-    KillRequest, ManualControlMsg, ManualControlReply, OfferSearchRequest,
+    KillRequest, ManualControlMsg, ManualControlReply, NodePhase, OfferSearchRequest,
     ProviderConfigurationRequest, ProvisionRequest,
 };
 
@@ -22,6 +30,343 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const OFFER_SEARCH_REPLY_MARGIN: Duration = Duration::from_secs(5);
 const OFFER_SEARCH_REPLY_TIMEOUT: Duration =
     VastClient::REQUEST_TIMEOUT.saturating_add(OFFER_SEARCH_REPLY_MARGIN);
+const MAX_JOB_FILE_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct UploadedJobFile {
+    job: Job,
+}
+
+fn parse_uploaded_job_file(body: &str) -> Result<Job, String> {
+    if body.len() > MAX_JOB_FILE_BYTES {
+        return Err(format!(
+            "job file exceeds the {MAX_JOB_FILE_BYTES}-byte limit"
+        ));
+    }
+    let file = toml::from_str::<UploadedJobFile>(body)
+        .map_err(|error| format!("invalid job TOML: {error}"))?;
+    if file.job.name.trim().is_empty() {
+        return Err("job.name must not be empty".to_owned());
+    }
+    if file.job.run.trim().is_empty() {
+        return Err("job.run must not be empty".to_owned());
+    }
+    Ok(file.job)
+}
+
+#[derive(Clone)]
+struct FleetJobRoutes {
+    route_view: RouteView,
+    pinned_routes: RouteView,
+    route_binder: Arc<OutboxRouteBinder>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FleetJobController {
+    runtime: Runtime,
+    engine: Option<EngineHandle>,
+    actor: ActorAddress,
+    done: Arc<swactor::runtime::Inbox<JobDone>>,
+    busy: Arc<AtomicBool>,
+    routes: Option<FleetJobRoutes>,
+}
+
+impl FleetJobController {
+    pub(crate) fn new(
+        runtime: Runtime,
+        engine: EngineHandle,
+        actor: ActorAddress,
+        done: swactor::runtime::Inbox<JobDone>,
+        route_view: RouteView,
+        pinned_routes: RouteView,
+        route_binder: Arc<OutboxRouteBinder>,
+    ) -> Self {
+        Self {
+            runtime,
+            engine: Some(engine),
+            actor,
+            done: Arc::new(done),
+            busy: Arc::new(AtomicBool::new(false)),
+            routes: Some(FleetJobRoutes {
+                route_view,
+                pinned_routes,
+                route_binder,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn inert() -> Self {
+        let parts = swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let done = runtime.new_inbox::<JobDone>().expect("inert job inbox");
+        Self {
+            runtime,
+            engine: None,
+            actor: ActorAddress::new_random(),
+            done: Arc::new(done),
+            busy: Arc::new(AtomicBool::new(false)),
+            routes: None,
+        }
+    }
+
+    fn run(
+        &self,
+        node_actor: ActorAddress,
+        node_endpoint: &EndpointAddr,
+        job: Job,
+    ) -> Result<JobDone, String> {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return Err("another uploaded job is still active".to_owned());
+        }
+        struct BusyReset(Arc<AtomicBool>);
+        impl Drop for BusyReset {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyReset(self.busy.clone());
+        while self.done.try_recv().is_some() {}
+
+        let routes = self
+            .routes
+            .as_ref()
+            .ok_or_else(|| "job controller routes are unavailable".to_owned())?;
+        let node = NodeId(*node_endpoint.id.as_bytes());
+        routes
+            .pinned_routes
+            .write()
+            .map_err(|_| "job pinned-route registry is poisoned".to_owned())?
+            .insert(node_actor, node);
+        routes
+            .route_view
+            .write()
+            .map_err(|_| "job route view is poisoned".to_owned())?
+            .insert(node_actor, node);
+        routes.route_binder.ensure_routable(node_actor);
+
+        self.runtime
+            .send_to(self.actor, OrchestratorJobMsg::Submit { job, node_actor })
+            .map_err(|error| format!("submit uploaded job: {error}"))?;
+
+        let deadline = self
+            .runtime
+            .new_inbox::<()>()
+            .map_err(|error| format!("job deadline inbox: {error}"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| "job controller is unavailable".to_owned())?;
+        engine.send_after(
+            Duration::from_secs(30),
+            self.runtime.create_sender(),
+            *deadline.addr(),
+            (),
+        );
+        future::block_on(future::race(async { Ok(self.done.recv().await) }, async {
+            deadline.recv().await;
+            Err("uploaded job did not complete within 30 seconds".to_owned())
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FleetJobState {
+    Idle,
+    Started,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl FleetJobState {
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Started | Self::Running)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FleetJobStatus {
+    state: FleetJobState,
+    message: String,
+}
+
+impl FleetJobStatus {
+    fn idle() -> Self {
+        Self {
+            state: FleetJobState::Idle,
+            message: "No job submitted".to_owned(),
+        }
+    }
+
+    fn started() -> Self {
+        Self {
+            state: FleetJobState::Started,
+            message: "Job started".to_owned(),
+        }
+    }
+
+    fn running() -> Self {
+        Self {
+            state: FleetJobState::Running,
+            message: "Job running".to_owned(),
+        }
+    }
+
+    fn completed() -> Self {
+        Self {
+            state: FleetJobState::Completed,
+            message: "Job completed".to_owned(),
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            state: FleetJobState::Failed,
+            message: format!("Job failed: {}", error.into()),
+        }
+    }
+}
+
+struct FleetJobRecord {
+    generation: u64,
+    status: FleetJobStatus,
+}
+
+#[derive(Clone)]
+struct FleetJobManager {
+    jobs: Arc<Mutex<BTreeMap<u64, FleetJobRecord>>>,
+    next_generation: Arc<AtomicU64>,
+    controller: FleetJobController,
+}
+
+impl FleetJobManager {
+    fn new(controller: FleetJobController) -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            next_generation: Arc::new(AtomicU64::new(0)),
+            controller,
+        }
+    }
+
+    fn status(&self, node_id: u64) -> FleetJobStatus {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&node_id)
+            .map(|record| record.status.clone())
+            .unwrap_or_else(FleetJobStatus::idle)
+    }
+
+    fn submit(
+        &self,
+        blocking: &BlockingWorkSender,
+        node_id: u64,
+        job_actor: ActorAddress,
+        endpoint: EndpointAddr,
+        job: Job,
+    ) -> Result<FleetJobStatus, String> {
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let started = FleetJobStatus::started();
+        {
+            let mut jobs = self
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if jobs.values().any(|record| record.status.state.is_active()) {
+                return Err("another uploaded job is already active".to_owned());
+            }
+            jobs.insert(
+                node_id,
+                FleetJobRecord {
+                    generation,
+                    status: started.clone(),
+                },
+            );
+        }
+
+        let manager = self.clone();
+        let controller = self.controller.clone();
+        let work = Box::new(move || {
+            manager.mark_running(node_id, generation);
+            let status = match controller.run(job_actor, &endpoint, job) {
+                Ok(done) if done.state == JobState::Completed => FleetJobStatus::completed(),
+                Ok(done) => FleetJobStatus::failed(format!(
+                    "remote state {:?}, exit code {:?}",
+                    done.state, done.exit_code
+                )),
+                Err(error) => FleetJobStatus::failed(error),
+            };
+            manager.complete_generation(node_id, generation, status);
+        });
+        if blocking.submit(work).is_err() {
+            let error = "job execution backend is unavailable".to_owned();
+            self.fail_generation(node_id, generation, error.clone());
+            return Err(error);
+        }
+        Ok(started)
+    }
+
+    fn mark_running(&self, node_id: u64, generation: u64) {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = jobs.get_mut(&node_id)
+            && record.generation == generation
+            && matches!(record.status.state, FleetJobState::Started)
+        {
+            record.status = FleetJobStatus::running();
+        }
+    }
+
+    fn complete_generation(&self, node_id: u64, generation: u64, status: FleetJobStatus) {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = jobs.get_mut(&node_id)
+            && record.generation == generation
+            && record.status.state.is_active()
+        {
+            record.status = status;
+        }
+    }
+
+    fn fail_running(&self, node_id: u64, error: impl Into<String>) {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = jobs.get_mut(&node_id) else {
+            return;
+        };
+        if record.status.state.is_active() {
+            record.status = FleetJobStatus::failed(error);
+        }
+    }
+
+    fn fail_generation(&self, node_id: u64, generation: u64, error: String) {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = jobs.get_mut(&node_id) else {
+            return;
+        };
+        if record.generation == generation {
+            record.status = FleetJobStatus::failed(error);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for FleetJobManager {
+    fn default() -> Self {
+        Self::new(FleetJobController::inert())
+    }
+}
 struct ControlReplyObserver {
     reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<ManualControlReply>>>>,
     engine: EngineHandle,
@@ -63,17 +408,23 @@ struct ControlHttpState {
     runtime: Runtime,
     engine: EngineHandle,
     orchestrator: ActorAddress,
+    blocking: BlockingWorkSender,
+    jobs: FleetJobManager,
 }
 
 pub(crate) fn plugin(
     runtime: Runtime,
     engine: EngineHandle,
     orchestrator: ActorAddress,
+    job_controller: FleetJobController,
 ) -> dashboard::DashboardPlugin {
+    let blocking = engine.blocking_work_sender();
     let state = ControlHttpState {
         runtime,
         engine,
         orchestrator,
+        blocking,
+        jobs: FleetJobManager::new(job_controller),
     };
     let routes = Router::new()
         .route(FLEET_CONTROL_SCRIPT_URL, get(fleet_control_script))
@@ -85,6 +436,10 @@ pub(crate) fn plugin(
         .route("/api/control/offers", post(search_offers))
         .route("/api/control/flush", post(flush))
         .route("/api/control/nodes/{logical_node_id}/kill", post(kill_path))
+        .route(
+            "/api/control/nodes/{logical_node_id}/job",
+            get(node_job_status).post(submit_node_job),
+        )
         .with_state(state);
     dashboard::DashboardPlugin::new(routes).with_page(dashboard::PluginPage::new(
         "provision",
@@ -115,13 +470,21 @@ async fn provision(
 }
 
 async fn kill(State(state): State<ControlHttpState>, Json(request): Json<KillRequest>) -> Response {
-    route_mutation(
+    let logical_node_id = request.logical_node_id;
+    let response = route_mutation(
         &state,
         ManualControlMsg::Kill {
             request,
             reply_to: None,
         },
-    )
+    );
+    if response.status().is_success() {
+        state.jobs.fail_running(
+            logical_node_id,
+            "managed node was killed while the GPU job was running",
+        );
+    }
+    response
 }
 
 #[derive(serde::Deserialize)]
@@ -134,7 +497,7 @@ async fn kill_path(
     State(state): State<ControlHttpState>,
     Json(request): Json<KillPathRequest>,
 ) -> Response {
-    route_mutation(
+    let response = route_mutation(
         &state,
         ManualControlMsg::Kill {
             request: KillRequest {
@@ -143,7 +506,123 @@ async fn kill_path(
             },
             reply_to: None,
         },
-    )
+    );
+    if response.status().is_success() {
+        state.jobs.fail_running(
+            logical_node_id,
+            "managed node was killed while the job was running",
+        );
+    }
+    response
+}
+
+async fn node_job_status(
+    Path(logical_node_id): Path<u64>,
+    State(state): State<ControlHttpState>,
+) -> Response {
+    Json(state.jobs.status(logical_node_id)).into_response()
+}
+
+async fn submit_node_job(
+    Path(logical_node_id): Path<u64>,
+    State(state): State<ControlHttpState>,
+    body: String,
+) -> Response {
+    let job = match parse_uploaded_job_file(&body) {
+        Ok(job) => job,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    };
+    let response_rx = match begin_request_reply(&state, CONTROL_REPLY_TIMEOUT, |reply_to| {
+        ManualControlMsg::Query { reply_to }
+    }) {
+        Ok(response_rx) => response_rx,
+        Err(response) => return response,
+    };
+    let model = match response_rx.await {
+        Ok(ManualControlReply::Status(model)) => model,
+        Ok(ManualControlReply::Rejected(error)) => {
+            return (StatusCode::CONFLICT, Json(ErrorResponse { error })).into_response();
+        }
+        Ok(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "manual control returned an unexpected job-selection reply".to_owned(),
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("control reply observer stopped: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Some(node) = model
+        .nodes
+        .into_iter()
+        .find(|node| node.logical_node_id == logical_node_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("managed node {logical_node_id} does not exist"),
+            }),
+        )
+            .into_response();
+    };
+    if node.phase != NodePhase::Running {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("managed node {logical_node_id} is not running"),
+            }),
+        )
+            .into_response();
+    }
+    let Some(runtime) = node.runtime else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("managed node {logical_node_id} has no runtime identity"),
+            }),
+        )
+            .into_response();
+    };
+    let Some(job_actor) = runtime.job_actor else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("managed node {logical_node_id} has no job runner"),
+            }),
+        )
+            .into_response();
+    };
+    let endpoint = match serde_json::from_str::<EndpointAddr>(&runtime.endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("managed node {logical_node_id} endpoint is invalid: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .jobs
+        .submit(&state.blocking, logical_node_id, job_actor, endpoint, job)
+    {
+        Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(ErrorResponse { error })).into_response(),
+    }
 }
 
 async fn configure_provider(
@@ -294,6 +773,59 @@ mod properties {
     };
 
     const STEP_BUDGET: usize = 64;
+
+    fn running_job(generation: u64) -> FleetJobRecord {
+        FleetJobRecord {
+            generation,
+            status: FleetJobStatus::running(),
+        }
+    }
+
+    #[test]
+    fn worker_kill_fails_job_and_late_completion_cannot_overwrite_failure() {
+        let manager = FleetJobManager::default();
+        manager
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(7, running_job(1));
+
+        manager.fail_running(7, "worker stopped");
+        let record = manager
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(record[&7].status.state, FleetJobState::Failed));
+        drop(record);
+
+        manager.complete_generation(7, 1, FleetJobStatus::completed());
+        assert!(matches!(manager.status(7).state, FleetJobState::Failed));
+
+        manager
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(7, running_job(2));
+        manager.complete_generation(7, 1, FleetJobStatus::failed("stale generation"));
+        assert!(matches!(manager.status(7).state, FleetJobState::Running));
+        manager.complete_generation(7, 2, FleetJobStatus::completed());
+        assert!(matches!(manager.status(7).state, FleetJobState::Completed));
+    }
+
+    #[test]
+    fn uploaded_job_file_parses_existing_toml_contract() {
+        let job = parse_uploaded_job_file(include_str!("../../jobs/ui_smoke.toml")).unwrap();
+        assert_eq!(job.name, "ui_smoke");
+        assert!(job.run.contains("myelin ui job completed"));
+    }
+
+    #[test]
+    fn uploaded_job_file_rejects_malformed_or_empty_jobs() {
+        assert!(parse_uploaded_job_file("not toml = [").is_err());
+        assert!(parse_uploaded_job_file("[job]\nname = \"\"\nrun = \"echo ok\"").is_err());
+        assert!(parse_uploaded_job_file("[job]\nname = \"empty\"\nrun = \"\"").is_err());
+        assert!(parse_uploaded_job_file(&"x".repeat(MAX_JOB_FILE_BYTES + 1)).is_err());
+    }
 
     fn reply(code: u8) -> ManualControlReply {
         match code % 3 {
@@ -487,6 +1019,7 @@ mod properties {
                             command_id: HttpAction::command_id(*command_slot),
                             count: u32::from(*count),
                             selected_offer_ids: Vec::new(),
+                            image: None,
                         },
                         reply_to: None,
                     },
@@ -679,6 +1212,8 @@ mod properties {
                 runtime: runtime.clone(),
                 engine: engine.handle(),
                 orchestrator,
+                blocking: engine.handle().blocking_work_sender(),
+                jobs: FleetJobManager::default(),
             };
             let outcome = (|| {
                 let mut responses = Vec::with_capacity(actions.len());
@@ -824,6 +1359,8 @@ mod properties {
             runtime: runtime.clone(),
             engine: engine.handle(),
             orchestrator: ActorAddress::default(),
+            blocking: engine.handle().blocking_work_sender(),
+            jobs: FleetJobManager::default(),
         };
         let response = match begin_request_reply(&state, Duration::from_millis(1), |reply_to| {
             ManualControlMsg::Query { reply_to }
@@ -864,6 +1401,8 @@ mod properties {
             runtime: runtime.clone(),
             engine: engine.handle(),
             orchestrator,
+            blocking: engine.handle().blocking_work_sender(),
+            jobs: FleetJobManager::default(),
         };
         let pending = begin_http_action(&state, 0, HttpAction::Status);
         drive_steps(&backend, STEP_BUDGET);
@@ -906,6 +1445,8 @@ mod properties {
             runtime,
             engine: engine.handle(),
             orchestrator: ActorAddress::default(),
+            blocking: engine.handle().blocking_work_sender(),
+            jobs: FleetJobManager::default(),
         };
         let actions = vec![HttpAction::Status];
         let responses = vec![HttpObservation {

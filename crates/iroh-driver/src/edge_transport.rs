@@ -102,7 +102,15 @@ pub(crate) fn spawn_edge_send_pump(
             }
             send.finish()
                 .map_err(|e| format!("finish edge stream {edge_id}: {e}"))?;
-            Ok(())
+            match engine_handle
+                .timeout(std::time::Duration::from_secs(30), send.stopped())
+                .await
+                .map_err(|_| format!("finish edge stream {edge_id}: timed out"))?
+                .map_err(|e| format!("finish edge stream {edge_id}: {e}"))?
+            {
+                Some(code) => return Err(format!("peer stopped edge stream {edge_id}: {code}")),
+                None => Ok(()),
+            }
         }
         .await;
         if let Err(error) = result {

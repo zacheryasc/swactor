@@ -9,4 +9,5 @@ pub(crate) fn register_myelin_actor_codecs(registry: &mut swactor_transport::Cod
     crate::orchestration::actor::register_codecs(registry);
     crate::orchestration::manual_control::register_codecs(registry);
     swactor_job_runner::register_job_codecs(registry);
+    data_plane::protocol::register_data_plane_codecs(registry);
 }

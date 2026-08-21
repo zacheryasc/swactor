@@ -5,9 +5,10 @@
 //! out-of-band so each side can route to the other over the iroh actor plane.
 
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -17,19 +18,26 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender};
 use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor_job_runner::{
-    Job, JobDone, NodeJobActor, OUTPUTS_EDGE_ID, OrchestratorJobActor, OrchestratorJobMsg,
-    WORKSPACE_EDGE_ID, register_job_codecs,
+    INFERENCE_RESULTS_EDGE_ID, Job, JobDataPlanePort, JobDone, NodeJobActor, OUTPUTS_EDGE_ID,
+    OrchestratorJobActor, OrchestratorJobMsg, WORKSPACE_EDGE_ID, register_job_codecs,
 };
 use swactor_transport::hex_encode;
 
+use data_plane::blob::BlobMetadata;
 use data_plane::edge_wire::WireEvent;
+use data_plane::host::BlobSource;
+use data_plane::path::{DataPath, JobContext};
+use data_plane::protocol::{JobCapability, register_data_plane_codecs};
 use distribution::node::DistributedNodeConfig;
 use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{
-    EDGE_ALPN, EndpointAddrMask, IrohDriver, IrohDriverConfig, MVP_IROH_ENDPOINT_ADDR_MASK_ENV,
-    advertised_endpoint,
+    EDGE_ALPN, EdgeConnector, EdgeSendHandle, EndpointAddrMask, IrohDriver, IrohDriverConfig,
+    MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
+use tokio::io::AsyncReadExt;
+use tokio::sync::Notify;
 
+use crate::job_data_plane::{ActorJobDataPlane, MyelinChildRouteRegistrar};
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 
 const POLL: Duration = Duration::from_millis(25);
@@ -39,6 +47,210 @@ const RELAY_WAIT_DEADLINE: Duration = Duration::from_secs(30);
 const MYELIN_IROH_RELAY_MODE_ENV: &str = "MYELIN_IROH_RELAY_MODE";
 const MYELIN_IROH_RELAY_URL_ENV: &str = "MYELIN_IROH_RELAY_URL";
 const SWACTOR_IROH_RELAY_URL_ENV: &str = "SWACTOR_IROH_RELAY_URL";
+const JOB_OUTPUT_SOCKET: &str = "inference-results.sock";
+const DATA_PLANE_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+const JOB_ARENA_BYTES: u64 = 1 << 20;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InputBlobAssignment {
+    edge_id: u64,
+    path: DataPath,
+    metadata: BlobMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EmbeddedDataPlaneAssignment {
+    result_endpoint: EndpointAddr,
+    input_blobs: Vec<InputBlobAssignment>,
+}
+
+/// Actor-driven finite-blob ingress plus the retained temporary Unix output
+/// stream bridge. Remote bytes remain on `EDGE_ALPN`.
+#[derive(Clone)]
+pub(crate) struct EmbeddedJobDataPlane {
+    input_paths: Arc<Mutex<BTreeMap<u64, DataPath>>>,
+    result_sink: Arc<Mutex<Option<EdgeSendHandle>>>,
+    result_ready: Arc<Notify>,
+    connector: EdgeConnector,
+    actor_plane: Arc<ActorJobDataPlane>,
+    host_endpoint_json: String,
+    output_path: PathBuf,
+}
+
+impl EmbeddedJobDataPlane {
+    pub(crate) fn start(
+        engine: EngineHandle,
+        connector: EdgeConnector,
+        root: &Path,
+        stack: &DistributionRuntimeStack,
+        host_endpoint: EndpointAddr,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("create job data-plane root {}: {error}", root.display()))?;
+        let output_path = root.join(JOB_OUTPUT_SOCKET);
+        remove_stale_socket(&output_path)?;
+        let capability = JobCapability::new(ActorAddress::new_random().0);
+        let route_registrar = Arc::new(MyelinChildRouteRegistrar::new(
+            stack.route_view.clone(),
+            stack.pinned_routes.clone(),
+            stack.route_binder.clone(),
+        ));
+        let actor_plane = Arc::new(ActorJobDataPlane::new(
+            &stack.runtime,
+            JOB_ARENA_BYTES,
+            1,
+            1,
+            capability,
+            JobContext {
+                run_id: "unconfigured".to_owned(),
+                read_prefixes: vec![DataPath::parse("/models").expect("static model prefix")],
+                write_prefixes: vec![DataPath::parse("/runs").expect("static run prefix")],
+            },
+            BTreeMap::<DataPath, BlobSource>::new(),
+            Some(route_registrar),
+        )?);
+        let host_endpoint_json = serde_json::to_string(&host_endpoint)
+            .map_err(|error| format!("serialize host data-plane endpoint: {error}"))?;
+
+        let input_paths = Arc::new(Mutex::new(BTreeMap::new()));
+        let result_sink: Arc<Mutex<Option<EdgeSendHandle>>> = Arc::new(Mutex::new(None));
+        let result_ready = Arc::new(Notify::new());
+
+        let output_slot = Arc::clone(&result_sink);
+        let output_ready = Arc::clone(&result_ready);
+        swactor_process::spawn_unix_stream_listener(engine, &output_path, move |mut stream| {
+            let output_slot = Arc::clone(&output_slot);
+            let output_ready = Arc::clone(&output_ready);
+            async move {
+                let sink = loop {
+                    let notified = output_ready.notified();
+                    if let Some(sink) = output_slot.lock().take() {
+                        break sink;
+                    }
+                    notified.await;
+                };
+                let mut bytes = vec![0_u8; 64 * 1024];
+                loop {
+                    match stream.read(&mut bytes).await {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            if sink.send(bytes[..count].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                drop(sink);
+            }
+        })
+        .map_err(|error| format!("bind job data-plane output: {error}"))?;
+
+        Ok(Self {
+            input_paths,
+            result_sink,
+            result_ready,
+            connector,
+            output_path,
+            actor_plane,
+            host_endpoint_json,
+        })
+    }
+
+    pub(crate) fn drain_input_events(&self, events: &Arc<Mutex<Vec<WireEvent>>>) {
+        let input_paths = self.input_paths.lock().clone();
+        let mut events = events.lock();
+        let mut remaining = Vec::with_capacity(events.len());
+        for event in events.drain(..) {
+            match event {
+                WireEvent::BytesRead { edge_id, bytes, .. }
+                    if input_paths.contains_key(&edge_id.0) =>
+                {
+                    let path = input_paths[&edge_id.0].clone();
+                    let _ = self.actor_plane.push_blob_chunk(path, bytes);
+                }
+                WireEvent::StreamEnded { edge_id, .. } if input_paths.contains_key(&edge_id.0) => {
+                    let path = input_paths[&edge_id.0].clone();
+                    let _ = self.actor_plane.finish_blob_source(path);
+                }
+                WireEvent::StreamFault {
+                    edge_id: Some(edge_id),
+                    reason,
+                    ..
+                } if input_paths.contains_key(&edge_id.0) => {
+                    let path = input_paths[&edge_id.0].clone();
+                    let _ = self
+                        .actor_plane
+                        .fail_blob_source(path, format!("{reason:?}"));
+                }
+                WireEvent::StreamArrived { edge_id, .. }
+                    if input_paths.contains_key(&edge_id.0) => {}
+                event => remaining.push(event),
+            }
+        }
+        events.extend(remaining);
+    }
+}
+
+impl JobDataPlanePort for EmbeddedJobDataPlane {
+    fn configure(
+        &self,
+        job_id: u64,
+        result_peer: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let assignment = serde_json::from_str::<EmbeddedDataPlaneAssignment>(result_peer)
+            .map_err(|error| format!("parse job data-plane assignment: {error}"))?;
+        let sink = self.connector.connect(
+            assignment.result_endpoint,
+            INFERENCE_RESULTS_EDGE_ID,
+            DATA_PLANE_CONNECT_DEADLINE,
+        )?;
+        *self.result_sink.lock() = Some(sink);
+        self.result_ready.notify_one();
+        self.actor_plane.configure_run(job_id.to_string())?;
+        let mut input_paths = BTreeMap::new();
+        for input in assignment.input_blobs {
+            if input_paths
+                .insert(input.edge_id, input.path.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate input blob edge id {} in job assignment",
+                    input.edge_id
+                ));
+            }
+            self.actor_plane.begin_blob_source(
+                input.path,
+                input.metadata.length,
+                input.metadata.digest,
+            )?;
+        }
+        *self.input_paths.lock() = input_paths;
+        let mut env = self.actor_plane.handoff_env(&self.host_endpoint_json);
+        env.insert(
+            "SWACTOR_DATA_PLANE_OUTPUT".to_owned(),
+            self.output_path.to_string_lossy().into_owned(),
+        );
+        Ok(env)
+    }
+
+    fn session_ended(&self, _job_id: u64) {
+        self.input_paths.lock().clear();
+        self.result_sink.lock().take();
+        self.actor_plane.close();
+    }
+}
+
+fn remove_stale_socket(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "remove stale job data-plane socket {}: {error}",
+            path.display()
+        )),
+    }
+}
 
 /// Out-of-band identity one side publishes so the other can route to it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,14 +272,22 @@ pub(crate) struct JobOrchestratorSession {
 type JobComposition = (Engine, IrohDriver, DistributionRuntimeStack);
 
 pub(crate) fn build_composition() -> Result<JobComposition, String> {
-    let (parts, runtime, codec, transport_router) =
-        DistributionRuntimeStack::build_runtime(|c| register_job_codecs(c), None);
+    build_composition_with_relay(relay_mode_from_env()?)
+}
+
+fn build_composition_with_relay(relay_mode: RelayMode) -> Result<JobComposition, String> {
+    let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
+        |c| {
+            register_job_codecs(c);
+            register_data_plane_codecs(c);
+        },
+        None,
+    );
     let engine = Engine::new(
         parts,
         TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
     )
     .expect("engine");
-    let relay_mode = relay_mode_from_env()?;
     let mut driver = IrohDriver::with_engine(
         engine.handle(),
         IrohDriverConfig {
@@ -417,14 +637,25 @@ pub fn run_worker(orch_identity_json: String, workdir: PathBuf) -> Result<(), St
 /// Starts the operator-side job actor and publishes enough identity for a
 /// provisioned worker to join over iroh.
 pub(crate) fn start_orchestrator(landing: PathBuf) -> Result<JobOrchestratorSession, String> {
-    let (engine, driver, stack) = build_composition()?;
+    start_orchestrator_mode(landing, true, None)
+}
+
+fn start_orchestrator_mode(
+    landing: PathBuf,
+    edge_mode: bool,
+    relay_override: Option<RelayMode>,
+) -> Result<JobOrchestratorSession, String> {
+    let (engine, driver, stack) = match relay_override {
+        Some(relay_mode) => build_composition_with_relay(relay_mode)?,
+        None => build_composition()?,
+    };
     let done = stack
         .runtime
         .new_inbox::<JobDone>()
         .map_err(|e| format!("inbox: {e}"))?;
     let orch = stack
         .runtime
-        .spawn(OrchestratorJobActor::new(*done.addr(), landing.clone()).with_edge_mode(true))
+        .spawn(OrchestratorJobActor::new(*done.addr(), landing.clone()).with_edge_mode(edge_mode))
         .map_err(|e| format!("spawn orchestrator: {e}"))?;
     stack.register_local_actor(driver.register_actor(orch, 1));
 
@@ -672,7 +903,6 @@ impl JobRunActor {
 impl ActorInterface for JobRunActor {
     type Incoming = JobRunTick;
     type Response = ();
-
     fn on_start(&mut self, ctx: &Ctx) {
         self.machine.start(Instant::now());
         let _ = ctx.send(ctx.self_addr(), JobRunTick);
@@ -723,7 +953,6 @@ impl JobOrchestratorSession {
         completion.wait()
     }
 }
-
 /// Orchestrator: expose an `OrchestratorJobActor`, print its identity, read the
 /// worker identity from stdin, drive the job to completion over iroh.
 pub fn run_serve(job: swactor_job_runner::Job, landing: PathBuf) -> Result<JobDone, String> {

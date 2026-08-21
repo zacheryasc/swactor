@@ -23,6 +23,7 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
         .expect("orchestrator inbox");
     let orchestrator = *orchestrator_inbox.addr();
     let node_actor = ActorAddress::new_random();
+    let job_actor = ActorAddress::new_random();
     let endpoint = EndpointAddr::new(SecretKey::from_bytes(&[9; 32]).public());
     let actor = runtime
         .spawn(NodeAgentActor::new(stage::NodeId(11), orchestrator, None))
@@ -37,6 +38,7 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
                 stage_index: 3,
                 endpoint: endpoint.clone(),
                 node_actor,
+                job_actor: Some(job_actor),
                 readiness_id: 99,
             },
         )
@@ -51,6 +53,7 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
             stage_index: 3,
             endpoint,
             node_actor,
+            job_actor: Some(job_actor),
             readiness_id: 99,
         })
     );

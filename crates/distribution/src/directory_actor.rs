@@ -96,6 +96,10 @@ pub struct DirectoryActor {
     /// Registers a route so the runtime can deliver an app message addressed to a
     /// remotely-hosted actor (the §5 egress seam). Called from [`Self::republish`].
     route_binder: Arc<dyn RouteBinder>,
+    /// Routes owned outside SWIM membership (for example an exec child actor
+    /// runtime attached to this host). Directory republishing always preserves
+    /// these entries.
+    pinned_routes: RouteView,
 }
 
 impl DirectoryActor {
@@ -103,6 +107,22 @@ impl DirectoryActor {
         self_id: NodeId,
         peer_directory: Arc<dyn PeerDirectory>,
         route_view: RouteView,
+        route_binder: Arc<dyn RouteBinder>,
+    ) -> Self {
+        Self::with_pinned_routes(
+            self_id,
+            peer_directory,
+            route_view,
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            route_binder,
+        )
+    }
+
+    pub fn with_pinned_routes(
+        self_id: NodeId,
+        peer_directory: Arc<dyn PeerDirectory>,
+        route_view: RouteView,
+        pinned_routes: RouteView,
         route_binder: Arc<dyn RouteBinder>,
     ) -> Self {
         Self {
@@ -114,6 +134,7 @@ impl DirectoryActor {
             peer_directory,
             route_view,
             route_binder,
+            pinned_routes,
         }
     }
 
@@ -212,9 +233,20 @@ impl DirectoryActor {
     /// (which takes the view's read lock on every send) never contends with the
     /// route registration.
     fn republish(&self) {
-        let mut view = HashMap::with_capacity(self.map.len());
-        let mut remote: Vec<ActorAddress> = Vec::new();
+        let pinned = self
+            .pinned_routes
+            .read()
+            .expect("pinned route view poisoned");
+        let mut view = pinned.clone();
+        let mut remote = pinned
+            .iter()
+            .filter_map(|(actor, node)| (*node != self.self_id).then_some(*actor))
+            .collect::<Vec<_>>();
+        drop(pinned);
         for (actor, claim) in &self.map {
+            if view.contains_key(actor) {
+                continue;
+            }
             if claim.node_id == self.self_id {
                 view.insert(*actor, claim.node_id);
             } else if self.alive.contains(&claim.node_id) {

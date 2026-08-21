@@ -1,0 +1,4 @@
+# Minimal job file for the Fleet UI file-submission flow.
+[job]
+name = "ui_smoke"
+run = "python3 -c \"print('myelin ui job completed')\""

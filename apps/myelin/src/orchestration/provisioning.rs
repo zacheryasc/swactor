@@ -66,14 +66,23 @@ pub(crate) struct LocalProcessPlugin {
     runtime: Runtime,
 }
 
-/// Safe Vast.ai provisioning simulator. Marketplace selection remains real;
-/// the selected offer is recorded here and a local worker stands in for the
-/// rented machine.
+/// Safe Vast.ai provisioning simulator. Marketplace selection and contract
+/// semantics remain VastAI-shaped while the selected image is realized by a
+/// delegated local provider.
 pub(crate) struct MockVastAiPlugin {
-    inner: LocalProcessPlugin,
+    inner: Box<dyn ProvisionPlugin>,
+    contracts: BTreeMap<u64, MockVastAiContract>,
     selected_offers: BTreeMap<u64, u64>,
     #[cfg(feature = "test-support")]
     lifecycle_observer_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct MockVastAiContract {
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    provider_ref: String,
+    selected_offer_id: Option<u64>,
 }
 
 struct LocalProcessNode {
@@ -266,35 +275,36 @@ impl LocalProcessPlugin {
 }
 
 impl MockVastAiPlugin {
-    #[cfg(test)]
-    pub(crate) fn new(program: impl Into<PathBuf>, runtime: Runtime) -> Self {
-        let mut inner = LocalProcessPlugin::new(program, runtime);
-        inner.provider_prefix = "mock-vastai".to_owned();
+    fn with_inner(inner: Box<dyn ProvisionPlugin>) -> Self {
         Self {
             inner,
-            selected_offers: BTreeMap::new(),
-            #[cfg(feature = "test-support")]
-            lifecycle_observer_path: None,
-        }
-    }
-
-    pub(crate) fn with_registry(
-        program: impl Into<PathBuf>,
-        registry_path: impl Into<PathBuf>,
-        runtime: Runtime,
-    ) -> Self {
-        Self {
-            inner: LocalProcessPlugin::with_registry(
-                program,
-                registry_path,
-                "mock-vastai",
-                runtime,
-            ),
+            contracts: BTreeMap::new(),
             selected_offers: BTreeMap::new(),
             #[cfg(feature = "test-support")]
             lifecycle_observer_path: std::env::var_os("MYELIN_MOCK_VASTAI_LEDGER_PATH")
                 .map(PathBuf::from),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_registry(
+        program: impl Into<PathBuf>,
+        registry_path: impl Into<PathBuf>,
+        runtime: Runtime,
+    ) -> Self {
+        Self::with_inner(Box::new(LocalProcessPlugin::with_registry(
+            program,
+            registry_path,
+            "mock-vastai",
+            runtime,
+        )))
+    }
+
+    pub(crate) fn with_docker(container_name_prefix: impl Into<String>, runtime: Runtime) -> Self {
+        Self::with_inner(Box::new(LocalDockerPlugin::new(
+            container_name_prefix,
+            runtime,
+        )))
     }
 }
 fn selected_offer_from_spec(spec: &NodeProvisionSpec) -> Option<u64> {
@@ -1386,13 +1396,21 @@ impl ProvisionPlugin for MockVastAiPlugin {
                 "mock Vast.ai provisioning requires an exact selected offer".to_owned()
             })?;
         let provider_ref = self.inner.provider_ref_for(&spec);
-        let event_spec = spec.clone();
-        let handle = self.inner.create_node(spec, sink.clone())?;
+        let handle = self.inner.create_node(spec.clone(), sink.clone())?;
         self.selected_offers.insert(handle.id, offer_id);
+        self.contracts.insert(
+            handle.id,
+            MockVastAiContract {
+                spec: spec.clone(),
+                sink: sink.clone(),
+                provider_ref: provider_ref.clone(),
+                selected_offer_id: Some(offer_id),
+            },
+        );
         observe_mock_vastai_contract(
             &sink,
             "MockVastAiContractCreated",
-            &event_spec,
+            &spec,
             &provider_ref,
             Some(offer_id),
         );
@@ -1400,7 +1418,7 @@ impl ProvisionPlugin for MockVastAiPlugin {
         observe_mock_vastai_lifecycle(
             mock_vastai_lifecycle_path(self),
             "created",
-            &event_spec,
+            &spec,
             &provider_ref,
             Some(offer_id),
         )?;
@@ -1420,36 +1438,25 @@ impl ProvisionPlugin for MockVastAiPlugin {
     }
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
-        let event = self.inner.nodes.get(&handle.id).map(|node| {
-            let offer_id = self
-                .selected_offers
-                .get(&handle.id)
-                .copied()
-                .or_else(|| selected_offer_from_spec(&node.spec));
-            (
-                node.spec.clone(),
-                node.sink.clone(),
-                self.inner.provider_ref_for(&node.spec),
-                offer_id,
-            )
-        });
+        let contract = self.contracts.get(&handle.id).cloned();
         self.inner.stop_node(handle)?;
         self.selected_offers.remove(&handle.id);
-        if let Some((spec, sink, provider_ref, offer_id)) = event {
+        self.contracts.remove(&handle.id);
+        if let Some(contract) = contract {
             observe_mock_vastai_contract(
-                &sink,
+                &contract.sink,
                 "MockVastAiContractDestroyed",
-                &spec,
-                &provider_ref,
-                offer_id,
+                &contract.spec,
+                &contract.provider_ref,
+                contract.selected_offer_id,
             );
             #[cfg(feature = "test-support")]
             observe_mock_vastai_lifecycle(
                 mock_vastai_lifecycle_path(self),
                 "destroyed",
-                &spec,
-                &provider_ref,
-                offer_id,
+                &contract.spec,
+                &contract.provider_ref,
+                contract.selected_offer_id,
             )?;
         }
         Ok(())
@@ -1481,6 +1488,15 @@ impl ProvisionPlugin for MockVastAiPlugin {
             if let Some(offer_id) = offer_id {
                 self.selected_offers.insert(adopted.handle.id, offer_id);
             }
+            self.contracts.insert(
+                adopted.handle.id,
+                MockVastAiContract {
+                    spec: spec.clone(),
+                    sink: sink.clone(),
+                    provider_ref: adopted.provider_ref.clone(),
+                    selected_offer_id: offer_id,
+                },
+            );
             observe_mock_vastai_contract(
                 &sink,
                 "MockVastAiContractAdopted",
@@ -1511,6 +1527,15 @@ impl ProvisionPlugin for MockVastAiPlugin {
             if let Some(offer_id) = offer_id {
                 self.selected_offers.insert(prepared.handle.id, offer_id);
             }
+            self.contracts.insert(
+                prepared.handle.id,
+                MockVastAiContract {
+                    spec: spec.clone(),
+                    sink: sink.clone(),
+                    provider_ref: prepared.provider_ref.clone(),
+                    selected_offer_id: offer_id,
+                },
+            );
             observe_mock_vastai_contract(
                 &sink,
                 "MockVastAiContractRecreated",
@@ -1542,6 +1567,20 @@ impl ProvisionPlugin for MockVastAiPlugin {
         let provider_ref = self.inner.provider_ref_for(spec);
         let stopped = self.inner.stop_by_spec(spec, sink.clone())?;
         if stopped {
+            let matching_handles = self
+                .contracts
+                .iter()
+                .filter_map(|(handle, contract)| {
+                    (contract.spec.run_id == spec.run_id
+                        && contract.spec.node_id == spec.node_id
+                        && contract.spec.attempt_id == spec.attempt_id)
+                        .then_some(*handle)
+                })
+                .collect::<Vec<_>>();
+            for handle in matching_handles {
+                self.contracts.remove(&handle);
+                self.selected_offers.remove(&handle);
+            }
             observe_mock_vastai_contract(
                 &sink,
                 "MockVastAiContractDestroyed",
@@ -1947,6 +1986,12 @@ mod tests {
         (engine, runtime)
     }
 
+    fn mock_docker_plugin(runtime: Runtime) -> (MockVastAiPlugin, Arc<ScriptedDockerBackend>) {
+        let backend = Arc::new(ScriptedDockerBackend::default());
+        let inner = LocalDockerPlugin::with_backend("mock-vastai", runtime, backend.clone());
+        (MockVastAiPlugin::with_inner(Box::new(inner)), backend)
+    }
+
     fn recv_provider_event(rx: &mpsc::Receiver<PluginObservation>) -> serde_json::Value {
         for _ in 0..32 {
             let observation = rx
@@ -1964,7 +2009,7 @@ mod tests {
         let (_engine, runtime) = test_runtime();
         let (tx, rx) = mpsc::channel();
         let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
-        let mut plugin = MockVastAiPlugin::new("/not/executed", runtime);
+        let (mut plugin, backend) = mock_docker_plugin(runtime);
         let spec = test_spec();
 
         let handle = plugin
@@ -1973,7 +2018,8 @@ mod tests {
 
         assert_eq!(plugin.provider_ref_for(&spec), "mock-vastai-5-7-attempt-11");
         assert_eq!(plugin.selected_offers.get(&handle.id), Some(&8_675_309));
-        assert_eq!(plugin.inner.nodes.len(), 1);
+        assert!(backend.state.lock().resources.is_empty());
+        assert_eq!(plugin.contracts.len(), 1);
         let event = recv_provider_event(&rx);
         assert_eq!(event["type"], "MockVastAiContractCreated");
         assert_eq!(event["simulated"], true);
@@ -1982,7 +2028,7 @@ mod tests {
 
         plugin.stop_node(&handle).unwrap();
         assert!(plugin.selected_offers.is_empty());
-        assert!(plugin.inner.nodes.is_empty());
+        assert!(plugin.contracts.is_empty());
         let event = recv_provider_event(&rx);
         assert_eq!(event["type"], "MockVastAiContractDestroyed");
         assert_eq!(event["provider_ref"], "mock-vastai-5-7-attempt-11");
@@ -1994,13 +2040,13 @@ mod tests {
         let (_engine, runtime) = test_runtime();
         let (tx, _) = mpsc::channel();
         let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
-        let mut plugin = MockVastAiPlugin::new("/not/executed", runtime);
+        let (mut plugin, _) = mock_docker_plugin(runtime);
 
         let error = plugin.create_node(test_spec(), sink).unwrap_err();
 
         assert!(error.contains("exact selected offer"));
         assert!(plugin.selected_offers.is_empty());
-        assert!(plugin.inner.nodes.is_empty());
+        assert!(plugin.contracts.is_empty());
     }
 
     proptest::proptest! {
@@ -2022,14 +2068,14 @@ mod tests {
             let (_engine, runtime) = test_runtime();
             let (tx, _) = mpsc::channel();
             let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
-            let mut plugin = MockVastAiPlugin::new("/not/executed", runtime);
+            let (mut plugin, _) = mock_docker_plugin(runtime);
             let mut handles = Vec::new();
 
             for (offer_id, should_stop) in operations {
                 let mut spec = test_spec();
                 spec.node_id = handles.len() as u64 + 1;
                 let handle = plugin
-                    .create_node_selected(spec, sink.clone(), Some(offer_id))
+                    .create_node_selected(spec, sink.clone(), Some(offer_id.max(1)))
                     .unwrap();
                 handles.push(handle.clone());
                 if should_stop {
@@ -2039,7 +2085,7 @@ mod tests {
                 }
                 proptest::prop_assert_eq!(
                     plugin.selected_offers.keys().copied().collect::<Vec<_>>(),
-                    plugin.inner.nodes.keys().copied().collect::<Vec<_>>()
+                    plugin.contracts.keys().copied().collect::<Vec<_>>()
                 );
             }
 
@@ -2047,7 +2093,7 @@ mod tests {
                 plugin.stop_node(&handle).unwrap();
             }
             proptest::prop_assert!(plugin.selected_offers.is_empty());
-            proptest::prop_assert!(plugin.inner.nodes.is_empty());
+            proptest::prop_assert!(plugin.contracts.is_empty());
         }
     }
 
@@ -2356,6 +2402,7 @@ mod tests {
         next_resource_id: u64,
         fail_next_start: bool,
         fail_next_remove: bool,
+        started_specs: Vec<NodeProvisionSpec>,
     }
 
     #[derive(Default)]
@@ -2551,6 +2598,7 @@ mod tests {
                         node.container_name
                     ));
                 }
+                state.started_specs.push(node.spec.clone());
                 state.next_resource_id = state.next_resource_id.wrapping_add(1).max(1);
                 let id = state.next_resource_id;
                 state.resources.push(ScriptedDockerResource {
@@ -2615,6 +2663,121 @@ mod tests {
         fn observe(&self, observation: PluginObservation) {
             self.observations.lock().push(observation);
         }
+    }
+
+    #[test]
+    fn mock_vastai_realizes_selected_image_in_one_docker_resource() {
+        let (_engine, runtime) = test_runtime();
+        let (tx, rx) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let (mut plugin, backend) = mock_docker_plugin(runtime.clone());
+        let mut spec = test_spec();
+        spec.image = "myelin-job-tinygrad:test".to_owned();
+        spec.env
+            .push(("MYELIN_DOCKER_GPUS".to_owned(), "device=0".to_owned()));
+
+        let handle = plugin
+            .create_node_selected(spec.clone(), sink, Some(91))
+            .unwrap();
+        assert!(backend.state.lock().resources.is_empty());
+        plugin.start_bootstrap(&handle).unwrap();
+
+        let state = backend.state.lock();
+        assert_eq!(state.resources.len(), 1);
+        assert_eq!(state.started_specs, [spec.clone()]);
+        drop(state);
+        let created = recv_provider_event(&rx);
+        assert_eq!(created["type"], "MockVastAiContractCreated");
+        assert_eq!(created["provider_ref"], "mock-vastai-5-7-attempt-11");
+
+        plugin.complete_bootstrap(&handle).unwrap();
+        plugin.stop_node(&handle).unwrap();
+        plugin.stop_node(&handle).unwrap();
+        assert!(
+            backend
+                .finish(
+                    &runtime,
+                    "mock-vastai-5-7-attempt-11",
+                    ScriptedDockerTerminal::Exit(137),
+                )
+                .unwrap()
+        );
+        assert!(plugin.contracts.is_empty());
+        assert!(plugin.selected_offers.is_empty());
+        assert!(backend.state.lock().resources.is_empty());
+        let destroyed = recv_provider_event(&rx);
+        assert_eq!(destroyed["type"], "MockVastAiContractDestroyed");
+    }
+
+    #[test]
+    fn mock_vastai_can_stop_before_start_and_reprovision_new_attempt() {
+        let (_engine, runtime) = test_runtime();
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let (mut plugin, backend) = mock_docker_plugin(runtime);
+        let first = test_spec();
+        let first_handle = plugin
+            .create_node_selected(first.clone(), sink.clone(), Some(1))
+            .unwrap();
+
+        plugin.cancel_bootstrap(&first_handle).unwrap();
+        plugin.stop_node(&first_handle).unwrap();
+        plugin.stop_node(&first_handle).unwrap();
+        assert!(backend.state.lock().resources.is_empty());
+
+        let mut second = first;
+        second.attempt_id += 1;
+        let second_handle = plugin
+            .create_node_selected(second.clone(), sink, Some(2))
+            .unwrap();
+        plugin.start_bootstrap(&second_handle).unwrap();
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .resources
+                .iter()
+                .map(|resource| resource.attempt.as_str())
+                .collect::<Vec<_>>(),
+            ["mock-vastai-5-7-attempt-12"]
+        );
+        plugin.stop_node(&second_handle).unwrap();
+        assert!(backend.state.lock().resources.is_empty());
+    }
+
+    #[test]
+    fn mock_vastai_worker_death_cleanup_allows_reprovision() {
+        let (_engine, runtime) = test_runtime();
+        let (tx, _) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let (mut plugin, backend) = mock_docker_plugin(runtime.clone());
+        let first = test_spec();
+        let first_handle = plugin
+            .create_node_selected(first.clone(), sink.clone(), Some(11))
+            .unwrap();
+        plugin.start_bootstrap(&first_handle).unwrap();
+        assert!(
+            backend
+                .finish(
+                    &runtime,
+                    "mock-vastai-5-7-attempt-11",
+                    ScriptedDockerTerminal::Exit(23),
+                )
+                .unwrap()
+        );
+        assert!(plugin.stop_by_spec(&first, sink.clone()).unwrap());
+        assert!(plugin.contracts.is_empty());
+        assert!(backend.state.lock().resources.is_empty());
+
+        let mut replacement = first;
+        replacement.attempt_id += 1;
+        let replacement_handle = plugin
+            .create_node_selected(replacement, sink, Some(12))
+            .unwrap();
+        plugin.start_bootstrap(&replacement_handle).unwrap();
+        assert_eq!(backend.state.lock().resources.len(), 1);
+        plugin.stop_node(&replacement_handle).unwrap();
+        assert!(backend.state.lock().resources.is_empty());
     }
 
     #[derive(Clone, Debug)]

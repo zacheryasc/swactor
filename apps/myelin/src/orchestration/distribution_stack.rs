@@ -99,6 +99,8 @@ pub(crate) struct DistributionRuntimeStack {
     pub outbox: Outbox,
     pub relay_mirror: RelayMirror,
     pub route_view: RouteView,
+    pub pinned_routes: RouteView,
+    pub route_binder: Arc<OutboxRouteBinder>,
     pub registry_view: RegistryView,
     pub membership_mirror: Arc<Mutex<MemberList>>,
     pub swim_telemetry: Arc<SwimTelemetry>,
@@ -156,6 +158,7 @@ impl DistributionRuntimeStack {
         let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
         let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
+        let pinned_routes: RouteView = Arc::new(RwLock::new(HashMap::new()));
         let peer_directory = Arc::new(OutboxPeerDirectory::new(
             Arc::clone(&transport_router),
             Arc::clone(&outbox),
@@ -198,11 +201,12 @@ impl DistributionRuntimeStack {
             Arc::clone(&route_view_transport),
         ));
         let directory_addr = runtime
-            .spawn(DirectoryActor::new(
+            .spawn(DirectoryActor::with_pinned_routes(
                 node_id,
                 peer_directory,
                 Arc::clone(&route_view),
-                route_binder,
+                Arc::clone(&pinned_routes),
+                route_binder.clone(),
             ))
             .expect("spawn DirectoryActor");
 
@@ -231,6 +235,8 @@ impl DistributionRuntimeStack {
             outbox,
             relay_mirror,
             route_view,
+            route_binder,
+            pinned_routes,
             membership_mirror,
             registry_view,
             swim_telemetry,

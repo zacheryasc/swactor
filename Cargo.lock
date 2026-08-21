@@ -959,11 +959,16 @@ dependencies = [
 name = "data-plane"
 version = "0.1.0"
 dependencies = [
+ "futures-lite",
  "libc",
  "parking_lot",
  "serde",
+ "sha2 0.10.9",
  "swactor",
+ "swactor-engine",
+ "swactor-transport",
  "telemetry",
+ "tokio",
 ]
 
 [[package]]
@@ -2491,6 +2496,7 @@ dependencies = [
  "dashboard",
  "data-plane",
  "distribution",
+ "futures-lite",
  "iroh",
  "iroh-driver",
  "libc",
@@ -3358,11 +3364,18 @@ name = "python"
 version = "0.1.0"
 dependencies = [
  "data-plane",
+ "distribution",
+ "futures-lite",
+ "iroh",
+ "iroh-driver",
  "libc",
+ "parking_lot",
  "pyo3",
  "pyo3-async-runtimes",
+ "serde_json",
  "swactor",
  "swactor-engine",
+ "swactor-transport",
  "tokio",
 ]
 
@@ -4315,10 +4328,12 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "swactor"
 version = "0.1.0"
 dependencies = [
+ "atomic-waker",
  "criterion",
  "crossbeam-queue",
  "crossbeam-utils",
  "getrandom 0.2.17",
+ "loom",
  "parking_lot",
  "proptest",
  "proptest-state-machine",

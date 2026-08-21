@@ -1,0 +1,37 @@
+# Minimal job image: Myelin agent + Python binding + tinygrad CUDA runtime.
+# Build from the workspace root after building myelin-node:latest:
+#   docker build -f apps/myelin/node-image/Dockerfile.job-tinygrad -t myelin-job-tinygrad:cuda12.6 .
+
+ARG BASE_IMAGE=myelin-node:latest
+FROM ubuntu:24.04 AS python-binding
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        pkg-config \
+        python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH=/root/.cargo/bin:${PATH}
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p python
+
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip && \
+    python3 -m pip install --break-system-packages --no-cache-dir tinygrad==0.11.0 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* \
+           /var/cache/apt/archives/* \
+           /root/.cache/pip
+
+COPY --from=python-binding /src/target/release/libswactor.so /usr/local/lib/python3.12/dist-packages/swactor.so
+COPY apps/myelin/jobs/tiny_linear_inference.py /usr/local/share/myelin/tiny_linear_inference.py
+
+ENV CUDA_PTX=1 \
+    DEV=CUDA \
+    PYTHONPATH=/usr/local/lib/python3.12/dist-packages

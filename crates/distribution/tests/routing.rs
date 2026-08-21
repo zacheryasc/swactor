@@ -572,6 +572,62 @@ mod directory_actor {
         );
     }
 
+    #[test]
+    fn pinned_external_route_survives_directory_republication() {
+        let self_id = Keypair::generate().node_id();
+        let external_node = Keypair::generate().node_id();
+        let external_actor = an_actor();
+        let parts = RuntimeParts::new(RuntimeConfig::default())
+            .with_extension(Arc::new(StdExtension::new()));
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
+        let pinned_routes: RouteView = Arc::new(RwLock::new(HashMap::from([(
+            external_actor,
+            external_node,
+        )])));
+        let directory = runtime
+            .spawn(DirectoryActor::with_pinned_routes(
+                self_id,
+                Arc::new(SharedPeerDirectory::new()),
+                route_view.clone(),
+                pinned_routes,
+                Arc::new(NoopRouteBinder),
+            ))
+            .unwrap();
+
+        runtime
+            .send_to(
+                directory,
+                DirectoryIn::Membership(MembershipChanged {
+                    node_id: external_node,
+                    state: MemberState::Alive,
+                    incarnation: 1,
+                }),
+            )
+            .unwrap();
+        runtime
+            .send_to(
+                directory,
+                DirectoryIn::Membership(MembershipChanged {
+                    node_id: external_node,
+                    state: MemberState::Dead,
+                    incarnation: 2,
+                }),
+            )
+            .unwrap();
+        for _ in 0..4 {
+            backend.step();
+        }
+
+        assert_eq!(
+            route_view.read().unwrap().get(&external_actor).copied(),
+            Some(external_node),
+            "directory snapshots must not prune an attached exec-child route"
+        );
+    }
+
     /// Deliver a batch of claims straight into a node's directory actor as if gossiped
     /// by a peer (exercises the merge path without the round-robin scheduler).
     fn feed_gossip(node: &Node, claims: Vec<DirectoryEntry>) {

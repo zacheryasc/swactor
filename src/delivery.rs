@@ -1,6 +1,6 @@
 use crate::Error;
 use crate::actor::{ActorAddress, Message, SpawnRequest};
-use crate::channel::Sender;
+use crate::channel::{AsyncSender, Sender};
 use crate::config::RuntimeConfig;
 use crate::stats::{StatsHook, WorkerStats};
 use parking_lot::RwLock;
@@ -150,6 +150,14 @@ impl<M: Message> SenderT for Sender<M> {
     }
 }
 
+impl<M: Message> SenderT for AsyncSender<M> {
+    fn try_send_any(&self, msg: Box<dyn Any + Send>) {
+        if let Ok(typed) = msg.downcast::<M>() {
+            AsyncSender::send(self, *typed);
+        }
+    }
+}
+
 /// Registry of external inboxes — replaces the Router's role for non-actor receivers.
 pub(crate) struct InboxRegistry {
     senders: RwLock<AddrMap<Arc<dyn SenderT>>>,
@@ -164,6 +172,10 @@ impl InboxRegistry {
 
     pub fn register(&self, addr: ActorAddress, sender: Arc<dyn SenderT>) {
         self.senders.write().insert(addr, sender);
+    }
+
+    pub fn unregister(&self, addr: &ActorAddress) {
+        self.senders.write().remove(addr);
     }
     /// Check if an address is registered without consuming a message.
     #[cfg(feature = "transport")]

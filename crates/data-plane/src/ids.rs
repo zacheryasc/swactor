@@ -23,6 +23,11 @@ pub struct StreamId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LeaseRequestId(pub u64);
 
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct BlobLeaseId(pub u64);
+
 /// Data-plane-local actor address for edge endpoints. Distinct from the
 /// swactor runtime's actor address; the application maps between them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

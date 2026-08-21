@@ -6,6 +6,7 @@
 use crate::orchestrator::OrchestratorJobMsg;
 
 use std::collections::BTreeMap;
+use swactor::actor::ActorAddress;
 
 use serde::{Deserialize, Serialize};
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
@@ -26,6 +27,12 @@ pub const WORKSPACE_EDGE_ID: u64 = 1;
 /// Logical edge-stream id for the worker→orchestrator outputs tar.
 pub const OUTPUTS_EDGE_ID: u64 = 2;
 
+/// Logical edge-stream id for model weights sent into a running job.
+pub const MODEL_WEIGHTS_EDGE_ID: u64 = 3;
+
+/// Logical edge-stream id for inference results emitted by a running job.
+pub const INFERENCE_RESULTS_EDGE_ID: u64 = 4;
+
 /// Substrate-agnostic bulk byte sink for the EDGE_ALPN path. The integration
 /// layer (e.g. `job_deploy`) implements this around the real iroh edge handle;
 /// the job-runner crate stays free of any iroh dependency. When a node actor is
@@ -41,6 +48,32 @@ pub trait JobEdgeSink: Send + Sync + 'static {
 /// Orchestrator → node commands. Spec §6 command table + workspace chunks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeJobCommand {
+    /// Pin the controller's reverse route before lifecycle reports are sent.
+    RegisterController {
+        controller: ActorAddress,
+        node: [u8; 32],
+    },
+    /// Bind an embedded node job actor to one orchestrator and configure its
+    /// application-owned data-plane bridge before lifecycle commands arrive.
+    Assign {
+        job_id: u64,
+        orchestrator: ActorAddress,
+        result_peer: Option<String>,
+    },
+    /// Application-owned data-plane setup completion delivered back to the node
+    /// actor from its engine blocking-I/O owner.
+    #[doc(hidden)]
+    DataPlaneConfigured {
+        job_id: u64,
+        env: BTreeMap<String, String>,
+        error: Option<String>,
+    },
+    /// Engine-owned retry that keeps announcing assignment until the
+    /// orchestrator proves the reverse actor route by sending lifecycle work.
+    #[doc(hidden)]
+    CheckAssignment {
+        job_id: u64,
+    },
     MaterializeWorkspace {
         job_id: u64,
     },
@@ -89,6 +122,7 @@ impl NetworkMessage for NodeJobCommand {
 /// Node → orchestrator events. Spec §6 event table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeJobEvent {
+    Assigned { job_id: u64 },
     WorkspaceMaterialized { job_id: u64 },
     SetupCompleted { job_id: u64 },
     JobExited { job_id: u64, code: i32 },

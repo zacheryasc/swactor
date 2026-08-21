@@ -221,6 +221,8 @@ pub(crate) struct ProvisionRequest {
     pub count: u32,
     #[serde(default)]
     pub selected_offer_ids: Vec<u64>,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 const fn default_one() -> u32 {
@@ -243,6 +245,8 @@ pub(crate) struct RejoinHello {
     pub swim_node_id: distribution::types::NodeId,
     pub stage_index: u32,
     pub node_actor: ActorAddress,
+    #[serde(default)]
+    pub job_actor: Option<ActorAddress>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +456,13 @@ impl ManualControl {
         {
             return Err("selected offer count must equal provision count".to_owned());
         }
+        if request
+            .image
+            .as_deref()
+            .is_some_and(|image| image.trim().is_empty())
+        {
+            return Err("runtime image must not be empty".to_owned());
+        }
         if self.provider.kind != ProviderReadinessKind::Ready {
             self.snapshot.commands.insert(
                 command_id.to_owned(),
@@ -483,6 +494,9 @@ impl ManualControl {
                 .ok_or_else(|| "logical node id space exhausted".to_owned())?;
             let selected_offer_id = request.selected_offer_ids.get(offset as usize).copied();
             let mut spec = build_spec(node_id)?;
+            if let Some(image) = request.image.as_ref() {
+                spec.image = image.clone();
+            }
             if let Some(offer_id) = selected_offer_id {
                 spec.env
                     .push((SELECTED_OFFER_ID_ENV.to_owned(), offer_id.to_string()));
@@ -749,6 +763,7 @@ impl ManualControl {
             attempt_id: hello.attempt_id,
             endpoint: hello.endpoint.clone(),
             node_actor: hello.node_actor,
+            job_actor: hello.job_actor,
             swim_node_id: hello.swim_node_id,
             stage_index: hello.stage_index,
             readiness_id: hello.attempt_id,
@@ -2117,6 +2132,7 @@ mod tests {
             attempt_id: 0,
             endpoint: format!("endpoint-{node_id}"),
             node_actor: ActorAddress::default(),
+            job_actor: None,
             swim_node_id: DistNodeId([node_id as u8; 32]),
             stage_index: 0,
             readiness_id,
@@ -2150,6 +2166,7 @@ mod tests {
                 command_id: command_id.to_owned(),
                 count: 1,
                 selected_offer_ids: offer.into_iter().collect(),
+                image: None,
             },
             |node_id| Ok(spec(node_id)),
         )
@@ -2488,6 +2505,7 @@ mod tests {
                     swim_node_id: DistNodeId([7; 32]),
                     stage_index: 0,
                     node_actor: ActorAddress([8; 32]),
+                    job_actor: None,
                 },
                 current,
                 12,
@@ -2529,6 +2547,7 @@ mod tests {
                     swim_node_id: DistNodeId([7; 32]),
                     stage_index: 0,
                     node_actor: ActorAddress([8; 32]),
+                    job_actor: None,
                 },
                 current,
                 12,
@@ -2670,6 +2689,7 @@ mod tests {
                                 selected_offer_ids: (0..count)
                                     .map(|offset| 10_000 + u64::from(offset))
                                     .collect(),
+                                image: None,
                             },
                             |node_id| Ok(spec(node_id)),
                         );
@@ -2751,6 +2771,7 @@ mod tests {
                                     command_id: existing,
                                     count: 1,
                                     selected_offer_ids: Vec::new(),
+                                    image: None,
                                 },
                                 |node_id| Ok(spec(node_id)),
                             );
@@ -2889,6 +2910,7 @@ mod tests {
                                 selected_offer_ids: (0..count)
                                     .map(|offset| 100_000 + command_serial * 8 + u64::from(offset))
                                     .collect(),
+                                image: None,
                             },
                             |node_id| Ok(spec(node_id)),
                         )
@@ -2926,6 +2948,7 @@ mod tests {
                                 command_id: format!("rejected-{command_serial}"),
                                 count: 1,
                                 selected_offer_ids: vec![200_000 + command_serial],
+                                image: None,
                             },
                             |node_id| Ok(spec(node_id)),
                         )
@@ -2941,6 +2964,7 @@ mod tests {
                                     command_id: existing,
                                     count: 1,
                                     selected_offer_ids: vec![u64::from(selector)],
+                                    image: None,
                                 },
                                 |node_id| Ok(spec(node_id)),
                             )
@@ -3580,6 +3604,7 @@ mod tests {
                                     selected_offer_ids: (count == 1)
                                         .then_some(vec![10_000 + request_serial])
                                         .unwrap_or_default(),
+                                    image: None,
                                 },
                                 reply_to,
                             },
@@ -3652,6 +3677,7 @@ mod tests {
                                     swim_node_id: DistNodeId([selector; 32]),
                                     stage_index: 0,
                                     node_actor: ActorAddress([selector; 32]),
+                                    job_actor: None,
                                 },
                                 reply_to,
                             },

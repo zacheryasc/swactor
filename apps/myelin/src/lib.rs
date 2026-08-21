@@ -24,6 +24,7 @@ pub fn run_worker_node_from_env() -> std::process::ExitCode {
 }
 
 mod job_deploy;
+mod job_data_plane;
 
 /// `myelin-job-worker` — GPU-node side of the iroh job runner.
 pub fn run_job_worker_from_args<I>(args: I) -> std::process::ExitCode

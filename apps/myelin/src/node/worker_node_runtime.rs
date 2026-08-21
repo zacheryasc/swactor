@@ -23,6 +23,8 @@ use telemetry::{
 
 use crate::codecs::register_myelin_actor_codecs;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
+use crate::job_data_plane::MyelinChildRouteRegistrar;
+use crate::job_deploy::EmbeddedJobDataPlane;
 use crate::node::prompt_wire::{PromptEvent, TokenizerEvent};
 use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
@@ -53,6 +55,7 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime};
 use swactor::stats::{ActorSnapshot, StatsHook};
 use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor_job_runner::{NodeJobActor, register_job_codecs};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/myelin/tinygrad_worker.py";
@@ -1656,6 +1659,7 @@ fn run() -> Result<(), String> {
     let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
         |registry| {
             register_myelin_actor_codecs(registry);
+            register_job_codecs(registry);
             telemetry::wire::register_telemetry_codec(registry);
         },
         Some(worker_stats_hook),
@@ -1925,18 +1929,53 @@ fn run() -> Result<(), String> {
         }
     };
     stack.register_local_actor(driver.register_actor(node_actor, 1));
+    let job_services = if config.agent_only {
+        let workdir = PathBuf::from("/var/cache/myelin-jobs");
+        let data_plane = EmbeddedJobDataPlane::start(
+            engine.handle(),
+            driver.edge_connector(),
+            &workdir,
+            &stack,
+            driver.endpoint_addr(),
+        )?;
+        let job_route_registrar = Arc::new(MyelinChildRouteRegistrar::new(
+            stack.route_view.clone(),
+            stack.pinned_routes.clone(),
+            stack.route_binder.clone(),
+        ));
+        let job_actor = stack
+            .runtime
+            .spawn(
+                NodeJobActor::unbound(workdir, stack.runtime.create_sender())
+                    .with_actor_timers(engine.handle())
+                    .with_route_registrar(job_route_registrar)
+                    .with_data_plane(Arc::new(data_plane.clone())),
+            )
+            .map_err(|error| format!("spawn embedded job actor: {error}"))?;
+        stack.register_local_actor(driver.register_actor(job_actor, 1));
+        boot(
+            "job_actor",
+            "ready",
+            json!({"job_actor":job_actor,"data_plane":"edge+unix-stream"}),
+        )?;
+        Some((job_actor, data_plane))
+    } else {
+        None
+    };
+    let job_actor = job_services.as_ref().map(|(actor, _)| *actor);
     stack.register_local_actor(driver.register_actor(*rejoin_replies.addr(), 1));
     let pending_control_rejoin = PendingControlRejoin::new(
         &config,
         &advertised_self_endpoint,
         driver.node_id(),
         node_actor,
+        job_actor,
         orchestrator,
     )?;
     boot(
         "node_actor_registration",
         "ready",
-        json!({"node_actor":node_actor,"network_reachable":true}),
+        json!({"node_actor":node_actor,"job_actor":job_actor,"network_reachable":true}),
     )?;
 
     if config.agent_only {
@@ -1945,13 +1984,18 @@ fn run() -> Result<(), String> {
             "ready",
             json!({"framework":"none","workloads":"external_jobs"}),
         )?;
-        let pending_runtime_ready =
-            PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
+        let pending_runtime_ready = PendingRuntimeReady::new(
+            &config,
+            advertised_self_endpoint.clone(),
+            node_actor,
+            job_actor,
+        );
         let ready = json!({
             "type":"ready",
             "role":"node",
             "endpoint":advertised_self_endpoint.clone(),
             "node_actor":node_actor,
+            "job_actor":job_actor,
             "logical_node_id":config.logical_node_id,
             "stage_index":config.stage_index,
         });
@@ -1961,6 +2005,7 @@ fn run() -> Result<(), String> {
             json!({
                 "endpoint":advertised_self_endpoint,
                 "node_actor":node_actor,
+                "job_actor":job_actor,
                 "logical_node_id":config.logical_node_id,
                 "stage_index":config.stage_index,
                 "readiness_id":pending_runtime_ready.readiness_id,
@@ -1980,6 +2025,9 @@ fn run() -> Result<(), String> {
         let sender = actor_runtime.create_sender();
         let exit_on_stdin_eof = config.exit_on_stdin_eof;
         let completion = ActorCompletion::new();
+        let job_data_plane = job_services
+            .expect("agent-only nodes initialize job services")
+            .1;
         let runtime_actor = actor_runtime
             .spawn(AgentNodeRuntimeActor {
                 effects: AgentNodeRuntimeLive {
@@ -1991,6 +2039,7 @@ fn run() -> Result<(), String> {
                     runtime_stats: runtime_stats.clone(),
                     pending_control_rejoin,
                     rejoin_replies,
+                    job_data_plane,
                 },
                 reports,
                 pending_runtime_ready,
@@ -2058,7 +2107,7 @@ fn run() -> Result<(), String> {
     }
     let edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
     let pending_runtime_ready =
-        PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
+        PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor, None);
 
     let ready = json!({
         "type":"ready",
@@ -2189,10 +2238,13 @@ struct AgentNodeRuntimeLive {
     runtime_stats: RuntimeStatsInspector,
     pending_control_rejoin: PendingControlRejoin,
     rejoin_replies: Inbox<ManualControlReply>,
+    job_data_plane: EmbeddedJobDataPlane,
 }
 
 impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
     fn tick_before_reports(&mut self, node_actor: ActorAddress) -> Result<(), String> {
+        self.job_data_plane
+            .drain_input_events(&self.driver.edge_events_handle());
         self.pending_control_rejoin
             .drive(&self.stack, node_actor, &self.rejoin_replies)?;
         emit_swim_telemetry(&mut self.telemetry, &self.stack, "agent_loop");
@@ -2926,6 +2978,7 @@ impl PendingControlRejoin {
         endpoint: &EndpointAddr,
         swim_node_id: DistNodeId,
         node_actor: ActorAddress,
+        job_actor: Option<ActorAddress>,
         orchestrator_actor: ActorAddress,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -2937,6 +2990,7 @@ impl PendingControlRejoin {
                 endpoint: serde_json::to_string(endpoint)
                     .map_err(|error| format!("serialize rejoin endpoint: {error}"))?,
                 swim_node_id,
+                job_actor,
                 stage_index: config.stage_index,
                 node_actor,
             },
@@ -3042,6 +3096,7 @@ struct PendingRuntimeReady {
     stage_index: u32,
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
+    job_actor: Option<ActorAddress>,
     coordinator: Option<DistNodeId>,
     readiness_id: u64,
     attempts: u32,
@@ -3052,13 +3107,19 @@ struct PendingRuntimeReady {
 }
 
 impl PendingRuntimeReady {
-    fn new(config: &DeploymentConfig, endpoint: EndpointAddr, node_actor: ActorAddress) -> Self {
+    fn new(
+        config: &DeploymentConfig,
+        endpoint: EndpointAddr,
+        node_actor: ActorAddress,
+        job_actor: Option<ActorAddress>,
+    ) -> Self {
         Self {
             run_id: config.run_id,
             node_id: config.logical_node_id,
             stage_index: config.stage_index,
             endpoint,
             node_actor,
+            job_actor,
             coordinator: config
                 .coordinator_endpoint
                 .as_ref()
@@ -3120,6 +3181,7 @@ impl PendingRuntimeReady {
                     stage_index: self.stage_index,
                     endpoint: self.endpoint.clone(),
                     node_actor: self.node_actor,
+                    job_actor: self.job_actor,
                     readiness_id: self.readiness_id,
                 },
             )
@@ -5392,6 +5454,7 @@ mod control_flow_properties {
             stage_index: 3,
             endpoint: EndpointAddr::new(SecretKey::from_bytes(&[9; 32]).public()),
             node_actor,
+            job_actor: None,
             coordinator: None,
             readiness_id: 99,
             attempts: 0,

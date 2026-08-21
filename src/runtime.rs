@@ -1,7 +1,9 @@
 use crate::Instant;
 use std::any::{Any, TypeId};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
+use std::task::{Context, Poll};
 
 use crate::actor::{
     Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment, Message,
@@ -11,7 +13,7 @@ use crate::admin::{
     ActorStateSnapshot, Admin, AdminCommand, AdminError, AdminResult, GetActorStateResponse,
     InspectActorResponse, ListActorsAccumulator, ListActorsResponse, OperationResult, RuntimeAdmin,
 };
-use crate::channel::{Receiver, Sender};
+use crate::channel::{AsyncReceiver, Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::RuntimeConfig;
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, WorkerId};
@@ -24,7 +26,8 @@ use crate::worker::Worker;
 /// Generic message inbox for receiving messages outside of the runtime.
 pub struct Inbox<M: Message> {
     addr: ActorAddress,
-    inner: Receiver<M>,
+    inner: AsyncReceiver<M>,
+    runtime: Weak<RuntimeShared>,
 }
 
 impl<M: Message> Inbox<M> {
@@ -34,6 +37,16 @@ impl<M: Message> Inbox<M> {
 
     pub fn try_recv(&self) -> Option<M> {
         self.inner.try_recv()
+    }
+
+    /// Wait asynchronously for the next message delivered to this external
+    /// inbox. The runtime must be driven independently.
+    pub async fn recv(&self) -> M {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<M> {
+        self.inner.poll_recv(cx)
     }
 
     /// Poll up to `max_ticks` times, driving `host` once per attempt, returning
@@ -49,10 +62,18 @@ impl<M: Message> Inbox<M> {
     }
 }
 
-/// Pending ask response — wraps an inbox with convenience recv methods.
+impl<M: Message> Drop for Inbox<M> {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.inbox_registry.unregister(&self.addr);
+        }
+    }
+}
+
+/// Pending ask response — an awaitable external inbox.
 ///
-/// Created by [`Runtime::ask`]. Provides `try_recv()` for polling and
-/// `recv_ticking()` for automatic tick-until-response.
+/// Created by [`Runtime::ask`]. The runtime must be driven independently while
+/// this future is pending.
 pub struct Ask<R: Message> {
     inbox: Inbox<R>,
 }
@@ -64,6 +85,14 @@ impl<R: Message> Ask<R> {
 
     pub fn recv_ticking(&self, host: &mut SingleThreadRuntime, max_ticks: usize) -> Option<R> {
         self.inbox.recv_ticking(host, max_ticks)
+    }
+}
+
+impl<R: Message> Future for Ask<R> {
+    type Output = R;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().inbox.poll_recv(cx)
     }
 }
 
@@ -440,12 +469,13 @@ impl Runtime {
     /// Create an external inbox for receiving messages in the outer process containing the runtime
     pub fn new_inbox<M: Message>(&self) -> Result<Inbox<M>, Error> {
         let addr = ActorAddress::new_random();
-        let receiver = Receiver::<M>::new(self.shared.config.channel_buffer_size);
+        let receiver = AsyncReceiver::<M>::new(self.shared.config.channel_buffer_size);
         let sender = receiver.new_sender();
         self.shared.inbox_registry.register(addr, Arc::new(sender));
         Ok(Inbox {
             addr,
             inner: receiver,
+            runtime: Arc::downgrade(&self.shared),
         })
     }
 

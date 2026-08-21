@@ -42,6 +42,17 @@ impl ActorInterface for CommandSink {
     fn handle(&mut self, _ctx: &Ctx, _msg: NodeJobCommand) {}
 }
 
+struct RecordingCommandSink(Arc<Mutex<Vec<NodeJobCommand>>>);
+
+impl ActorInterface for RecordingCommandSink {
+    type Incoming = NodeJobCommand;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, msg: NodeJobCommand) {
+        self.0.lock().push(msg);
+    }
+}
+
 fn tar_file(name: &str, contents: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut builder = tar::Builder::new(&mut buf);
@@ -524,5 +535,96 @@ fn node_actor_edge_mode_workspace_announces_on_ready_flag() {
             .any(|ev| matches!(ev, NodeJobEvent::WorkspaceMaterialized { job_id: 0 })),
         "edge workspace emitted WorkspaceMaterialized, got {:?}",
         collected
+    );
+}
+
+#[test]
+fn data_plane_job_waits_for_reverse_route_acknowledgment() {
+    let landing = tempfile::tempdir().expect("landing");
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio"),
+    )
+    .expect("engine");
+
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let node = runtime
+        .spawn(RecordingCommandSink(commands.clone()))
+        .expect("spawn command sink");
+    let done = runtime.new_inbox::<JobDone>().expect("done inbox");
+    let orchestrator = runtime
+        .spawn(OrchestratorJobActor::new(
+            *done.addr(),
+            landing.path().to_path_buf(),
+        ))
+        .expect("spawn orchestrator");
+
+    runtime
+        .send_to(
+            orchestrator,
+            OrchestratorJobMsg::SubmitDataPlane {
+                job: Job {
+                    name: "assignment-handshake".to_owned(),
+                    setup: None,
+                    run: "true".to_owned(),
+                    workspace: None,
+                    outputs: Vec::new(),
+                    env: BTreeMap::new(),
+                },
+                node_actor: node,
+                result_peer: "test-peer".to_owned(),
+            },
+        )
+        .expect("submit data-plane job");
+
+    let started = Instant::now();
+    while started.elapsed() < DEADLINE
+        && !commands
+            .lock()
+            .iter()
+            .any(|command| matches!(command, NodeJobCommand::Assign { .. }))
+    {
+        std::thread::sleep(POLL);
+    }
+    assert!(
+        commands
+            .lock()
+            .iter()
+            .any(|command| matches!(command, NodeJobCommand::Assign { .. })),
+        "data-plane submission did not assign the node"
+    );
+    assert!(
+        !commands
+            .lock()
+            .iter()
+            .any(|command| matches!(command, NodeJobCommand::RunJob { .. })),
+        "job started before the node acknowledged its reverse route"
+    );
+
+    runtime
+        .send_to(
+            orchestrator,
+            OrchestratorJobMsg::NodeEvent(NodeJobEvent::Assigned { job_id: 0 }),
+        )
+        .expect("acknowledge assignment");
+    let started = Instant::now();
+    while started.elapsed() < DEADLINE
+        && !commands
+            .lock()
+            .iter()
+            .any(|command| matches!(command, NodeJobCommand::RunJob { .. }))
+    {
+        std::thread::sleep(POLL);
+    }
+    drop(engine);
+
+    assert!(
+        commands
+            .lock()
+            .iter()
+            .any(|command| matches!(command, NodeJobCommand::RunJob { .. })),
+        "job did not start after the reverse route acknowledgment"
     );
 }

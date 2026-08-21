@@ -17,6 +17,7 @@ telemetry = { path = "../../crates/telemetry" }
 data-plane = { path = "../../crates/data-plane" }
 provisioning = { path = "../../crates/provisioning" }
 dashboard = { path = "../../crates/dashboard" }
+futures-lite = "2"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 swactor = { path = "../..", features = ["serde", "transport"] }

@@ -23,6 +23,7 @@ use crate::orchestration::manual_control::{
     ManualControlReply, NodePhase, OfferDto, OfferSearchRequest, OfferSearcher,
     ProviderConfigurationRequest, ProviderFactory, ProviderReadiness, SpecBuilder,
 };
+use swactor_job_runner::{JobDone, OrchestratorJobActor};
 
 use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
@@ -552,14 +553,42 @@ where
             )
             .map_err(|error| format!("route initial provider validation: {error}"))?;
     }
+
+    let fleet_job_done = stack
+        .runtime
+        .new_inbox::<JobDone>()
+        .map_err(|error| format!("create Fleet job completion inbox: {error}"))?;
+    let fleet_job_actor = stack
+        .runtime
+        .spawn(
+            OrchestratorJobActor::new(
+                *fleet_job_done.addr(),
+                std::env::temp_dir().join("myelin-ui-job-results"),
+            )
+            .with_edge_mode(false)
+            .with_controller_node(driver.node_id().0),
+        )
+        .map_err(|error| format!("spawn Fleet job controller: {error}"))?;
+    stack.register_local_actor(driver.register_actor(fleet_job_actor, 1));
+    let fleet_job_controller = control::FleetJobController::new(
+        stack.runtime.clone(),
+        engine.handle(),
+        fleet_job_actor,
+        fleet_job_done,
+        stack.route_view.clone(),
+        stack.pinned_routes.clone(),
+        stack.route_binder.clone(),
+    );
+    let control_plugin = control::plugin(
+        stack.runtime.clone(),
+        engine.handle(),
+        orchestrator_actor,
+        fleet_job_controller,
+    );
     dashboard = DashboardSupport::start_with_plugins(
         config.dashboard,
         &engine.handle(),
-        vec![control::plugin(
-            stack.runtime.clone(),
-            engine.handle(),
-            orchestrator_actor,
-        )],
+        vec![control_plugin],
     )?;
     bootstrap(
         &mut orch_telemetry,
@@ -1297,6 +1326,9 @@ impl ConfigBuilder {
                         "--vastai-provisioning",
                     )?)?
                 }
+                "--vastai-provisioning-mock" => {
+                    self.vastai_provisioning_mode = VastAiProvisioningMode::Mock
+                }
                 "--worker-bin" => {
                     self.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
                 }
@@ -1688,9 +1720,9 @@ impl Config {
                     "VastAI config was not resolved for provider vastai".to_owned()
                 })?;
                 if vastai.provisioning_mode == VastAiProvisioningMode::Mock {
-                    return Ok(Box::new(MockVastAiPlugin::with_registry(
-                        self.local_worker_bin()?,
-                        process_registry_path,
+                    return Ok(Box::new(MockVastAiPlugin::with_docker(
+                        env_optional("MYELIN_MOCK_VASTAI_CONTAINER_PREFIX")
+                            .unwrap_or_else(|| "myelin-mock-vastai".to_owned()),
                         bootstrap_runtime.clone(),
                     )));
                 }
@@ -1729,7 +1761,12 @@ impl Config {
         if let Some(url) = &self.relay.url {
             env.push((MYELIN_IROH_RELAY_URL_ENV.to_owned(), url.clone()));
         }
-        if self.provider.as_str() == "docker" {
+        let docker_realized = self.provider.as_str() == "docker"
+            || (self.provider.as_str() == "vastai"
+                && self.vastai.as_ref().is_some_and(|vastai| {
+                    vastai.provisioning_mode == VastAiProvisioningMode::Mock
+                }));
+        if docker_realized {
             env.push(("MYELIN_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
         env
@@ -3441,7 +3478,39 @@ mod lifecycle_policy_tests {
             ),
             Some(attempt_id.as_str()),
         );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find_map(|(key, value)| (key == "MYELIN_DOCKER_GPUS").then_some(value.as_str())),
+            Some("all"),
+        );
         assert!(vastai.bootstrap_command.is_none());
+    }
+
+    #[test]
+    fn vastai_mock_alias_selects_docker_backed_mock_mode() {
+        let config = ConfigBuilder::hardcoded_defaults()
+            .overlay_cli([
+                "--provider".to_owned(),
+                "vastai".to_owned(),
+                "--vastai-provisioning-mock".to_owned(),
+                "--gpus".to_owned(),
+                "device=0".to_owned(),
+            ])
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        assert_eq!(
+            config.vastai.as_ref().unwrap().provisioning_mode,
+            VastAiProvisioningMode::Mock
+        );
+        assert_eq!(
+            config.extra_worker_env().iter().find_map(|(key, value)| {
+                (key == "MYELIN_DOCKER_GPUS").then_some(value.as_str())
+            }),
+            Some("device=0"),
+        );
     }
 
     #[test]

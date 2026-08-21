@@ -33,6 +33,7 @@ pub(crate) enum OrchestratorMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        job_actor: Option<ActorAddress>,
         readiness_id: u64,
     },
     ObserveNodeRuntimeReadyAck {
@@ -344,6 +345,7 @@ impl ActorInterface for OrchestratorActor {
                 stage_index,
                 endpoint,
                 node_actor,
+                job_actor,
                 readiness_id,
             } => {
                 if let Some(manual) = self.manual.as_mut() {
@@ -361,6 +363,7 @@ impl ActorInterface for OrchestratorActor {
                                 .map_or(0, |spec| spec.attempt_id),
                             endpoint: serde_json::to_string(&endpoint).unwrap_or_default(),
                             node_actor,
+                            job_actor,
                             swim_node_id: distribution::types::NodeId(*endpoint.id.as_bytes()),
                             stage_index,
                             readiness_id,

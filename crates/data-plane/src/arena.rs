@@ -1,6 +1,7 @@
 //! Reusable arena-backed ring allocation contracts.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::ptr::NonNull;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -311,6 +312,20 @@ impl ArenaManager {
     #[cfg(target_os = "linux")]
     pub fn read_arena(&self, offset: u64, len: usize) -> Result<Vec<u8>, std::io::Error> {
         self._backing.read_at(offset, len)
+    }
+
+    /// Bounds-checked pointer to `[offset, offset+len)` inside the live
+    /// mapping. Returns `None` when the range leaves the arena; the check is
+    /// against the backing's true length, never a caller claim.
+    #[cfg(target_os = "linux")]
+    pub fn region_ptr(&self, offset: u64, len: u64) -> Option<std::ptr::NonNull<u8>> {
+        let end = offset.checked_add(len)?;
+        let backing_len = u64::try_from(self._backing.len).ok()?;
+        if end > backing_len {
+            return None;
+        }
+        // SAFETY: `offset` is bounds-checked against the mapping above.
+        NonNull::new(unsafe { self._backing.ptr.cast::<u8>().add(offset as usize) })
     }
 
     fn lease_ring(&mut self, request: LeaseRing) -> Vec<ArenaEvent> {
