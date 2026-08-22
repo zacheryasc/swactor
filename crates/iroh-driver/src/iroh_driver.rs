@@ -139,14 +139,13 @@ pub fn discover_lan_ips() -> Vec<IpAddr> {
     // UDP socket trick: connect to a broadcast-ish address, read local_addr
     let targets: &[&str] = &["10.255.255.255:1", "192.168.255.255:1", "172.31.255.255:1"];
     for target in targets {
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if sock.connect(target).is_ok() {
-                if let Ok(local) = sock.local_addr() {
-                    let ip = local.ip();
-                    if !ip.is_loopback() && !ip.is_unspecified() && seen.insert(ip) {
-                        ips.push(ip);
-                    }
-                }
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
+            && sock.connect(target).is_ok()
+            && let Ok(local) = sock.local_addr()
+        {
+            let ip = local.ip();
+            if !ip.is_loopback() && !ip.is_unspecified() && seen.insert(ip) {
+                ips.push(ip);
             }
         }
     }
@@ -173,10 +172,10 @@ pub fn discover_lan_ips() -> Vec<IpAddr> {
                         let ip = IpAddr::V6(std::net::Ipv6Addr::from(bytes));
                         if !ip.is_loopback() && !ip.is_unspecified() {
                             // Skip link-local (fe80::)
-                            if let IpAddr::V6(v6) = ip {
-                                if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                                    continue;
-                                }
+                            if let IpAddr::V6(v6) = ip
+                                && (v6.segments()[0] & 0xffc0) == 0xfe80
+                            {
+                                continue;
                             }
                             if seen.insert(ip) {
                                 ips.push(ip);
@@ -278,6 +277,35 @@ impl EdgeConnector {
     }
 }
 
+/// Cloneable capability for signing local actor-location claims.
+#[derive(Clone)]
+pub struct ActorRegistrar {
+    keypair: Keypair,
+}
+
+impl ActorRegistrar {
+    pub fn register_actor(
+        &self,
+        actor_addr: ActorAddress,
+        generation: u64,
+    ) -> distribution::types::DirectoryEntry {
+        self.keypair.sign_directory_entry(actor_addr, generation)
+    }
+}
+
+type AcceptedConnections = Arc<Mutex<Vec<(NodeId, Connection)>>>;
+type OtherAcceptedConnections = Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>;
+type IncomingActorFrames = Arc<Mutex<Vec<(ActorAddress, String, Vec<u8>, NodeId)>>>;
+pub struct ActorBridgeConfig {
+    pub runtime: Runtime,
+    pub codec: Arc<CodecRegistry>,
+    pub routes: HashMap<String, ActorAddress>,
+    pub swim: ActorAddress,
+    pub relay_mirror: RelayMirror,
+    pub route_view: RouteView,
+    pub outbox: Outbox,
+}
+
 /// iroh P2P network transport bridge.
 ///
 /// Bridges the actorized distribution protocol (running on a swactor runtime)
@@ -309,9 +337,9 @@ pub struct IrohDriver {
     /// a dead peer would otherwise freeze the whole node for the dial budget).
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     /// Connections accepted by the background accept loop (SWIM ALPN).
-    accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
+    accepted_conns: AcceptedConnections,
     /// Connections accepted on non-SWIM ALPNs before driver-owned adapters claim them.
-    other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
+    other_accepted_conns: OtherAcceptedConnections,
     /// Completed telemetry QUIC reads from driver-owned TELEMETRY_ALPN adapters.
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
@@ -326,7 +354,7 @@ pub struct IrohDriver {
     /// reads from the state machine. Each entry is `(dest, type_tag, payload,
     /// from)` — `dest` is the destination actor address carried on the wire
     /// (`DIRECTORY.md` §5).
-    incoming: Arc<Mutex<Vec<(ActorAddress, String, Vec<u8>, NodeId)>>>,
+    incoming: IncomingActorFrames,
     /// Connections whose fire-and-forget send failed; evicted (and re-dialed)
     /// on the next `recv()`. Populated by the spawned send tasks.
     evict: Arc<Mutex<Vec<FailedConnection>>>,
@@ -467,11 +495,8 @@ impl IrohDriver {
         let iroh_secret = endpoint.secret_key().to_bytes();
         let keypair = Keypair::from_bytes(&iroh_secret);
 
-        // Spawn background accept loop so incoming connections are never missed
-        let accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let accepted_conns: AcceptedConnections = Arc::new(Mutex::new(Vec::new()));
+        let other_accepted_conns: OtherAcceptedConnections = Arc::new(Mutex::new(Vec::new()));
         let telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>> = Arc::new(Mutex::new(Vec::new()));
         let edge_events: Arc<Mutex<Vec<WireEvent>>> = Arc::new(Mutex::new(Vec::new()));
         {
@@ -480,32 +505,26 @@ impl IrohDriver {
             let swim_buf = Arc::clone(&accepted_conns);
             let other_buf = Arc::clone(&other_accepted_conns);
             engine.spawn(async move {
-                loop {
-                    match ep.accept().await {
-                        Some(incoming) => match incoming.await {
-                            Ok(conn) => {
-                                let remote_id = conn.remote_id();
-                                let node_id = NodeId(*remote_id.as_bytes());
-                                // Peer auth check
-                                let allowed = match &peer_auth {
-                                    None => true,
-                                    Some(auth) => auth.lock().is_allowed(&node_id),
-                                };
-                                if !allowed {
-                                    conn.close(0u32.into(), b"unauthorized");
-                                    continue;
-                                }
-                                // Route by negotiated ALPN.
-                                let negotiated_alpn = conn.alpn().to_vec();
-                                if negotiated_alpn == ALPN {
-                                    swim_buf.lock().push((node_id, conn));
-                                } else {
-                                    other_buf.lock().push((node_id, negotiated_alpn, conn));
-                                }
-                            }
-                            Err(_) => {}
-                        },
-                        None => break, // endpoint closed
+                while let Some(incoming) = ep.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        let remote_id = conn.remote_id();
+                        let node_id = NodeId(*remote_id.as_bytes());
+                        // Peer auth check
+                        let allowed = match &peer_auth {
+                            None => true,
+                            Some(auth) => auth.lock().is_allowed(&node_id),
+                        };
+                        if !allowed {
+                            conn.close(0u32.into(), b"unauthorized");
+                            continue;
+                        }
+                        // Route by negotiated ALPN.
+                        let negotiated_alpn = conn.alpn().to_vec();
+                        if negotiated_alpn == ALPN {
+                            swim_buf.lock().push((node_id, conn));
+                        } else {
+                            other_buf.lock().push((node_id, negotiated_alpn, conn));
+                        }
                     }
                 }
             });
@@ -669,10 +688,10 @@ impl IrohDriver {
     /// directly. IPv6 unspecified is mapped to localhost.
     pub fn endpoint_addr(&self) -> EndpointAddr {
         let mut addr = self.endpoint.addr();
-        if addr.relay_urls().next().is_none() {
-            if let Some(relay) = self.relay_url.clone() {
-                addr = addr.with_relay_url(relay);
-            }
+        if addr.relay_urls().next().is_none()
+            && let Some(relay) = self.relay_url.clone()
+        {
+            addr = addr.with_relay_url(relay);
         }
         for sa in self.direct_addresses() {
             addr = addr.with_ip_addr(sa);
@@ -729,6 +748,12 @@ impl IrohDriver {
         self.keypair.sign_directory_entry(actor_addr, generation)
     }
 
+    pub fn actor_registrar(&self) -> ActorRegistrar {
+        ActorRegistrar {
+            keypair: self.keypair.clone(),
+        }
+    }
+
     /// Capture the driver-owned slice of the node's observable state: identity,
     /// listen address, and the directory route-view extent. The core node no
     /// longer polls this (its telemetry flows over the telemetry), so this is
@@ -776,7 +801,7 @@ impl IrohDriver {
                         .map(|(actor, host)| (*actor, *host))
                         .collect();
                     // Stable order so observers don't reshuffle each tick.
-                    entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+                    entries.sort_by_key(|a| a.0.0);
                     entries
                 })
             })
@@ -1123,22 +1148,22 @@ impl IrohDriver {
     /// and the swactor runtime — the seam by which the protocol actors send and
     /// receive over iroh. Frame progression is driven by the engine-hosted
     /// adapter pump ([`Self::install_actor_bridge_pump`]).
-    pub fn enable_actor_bridge(
-        &mut self,
-        rt: Runtime,
-        codec: Arc<CodecRegistry>,
-        routes: HashMap<String, ActorAddress>,
-        swim_addr: ActorAddress,
-        relay_mirror: RelayMirror,
-        route_view: RouteView,
-        outbox: Outbox,
-    ) {
-        let self_peer_addr = peer_addr(self.node_id());
-        self.actor_bridge = Some(Arc::new(ActorBridge {
-            rt,
+    pub fn enable_actor_bridge(&mut self, config: ActorBridgeConfig) {
+        let ActorBridgeConfig {
+            runtime,
             codec,
             routes,
-            swim_addr,
+            swim,
+            relay_mirror,
+            route_view,
+            outbox,
+        } = config;
+        let self_peer_addr = peer_addr(self.node_id());
+        self.actor_bridge = Some(Arc::new(ActorBridge {
+            rt: runtime,
+            codec,
+            routes,
+            swim_addr: swim,
             self_peer_addr,
             relay_mirror,
             route_view,
@@ -1243,11 +1268,11 @@ struct AdapterPump {
     engine: EngineHandle,
     endpoint: Endpoint,
     conns: Arc<Mutex<ConnCache>>,
-    incoming: Arc<Mutex<Vec<(ActorAddress, String, Vec<u8>, NodeId)>>>,
+    incoming: IncomingActorFrames,
     evict: Arc<Mutex<Vec<FailedConnection>>>,
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
-    accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
-    other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
+    accepted_conns: AcceptedConnections,
+    other_accepted_conns: OtherAcceptedConnections,
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     edge_events: Arc<Mutex<Vec<WireEvent>>>,
     retain_telemetry_conns: Arc<std::sync::atomic::AtomicBool>,
@@ -1293,10 +1318,8 @@ impl AdapterPump {
                     false
                 }
             };
-            if should_redial {
-                if let Ok(key) = PublicKey::from_bytes(&failed.node_id.0) {
-                    let _ = self.get_or_connect(failed.node_id, key);
-                }
+            if should_redial && let Ok(key) = PublicKey::from_bytes(&failed.node_id.0) {
+                let _ = self.get_or_connect(failed.node_id, key);
             }
         }
     }
@@ -1455,10 +1478,8 @@ impl AdapterPump {
                 .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
             {
                 Some(r)
-            } else if let Some(r) = self.home_relay_url() {
-                Some(r)
             } else {
-                None
+                self.home_relay_url()
             }
         };
 

@@ -8,6 +8,14 @@
 //! such as `fsm::RunPlan::test_linear(..)` and
 //! `stage::WeightSource::embedded_gguf(..)` work unchanged.
 
+use std::time::Duration;
+
+use distribution::node::DistributedNodeConfig;
+use iroh::RelayMode;
+use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig};
+use swactor_engine::{Engine, TokioBackend, TokioConfig};
+
+use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::run_fsm::{NodeId as FsmNodeId, OrchestratorRun, RunId as FsmRunId, RunPlan, StageRef};
 use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::{DeviceHandle, StageController, WeightSource};
@@ -45,6 +53,49 @@ impl WeightSource {
 
 /// Test alias for the orchestrator run core, retained for readable test prose.
 pub(crate) type OrchestratorHarness = OrchestratorRun;
+
+pub(crate) fn build_iroh_composition(
+    poll: Duration,
+) -> (Engine, IrohDriver, DistributionRuntimeStack) {
+    let (parts, runtime, codec, transport_router) =
+        DistributionRuntimeStack::build_runtime(crate::codecs::register_myelin_actor_codecs, None);
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+    )
+    .expect("engine");
+    let mut driver = IrohDriver::with_engine(
+        engine.handle(),
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Disabled,
+            node: DistributedNodeConfig::default(),
+            peer_auth: None,
+            additional_alpns: vec![EDGE_ALPN.to_vec()],
+        },
+    )
+    .expect("iroh driver");
+    let stack = DistributionRuntimeStack::new_from_runtime(
+        runtime,
+        codec,
+        transport_router,
+        driver.node_id(),
+        DistributedNodeConfig::default(),
+        engine.handle(),
+    );
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: stack.runtime.clone(),
+        codec: stack.codec.clone(),
+        routes: stack.actor_bridge_routes(),
+        swim: stack.actors.swim,
+        relay_mirror: stack.relay_mirror.clone(),
+        route_view: stack.route_view.clone(),
+        outbox: stack.outbox.clone(),
+    });
+    stack.spawn_protocol_ticker(poll);
+    driver.install_actor_bridge_pump(poll);
+    (engine, driver, stack)
+}
 
 /// Test alias for the stage controller core, retained for readable test prose.
 pub(crate) type StageControllerHarness = StageController;

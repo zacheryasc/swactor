@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh_driver::{
-    TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection, spawn_pull_collector,
-    write_available_subscription,
+    PullCollectorConfig, TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection,
+    spawn_pull_collector, write_available_subscription,
 };
 use swactor::config::RuntimeConfig;
 use swactor::runtime::RuntimeParts;
@@ -134,12 +134,14 @@ fn pull_collector_cancellation_interrupts_inflight_io() {
         let (header_tx, header_rx) = std::sync::mpsc::channel();
         let collector = spawn_pull_collector(
             &setup_handle,
-            collector_endpoint.clone(),
-            endpoint_addr(&silent_peer),
-            [3; 16],
-            Vec::new(),
-            SubscriptionRequest::all(),
-            Arc::new(DeliveryFanout::new(8)),
+            PullCollectorConfig {
+                endpoint: collector_endpoint.clone(),
+                peer: endpoint_addr(&silent_peer),
+                flow_id: [3; 16],
+                token: Vec::new(),
+                request: SubscriptionRequest::all(),
+                fanout: Arc::new(DeliveryFanout::new(8)),
+            },
             header_tx,
         );
         resource_tx

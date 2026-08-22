@@ -46,7 +46,6 @@ const BATCH: usize = 16;
 /// claims stay cached so a false-dead peer can become routable again as soon as
 /// SWIM reports it Alive. Claim deletion requires a future explicit tombstone or
 /// owner-side lifecycle signal; raw `Tick` cadence is not a safe GC clock.
-
 /// Everything the `DirectoryActor` receives, as one enum. Only [`Gossip`](DirectoryIn::Gossip)
 /// crosses the wire (it carries the registered `DirectoryGossip` tag); the rest
 /// are local control — see [`crate::messages::actor_codec_registry`].

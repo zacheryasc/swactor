@@ -82,7 +82,7 @@ impl EffectBackend for AdoptingBackend {
         }
         let mut live = self.lease.lock().unwrap();
         if let Some(lease) = live.as_ref() {
-            return Ok(OperationOutcome::LeaseCreated(lease.clone()));
+            return Ok(OperationOutcome::LeaseCreated(Box::new(lease.clone())));
         }
         self.creates.fetch_add(1, Ordering::SeqCst);
         *live = Some(lease_result(effect.operation.attempt));
@@ -169,7 +169,7 @@ fn lease_result(attempt: NodeAttemptId) -> CreateLeaseResult {
 fn outcome_for(effect: &PlannedEffect) -> OperationOutcome {
     match &effect.command {
         NodeManagerCommand::CreateLease(_) => {
-            OperationOutcome::LeaseCreated(lease_result(effect.operation.attempt))
+            OperationOutcome::LeaseCreated(Box::new(lease_result(effect.operation.attempt)))
         }
         NodeManagerCommand::LookupEndpoint(_) => {
             OperationOutcome::EndpointLookup(Some(SshEndpoint {

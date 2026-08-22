@@ -1,5 +1,4 @@
 //! Shared test config for the iroh-driver integration tests.
-#![allow(dead_code)]
 
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;

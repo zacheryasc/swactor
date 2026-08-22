@@ -5,7 +5,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use data_plane::blob::{ArenaView, Blob, ContentDigest, WritableArenaView};
+use data_plane::blob::{Blob, BlobView, ContentDigest, WritableArenaView};
 use data_plane::bootstrap as dp_bootstrap;
 use data_plane::data_plane::{BlobWriter, DataPlane, DataPlaneBootstrap, parse_actor_address};
 use data_plane::path::DataPath;
@@ -54,9 +54,6 @@ fn data_plane_error(error: DataPlaneError) -> PyErr {
         }
         DataPlaneError::PathNotFound(path) => {
             PyErr::new::<DataPathError, _>(format!("data path not found: {path}"))
-        }
-        DataPlaneError::PathAlreadyExists(path) => {
-            PyErr::new::<DataPathError, _>(format!("data path already exists: {path}"))
         }
         DataPlaneError::Blob(reason) => PyErr::new::<BlobError, _>(format!("{reason:?}")),
         DataPlaneError::Attachment(reason) => {
@@ -190,15 +187,15 @@ fn build_child_routing(
     let binder = OutboxRouteBinder::new(router, route_transport);
     binder.ensure_routable(host_session);
 
-    driver.enable_actor_bridge(
-        runtime.clone(),
-        codecs,
-        HashMap::new(),
-        ActorAddress::default(),
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: runtime.clone(),
+        codec: codecs,
+        routes: HashMap::new(),
+        swim: ActorAddress::default(),
         relay_mirror,
         route_view,
         outbox,
-    );
+    });
     driver.install_actor_bridge_pump(ROUTE_POLL);
     driver.join(std::slice::from_ref(&host_endpoint));
 
@@ -295,14 +292,14 @@ impl PyBlob {
         self.inner.digest().map(digest_hex)
     }
 
-    fn map(&self, py: Python<'_>) -> PyResult<Py<PyArenaView>> {
+    fn map(&self, py: Python<'_>) -> PyResult<Py<PyBlobView>> {
         let inner = self
             .inner
             .map()
             .map_err(|error| data_plane_error(DataPlaneError::Blob(BlobFailure::from(error))))?;
         Py::new(
             py,
-            PyArenaView {
+            PyBlobView {
                 inner: Some(inner),
                 exports: 0,
             },
@@ -319,17 +316,17 @@ fn digest_hex(digest: &ContentDigest) -> String {
     encoded
 }
 
-#[pyclass(name = "ArenaView")]
-pub struct PyArenaView {
-    inner: Option<ArenaView>,
+#[pyclass(name = "BlobView")]
+pub struct PyBlobView {
+    inner: Option<BlobView>,
     exports: usize,
 }
 
 #[pymethods]
-impl PyArenaView {
+impl PyBlobView {
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
         if slf.inner.is_none() {
-            return Err(PyBufferError::new_err("arena view is closed"));
+            return Err(PyBufferError::new_err("blob view is closed"));
         }
         Ok(slf)
     }
@@ -347,7 +344,7 @@ impl PyArenaView {
     fn close(&mut self) -> PyResult<()> {
         if self.exports != 0 {
             return Err(PyBufferError::new_err(
-                "cannot close an arena view with active buffer exports",
+                "cannot close a blob view with active buffer exports",
             ));
         }
         self.inner.take();
@@ -364,10 +361,10 @@ impl PyArenaView {
             let inner = borrowed
                 .inner
                 .as_ref()
-                .ok_or_else(|| PyBufferError::new_err("arena view is closed"))?;
+                .ok_or_else(|| PyBufferError::new_err("blob view is closed"))?;
             (inner.as_ptr().cast_mut(), inner.len())
         };
-        // SAFETY: the retained `ArenaView` owns the stable mapping and the
+        // SAFETY: the retained `BlobView` owns the stable mapping and the
         // Python buffer owns the cloned `slf` reference until release.
         unsafe { fill_buffer(view, flags, pointer, length, true, slf.clone().into_any()) }?;
         slf.borrow_mut().exports += 1;
@@ -727,8 +724,10 @@ fn run(py: Python<'_>, main: Bound<'_, PyAny>) -> PyResult<()> {
         host_session,
         capability,
         Some(child_node),
-        attachment_engine,
-        ROUTE_DEADLINE,
+        data_plane::data_plane::AttachDeadline {
+            engine: attachment_engine,
+            timeout: ROUTE_DEADLINE,
+        },
     ))
     .map_err(data_plane_error)?;
 
@@ -770,13 +769,100 @@ impl data_plane::host::HostRouteRegistrar for DebugHostRouteRegistrar {
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
+struct DebugBlobSender {
+    runtime: Runtime,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl data_plane::blob_transfer::BlobTransferSender for DebugBlobSender {
+    fn start_file(
+        &self,
+        request: data_plane::blob_transfer::FileTransferRequest,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::FileExt;
+        let mut bytes = vec![0_u8; request.length as usize];
+        request
+            .file
+            .read_exact_at(&mut bytes, request.offset)
+            .map_err(|error| error.to_string())?;
+        self.runtime
+            .send_to(
+                request.offer.destination,
+                data_plane::blob_transfer::BlobTransferEvent::Chunk {
+                    transfer_id: request.offer.transfer_id,
+                    bytes,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        self.runtime
+            .send_to(
+                request.offer.destination,
+                data_plane::blob_transfer::BlobTransferEvent::Finished {
+                    transfer_id: request.offer.transfer_id,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        request.completion.complete(Ok(()));
+        Ok(())
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+struct DebugBlobReceiver;
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl data_plane::blob_transfer::BlobTransferReceiver for DebugBlobReceiver {
+    fn open(
+        &self,
+        destination: ActorAddress,
+        transfer_id: data_plane::blob_transfer::BlobTransferId,
+    ) -> Result<data_plane::blob_transfer::BlobTransferOffer, String> {
+        Ok(data_plane::blob_transfer::BlobTransferOffer {
+            transfer_id,
+            destination,
+            failure_proxy: None,
+            transport: Vec::new(),
+        })
+    }
+
+    fn cancel(&self, _offer: &data_plane::blob_transfer::BlobTransferOffer) {}
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+struct DebugNamespaceDiscovery(ActorAddress);
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl data_plane::namespace::NamespaceDiscovery for DebugNamespaceDiscovery {
+    fn current_directory(&self) -> Option<ActorAddress> {
+        Some(self.0)
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+struct DebugSourceRegistrar;
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl data_plane::source::BlobSourcePublisher for DebugSourceRegistrar {
+    fn publish_source(&self, _source: ActorAddress) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
 #[pyclass(name = "_TestDataPlaneHost")]
 struct PyTestDataPlaneHost {
     _driver: Arc<IrohDriver>,
     _engine: Engine,
-    runtime: Runtime,
-    host_session: ActorAddress,
     handoff: data_plane::bootstrap::JobHandoff,
+    namespace_root: std::path::PathBuf,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl Drop for PyTestDataPlaneHost {
+    fn drop(&mut self) {
+        self._driver.shutdown();
+        let _ = std::fs::remove_dir_all(&self.namespace_root);
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -792,51 +878,6 @@ impl PyTestDataPlaneHost {
 
     fn arena_fd(&self) -> RawFd {
         std::os::fd::AsRawFd::as_raw_fd(&self.handoff.arena_fd)
-    }
-
-    fn published<'py>(
-        &self,
-        py: Python<'py>,
-        path: String,
-    ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
-        let path =
-            DataPath::parse(path).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let published = future::block_on(async {
-            let ask = self
-                .runtime
-                .ask::<
-                    data_plane::protocol::HostSessionIn,
-                    Option<data_plane::protocol::PublishedBlobInfo>,
-                >(
-                    self.host_session,
-                    |reply_to| data_plane::protocol::HostSessionIn::InspectPublished {
-                        path,
-                        reply_to,
-                    },
-                )
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Ok::<_, PyErr>(ask.await)
-        })?;
-        let Some(published) = published else {
-            return Ok(None);
-        };
-        // SAFETY: dup returns a fresh descriptor or -1.
-        let fd = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&self.handoff.arena_fd)) };
-        if fd < 0 {
-            return Err(PyRuntimeError::new_err(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
-        // SAFETY: `fd` is a fresh uniquely-owned duplicate.
-        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        let mut bytes = vec![0_u8; published.metadata.length as usize];
-        std::os::unix::fs::FileExt::read_exact_at(
-            &file,
-            &mut bytes,
-            published.lease.offset + data_plane::blob::BLOB_HEADER_LEN,
-        )
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        Ok(Some(pyo3::types::PyBytes::new(py, &bytes)))
     }
 }
 
@@ -896,15 +937,50 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
     )
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let capability = JobCapability::new([0x5a; 32]);
-    let weights: Arc<[u8]> =
-        Arc::from(include_bytes!("../../../../apps/myelin/jobs/tiny_linear.weights").as_slice());
+    let namespace_root = std::env::temp_dir().join(format!(
+        "swactor-python-namespace-{}",
+        ActorAddress::new_random().to_full_hex()
+    ));
+    std::fs::create_dir_all(&namespace_root)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let source_sender: Arc<dyn data_plane::blob_transfer::BlobTransferSender> =
+        Arc::new(DebugBlobSender {
+            runtime: runtime.clone(),
+        });
+    let source_publisher: Arc<dyn data_plane::source::BlobSourcePublisher> =
+        Arc::new(DebugSourceRegistrar);
+    let namespace_service = data_plane::control::DataNamespaceService::recover(
+        runtime.clone(),
+        namespace_root.join("namespace.json"),
+        Arc::clone(&source_sender),
+        Arc::clone(&source_publisher),
+    )
+    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let directory = namespace_service.directory();
     let weights_path = DataPath::parse("/models/tiny-linear/weights")
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    let blobs = std::collections::BTreeMap::new();
+    let weights_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../apps/myelin/jobs/tiny_linear.weights");
+    future::block_on(
+        namespace_service
+            .control()
+            .register(weights_path, data_plane::blob::file(weights_file)),
+    )
+    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let namespace_proxy = runtime
+        .spawn(data_plane::namespace::NamespaceClientActor::new(
+            engine.handle(),
+            runtime.create_sender(),
+            Arc::new(DebugNamespaceDiscovery(directory)),
+            ROUTE_POLL,
+        ))
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let namespace = data_plane::namespace::NamespaceClient::new(runtime.clone(), namespace_proxy);
     let host_session = runtime
         .spawn(
             data_plane::host::HostDataPlaneSessionActor::new(
                 data_plane::host::HostDataPlaneConfig {
+                    runtime: runtime.clone(),
                     arena,
                     arena_generation: 1,
                     session_generation: 1,
@@ -914,13 +990,18 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
                         read_prefixes: vec![
                             DataPath::parse("/models")
                                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+                            DataPath::parse("/runs/test-run/results")
+                                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
                         ],
                         write_prefixes: vec![
                             DataPath::parse("/runs/test-run/results")
                                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
                         ],
                     },
-                    blobs,
+                    namespace: Some(namespace),
+                    transfer_receiver: Some(Arc::new(DebugBlobReceiver)),
+                    source_sender: Some(source_sender),
+                    source_publisher: Some(source_publisher),
                     route_registrar: Some(registrar),
                 },
             )
@@ -928,48 +1009,16 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
         )
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     data_plane::host::install_session_env(&mut handoff, host_session, capability);
-    future::block_on(async {
-        runtime
-            .ask::<data_plane::protocol::HostSessionIn, Result<(), DataPlaneError>>(
-                host_session,
-                |reply_to| data_plane::protocol::HostSessionIn::BeginBlobSource {
-                    path: weights_path.clone(),
-                    metadata: data_plane::blob::BlobMetadata {
-                        length: weights.len() as u64,
-                        digest: Some(ContentDigest::sha256(&weights)),
-                    },
-                    reply_to,
-                },
-            )
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-            .await
-            .map_err(data_plane_error)
-    })?;
-    runtime
-        .send_to(
-            host_session,
-            data_plane::protocol::HostSessionIn::BlobSourceChunk {
-                path: weights_path.clone(),
-                bytes: weights.to_vec(),
-            },
-        )
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    runtime
-        .send_to(
-            host_session,
-            data_plane::protocol::HostSessionIn::FinishBlobSource { path: weights_path },
-        )
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
-    driver.enable_actor_bridge(
-        runtime.clone(),
-        codecs,
-        HashMap::new(),
-        ActorAddress::default(),
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: runtime.clone(),
+        codec: codecs,
+        routes: HashMap::new(),
+        swim: ActorAddress::default(),
         relay_mirror,
         route_view,
         outbox,
-    );
+    });
     driver.install_actor_bridge_pump(ROUTE_POLL);
     handoff.env.insert(
         dp_bootstrap::ENV_DATA_PLANE_ENDPOINT.to_owned(),
@@ -980,9 +1029,8 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
     Ok(PyTestDataPlaneHost {
         _driver: Arc::new(driver),
         _engine: engine,
-        runtime,
-        host_session,
         handoff,
+        namespace_root,
     })
 }
 
@@ -994,7 +1042,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("SessionError", module.py().get_type::<SessionError>())?;
     module.add_class::<PyDataPlane>()?;
     module.add_class::<PyBlob>()?;
-    module.add_class::<PyArenaView>()?;
+    module.add_class::<PyBlobView>()?;
     module.add_class::<PyStreamWriter>()?;
     module.add_class::<PyContext>()?;
     module.add_function(wrap_pyfunction!(run, module)?)?;

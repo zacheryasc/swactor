@@ -257,10 +257,12 @@ impl MyelinEffectBackend {
         let mut effects = lock_node(&effects);
         if let Some(live) = &effects.live {
             if live.attempt == effect.operation.attempt {
-                return Ok(OperationOutcome::LeaseCreated(CreateLeaseResult {
-                    lease: live.lease.clone(),
-                    endpoint: Some(live.endpoint.clone()),
-                }));
+                return Ok(OperationOutcome::LeaseCreated(Box::new(
+                    CreateLeaseResult {
+                        lease: live.lease.clone(),
+                        endpoint: Some(live.endpoint.clone()),
+                    },
+                )));
             }
             return Err(EffectError::ambiguous(format!(
                 "node {} still owns attempt {} while creating attempt {}",
@@ -335,10 +337,12 @@ impl MyelinEffectBackend {
             bootstrap_started: false,
         });
         failure_sink.arm();
-        Ok(OperationOutcome::LeaseCreated(CreateLeaseResult {
-            lease,
-            endpoint: Some(endpoint),
-        }))
+        Ok(OperationOutcome::LeaseCreated(Box::new(
+            CreateLeaseResult {
+                lease,
+                endpoint: Some(endpoint),
+            },
+        )))
     }
 }
 

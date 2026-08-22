@@ -133,7 +133,7 @@ impl PeerAllowList {
             std::fs::create_dir_all(parent)?;
         }
 
-        let json = serde_json::to_string_pretty(&file).map_err(|e| io::Error::other(e))?;
+        let json = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
         std::fs::write(path, json)
     }
 }

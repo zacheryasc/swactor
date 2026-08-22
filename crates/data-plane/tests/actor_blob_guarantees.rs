@@ -1,20 +1,18 @@
 #![cfg(target_os = "linux")]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId};
 use data_plane::blob::{
-    BLOB_HEADER_LEN, Blob, BlobError, BlobLease, BlobMetadata, BlobSharedState, ContentDigest,
-    LeaseReleaser,
+    BLOB_HEADER_LEN, Blob, BlobError, BlobLease, BlobMetadata, BlobSharedState, LeaseReleaser,
 };
 use data_plane::bootstrap::{self, BootstrapSpec};
 use data_plane::data_plane::DataPlaneBootstrap;
-use data_plane::host::{BlobSource, HostDataPlaneConfig, HostDataPlaneSessionActor};
+use data_plane::host::{HostDataPlaneConfig, HostDataPlaneSessionActor};
 use data_plane::path::{DataPath, JobContext};
-use data_plane::protocol::{DataPlaneError, HostSessionIn, JobCapability, PublishedBlobInfo};
+use data_plane::protocol::{DataPlaneError, JobCapability};
 use futures_lite::future::{self, FutureExt};
 use swactor::Error;
 use swactor::actor::ActorAddress;
@@ -56,9 +54,32 @@ impl RemoteSink for BlackHoleSink {
 struct Harness {
     _host_engine: Engine,
     _child_engine: Engine,
-    host_runtime: Runtime,
-    host_session: ActorAddress,
+    _temp: TempState,
     bootstrap: DataPlaneBootstrap,
+}
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+struct TempState {
+    root: std::path::PathBuf,
+}
+
+impl TempState {
+    fn new() -> Self {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "swactor-actor-blob-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+}
+
+impl Drop for TempState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 fn path(value: &str) -> DataPath {
@@ -66,14 +87,88 @@ fn path(value: &str) -> DataPath {
 }
 
 fn runtime_parts() -> (RuntimeParts, Runtime) {
-    let mut config = RuntimeConfig::default();
-    config.worker_count = 1;
-    let parts = RuntimeParts::new(config);
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
     let runtime = parts.runtime().clone();
     (parts, runtime)
 }
 
+struct LoopbackSender {
+    runtime: Runtime,
+}
+
+impl data_plane::blob_transfer::BlobTransferSender for LoopbackSender {
+    fn start_file(
+        &self,
+        request: data_plane::blob_transfer::FileTransferRequest,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::FileExt;
+        let mut bytes = vec![0_u8; request.length as usize];
+        request
+            .file
+            .read_exact_at(&mut bytes, request.offset)
+            .map_err(|error| error.to_string())?;
+        self.runtime
+            .send_to(
+                request.offer.destination,
+                data_plane::blob_transfer::BlobTransferEvent::Chunk {
+                    transfer_id: request.offer.transfer_id,
+                    bytes,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        self.runtime
+            .send_to(
+                request.offer.destination,
+                data_plane::blob_transfer::BlobTransferEvent::Finished {
+                    transfer_id: request.offer.transfer_id,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        request.completion.complete(Ok(()));
+        Ok(())
+    }
+}
+
+struct DirectReceiver;
+
+impl data_plane::blob_transfer::BlobTransferReceiver for DirectReceiver {
+    fn open(
+        &self,
+        destination: ActorAddress,
+        transfer_id: data_plane::blob_transfer::BlobTransferId,
+    ) -> Result<data_plane::blob_transfer::BlobTransferOffer, String> {
+        Ok(data_plane::blob_transfer::BlobTransferOffer {
+            transfer_id,
+            destination,
+            failure_proxy: None,
+            transport: Vec::new(),
+        })
+    }
+
+    fn cancel(&self, _offer: &data_plane::blob_transfer::BlobTransferOffer) {}
+}
+
+struct StaticDiscovery(ActorAddress);
+
+impl data_plane::namespace::NamespaceDiscovery for StaticDiscovery {
+    fn current_directory(&self) -> Option<ActorAddress> {
+        Some(self.0)
+    }
+}
+
+struct NoopSourceRegistrar;
+
+impl data_plane::source::BlobSourcePublisher for NoopSourceRegistrar {
+    fn publish_source(&self, _source: ActorAddress) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 fn harness(arena_bytes: u64) -> Harness {
+    let temp = TempState::new();
     let mut arena = ArenaManager::boot(ArenaConfig {
         node_id: NodeId(1),
         reservation_ceiling: arena_bytes,
@@ -97,35 +192,6 @@ fn harness(arena_bytes: u64) -> Harness {
     child_runtime.set_remote_sink(Arc::new(DirectRuntimeSink {
         destination: host_runtime.clone(),
     }));
-
-    let mut blobs = BTreeMap::new();
-    blobs.insert(
-        path("/models/tiny-linear/weights"),
-        BlobSource::with_sha256(Arc::<[u8]>::from(WEIGHTS)),
-    );
-    blobs.insert(
-        path("/models/second"),
-        BlobSource::new(Arc::<[u8]>::from(b"second-blob".as_slice())),
-    );
-    let host_session = host_runtime
-        .spawn(
-            HostDataPlaneSessionActor::new(HostDataPlaneConfig {
-                arena,
-                arena_generation: ARENA_GENERATION,
-                session_generation: SESSION_GENERATION,
-                capability: CAPABILITY,
-                job_context: JobContext {
-                    run_id: "run-7".to_owned(),
-                    read_prefixes: vec![path("/models")],
-                    write_prefixes: vec![path("/runs/run-7/results")],
-                },
-                blobs,
-                route_registrar: None,
-            })
-            .expect("host session config"),
-        )
-        .expect("spawn host session");
-
     let host_engine = Engine::new(
         host_parts,
         TokioBackend::new(TokioConfig::default()).expect("host backend"),
@@ -136,6 +202,77 @@ fn harness(arena_bytes: u64) -> Harness {
         TokioBackend::new(TokioConfig::default()).expect("child backend"),
     )
     .expect("child engine");
+
+    let sender: Arc<dyn data_plane::blob_transfer::BlobTransferSender> = Arc::new(LoopbackSender {
+        runtime: host_runtime.clone(),
+    });
+    let directory_actor = data_plane::namespace::DataDirectoryActor::recover(
+        temp.root.join("namespace.json"),
+        |_record, _length| {
+            Err(data_plane::namespace::NamespaceError::SourceRecovery(
+                "unexpected recovery".to_owned(),
+            ))
+        },
+    )
+    .unwrap();
+    let directory = host_runtime.spawn(directory_actor).unwrap();
+    let directory_client =
+        data_plane::namespace::DirectoryClient::new(host_runtime.clone(), directory);
+    for (logical, name, bytes) in [
+        ("/models/tiny-linear/weights", "weights.bin", WEIGHTS),
+        ("/models/second", "second.bin", b"second-blob".as_slice()),
+    ] {
+        let file_path = temp.root.join(name);
+        std::fs::write(&file_path, bytes).unwrap();
+        let source = data_plane::source::FileBlobSourceActor::open(
+            host_runtime.clone(),
+            Arc::clone(&sender),
+            &file_path,
+        )
+        .unwrap();
+        let length = source.length();
+        let recovery = source.recovery();
+        let source = host_runtime.spawn(source).unwrap();
+        future::block_on(directory_client.register(
+            path(logical),
+            source,
+            length,
+            recovery,
+            data_plane::namespace::OperationId::from_u128(u128::from(length) + 1),
+        ))
+        .unwrap();
+    }
+    let proxy = host_runtime
+        .spawn(data_plane::namespace::NamespaceClientActor::new(
+            host_engine.handle(),
+            host_runtime.create_sender(),
+            Arc::new(StaticDiscovery(directory)),
+            Duration::from_millis(5),
+        ))
+        .unwrap();
+    let namespace = data_plane::namespace::NamespaceClient::new(host_runtime.clone(), proxy);
+    let host_session = host_runtime
+        .spawn(
+            HostDataPlaneSessionActor::new(HostDataPlaneConfig {
+                runtime: host_runtime.clone(),
+                arena,
+                arena_generation: ARENA_GENERATION,
+                session_generation: SESSION_GENERATION,
+                capability: CAPABILITY,
+                job_context: JobContext {
+                    run_id: "run-7".to_owned(),
+                    read_prefixes: vec![path("/models"), path("/runs/run-7/results")],
+                    write_prefixes: vec![path("/runs/run-7/results")],
+                },
+                namespace: Some(namespace),
+                transfer_receiver: Some(Arc::new(DirectReceiver)),
+                source_sender: Some(sender),
+                source_publisher: Some(Arc::new(NoopSourceRegistrar)),
+                route_registrar: None,
+            })
+            .expect("host session config"),
+        )
+        .expect("spawn host session");
     let bootstrap = future::block_on(DataPlaneBootstrap::attach(
         handoff.arena_fd,
         child_runtime,
@@ -147,8 +284,7 @@ fn harness(arena_bytes: u64) -> Harness {
     Harness {
         _host_engine: host_engine,
         _child_engine: child_engine,
-        host_runtime,
-        host_session,
+        _temp: temp,
         bootstrap,
     }
 }
@@ -158,21 +294,6 @@ struct NoopReleaser;
 
 impl LeaseReleaser for NoopReleaser {
     fn release(&self, _lease: BlobLease) {}
-}
-
-fn inspect_published(harness: &Harness, logical: &str) -> Option<PublishedBlobInfo> {
-    future::block_on(async {
-        harness
-            .host_runtime
-            .ask::<HostSessionIn, Option<PublishedBlobInfo>>(harness.host_session, |reply_to| {
-                HostSessionIn::InspectPublished {
-                    path: path(logical),
-                    reply_to,
-                }
-            })
-            .expect("inspect ask")
-            .await
-    })
 }
 
 #[test]
@@ -202,8 +323,10 @@ fn attachment_without_a_host_reply_fails_on_actor_deadline() {
         ActorAddress::new_random(),
         CAPABILITY,
         None,
-        engine.handle(),
-        Duration::from_millis(20),
+        data_plane::data_plane::AttachDeadline {
+            engine: engine.handle(),
+            timeout: Duration::from_millis(20),
+        },
     ));
     assert!(matches!(
         result,
@@ -223,7 +346,7 @@ fn routed_read_blob_maps_final_sealed_lease_without_copying() {
     .expect("read blob");
 
     assert_eq!(blob.length(), 24);
-    assert!(blob.digest().is_some());
+    assert!(blob.digest().is_none());
     let lease = blob.lease();
     let view = blob.map().expect("map sealed blob");
     assert_eq!(view.as_ref(), WEIGHTS);
@@ -304,7 +427,7 @@ fn thirty_two_concurrent_remote_opens_complete_without_cross_wiring() {
     ) -> future::Boxed<Vec<(usize, Blob)>> {
         if count == 1 {
             return async move {
-                let path = if first % 2 == 0 {
+                let path = if first.is_multiple_of(2) {
                     "/models/tiny-linear/weights"
                 } else {
                     "/models/second"
@@ -407,7 +530,7 @@ fn path_absence_and_authorization_fail_before_blob_success() {
         harness
             .bootstrap
             .data_plane
-            .read_blob_path("/runs/self/results/private"),
+            .read_blob_path("/runs/self/private"),
     );
     assert!(matches!(
         unauthorized,
@@ -463,21 +586,15 @@ fn write_blob_seals_once_and_abort_publishes_nothing() {
     drop(view);
     future::block_on(writer.seal()).expect("seal and publish");
 
-    let published = inspect_published(&harness, "/runs/self/results/blob")
-        .expect("clean exit publishes exactly once");
-    assert_eq!(published.metadata.length, 6);
-    // SAFETY: publication validated a sealed lease wholly inside this mapping.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            harness
-                .bootstrap
-                .arena
-                .base_ptr()
-                .add((published.lease.offset + BLOB_HEADER_LEN) as usize),
-            6,
-        )
-    };
-    assert_eq!(bytes, b"result");
+    let published = future::block_on(
+        harness
+            .bootstrap
+            .data_plane
+            .read_blob_path("/runs/self/results/blob"),
+    )
+    .expect("clean exit publishes exactly once");
+    assert_eq!(published.length(), 6);
+    assert_eq!(published.map().unwrap().as_ref(), b"result");
     assert!(future::block_on(writer.seal()).is_err());
 
     let mut aborted = future::block_on(
@@ -491,209 +608,13 @@ fn write_blob_seals_once_and_abort_publishes_nothing() {
     assert!(future::block_on(aborted.abort()).is_err());
     drop(active);
     future::block_on(aborted.abort()).expect("abort after view closes");
-    assert_eq!(
-        inspect_published(&harness, "/runs/self/results/aborted"),
-        None
-    );
-}
-
-#[test]
-fn streamed_blob_chunks_fill_the_final_lease_before_waiting_open_completes() {
-    let harness = harness(4096);
-    let streamed = path("/models/streamed");
-    let payload = b"direct-final-lease";
-    let metadata = BlobMetadata {
-        length: payload.len() as u64,
-        digest: Some(ContentDigest::sha256(payload)),
-    };
-    future::block_on(async {
-        harness
-            .host_runtime
-            .ask::<HostSessionIn, Result<(), DataPlaneError>>(harness.host_session, |reply_to| {
-                HostSessionIn::BeginBlobSource {
-                    path: streamed.clone(),
-                    metadata,
-                    reply_to,
-                }
-            })
-            .expect("begin source ask")
-            .await
-            .expect("source lease allocated");
-
-        let read = harness.bootstrap.data_plane.read_blob(&streamed);
-        futures_lite::pin!(read);
-        assert!(
-            future::poll_once(&mut read).await.is_none(),
-            "read remains pending until the source seals"
-        );
-
-        harness
-            .host_runtime
-            .send_to(
-                harness.host_session,
-                HostSessionIn::BlobSourceChunk {
-                    path: streamed.clone(),
-                    bytes: payload[..6].to_vec(),
-                },
-            )
-            .unwrap();
-        harness
-            .host_runtime
-            .send_to(
-                harness.host_session,
-                HostSessionIn::BlobSourceChunk {
-                    path: streamed.clone(),
-                    bytes: payload[6..].to_vec(),
-                },
-            )
-            .unwrap();
-        harness
-            .host_runtime
-            .send_to(
-                harness.host_session,
-                HostSessionIn::FinishBlobSource {
-                    path: streamed.clone(),
-                },
-            )
-            .unwrap();
-
-        let blob = read.await.expect("sealed streamed blob");
-        assert_eq!(blob.map().unwrap().as_ref(), payload);
-    });
-}
-
-#[test]
-fn read_opened_after_stream_seal_acquires_persistent_source_lease() {
-    let harness = harness(4096);
-    let streamed = path("/models/sealed-before-open");
-    let payload = b"sealed-first";
-    future::block_on(async {
-        harness
-            .host_runtime
-            .ask::<HostSessionIn, Result<(), DataPlaneError>>(harness.host_session, |reply_to| {
-                HostSessionIn::BeginBlobSource {
-                    path: streamed.clone(),
-                    metadata: BlobMetadata {
-                        length: payload.len() as u64,
-                        digest: Some(ContentDigest::sha256(payload)),
-                    },
-                    reply_to,
-                }
-            })
-            .unwrap()
-            .await
-            .unwrap();
-        harness
-            .host_runtime
-            .send_to(
-                harness.host_session,
-                HostSessionIn::BlobSourceChunk {
-                    path: streamed.clone(),
-                    bytes: payload.to_vec(),
-                },
-            )
-            .unwrap();
-        harness
-            .host_runtime
-            .send_to(
-                harness.host_session,
-                HostSessionIn::FinishBlobSource {
-                    path: streamed.clone(),
-                },
-            )
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-
-        let blob = harness
-            .bootstrap
-            .data_plane
-            .read_blob(&streamed)
-            .await
-            .unwrap();
-        assert_eq!(blob.map().unwrap().as_ref(), payload);
-    });
-}
-
-#[test]
-fn partial_overlength_and_digest_mismatch_sources_fail_waiting_opens() {
-    let harness = harness(4096);
-    future::block_on(async {
-        let cases = [
-            (
-                "/models/partial",
-                BlobMetadata {
-                    length: 4,
-                    digest: None,
-                },
-                b"ab".as_slice(),
-                true,
-            ),
-            (
-                "/models/overlength",
-                BlobMetadata {
-                    length: 4,
-                    digest: None,
-                },
-                b"abcde".as_slice(),
-                false,
-            ),
-            (
-                "/models/bad-digest",
-                BlobMetadata {
-                    length: 4,
-                    digest: Some(ContentDigest::sha256(b"good")),
-                },
-                b"evil".as_slice(),
-                true,
-            ),
-        ];
-
-        for (name, metadata, bytes, finish) in cases {
-            let source = path(name);
+    assert!(matches!(
+        future::block_on(
             harness
-                .host_runtime
-                .ask::<HostSessionIn, Result<(), DataPlaneError>>(
-                    harness.host_session,
-                    |reply_to| HostSessionIn::BeginBlobSource {
-                        path: source.clone(),
-                        metadata,
-                        reply_to,
-                    },
-                )
-                .unwrap()
-                .await
-                .unwrap();
-
-            let read = harness.bootstrap.data_plane.read_blob(&source);
-            futures_lite::pin!(read);
-            assert!(future::poll_once(&mut read).await.is_none());
-            std::thread::sleep(Duration::from_millis(5));
-            harness
-                .host_runtime
-                .send_to(
-                    harness.host_session,
-                    HostSessionIn::BlobSourceChunk {
-                        path: source.clone(),
-                        bytes: bytes.to_vec(),
-                    },
-                )
-                .unwrap();
-            if finish {
-                harness
-                    .host_runtime
-                    .send_to(
-                        harness.host_session,
-                        HostSessionIn::FinishBlobSource {
-                            path: source.clone(),
-                        },
-                    )
-                    .unwrap();
-            }
-            let result = read.await;
-            assert!(
-                matches!(result, Err(DataPlaneError::Blob(_))),
-                "unexpected source failure for {name}: {result:?}"
-            );
-        }
-    });
+                .bootstrap
+                .data_plane
+                .read_blob_path("/runs/self/results/aborted")
+        ),
+        Err(DataPlaneError::PathNotFound(_))
+    ));
 }

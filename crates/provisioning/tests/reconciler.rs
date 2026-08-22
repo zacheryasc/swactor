@@ -223,7 +223,7 @@ fn driver_records_operations_before_returning_effects_and_reaches_ready() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-1", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-1", true))),
         now,
     );
     let bootstrap = only_effect(&mut driver, now);
@@ -284,7 +284,7 @@ fn deletion_cancels_bootstrap_then_destroys_lease_then_reaps() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-2", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-2", true))),
         now,
     );
     let bootstrap = only_effect(&mut driver, now);
@@ -343,7 +343,7 @@ fn failed_bootstrap_attempt_rejects_late_join_and_close() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-failed-bootstrap", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-failed-bootstrap", true))),
         now,
     );
     let bootstrap = only_effect(&mut driver, now);
@@ -403,7 +403,7 @@ fn replacement_waits_for_cleanup_and_uses_a_fresh_attempt() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-3", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-3", true))),
         now,
     );
     let bootstrap = only_effect(&mut driver, now);
@@ -481,7 +481,7 @@ fn retry_backoff_is_per_node_and_stores_one_deadline() {
     succeed(
         &mut driver,
         progressing,
-        OperationOutcome::LeaseCreated(lease("lease-4", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-4", true))),
         now,
     );
 
@@ -515,7 +515,7 @@ fn ambiguous_bootstrap_start_retries_adoption_without_replacing_the_attempt() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-ambiguous-start", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-ambiguous-start", true))),
         now,
     );
     let start = only_effect(&mut driver, now);
@@ -580,7 +580,7 @@ fn deleting_node_resolves_ambiguous_create_before_marking_destroyed() {
     succeed(
         &mut driver,
         &adopt,
-        OperationOutcome::LeaseCreated(lease("adopted-before-delete", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("adopted-before-delete", true))),
         retry_at,
     );
     let destroy = only_effect(&mut driver, retry_at);
@@ -607,7 +607,7 @@ fn deleting_node_resolves_ambiguous_bootstrap_before_cleanup() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-ambiguous-delete", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-ambiguous-delete", true))),
         now,
     );
     let start = only_effect(&mut driver, now);
@@ -706,7 +706,7 @@ fn attempt_failure_cleans_up_immediately_but_delays_replacement() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-5", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-5", true))),
         now,
     );
     let bootstrap = only_effect(&mut driver, now);
@@ -747,7 +747,7 @@ fn endpoint_not_ready_uses_probe_deadline_without_counting_a_failure() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("lease-6", false)),
+        OperationOutcome::LeaseCreated(Box::new(lease("lease-6", false))),
         now,
     );
     let lookup = only_effect(&mut driver, now);
@@ -929,7 +929,7 @@ fn cleanup_failure_retries_without_releasing_live_facts() {
     succeed(
         &mut driver,
         &create,
-        OperationOutcome::LeaseCreated(lease("cleanup", true)),
+        OperationOutcome::LeaseCreated(Box::new(lease("cleanup", true))),
         now,
     );
     let bootstrap = only_effect(&mut driver, now);

@@ -307,6 +307,10 @@ impl ClusterRegistry {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Number of tombstones.
     pub fn tombstone_count(&self) -> usize {
         self.entries.values().filter(|e| e.tombstone).count()

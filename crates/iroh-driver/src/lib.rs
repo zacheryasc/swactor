@@ -9,24 +9,26 @@
 // work goes through `EngineHandle`.
 #![deny(clippy::disallowed_methods)]
 
+pub mod blob_transfer;
 pub mod edge_transport;
 pub mod endpoint_advertisement;
 pub mod iroh_driver;
 pub mod telemetry_transport;
 
+pub use blob_transfer::{IrohBlobTransferReceiver, IrohBlobTransferSender};
 pub use endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 pub use iroh_driver::{
-    ConnType, EdgeConnector, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus,
-    TelemetryPublishHandle, conn_type_of, discover_lan_ips,
+    ActorBridgeConfig, ActorRegistrar, ConnType, EdgeConnector, IrohDriver, IrohDriverConfig,
+    JoinPhase, JoinStatus, TelemetryPublishHandle, conn_type_of, discover_lan_ips,
 };
 
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};
 
 pub use telemetry_transport::{
-    PullCollectorHandle, TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead,
-    TelemetryQuicWriteStats, read_events_from_stream, read_next_event,
+    PullCollectorConfig, PullCollectorHandle, TELEMETRY_ALPN, TelemetryQuicHeader,
+    TelemetryQuicRead, TelemetryQuicWriteStats, read_events_from_stream, read_next_event,
     read_next_uni_from_connection, read_pull_request, read_stream_header, read_stream_into_fanout,
     spawn_connection_reader, spawn_pull_collector, spawn_pull_collector_to_actor,
     spawn_pull_server, spawn_subscription_writer, write_available_subscription, write_event,

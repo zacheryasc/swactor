@@ -73,8 +73,6 @@ pub(crate) struct MockVastAiPlugin {
     inner: Box<dyn ProvisionPlugin>,
     contracts: BTreeMap<u64, MockVastAiContract>,
     selected_offers: BTreeMap<u64, u64>,
-    #[cfg(feature = "test-support")]
-    lifecycle_observer_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -280,9 +278,6 @@ impl MockVastAiPlugin {
             inner,
             contracts: BTreeMap::new(),
             selected_offers: BTreeMap::new(),
-            #[cfg(feature = "test-support")]
-            lifecycle_observer_path: std::env::var_os("MYELIN_MOCK_VASTAI_LEDGER_PATH")
-                .map(PathBuf::from),
         }
     }
 
@@ -332,113 +327,6 @@ fn observe_mock_vastai_contract(
         })
         .to_string(),
     });
-}
-#[cfg(feature = "test-support")]
-fn observe_mock_vastai_lifecycle(
-    path: Option<&Path>,
-    event: &str,
-    spec: &NodeProvisionSpec,
-    provider_ref: &str,
-    selected_offer_id: Option<u64>,
-) -> Result<(), String> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| {
-            format!(
-                "open mock Vast.ai lifecycle observer {}: {error}",
-                path.display()
-            )
-        })?;
-    let mut observation = serde_json::to_string(&serde_json::json!({
-        "event": event,
-        "run_id": spec.run_id,
-        "node_id": spec.node_id,
-        "attempt_id": spec.attempt_id,
-        "provider_ref": provider_ref,
-        "selected_offer_id": selected_offer_id,
-    }))
-    .map_err(|error| {
-        format!(
-            "encode mock Vast.ai lifecycle observation {}: {error}",
-            path.display()
-        )
-    })?;
-    observation.push('\n');
-    file.write_all(observation.as_bytes()).map_err(|error| {
-        format!(
-            "append mock Vast.ai lifecycle observation {}: {error}",
-            path.display()
-        )
-    })
-}
-
-#[cfg(feature = "test-support")]
-fn mock_vastai_lifecycle_path(plugin: &MockVastAiPlugin) -> Option<&Path> {
-    plugin.lifecycle_observer_path.as_deref()
-}
-
-#[cfg(feature = "test-support")]
-fn mock_vastai_resource_is_live(
-    path: Option<&Path>,
-    spec: &NodeProvisionSpec,
-    provider_ref: &str,
-) -> Result<bool, String> {
-    let Some(path) = path else {
-        return Ok(false);
-    };
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "read mock Vast.ai provider state {}: {error}",
-                path.display()
-            ));
-        }
-    };
-    let mut live = false;
-    for (index, line) in contents.lines().enumerate() {
-        let event: serde_json::Value = serde_json::from_str(line).map_err(|error| {
-            format!(
-                "parse mock Vast.ai provider state {} line {}: {error}",
-                path.display(),
-                index + 1
-            )
-        })?;
-        if event
-            .get("provider_ref")
-            .and_then(serde_json::Value::as_str)
-            != Some(provider_ref)
-        {
-            continue;
-        }
-        let event_run_id = event.get("run_id").and_then(serde_json::Value::as_u64);
-        let event_node_id = event.get("node_id").and_then(serde_json::Value::as_u64);
-        let event_attempt_id = event.get("attempt_id").and_then(serde_json::Value::as_u64);
-        if (event_run_id, event_node_id, event_attempt_id)
-            != (Some(spec.run_id), Some(spec.node_id), Some(spec.attempt_id))
-        {
-            return Err(format!(
-                "mock Vast.ai provider reference {provider_ref} belongs to another node: {event}"
-            ));
-        }
-        match event.get("event").and_then(serde_json::Value::as_str) {
-            Some("created") => live = true,
-            Some("destroyed") => live = false,
-            Some("adopted" | "recreated") => {}
-            other => {
-                return Err(format!(
-                    "unknown mock Vast.ai provider lifecycle event {other:?}: {event}"
-                ));
-            }
-        }
-    }
-    Ok(live)
 }
 
 fn local_process_provider_ref(prefix: &str, spec: &NodeProvisionSpec) -> String {
@@ -720,9 +608,8 @@ fn docker_inspect_error_is_absent(stderr: &str) -> bool {
 }
 
 fn docker_container_is_absent(name: &str) -> Result<bool, String> {
-    let output =
-        swactor_process::command_output(&mut Command::new("docker").arg("inspect").arg(name))
-            .map_err(|error| format!("inspect Docker container {name}: {error}"))?;
+    let output = swactor_process::command_output(Command::new("docker").arg("inspect").arg(name))
+        .map_err(|error| format!("inspect Docker container {name}: {error}"))?;
     if output.status.success() {
         return Ok(false);
     }
@@ -740,7 +627,7 @@ fn docker_container_is_absent(name: &str) -> Result<bool, String> {
 
 fn docker_container_is_running(name: &str) -> Result<bool, String> {
     let output = swactor_process::command_output(
-        &mut Command::new("docker")
+        Command::new("docker")
             .args(["inspect", "-f", "{{.State.Running}}"])
             .arg(name),
     )
@@ -757,7 +644,7 @@ fn docker_container_is_running(name: &str) -> Result<bool, String> {
 
 /// Lists container names carrying this daemon's label, running or not.
 fn docker_labeled_containers(prefix: &str) -> Result<Vec<String>, String> {
-    let output = swactor_process::command_output(&mut Command::new("docker").args([
+    let output = swactor_process::command_output(Command::new("docker").args([
         "ps",
         "-a",
         "--filter",
@@ -786,7 +673,7 @@ fn docker_containers_for_spec(
     spec: &NodeProvisionSpec,
 ) -> Result<Vec<String>, String> {
     let output = swactor_process::command_output(
-        &mut Command::new("docker")
+        Command::new("docker")
             .args(["ps", "-a"])
             .arg("--filter")
             .arg(format!("label=myelin.daemon={prefix}"))
@@ -886,7 +773,7 @@ fn prepare_docker_file_volume(
     )?;
     let loader_name = format!("myelin-cache-load-{}-{volume}", std::process::id());
     let _ = swactor_process::command_status(
-        &mut Command::new("docker")
+        Command::new("docker")
             .args(["rm", "-f", &loader_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -915,7 +802,7 @@ fn prepare_docker_file_volume(
         "copy cached model into docker volume",
     );
     let _ = swactor_process::command_status(
-        &mut Command::new("docker")
+        Command::new("docker")
             .args(["rm", &loader_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -966,7 +853,7 @@ fn safe_docker_volume_component(value: &str) -> String {
 
 fn docker_status(args: &[&str], label: &str) -> Result<(), String> {
     let status = swactor_process::command_status(
-        &mut Command::new("docker")
+        Command::new("docker")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -982,7 +869,7 @@ fn docker_status(args: &[&str], label: &str) -> Result<(), String> {
 
 fn docker_status_vec(args: Vec<String>, label: &str) -> Result<(), String> {
     let status = swactor_process::command_status(
-        &mut Command::new("docker")
+        Command::new("docker")
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1012,11 +899,11 @@ fn stop_owned_process(runtime: &mut LocalProcessRuntime) -> Result<Option<i32>, 
 fn stop_adopted_process(record: &LocalProcessRecord) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        return swactor_process::terminate_process_group(
+        swactor_process::terminate_process_group(
             &record.identity(),
             Duration::from_secs(2),
             Duration::from_millis(50),
-        );
+        )
     }
     #[cfg(not(target_os = "linux"))]
     Ok(())
@@ -1414,14 +1301,6 @@ impl ProvisionPlugin for MockVastAiPlugin {
             &provider_ref,
             Some(offer_id),
         );
-        #[cfg(feature = "test-support")]
-        observe_mock_vastai_lifecycle(
-            mock_vastai_lifecycle_path(self),
-            "created",
-            &spec,
-            &provider_ref,
-            Some(offer_id),
-        )?;
         Ok(handle)
     }
 
@@ -1450,14 +1329,6 @@ impl ProvisionPlugin for MockVastAiPlugin {
                 &contract.provider_ref,
                 contract.selected_offer_id,
             );
-            #[cfg(feature = "test-support")]
-            observe_mock_vastai_lifecycle(
-                mock_vastai_lifecycle_path(self),
-                "destroyed",
-                &contract.spec,
-                &contract.provider_ref,
-                contract.selected_offer_id,
-            )?;
         }
         Ok(())
     }
@@ -1468,21 +1339,6 @@ impl ProvisionPlugin for MockVastAiPlugin {
         sink: PluginSink,
     ) -> Result<Option<AdoptedNode>, String> {
         let adopted = self.inner.adopt_by_spec(spec, sink.clone())?;
-        #[cfg(feature = "test-support")]
-        let adopted = {
-            let provider_ref = self.inner.provider_ref_for(spec);
-            if adopted.is_none()
-                && mock_vastai_resource_is_live(
-                    mock_vastai_lifecycle_path(self),
-                    spec,
-                    &provider_ref,
-                )?
-            {
-                self.inner.prepare_missing_bootstrap(spec, sink.clone())?
-            } else {
-                adopted
-            }
-        };
         if let Some(adopted) = &adopted {
             let offer_id = selected_offer_from_spec(spec);
             if let Some(offer_id) = offer_id {
@@ -1504,14 +1360,6 @@ impl ProvisionPlugin for MockVastAiPlugin {
                 &adopted.provider_ref,
                 offer_id,
             );
-            #[cfg(feature = "test-support")]
-            observe_mock_vastai_lifecycle(
-                mock_vastai_lifecycle_path(self),
-                "adopted",
-                spec,
-                &adopted.provider_ref,
-                offer_id,
-            )?;
         }
         Ok(adopted)
     }
@@ -1543,14 +1391,6 @@ impl ProvisionPlugin for MockVastAiPlugin {
                 &prepared.provider_ref,
                 offer_id,
             );
-            #[cfg(feature = "test-support")]
-            observe_mock_vastai_lifecycle(
-                mock_vastai_lifecycle_path(self),
-                "recreated",
-                spec,
-                &prepared.provider_ref,
-                offer_id,
-            )?;
         }
         Ok(prepared)
     }
@@ -1588,14 +1428,6 @@ impl ProvisionPlugin for MockVastAiPlugin {
                 &provider_ref,
                 selected_offer_from_spec(spec),
             );
-            #[cfg(feature = "test-support")]
-            observe_mock_vastai_lifecycle(
-                mock_vastai_lifecycle_path(self),
-                "destroyed",
-                spec,
-                &provider_ref,
-                selected_offer_from_spec(spec),
-            )?;
         }
         Ok(stopped)
     }
@@ -1879,7 +1711,7 @@ impl ProvisionPlugin for LocalDockerPlugin {
 
 fn remove_docker_container(container_name: &str) -> Result<(), String> {
     let status = swactor_process::command_status(
-        &mut Command::new("docker")
+        Command::new("docker")
             .arg("rm")
             .arg("-f")
             .arg(container_name)
@@ -2272,78 +2104,6 @@ mod tests {
         assert_eq!(adopted.handle.provider_process_id, Some(record.pid));
         restarted.stop_node(&adopted.handle).unwrap();
         assert!(!process_record_matches(&record));
-        let _ = fs::remove_file(registry_path);
-    }
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mixed_mock_processes_survive_kill_provision_and_restart() {
-        let (_engine, runtime) = test_runtime();
-        let registry_path = std::env::temp_dir().join(format!(
-            "myelin-mixed-mock-test-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let (tx, _) = mpsc::channel();
-        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
-        let make_spec = |node_id: u64| {
-            let mut spec = test_spec();
-            spec.node_id = node_id;
-            spec.env
-                .push(("MYELIN_RUN_ID".to_owned(), spec.run_id.to_string()));
-            spec.env.push((
-                "MYELIN_LOGICAL_NODE_ID".to_owned(),
-                spec.node_id.to_string(),
-            ));
-            spec.args = vec![
-                "-c".to_owned(),
-                "trap 'exit 0' TERM; while :; do sleep 1; done".to_owned(),
-            ];
-            spec
-        };
-
-        {
-            let mut plugin =
-                MockVastAiPlugin::with_registry("/bin/sh", &registry_path, runtime.clone());
-            for node_id in 1..=3 {
-                let handle = plugin
-                    .create_node_selected(make_spec(node_id), sink.clone(), Some(node_id))
-                    .unwrap();
-                plugin.start_bootstrap(&handle).unwrap();
-            }
-        }
-        {
-            let mut restarted =
-                MockVastAiPlugin::with_registry("/bin/sh", &registry_path, runtime.clone());
-            let killed = restarted
-                .adopt_by_spec(&make_spec(2), sink.clone())
-                .unwrap()
-                .expect("node 2");
-            restarted.stop_node(&killed.handle).unwrap();
-            let new_node = restarted
-                .create_node_selected(make_spec(4), sink.clone(), Some(4))
-                .unwrap();
-            restarted.start_bootstrap(&new_node).unwrap();
-        }
-
-        let mut final_restart = MockVastAiPlugin::with_registry("/bin/sh", &registry_path, runtime);
-        assert_eq!(
-            final_restart.list_managed_refs().unwrap(),
-            [
-                "mock-vastai-5-1-attempt-11",
-                "mock-vastai-5-3-attempt-11",
-                "mock-vastai-5-4-attempt-11",
-            ]
-        );
-        for node_id in [1, 3, 4] {
-            let adopted = final_restart
-                .adopt_by_spec(&make_spec(node_id), sink.clone())
-                .unwrap()
-                .expect("surviving mock process");
-            final_restart.stop_node(&adopted.handle).unwrap();
-        }
         let _ = fs::remove_file(registry_path);
     }
 

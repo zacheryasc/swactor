@@ -180,7 +180,7 @@ enum ReconciledJobPhase {
         deadline: Instant,
         worker: NodeIdentity,
     },
-    Running(JobRunStateMachine),
+    Running(Box<JobRunStateMachine>),
     Stopping {
         result: Result<JobDone, String>,
     },
@@ -291,9 +291,9 @@ impl ActorInterface for ReconciledJobActor {
                         Err(error) => self.begin_stop(Err(error)),
                     }
                 } else if Instant::now() >= deadline {
-                    self.begin_stop(Err(format!(
-                        "timed out waiting for reconciled job worker identity"
-                    )));
+                    self.begin_stop(Err(
+                        "timed out waiting for reconciled job worker identity".to_string()
+                    ));
                 } else {
                     self.phase = ReconciledJobPhase::Provisioning { deadline };
                 }
@@ -313,7 +313,7 @@ impl ActorInterface for ReconciledJobActor {
                     match machine {
                         Ok(mut machine) => {
                             machine.start(Instant::now());
-                            self.phase = ReconciledJobPhase::Running(machine);
+                            self.phase = ReconciledJobPhase::Running(Box::new(machine));
                         }
                         Err(error) => self.begin_stop(Err(error)),
                     }
@@ -382,14 +382,16 @@ fn build_vastai_provisioner(
         ssh_public_key_fingerprint(&public_key)
     );
 
-    let mut config = VastAiProvisioningConfig::default();
-    config.label_prefix = options.label_prefix.clone();
-    config.disk_gb = options.disk_gb;
-    config.ssh_user = options.ssh_user.clone();
-    config.confirm_lease = options.confirm_lease;
-    config.onstart = options.onstart.clone();
-    config.ssh_public_key = Some(public_key);
-    config.selection = selection_policy(options);
+    let mut config = VastAiProvisioningConfig {
+        label_prefix: options.label_prefix.clone(),
+        disk_gb: options.disk_gb,
+        ssh_user: options.ssh_user.clone(),
+        confirm_lease: options.confirm_lease,
+        onstart: options.onstart.clone(),
+        ssh_public_key: Some(public_key),
+        selection: selection_policy(options),
+        ..VastAiProvisioningConfig::default()
+    };
     if let Some(poll_interval) = options.poll_interval {
         config.lifecycle.poll_interval = poll_interval;
     }
@@ -502,8 +504,10 @@ fn build_cluster(
             },
         }],
     };
-    let mut retry = RetryPolicy::default();
-    retry.operation_timeout = options.provision_timeout;
+    let retry = RetryPolicy {
+        operation_timeout: options.provision_timeout,
+        ..RetryPolicy::default()
+    };
     ProvisionedClusterGuard::new(
         desired,
         vec![ReconcilerNodeBinding {

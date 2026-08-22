@@ -4,7 +4,7 @@
 //! releases", "ambiguous create adopts", and "converged leaks nothing"
 //! are verified by counting actual live PIDs.
 
-mod common;
+pub mod common;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::process::{Child, Command};

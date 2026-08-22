@@ -7,8 +7,10 @@
 
 pub mod arena;
 pub mod blob;
+pub mod blob_transfer;
 pub mod bootstrap;
 pub mod byte_ring;
+pub mod control;
 pub mod data_plane;
 pub mod edge_lifecycle;
 pub mod edge_runtime;
@@ -16,7 +18,10 @@ pub mod edge_wire;
 pub mod host;
 pub mod ids;
 pub mod mapped_arena;
+pub mod namespace;
+pub mod namespace_store;
 pub mod object_record;
 pub mod path;
 pub mod protocol;
 pub mod ring;
+pub mod source;

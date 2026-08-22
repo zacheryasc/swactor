@@ -84,15 +84,15 @@ fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
         engine.handle(),
     );
 
-    driver.enable_actor_bridge(
-        stack.runtime.clone(),
-        stack.codec.clone(),
-        stack.actor_bridge_routes(),
-        stack.actors.swim,
-        stack.relay_mirror.clone(),
-        stack.route_view.clone(),
-        stack.outbox.clone(),
-    );
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: stack.runtime.clone(),
+        codec: stack.codec.clone(),
+        routes: stack.actor_bridge_routes(),
+        swim: stack.actors.swim,
+        relay_mirror: stack.relay_mirror.clone(),
+        route_view: stack.route_view.clone(),
+        outbox: stack.outbox.clone(),
+    });
     // Engine-hosted protocol tick injection + adapter progression — no manual
     // pump is wired anywhere.
     stack.spawn_protocol_ticker(PROBE_TICK);
@@ -156,8 +156,10 @@ fn dashboard_server_is_scheduled_through_the_engine() {
         .port();
 
     let (engine, _driver, _stack) = build_composition();
-    let mut config = dashboard::DashboardConfig::default();
-    config.port = free_port;
+    let config = dashboard::DashboardConfig {
+        port: free_port,
+        ..dashboard::DashboardConfig::default()
+    };
     let handle = dashboard::DashboardHandle::new(config);
     handle.spawn(&engine.handle());
 

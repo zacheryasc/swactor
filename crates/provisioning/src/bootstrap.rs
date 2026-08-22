@@ -254,8 +254,8 @@ impl BootstrapActor {
                 // An exit before the join signal is a failed attempt.
                 LogicProbe::Exited(reason) => self.fail(format!("node process exited: {reason}")),
             },
-            Phase::Ready | Phase::Stopping => match self.logic.probe(now) {
-                LogicProbe::Exited(reason) => {
+            Phase::Ready | Phase::Stopping => {
+                if let LogicProbe::Exited(reason) = self.logic.probe(now) {
                     if self.phase == Phase::Stopping && !self.announced {
                         // Stopped before it ever joined: failed attempt.
                         self.fail(format!("stopped before join: {reason}"));
@@ -263,8 +263,7 @@ impl BootstrapActor {
                         self.exit(reason);
                     }
                 }
-                _ => {}
-            },
+            }
         }
     }
 

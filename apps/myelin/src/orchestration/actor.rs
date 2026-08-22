@@ -139,10 +139,10 @@ pub(crate) enum RunCommandWire {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LifecycleEventWire {
-    RunFaulted { run_id: u64 },
-    RunCompleted { run_id: u64 },
-    RunOperatorStopped { run_id: u64 },
-    RunTornDown { run_id: u64 },
+    Faulted { run_id: u64 },
+    Completed { run_id: u64 },
+    OperatorStopped { run_id: u64 },
+    TornDown { run_id: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,16 +512,12 @@ impl From<&core::RunCommand> for RunCommandWire {
 impl From<&core::LifecycleEvent> for LifecycleEventWire {
     fn from(event: &core::LifecycleEvent) -> Self {
         match event {
-            core::LifecycleEvent::RunFaulted { run_id, .. } => {
-                Self::RunFaulted { run_id: run_id.0 }
+            core::LifecycleEvent::Faulted { run_id, .. } => Self::Faulted { run_id: run_id.0 },
+            core::LifecycleEvent::Completed { run_id } => Self::Completed { run_id: run_id.0 },
+            core::LifecycleEvent::OperatorStopped { run_id } => {
+                Self::OperatorStopped { run_id: run_id.0 }
             }
-            core::LifecycleEvent::RunCompleted { run_id } => {
-                Self::RunCompleted { run_id: run_id.0 }
-            }
-            core::LifecycleEvent::RunOperatorStopped { run_id } => {
-                Self::RunOperatorStopped { run_id: run_id.0 }
-            }
-            core::LifecycleEvent::RunTornDown { run_id } => Self::RunTornDown { run_id: run_id.0 },
+            core::LifecycleEvent::TornDown { run_id } => Self::TornDown { run_id: run_id.0 },
         }
     }
 }

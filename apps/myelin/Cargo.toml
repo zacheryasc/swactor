@@ -10,7 +10,6 @@ autobins = false
 [features]
 default = ["dashboard"]
 dashboard = []
-test-support = ["swactor-vastai/test-support"]
 
 [dependencies]
 telemetry = { path = "../../crates/telemetry" }
@@ -41,10 +40,6 @@ tempfile = "3"
 swactor-vastai = { path = "../../tools/vastai", features = ["test-support"] }
 proptest = "1"
 
-[[test]]
-name = "stateful_vastai"
-path = "tests/stateful_vastai.rs"
-required-features = ["test-support"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -65,3 +60,6 @@ path = "src/bin/job_worker.rs"
 name = "myelin-job"
 path = "src/bin/job.rs"
 
+
+[lints]
+workspace = true

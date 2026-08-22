@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId as ArenaNodeId};
-use data_plane::blob::{BlobMetadata, ContentDigest};
+use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
 use data_plane::bootstrap::{self, BootstrapSpec, ENV_DATA_PLANE_ENDPOINT, JobHandoff};
 use data_plane::host::{
-    BlobSource, HostDataPlaneConfig, HostDataPlaneSessionActor, HostRouteRegistrar,
-    install_session_env,
+    HostDataPlaneConfig, HostDataPlaneSessionActor, HostRouteRegistrar, install_session_env,
 };
-use data_plane::path::{DataPath, JobContext};
+use data_plane::namespace::NamespaceClient;
+use data_plane::path::JobContext;
 use data_plane::protocol::JobCapability;
+use data_plane::source::BlobSourcePublisher;
 use distribution::transport_bridge::{OutboxRouteBinder, RouteBinder, RouteView};
 use distribution::types::NodeId;
 use swactor::actor::ActorAddress;
@@ -78,17 +79,33 @@ pub(crate) struct ActorJobDataPlane {
     runtime: Runtime,
 }
 
+pub(crate) struct ActorJobDataPlaneConfig {
+    pub(crate) arena_bytes: u64,
+    pub(crate) arena_generation: u64,
+    pub(crate) session_generation: u64,
+    pub(crate) capability: JobCapability,
+    pub(crate) job_context: JobContext,
+    pub(crate) namespace: Option<NamespaceClient>,
+    pub(crate) transfer_receiver: Option<Arc<dyn BlobTransferReceiver>>,
+    pub(crate) source_sender: Option<Arc<dyn BlobTransferSender>>,
+    pub(crate) source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
+    pub(crate) route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
+}
+
 impl ActorJobDataPlane {
-    pub(crate) fn new(
-        runtime: &Runtime,
-        arena_bytes: u64,
-        arena_generation: u64,
-        session_generation: u64,
-        capability: JobCapability,
-        job_context: JobContext,
-        blobs: BTreeMap<DataPath, BlobSource>,
-        route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(runtime: &Runtime, config: ActorJobDataPlaneConfig) -> Result<Self, String> {
+        let ActorJobDataPlaneConfig {
+            arena_bytes,
+            arena_generation,
+            session_generation,
+            capability,
+            job_context,
+            namespace,
+            transfer_receiver,
+            source_sender,
+            source_publisher,
+            route_registrar,
+        } = config;
         let mut arena = ArenaManager::boot(ArenaConfig {
             node_id: ArenaNodeId(1),
             reservation_ceiling: arena_bytes,
@@ -106,12 +123,16 @@ impl ActorJobDataPlane {
         let host_session = runtime
             .spawn(
                 HostDataPlaneSessionActor::new(HostDataPlaneConfig {
+                    runtime: runtime.clone(),
                     arena,
                     arena_generation,
                     session_generation,
                     capability,
                     job_context,
-                    blobs,
+                    namespace,
+                    transfer_receiver,
+                    source_sender,
+                    source_publisher,
                     route_registrar,
                 })
                 .map_err(|error| format!("configure host data-plane session: {error}"))?,
@@ -141,55 +162,6 @@ impl ActorJobDataPlane {
         })
     }
 
-    pub(crate) fn begin_blob_source(
-        &self,
-        path: DataPath,
-        length: u64,
-        digest: Option<ContentDigest>,
-    ) -> Result<(), String> {
-        futures_lite::future::block_on(async {
-            self.runtime
-                .ask::<data_plane::protocol::HostSessionIn, Result<(), data_plane::protocol::DataPlaneError>>(
-                    self.host_session,
-                    |reply_to| data_plane::protocol::HostSessionIn::BeginBlobSource {
-                        path,
-                        metadata: BlobMetadata { length, digest },
-                        reply_to,
-                    },
-                )
-                .map_err(|error| format!("begin data-plane blob source: {error}"))?
-                .await
-                .map_err(|error| format!("begin data-plane blob source: {error}"))
-        })
-    }
-
-    pub(crate) fn push_blob_chunk(&self, path: DataPath, bytes: Vec<u8>) -> Result<(), String> {
-        self.runtime
-            .send_to(
-                self.host_session,
-                data_plane::protocol::HostSessionIn::BlobSourceChunk { path, bytes },
-            )
-            .map_err(|error| format!("publish data-plane blob chunk: {error}"))
-    }
-
-    pub(crate) fn finish_blob_source(&self, path: DataPath) -> Result<(), String> {
-        self.runtime
-            .send_to(
-                self.host_session,
-                data_plane::protocol::HostSessionIn::FinishBlobSource { path },
-            )
-            .map_err(|error| format!("finish data-plane blob source: {error}"))
-    }
-
-    pub(crate) fn fail_blob_source(&self, path: DataPath, reason: String) -> Result<(), String> {
-        self.runtime
-            .send_to(
-                self.host_session,
-                data_plane::protocol::HostSessionIn::FailBlobSource { path, reason },
-            )
-            .map_err(|error| format!("fault data-plane blob source: {error}"))
-    }
-
     pub(crate) fn close(&self) {
         let _ = self.runtime.send_to(
             self.host_session,
@@ -204,11 +176,6 @@ impl ActorJobDataPlane {
             host_endpoint_json.to_owned(),
         );
         env
-    }
-
-    #[cfg(test)]
-    pub(crate) fn host_session(&self) -> ActorAddress {
-        self.host_session
     }
 
     #[cfg(test)]

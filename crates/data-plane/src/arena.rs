@@ -345,10 +345,10 @@ impl ArenaManager {
             }];
         }
 
-        if self.pending.is_empty() {
-            if let Some(lease) = self.try_allocate(&request) {
-                return vec![ArenaEvent::RingLeased { lease }];
-            }
+        if self.pending.is_empty()
+            && let Some(lease) = self.try_allocate(&request)
+        {
+            return vec![ArenaEvent::RingLeased { lease }];
         }
 
         let request_id = request.request_id;
@@ -517,11 +517,11 @@ impl ArenaManager {
             if range.start == range.end {
                 continue;
             }
-            if let Some(last) = coalesced.last_mut() {
-                if range.start <= last.end {
-                    last.end = last.end.max(range.end);
-                    continue;
-                }
+            if let Some(last) = coalesced.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+                continue;
             }
             coalesced.push(range);
         }

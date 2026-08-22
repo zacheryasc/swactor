@@ -126,9 +126,9 @@ def test_run_attaches_before_main_and_maps_blob_buffer_directly(monkeypatch, hos
         blob = await ctx.data.read_blob("/models/tiny-linear/weights")
         assert isinstance(blob, swactor.Blob)
         assert blob.length == 24
-        assert len(blob.digest) == 64
+        assert blob.digest is None
         with blob.map() as mapped:
-            assert isinstance(mapped, swactor.ArenaView)
+            assert isinstance(mapped, swactor.BlobView)
             assert struct.unpack_from("<6f", mapped) == pytest.approx(
                 (1.5, -2.0, 0.5, 4.0, 0.25, -0.75)
             )
@@ -194,9 +194,13 @@ def test_write_blob_seals_cleanly_and_exception_aborts(monkeypatch, host):
         except AbortWrite:
             pass
 
+        complete = await ctx.data.read_blob("/runs/self/results/complete")
+        with complete.map() as mapped:
+            assert bytes(mapped) == b"result"
+        with pytest.raises(swactor.DataPathError, match="not found"):
+            await ctx.data.read_blob("/runs/self/results/aborted")
+
     swactor.run(main)
-    assert bytes(host.published("/runs/self/results/complete")) == b"result"
-    assert host.published("/runs/self/results/aborted") is None
 
 
 def test_missing_path_and_authorization_are_typed(monkeypatch, host):
@@ -206,7 +210,7 @@ def test_missing_path_and_authorization_are_typed(monkeypatch, host):
         with pytest.raises(swactor.DataPathError, match="not found"):
             await ctx.data.read_blob("/models/missing")
         with pytest.raises(PermissionError):
-            await ctx.data.read_blob("/runs/self/results/private")
+            await ctx.data.read_blob("/runs/self/private")
 
     swactor.run(main)
 

@@ -12,16 +12,16 @@ use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
 use crate::codecs::register_myelin_actor_codecs;
 use crate::observability::frame_collector::FrameCollector;
 use crate::observability::orch_telemetry::{
-    DashboardSupport, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
+    BootstrapEmission, DashboardSupport, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
 };
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 use crate::orchestration::control;
 use crate::orchestration::daemon;
 use crate::orchestration::manual_control::{
-    CONTROL_REGISTRY_NAME, ConfigValidator, ManualActorControl, ManualControl, ManualControlMsg,
-    ManualControlReply, NodePhase, OfferDto, OfferSearchRequest, OfferSearcher,
-    ProviderConfigurationRequest, ProviderFactory, ProviderReadiness, SpecBuilder,
+    CONTROL_REGISTRY_NAME, ConfigValidator, ManualActorControl, ManualActorControlConfig,
+    ManualControl, ManualControlMsg, ManualControlReply, NodePhase, OfferDto, OfferSearchRequest,
+    OfferSearcher, ProviderConfigurationRequest, ProviderFactory, ProviderReadiness, SpecBuilder,
 };
 use swactor_job_runner::{JobDone, OrchestratorJobActor};
 
@@ -69,6 +69,154 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEMETRY_FRAME_LOG_ENV: &str = "MYELIN_TELEMETRY_FRAME_LOG";
 
+fn sample_orchestrator_cpu(
+    mut sampler: telemetry::hardware::cpu::CpuSampler,
+    seq: u64,
+) -> (
+    telemetry::hardware::cpu::CpuSampler,
+    telemetry::hardware::cpu::HostCpuSample,
+) {
+    let sample = sampler.sample(seq);
+    (sampler, sample)
+}
+
+fn sample_orchestrator_gpu((): (), seq: u64) -> ((), telemetry::hardware::gpu::HostGpuSample) {
+    ((), telemetry::hardware::gpu::sample(seq))
+}
+
+fn sample_orchestrator_memory(
+    (): (),
+    seq: u64,
+) -> ((), telemetry::hardware::memory::HostMemorySample) {
+    ((), telemetry::hardware::memory::sample(seq))
+}
+
+fn sample_orchestrator_net((): (), seq: u64) -> ((), telemetry::hardware::net::HostNetSample) {
+    ((), telemetry::hardware::net::sample(seq))
+}
+
+fn sample_orchestrator_storage(
+    (): (),
+    seq: u64,
+) -> ((), telemetry::hardware::storage::HostStorageSample) {
+    ((), telemetry::hardware::storage::sample(seq))
+}
+
+fn spawn_orchestrator_hardware_samplers(engine: &EngineHandle, telemetry: &mut OrchTelemetry) {
+    let cpu_channel = telemetry.record_channel::<telemetry::hardware::cpu::HostCpuSample>();
+    let cpu_producer = telemetry.producer();
+    telemetry::hardware::spawn_blocking_sampler(
+        engine.clone(),
+        telemetry::hardware::cpu::CPU_SAMPLE_INTERVAL,
+        telemetry::hardware::cpu::CpuSampler::new([std::process::id()]),
+        sample_orchestrator_cpu,
+        || {},
+        move |_, sample| {
+            cpu_producer.submit_record(cpu_channel, &sample);
+        },
+    );
+
+    let gpu_channel = telemetry.record_channel::<telemetry::hardware::gpu::HostGpuSample>();
+    let gpu_producer = telemetry.producer();
+    telemetry::hardware::spawn_blocking_sampler(
+        engine.clone(),
+        telemetry::hardware::gpu::GPU_SAMPLE_INTERVAL,
+        (),
+        sample_orchestrator_gpu,
+        || {},
+        move |_, sample| {
+            gpu_producer.submit_record(gpu_channel, &sample);
+        },
+    );
+
+    let memory_channel =
+        telemetry.record_channel::<telemetry::hardware::memory::HostMemorySample>();
+    let memory_producer = telemetry.producer();
+    telemetry::hardware::spawn_blocking_sampler(
+        engine.clone(),
+        telemetry::hardware::memory::MEMORY_SAMPLE_INTERVAL,
+        (),
+        sample_orchestrator_memory,
+        || {},
+        move |_, sample| {
+            memory_producer.submit_record(memory_channel, &sample);
+        },
+    );
+
+    let net_channel = telemetry.record_channel::<telemetry::hardware::net::HostNetSample>();
+    let net_producer = telemetry.producer();
+    telemetry::hardware::spawn_blocking_sampler(
+        engine.clone(),
+        telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
+        (),
+        sample_orchestrator_net,
+        || {},
+        move |_, sample| {
+            net_producer.submit_record(net_channel, &sample);
+        },
+    );
+
+    let storage_channel =
+        telemetry.record_channel::<telemetry::hardware::storage::HostStorageSample>();
+    let storage_producer = telemetry.producer();
+    telemetry::hardware::spawn_blocking_sampler(
+        engine.clone(),
+        telemetry::hardware::storage::STORAGE_SAMPLE_INTERVAL,
+        (),
+        sample_orchestrator_storage,
+        || {},
+        move |_, sample| {
+            storage_producer.submit_record(storage_channel, &sample);
+        },
+    );
+}
+
+#[cfg(test)]
+mod hardware_telemetry_tests {
+    use std::time::{Duration, Instant};
+
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::RuntimeParts;
+
+    use super::*;
+
+    #[test]
+    fn orchestrator_emits_all_host_hardware_channels() {
+        let frame_log = tempfile::NamedTempFile::new().expect("frame log");
+        let mut telemetry =
+            OrchTelemetry::new(1, Some(frame_log.path())).expect("orchestrator telemetry");
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+        )
+        .expect("engine");
+        spawn_orchestrator_hardware_samplers(&engine.handle(), &mut telemetry);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            telemetry.flush(None, "test");
+            let frames = std::fs::read_to_string(frame_log.path()).expect("read frame log");
+            if [
+                "host.cpu",
+                "host.gpu",
+                "host.memory",
+                "host.net",
+                "host.storage",
+            ]
+            .iter()
+            .all(|channel| frames.contains(&format!(r#""channel":"{channel}""#)))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orchestrator hardware channels were incomplete: {frames}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 pub(crate) fn run_with_options<I>(
     args: I,
     capture_stdio: bool,
@@ -86,6 +234,7 @@ where
         .overlay_cli(args)?
         .finalize()?;
     let state_dir = daemon::StateDir::new(config.state_dir.clone());
+    let data_namespace_path = config.state_dir.join("data-namespace.json");
     if config.reset_state {
         state_dir.reset()?;
     }
@@ -224,6 +373,7 @@ where
             return Err(format!("create engine: {error}"));
         }
     };
+    spawn_orchestrator_hardware_samplers(&engine.handle(), &mut orch_telemetry);
     let mut driver = match IrohDriver::with_engine(
         engine.handle(),
         IrohDriverConfig {
@@ -295,15 +445,28 @@ where
         "ready",
         json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
     );
-    driver.enable_actor_bridge(
-        stack.runtime.clone(),
-        stack.codec.clone(),
-        stack.actor_bridge_routes(),
-        stack.actors.swim,
-        stack.relay_mirror.clone(),
-        stack.route_view.clone(),
-        stack.outbox.clone(),
-    );
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: stack.runtime.clone(),
+        codec: stack.codec.clone(),
+        routes: stack.actor_bridge_routes(),
+        swim: stack.actors.swim,
+        relay_mirror: stack.relay_mirror.clone(),
+        route_view: stack.route_view.clone(),
+        outbox: stack.outbox.clone(),
+    });
+    let data_namespace =
+        crate::data_namespace::DataNamespaceAuthority::start(&stack, &driver, data_namespace_path)?;
+    let tiny_linear_weights = std::env::var_os("MYELIN_TINY_LINEAR_WEIGHTS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("apps/myelin/jobs/tiny_linear.weights"));
+    futures_lite::future::block_on(
+        data_namespace.control().ensure(
+            data_plane::path::DataPath::parse("/models/tiny-linear/weights")
+                .expect("static tiny-linear data path"),
+            data_plane::blob::file(tiny_linear_weights),
+        ),
+    )
+    .map_err(|error| format!("register tiny-linear weights: {error}"))?;
     let recovery_nodes = snapshot
         .nodes
         .iter()
@@ -508,13 +671,15 @@ where
         ManualControl::new(snapshot, readiness),
         stack.runtime.clone(),
         stack.engine.blocking_work_sender(),
-        state_dir,
-        sink,
-        provider_factory,
-        spec_builder,
-        Some(config_validator),
-        offer_searcher,
-        daemon::unix_ms_now(),
+        ManualActorControlConfig {
+            state_dir,
+            sink,
+            provider_factory,
+            spec_builder,
+            config_validator: Some(config_validator),
+            offer_searcher,
+            control_generation: daemon::unix_ms_now(),
+        },
     );
     let orchestrator_actor = match stack.runtime.spawn(
         OrchestratorActor::new(
@@ -1476,10 +1641,11 @@ impl ConfigBuilder {
             });
         let provider_name = provider.as_str();
         let mut image = self.image.clone();
-        if provider_name == "vastai" && !self.image_overridden_after_toml {
-            if let Some(vastai_image) = &self.toml_vastai_image {
-                image = vastai_image.clone();
-            }
+        if provider_name == "vastai"
+            && !self.image_overridden_after_toml
+            && let Some(vastai_image) = &self.toml_vastai_image
+        {
+            image = vastai_image.clone();
         }
         if self.pipeline_stages == 0 {
             return Err("--pipeline-stages must be greater than 0".to_owned());
@@ -2367,6 +2533,8 @@ impl ServeClusterActor {
             }
             telemetry.archive_frame("node", stream, channel, frame);
         });
+        self.orch_telemetry
+            .flush(self.dashboard.as_ref(), "orchestrator");
         self.drain_observations();
         while let Some(report) = self.orchestrator_reports.try_recv() {
             self.observe_report(report);
@@ -2587,14 +2755,14 @@ fn emit_swim_transitions(
         let last_ack_age_ms = transition.last_ack_age.map(duration_ms_u64);
         let consecutive_timeouts = transition.consecutive_timeouts;
         let recent_probe_targets = stack.swim_recent_probe_targets();
-        orch_telemetry.emit_bootstrap_to_channel(
+        orch_telemetry.emit_bootstrap_to_channel(BootstrapEmission {
             dashboard,
-            MYELIN_SWIM_MEMBERSHIP,
+            channel: MYELIN_SWIM_MEMBERSHIP,
             run_id,
             node_id,
-            "membership_transition",
-            "observed",
-            json!({
+            phase: "membership_transition",
+            status: "observed",
+            detail: json!({
                 "peer":peer.clone(),
                 "from":from.clone(),
                 "to":to.clone(),
@@ -2604,7 +2772,7 @@ fn emit_swim_transitions(
                 "recent_probe_targets":recent_probe_targets.clone(),
                 "member_state":member_state.clone(),
             }),
-        );
+        });
         orch_telemetry.emit_record(dashboard, &stack.membership_transition(transition));
     }
     transitions
@@ -2656,7 +2824,7 @@ pub(crate) fn expand_home_path(value: &str) -> Result<PathBuf, String> {
 
 pub(crate) fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
     let output = swactor_process::command_output(
-        &mut Command::new("ssh-keygen").arg("-y").arg("-f").arg(identity),
+        Command::new("ssh-keygen").arg("-y").arg("-f").arg(identity),
     )
     .map_err(|e| {
         format!(
@@ -2685,10 +2853,9 @@ pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
     if std::fs::write(&path, format!("{public_key}\n")).is_err() {
         return UNAVAILABLE.to_owned();
     }
-    let output = swactor_process::command_output(
-        &mut Command::new("ssh-keygen").arg("-l").arg("-f").arg(&path),
-    )
-    .ok();
+    let output =
+        swactor_process::command_output(Command::new("ssh-keygen").arg("-l").arg("-f").arg(&path))
+            .ok();
     let _ = std::fs::remove_file(&path);
     let Some(output) = output.filter(|output| output.status.success()) else {
         return UNAVAILABLE.to_owned();
@@ -2704,7 +2871,7 @@ pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
 }
 
 fn vastai_account_has_ssh_key(api_key: &str, public_key: &str) -> Result<bool, String> {
-    let output = swactor_process::command_output(&mut Command::new("vastai").args([
+    let output = swactor_process::command_output(Command::new("vastai").args([
         "show",
         "ssh-keys",
         "--raw",
@@ -2730,7 +2897,7 @@ pub(crate) fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> 
     }
 
     let output = swactor_process::command_output(
-        &mut Command::new("vastai")
+        Command::new("vastai")
             .args(["create", "ssh-key"])
             .arg(public_key)
             .args(["-y", "--api-key", api_key]),
@@ -3347,9 +3514,10 @@ mod serve_cluster_properties {
         fn serve_cluster_production_transitions_converge_once_without_growth(
             actions in lifecycle_actions()
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");

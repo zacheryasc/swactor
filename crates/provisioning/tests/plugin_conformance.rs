@@ -3,7 +3,7 @@
 //! `PluginBackendAdapter` — one conformance level below the fake
 //! backend, still without leaving the crate.
 
-mod common;
+pub mod common;
 
 use common::{FakePlugin, PluginBackendAdapter, assert_plugin_contracts, run_trace_battery};
 

@@ -517,13 +517,11 @@ impl EdgeEstablisherState {
         let worker_ring_cleanup_required = record.worker_ring_cleanup_required();
         record.state = EdgeProvisionState::Stopping;
 
-        if cancel_lease {
-            if let Some(request_id) = request_id {
-                self.commands.push(EdgeCommand::CancelQueuedLease {
-                    request_id,
-                    edge_id,
-                });
-            }
+        if cancel_lease && let Some(request_id) = request_id {
+            self.commands.push(EdgeCommand::CancelQueuedLease {
+                request_id,
+                edge_id,
+            });
         }
 
         let Some(ring_id) = ring_id else {

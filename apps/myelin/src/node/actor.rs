@@ -129,7 +129,7 @@ impl StageProvisionWire {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum NodeAgentMsg {
-    ProvisionStage(StageProvisionWire),
+    ProvisionStage(Box<StageProvisionWire>),
     MarkWorkerReady,
     RuntimeLoaded {
         run_id: u64,
@@ -296,7 +296,7 @@ pub(crate) enum StageLifecycleWire {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum NodeAgentReport {
-    Command(StageCommandWire),
+    Command(Box<StageCommandWire>),
     Lifecycle(StageLifecycleWire),
     PromptRequested {
         request_id: u64,
@@ -455,7 +455,7 @@ impl NodeAgentActor {
             NodeAgentMsg::ProvisionStage(provision) => {
                 self.core.observe(stage::StageEvent::ProvisionStage {
                     from: stage::NodeId(provision.authorized_orchestrator),
-                    provision: provision.to_core(),
+                    provision: Box::new(provision.to_core()),
                 });
                 self.inbound_edge = provision.inbound_edge;
                 self.outbound_edge = provision.outbound_edge;
@@ -615,7 +615,10 @@ impl NodeAgentActor {
 
     fn drain_outputs(&mut self, ctx: &Ctx) {
         for command in &self.core.commands()[self.command_cursor..] {
-            self.report(ctx, NodeAgentReport::Command(self.command_wire(command)));
+            self.report(
+                ctx,
+                NodeAgentReport::Command(Box::new(self.command_wire(command))),
+            );
         }
         self.command_cursor = self.core.commands().len();
 
@@ -741,7 +744,7 @@ impl From<&stage::StageCommand> for StageCommandWire {
                 tokenizer: source.tokenizer.clone(),
                 layer_start: range.start,
                 layer_end_exclusive: range.end_exclusive,
-                stage_shard_plan: shard_plan.clone(),
+                stage_shard_plan: shard_plan.as_ref().clone(),
             },
             stage::StageCommand::ExecuteStep(step) => Self::ExecuteStep {
                 step_id: step.step_id.0,

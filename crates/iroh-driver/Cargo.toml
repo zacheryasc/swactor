@@ -27,3 +27,6 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 iroh-relay = { version = "0.98", features = ["server", "test-utils"] }
+
+[lints]
+workspace = true

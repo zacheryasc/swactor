@@ -13,8 +13,8 @@ use swactor::actor::Message;
 use swactor::runtime::Inbox;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use swactor_job_runner::{
-    register_job_codecs, Job, JobDone, JobState, NodeJobActor, OrchestratorJobActor,
-    OrchestratorJobMsg, Workspace,
+    Job, JobDone, JobState, NodeJobActor, OrchestratorJobActor, OrchestratorJobMsg, Workspace,
+    register_job_codecs,
 };
 
 use distribution::node::DistributedNodeConfig;
@@ -41,9 +41,12 @@ fn recv_within<T: Message>(inbox: &Inbox<T>, deadline: Duration) -> Option<T> {
 
 fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
     let (parts, runtime, codec, transport_router) =
-        DistributionRuntimeStack::build_runtime(|c| register_job_codecs(c), None);
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).expect("tokio backend"))
-        .expect("engine");
+        DistributionRuntimeStack::build_runtime(register_job_codecs, None);
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+    )
+    .expect("engine");
     let mut driver = IrohDriver::with_engine(
         engine.handle(),
         IrohDriverConfig {
@@ -63,15 +66,15 @@ fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
         DistributedNodeConfig::default(),
         engine.handle(),
     );
-    driver.enable_actor_bridge(
-        stack.runtime.clone(),
-        stack.codec.clone(),
-        stack.actor_bridge_routes(),
-        stack.actors.swim,
-        stack.relay_mirror.clone(),
-        stack.route_view.clone(),
-        stack.outbox.clone(),
-    );
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: stack.runtime.clone(),
+        codec: stack.codec.clone(),
+        routes: stack.actor_bridge_routes(),
+        swim: stack.actors.swim,
+        relay_mirror: stack.relay_mirror.clone(),
+        route_view: stack.route_view.clone(),
+        outbox: stack.outbox.clone(),
+    });
     stack.spawn_protocol_ticker(POLL);
     driver.install_actor_bridge_pump(POLL);
     (engine, driver, stack)
@@ -90,17 +93,28 @@ fn job_runs_through_swactor_inside_myelin_composition() {
 
     let done = runtime.new_inbox::<JobDone>().expect("done inbox");
     let orch = runtime
-        .spawn(OrchestratorJobActor::new(*done.addr(), landing.path().to_path_buf()))
+        .spawn(OrchestratorJobActor::new(
+            *done.addr(),
+            landing.path().to_path_buf(),
+        ))
         .expect("spawn orchestrator");
     let node = runtime
-        .spawn(NodeJobActor::new(orch, node_workdir.path().to_path_buf(), sender, 0))
+        .spawn(NodeJobActor::new(
+            orch,
+            node_workdir.path().to_path_buf(),
+            sender,
+            0,
+        ))
         .expect("spawn node");
 
     let job = Job {
         name: "myelin-probe".to_owned(),
         setup: Some("echo setup-ok > setup_done.txt".to_owned()),
         run: "echo hello-from-myelin-swactor > greeting.txt".to_owned(),
-        workspace: Some(Workspace { workdir: ws.path().to_path_buf(), exclude: vec![] }),
+        workspace: Some(Workspace {
+            workdir: ws.path().to_path_buf(),
+            exclude: vec![],
+        }),
         outputs: vec![
             "greeting.txt".to_owned(),
             "setup_done.txt".to_owned(),
@@ -109,18 +123,36 @@ fn job_runs_through_swactor_inside_myelin_composition() {
         env: BTreeMap::new(),
     };
     runtime
-        .send_to(orch, OrchestratorJobMsg::Submit { job, node_actor: node })
+        .send_to(
+            orch,
+            OrchestratorJobMsg::Submit {
+                job,
+                node_actor: node,
+            },
+        )
         .expect("submit");
 
     let result = recv_within(&done, DEADLINE);
     drop(engine);
     let done = result.expect("job did not reach a terminal state");
-    assert_eq!(done.state, JobState::Completed, "expected COMPLETED, got {:?}", done);
+    assert_eq!(
+        done.state,
+        JobState::Completed,
+        "expected COMPLETED, got {:?}",
+        done
+    );
     assert_eq!(done.exit_code, Some(0));
 
     let greeting = std::fs::read_to_string(landing.path().join("greeting.txt"))
         .expect("collected greeting.txt");
-    assert!(greeting.contains("hello-from-myelin-swactor"), "greeting: {greeting}");
-    let seed = std::fs::read_to_string(landing.path().join("seed.txt")).expect("collected seed.txt");
-    assert_eq!(seed, "seed-value", "workspace materialized + collected through swactor");
+    assert!(
+        greeting.contains("hello-from-myelin-swactor"),
+        "greeting: {greeting}"
+    );
+    let seed =
+        std::fs::read_to_string(landing.path().join("seed.txt")).expect("collected seed.txt");
+    assert_eq!(
+        seed, "seed-value",
+        "workspace materialized + collected through swactor"
+    );
 }

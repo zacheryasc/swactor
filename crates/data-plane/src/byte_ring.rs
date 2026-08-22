@@ -27,29 +27,32 @@
 //! Properties a correct implementation must uphold (each defended in
 //! `tests/byte_ring_guarantees.rs`):
 //!
-//! - P1  exactly-once, in-order byte delivery across interleavings,
-//!       wake timings, and wraparound;
-//! - P2  unread bytes are never overwritten by the producer;
-//! - P3  single-writer cursor fields (SPSC), enforced by endpoint roles;
-//! - P4  data publication is release-ordered before `commit` advance,
-//!       and `consume` advance after reads (acquire);
-//! - P5  untrusted-header containment: arbitrary header bytes yield typed
-//!       errors or bounded access, never out-of-region access;
-//! - P6  (binding slice) Python performs ring operations via helpers only;
-//! - P7  backpressure: reserving beyond free space fails cleanly with the
-//!       exact free amount, and succeeds again once the peer consumes;
-//! - P8  (binding slice) no lost wakeups: signals follow publication;
-//! - P9  completion is explicit: `Data`/`Eof`/`Fault` records, `Eof` only
-//!       after all bytes, torn (uncommitted) records stay invisible;
+//! - P1 exactly-once, in-order byte delivery across interleavings,
+//!   wake timings, and wraparound;
+//! - P2 unread bytes are never overwritten by the producer;
+//! - P3 single-writer cursor fields (SPSC), enforced by endpoint roles;
+//! - P4 data publication is release-ordered before `commit` advance,
+//!   and `consume` advance after reads (acquire);
+//! - P5 untrusted-header containment: arbitrary header bytes yield typed
+//!   errors or bounded access, never out-of-region access;
+//! - P6 (binding slice) Python performs ring operations via helpers only;
+//! - P7 backpressure: reserving beyond free space fails cleanly with the
+//!   exact free amount, and succeeds again once the peer consumes;
+//! - P8 (binding slice) no lost wakeups: signals follow publication;
+//! - P9 completion is explicit: `Data`/`Eof`/`Fault` records, `Eof` only
+//!   after all bytes, torn (uncommitted) records stay invisible;
 //! - P10 generation fence: stale reservations and stale generations are
-//!       rejected, never applied;
+//!   rejected, never applied;
 //! - P11 (binding slice) fast path performs no syscalls;
 //! - P12 one copy per side per byte.
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{ArenaEvent, ArenaManager, ArenaRequest, LeaseRing, LeaseRequestId, RingLease, RingLeaseRejection, RingSpec};
+use crate::arena::{
+    ArenaEvent, ArenaManager, ArenaRequest, LeaseRequestId, LeaseRing, RingLease,
+    RingLeaseRejection, RingSpec,
+};
 
 /// `"SWRG"` read little-endian.
 pub const RING_MAGIC: u32 = u32::from_le_bytes(*b"SWRG");
@@ -97,7 +100,6 @@ pub enum Role {
     Producer,
     Consumer,
 }
-
 
 /// A reserved, not-yet-committed span of the data region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,19 +151,42 @@ pub enum InstallError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderError {
-    BadMagic { found: u32 },
-    UnsupportedVersion { found: u16, supported: u16 },
-    ReservedBytesNotZero { at: u64 },
-    CapacityMismatch { header: u64, handle: u64 },
-    GenerationMismatch { header: u64, handle: u64 },
-    CommitBelowConsume { commit: u64, consume: u64 },
-    ReadableExceedsCapacity { commit: u64, consume: u64, capacity: u64 },
+    BadMagic {
+        found: u32,
+    },
+    UnsupportedVersion {
+        found: u16,
+        supported: u16,
+    },
+    ReservedBytesNotZero {
+        at: u64,
+    },
+    CapacityMismatch {
+        header: u64,
+        handle: u64,
+    },
+    GenerationMismatch {
+        header: u64,
+        handle: u64,
+    },
+    CommitBelowConsume {
+        commit: u64,
+        consume: u64,
+    },
+    ReadableExceedsCapacity {
+        commit: u64,
+        consume: u64,
+        capacity: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachError {
     /// The handle itself points outside the arena.
-    OutOfBounds { end: u64, arena_len: u64 },
+    OutOfBounds {
+        end: u64,
+        arena_len: u64,
+    },
     Header(HeaderError),
 }
 
@@ -173,12 +198,24 @@ pub enum RecordError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlowError {
-    InsufficientSpace { requested: u64, free: u64 },
-    BeyondCommitted { requested: u64, readable: u64 },
+    InsufficientSpace {
+        requested: u64,
+        free: u64,
+    },
+    BeyondCommitted {
+        requested: u64,
+        readable: u64,
+    },
     /// The reservation's generation no longer matches the ring header.
-    StaleReservation { reservation: u64, ring: u64 },
+    StaleReservation {
+        reservation: u64,
+        ring: u64,
+    },
     /// Operation reserved for the other role (property P3).
-    RoleViolation { operation: &'static str, role: Role },
+    RoleViolation {
+        operation: &'static str,
+        role: Role,
+    },
     /// The header stopped validating mid-protocol (property P5).
     Corrupt(HeaderError),
     BadRecord(RecordError),
@@ -289,16 +326,16 @@ pub fn attach(
             arena_len: arena.arena_len(),
         })?;
 
-    let endpoint = Endpoint { header, info: handle, role };
-    endpoint
-        .validate_fixed()
-        .map_err(AttachError::Header)?;
+    let endpoint = Endpoint {
+        header,
+        info: handle,
+        role,
+    };
+    endpoint.validate_fixed().map_err(AttachError::Header)?;
     endpoint
         .validate_generation(handle.generation)
         .map_err(AttachError::Header)?;
-    endpoint
-        .validate_cursors()
-        .map_err(AttachError::Header)?;
+    endpoint.validate_cursors().map_err(AttachError::Header)?;
     Ok(endpoint)
 }
 
@@ -462,7 +499,11 @@ impl Endpoint {
         // SAFETY: as `copy_into`.
         unsafe {
             std::ptr::copy_nonoverlapping(self.data_ptr().add(start), bytes.as_mut_ptr(), first);
-            std::ptr::copy_nonoverlapping(self.data_ptr(), bytes.as_mut_ptr().add(first), len - first);
+            std::ptr::copy_nonoverlapping(
+                self.data_ptr(),
+                bytes.as_mut_ptr().add(first),
+                len - first,
+            );
         }
         bytes
     }
@@ -478,7 +519,10 @@ impl Endpoint {
         let used = commit - consume;
         let free = self.info.capacity - used;
         if len > free {
-            return Err(FlowError::InsufficientSpace { requested: len, free });
+            return Err(FlowError::InsufficientSpace {
+                requested: len,
+                free,
+            });
         }
         Ok(Reservation {
             start: commit,
@@ -492,7 +536,8 @@ impl Endpoint {
         self.check("write", Role::Producer)?;
         self.stale_check(reservation)?;
         assert_eq!(
-            reservation.len as usize, bytes.len(),
+            reservation.len as usize,
+            bytes.len(),
             "reservation length must match the payload"
         );
         self.copy_into(reservation.start, bytes);
@@ -539,7 +584,10 @@ impl Endpoint {
         let (commit, consume) = (self.commit_cursor(), self.consume_cursor());
         let readable = commit - consume;
         if len > readable {
-            return Err(FlowError::BeyondCommitted { requested: len, readable });
+            return Err(FlowError::BeyondCommitted {
+                requested: len,
+                readable,
+            });
         }
         Ok(self.copy_out(consume, len))
     }
@@ -550,7 +598,10 @@ impl Endpoint {
         let (commit, consume) = (self.commit_cursor(), self.consume_cursor());
         let readable = commit - consume;
         if len > readable {
-            return Err(FlowError::BeyondCommitted { requested: len, readable });
+            return Err(FlowError::BeyondCommitted {
+                requested: len,
+                readable,
+            });
         }
         self.atomic(OFF_CONSUME)
             .store(consume + len, Ordering::Release);

@@ -8,7 +8,7 @@
 //!
 //! Runs in the `iroh-driver` crate, where iroh support is always available.
 
-mod common;
+pub mod common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

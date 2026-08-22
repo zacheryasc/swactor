@@ -1871,13 +1871,14 @@ mod node_behavior {
                         sequence,
                         piggyback,
                     } => {
-                        if let Some(t) = self.index_of(to) {
-                            if t != origin && !excluded.contains(&t) {
-                                let from = self.ids[origin];
-                                let resp = self.nodes[t].handle_ping(from, sequence, &piggyback);
-                                self.record(t, &resp);
-                                self.route(t, resp, excluded);
-                            }
+                        if let Some(t) = self.index_of(to)
+                            && t != origin
+                            && !excluded.contains(&t)
+                        {
+                            let from = self.ids[origin];
+                            let resp = self.nodes[t].handle_ping(from, sequence, &piggyback);
+                            self.record(t, &resp);
+                            self.route(t, resp, excluded);
                         }
                     }
                     NodeAction::SendAck {
@@ -1885,13 +1886,14 @@ mod node_behavior {
                         sequence,
                         piggyback,
                     } => {
-                        if let Some(t) = self.index_of(to) {
-                            if t != origin && !excluded.contains(&t) {
-                                let from = self.ids[origin];
-                                let resp = self.nodes[t].handle_ack(from, sequence, &piggyback);
-                                self.record(t, &resp);
-                                self.route(t, resp, excluded);
-                            }
+                        if let Some(t) = self.index_of(to)
+                            && t != origin
+                            && !excluded.contains(&t)
+                        {
+                            let from = self.ids[origin];
+                            let resp = self.nodes[t].handle_ack(from, sequence, &piggyback);
+                            self.record(t, &resp);
+                            self.route(t, resp, excluded);
                         }
                     }
                     NodeAction::SendPingReq {
@@ -1900,14 +1902,15 @@ mod node_behavior {
                         sequence,
                         piggyback,
                     } => {
-                        if let Some(t) = self.index_of(relay) {
-                            if t != origin && !excluded.contains(&t) {
-                                let from = self.ids[origin];
-                                let resp = self.nodes[t]
-                                    .handle_ping_req(from, target, sequence, &piggyback);
-                                self.record(t, &resp);
-                                self.route(t, resp, excluded);
-                            }
+                        if let Some(t) = self.index_of(relay)
+                            && t != origin
+                            && !excluded.contains(&t)
+                        {
+                            let from = self.ids[origin];
+                            let resp =
+                                self.nodes[t].handle_ping_req(from, target, sequence, &piggyback);
+                            self.record(t, &resp);
+                            self.route(t, resp, excluded);
                         }
                     }
                     NodeAction::ForwardAck {
@@ -1916,22 +1919,24 @@ mod node_behavior {
                         sequence,
                         piggyback,
                     } => {
-                        if let Some(t) = self.index_of(to) {
-                            if t != origin && !excluded.contains(&t) {
-                                let resp =
-                                    self.nodes[t].handle_indirect_ack(target, sequence, &piggyback);
-                                self.record(t, &resp);
-                                self.route(t, resp, excluded);
-                            }
+                        if let Some(t) = self.index_of(to)
+                            && t != origin
+                            && !excluded.contains(&t)
+                        {
+                            let resp =
+                                self.nodes[t].handle_indirect_ack(target, sequence, &piggyback);
+                            self.record(t, &resp);
+                            self.route(t, resp, excluded);
                         }
                     }
                     NodeAction::SendJoinResponse { to, members } => {
-                        if let Some(t) = self.index_of(to) {
-                            if t != origin && !excluded.contains(&t) {
-                                let resp = self.nodes[t].handle_join_response(members);
-                                self.record(t, &resp);
-                                self.route(t, resp, excluded);
-                            }
+                        if let Some(t) = self.index_of(to)
+                            && t != origin
+                            && !excluded.contains(&t)
+                        {
+                            let resp = self.nodes[t].handle_join_response(members);
+                            self.record(t, &resp);
+                            self.route(t, resp, excluded);
                         }
                     }
                     NodeAction::MembershipChanged { .. } => {}

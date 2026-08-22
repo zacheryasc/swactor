@@ -100,25 +100,57 @@ pub struct AttemptResources {
 }
 
 // Ledger transitions retain effects inline to avoid a heap allocation per operation.
-#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LedgerState {
+    Running,
+    Queued,
+    Completed,
+}
+
 #[derive(Clone, Debug)]
-enum LedgerEntry {
-    Running(PlannedEffect),
-    Queued(PlannedEffect),
-    Completed {
-        effect: PlannedEffect,
-        result: ExecutorResult,
-    },
+struct LedgerEntry {
+    effect: PlannedEffect,
+    state: LedgerState,
+    result: Option<ExecutorResult>,
 }
 
 impl LedgerEntry {
-    fn effect(&self) -> &PlannedEffect {
-        match self {
-            Self::Running(effect) | Self::Queued(effect) | Self::Completed { effect, .. } => effect,
+    fn running(effect: PlannedEffect) -> Self {
+        Self {
+            effect,
+            state: LedgerState::Running,
+            result: None,
         }
     }
-}
 
+    fn queued(effect: PlannedEffect) -> Self {
+        Self {
+            effect,
+            state: LedgerState::Queued,
+            result: None,
+        }
+    }
+
+    fn completed(effect: PlannedEffect, result: ExecutorResult) -> Self {
+        Self {
+            effect,
+            state: LedgerState::Completed,
+            result: Some(result),
+        }
+    }
+
+    fn effect(&self) -> &PlannedEffect {
+        &self.effect
+    }
+
+    fn is_running(&self) -> bool {
+        self.state == LedgerState::Running
+    }
+
+    fn is_queued(&self) -> bool {
+        self.state == LedgerState::Queued
+    }
+}
 #[derive(Default)]
 struct ExecutorLedger {
     operations: BTreeMap<OperationId, LedgerEntry>,
@@ -179,10 +211,10 @@ where
     pub fn operation_status(&self, operation: OperationId) -> ExecutorOperationStatus {
         match lock_ledger(&self.ledger).operations.get(&operation) {
             None => ExecutorOperationStatus::Unknown,
-            Some(LedgerEntry::Running(_) | LedgerEntry::Queued(_)) => {
-                ExecutorOperationStatus::InFlight
+            Some(entry) if entry.state == LedgerState::Completed => {
+                ExecutorOperationStatus::Completed
             }
-            Some(LedgerEntry::Completed { .. }) => ExecutorOperationStatus::Completed,
+            Some(_) => ExecutorOperationStatus::InFlight,
         }
     }
 
@@ -193,21 +225,17 @@ where
         let result = {
             let mut ledger = lock_ledger(&self.ledger);
             let effect = match ledger.operations.get(&operation).cloned() {
-                Some(LedgerEntry::Running(effect) | LedgerEntry::Queued(effect)) => effect,
-                None | Some(LedgerEntry::Completed { .. }) => return false,
+                Some(entry) if entry.state != LedgerState::Completed => entry.effect,
+                None | Some(_) => return false,
             };
             let result = ExecutorResult {
                 node: effect.node.clone(),
                 operation,
                 result: Err(EffectError::ambiguous(reason)),
             };
-            ledger.operations.insert(
-                operation,
-                LedgerEntry::Completed {
-                    effect,
-                    result: result.clone(),
-                },
-            );
+            ledger
+                .operations
+                .insert(operation, LedgerEntry::completed(effect, result.clone()));
             if ledger.in_flight_by_attempt.get(&operation.attempt) == Some(&operation) {
                 ledger.in_flight_by_attempt.remove(&operation.attempt);
             }
@@ -238,13 +266,12 @@ where
                         effect.operation.attempt.0, effect.operation.sequence
                     )));
                 }
-                return match entry {
-                    LedgerEntry::Completed { result, .. } => {
-                        self.result_tx.send(result).map_err(|_| {
-                            ExecutorSubmitError::new("executor result receiver is closed")
-                        })
-                    }
-                    LedgerEntry::Running(_) | LedgerEntry::Queued(_) => Ok(()),
+                return if let Some(result) = entry.result {
+                    self.result_tx
+                        .send(result)
+                        .map_err(|_| ExecutorSubmitError::new("executor result receiver is closed"))
+                } else {
+                    Ok(())
                 };
             }
             if let Some(in_flight) = ledger.in_flight_by_attempt.get(&effect.operation.attempt) {
@@ -264,10 +291,10 @@ where
                     )));
                 }
                 ledger.queued_by_attempt.insert(attempt, effect.operation);
-                LedgerEntry::Queued(effect.clone())
+                LedgerEntry::queued(effect.clone())
             } else {
                 ledger.running_by_attempt.insert(attempt, effect.operation);
-                LedgerEntry::Running(effect.clone())
+                LedgerEntry::running(effect.clone())
             };
             ledger.operations.insert(effect.operation, entry);
             ledger
@@ -287,10 +314,11 @@ where
             effect.clone(),
         ) {
             let mut ledger = lock_ledger(&self.ledger);
-            if matches!(
-                ledger.operations.get(&effect.operation),
-                Some(LedgerEntry::Running(running)) if running == effect
-            ) {
+            if ledger
+                .operations
+                .get(&effect.operation)
+                .is_some_and(|entry| entry.is_running() && entry.effect() == effect)
+            {
                 ledger.operations.remove(&effect.operation);
             }
             if ledger.in_flight_by_attempt.get(&effect.operation.attempt) == Some(&effect.operation)
@@ -352,17 +380,14 @@ where
         };
         let (publish, next) = {
             let mut ledger = lock_ledger(&ledger);
-            let publish = matches!(
-                ledger.operations.get(&operation),
-                Some(LedgerEntry::Running(effect)) if effect == &submitted
-            );
+            let publish = ledger
+                .operations
+                .get(&operation)
+                .is_some_and(|entry| entry.is_running() && entry.effect() == &submitted);
             if publish {
                 ledger.operations.insert(
                     operation,
-                    LedgerEntry::Completed {
-                        effect: submitted,
-                        result: executor_result.clone(),
-                    },
+                    LedgerEntry::completed(submitted, executor_result.clone()),
                 );
                 if ledger.in_flight_by_attempt.get(&operation.attempt) == Some(&operation) {
                     ledger.in_flight_by_attempt.remove(&operation.attempt);
@@ -424,10 +449,10 @@ fn record_spawn_failure(
 ) -> (Option<ExecutorResult>, Option<PlannedEffect>) {
     let mut ledger = lock_ledger(ledger);
     let operation = effect.operation;
-    let publish = matches!(
-        ledger.operations.get(&operation),
-        Some(LedgerEntry::Running(running)) if running == effect
-    );
+    let publish = ledger
+        .operations
+        .get(&operation)
+        .is_some_and(|entry| entry.is_running() && entry.effect() == effect);
     let result = publish.then(|| ExecutorResult {
         node: effect.node.clone(),
         operation,
@@ -436,10 +461,7 @@ fn record_spawn_failure(
     if let Some(result) = result.as_ref() {
         ledger.operations.insert(
             operation,
-            LedgerEntry::Completed {
-                effect: effect.clone(),
-                result: result.clone(),
-            },
+            LedgerEntry::completed(effect.clone(), result.clone()),
         );
     }
     if ledger.in_flight_by_attempt.get(&operation.attempt) == Some(&operation) {
@@ -454,13 +476,14 @@ fn record_spawn_failure(
 
 fn promote_queued(ledger: &mut ExecutorLedger, attempt: NodeAttemptId) -> Option<PlannedEffect> {
     let operation = ledger.queued_by_attempt.remove(&attempt)?;
-    let Some(LedgerEntry::Queued(effect)) = ledger.operations.get(&operation).cloned() else {
+    let entry = ledger.operations.get(&operation)?.clone();
+    if !entry.is_queued() {
         return None;
-    };
+    }
+    let effect = entry.effect;
     ledger
         .operations
-        .insert(operation, LedgerEntry::Running(effect.clone()));
-    ledger.running_by_attempt.insert(attempt, operation);
+        .insert(operation, LedgerEntry::running(effect.clone()));
     Some(effect)
 }
 

@@ -58,6 +58,8 @@ pub trait JobDataPlanePort: Send + Sync + 'static {
 }
 
 /// The node-side executor. `Incoming` is the orchestrator↔node wire command.
+type SharedJobEdgeSink = Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>;
+
 pub struct NodeJobActor {
     orchestrator: ActorAddress,
     workdir: PathBuf,
@@ -76,7 +78,7 @@ pub struct NodeJobActor {
     /// Edge-mode output sink slot, filled by the integration layer once the iroh
     /// connection to the orchestrator is up. `None` ⇒ chunk path (outputs stream
     /// back as `OutputChunk` actor messages).
-    output_sink: Option<Arc<Mutex<Option<Box<dyn JobEdgeSink>>>>>,
+    output_sink: Option<SharedJobEdgeSink>,
     data_plane: Option<Arc<dyn JobDataPlanePort>>,
     route_registrar: Option<Arc<dyn JobRouteRegistrar>>,
     data_plane_env: BTreeMap<String, String>,

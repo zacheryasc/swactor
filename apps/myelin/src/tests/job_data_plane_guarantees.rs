@@ -1,12 +1,10 @@
 #![cfg(target_os = "linux")]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use data_plane::blob::ContentDigest;
 use data_plane::bootstrap::{
     ENV_ARENA_FD, ENV_DATA_PLANE_ACTOR, ENV_DATA_PLANE_ENDPOINT, ENV_JOB_CAPABILITY,
 };
-use data_plane::host::BlobSource;
 use data_plane::path::{DataPath, JobContext};
 use data_plane::protocol::JobCapability;
 use swactor::config::RuntimeConfig;
@@ -24,24 +22,24 @@ fn path(value: &str) -> DataPath {
 fn plane() -> ActorJobDataPlane {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
-    let mut blobs = BTreeMap::new();
-    blobs.insert(
-        path("/models/fixture"),
-        BlobSource::with_sha256(b"opaque fixture".as_slice()),
-    );
     ActorJobDataPlane::new(
         &runtime,
-        ARENA_BYTES,
-        11,
-        13,
-        CAPABILITY,
-        JobContext {
-            run_id: "run-1".to_owned(),
-            read_prefixes: vec![path("/models")],
-            write_prefixes: vec![path("/runs/run-1/results")],
+        crate::job_data_plane::ActorJobDataPlaneConfig {
+            arena_bytes: ARENA_BYTES,
+            arena_generation: 11,
+            session_generation: 13,
+            capability: CAPABILITY,
+            job_context: JobContext {
+                run_id: "run-1".to_owned(),
+                read_prefixes: vec![path("/models")],
+                write_prefixes: vec![path("/runs/run-1/results")],
+            },
+            namespace: None,
+            transfer_receiver: None,
+            source_sender: None,
+            source_publisher: None,
+            route_registrar: None,
         },
-        blobs,
-        None,
     )
     .expect("actor data-plane")
 }
@@ -70,20 +68,4 @@ fn handoff_contains_one_descriptor_and_private_actor_metadata() {
     let flags = unsafe { libc::fcntl(plane.arena_fd(), libc::F_GETFD) };
     assert!(flags >= 0);
     assert_eq!(flags & libc::FD_CLOEXEC, 0);
-}
-
-#[test]
-fn fixture_source_metadata_is_application_opaque() {
-    let source = BlobSource::with_sha256(b"opaque fixture".as_slice());
-    assert_eq!(source.length(), 14);
-    assert_eq!(
-        source.digest(),
-        Some(ContentDigest::sha256(b"opaque fixture"))
-    );
-
-    let plane = plane();
-    assert_ne!(
-        plane.host_session(),
-        swactor::actor::ActorAddress::default()
-    );
 }

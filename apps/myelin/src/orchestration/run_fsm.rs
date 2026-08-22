@@ -114,17 +114,17 @@ pub(crate) enum RunFaultReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LifecycleEvent {
-    RunFaulted {
+    Faulted {
         run_id: RunId,
         reason: RunFaultReason,
     },
-    RunCompleted {
+    Completed {
         run_id: RunId,
     },
-    RunOperatorStopped {
+    OperatorStopped {
         run_id: RunId,
     },
-    RunTornDown {
+    TornDown {
         run_id: RunId,
     },
 }
@@ -373,7 +373,7 @@ impl OrchestratorRun {
             return;
         }
         self.terminal = true;
-        self.events.push(LifecycleEvent::RunCompleted {
+        self.events.push(LifecycleEvent::Completed {
             run_id: self.config.run_id,
         });
         self.start_teardown();
@@ -383,7 +383,7 @@ impl OrchestratorRun {
             return;
         }
         self.terminal = true;
-        self.events.push(LifecycleEvent::RunOperatorStopped {
+        self.events.push(LifecycleEvent::OperatorStopped {
             run_id: self.config.run_id,
         });
         self.start_teardown();
@@ -394,7 +394,7 @@ impl OrchestratorRun {
             return;
         }
         self.terminal = true;
-        self.events.push(LifecycleEvent::RunFaulted {
+        self.events.push(LifecycleEvent::Faulted {
             run_id: self.config.run_id,
             reason,
         });
@@ -437,9 +437,9 @@ impl OrchestratorRun {
         if !self
             .events
             .iter()
-            .any(|event| matches!(event, LifecycleEvent::RunTornDown { .. }))
+            .any(|event| matches!(event, LifecycleEvent::TornDown { .. }))
         {
-            self.events.push(LifecycleEvent::RunTornDown {
+            self.events.push(LifecycleEvent::TornDown {
                 run_id: self.config.run_id,
             });
         }

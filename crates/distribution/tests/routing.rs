@@ -804,15 +804,14 @@ mod directory_route_path {
             }
 
             // Every node considers the others alive.
-            for i in 0..n {
-                for j in 0..n {
+            for (i, node) in nodes.iter().enumerate() {
+                for (j, node_id) in ids.iter().copied().enumerate() {
                     if i != j {
-                        nodes[i]
-                            .rt
+                        node.rt
                             .send_to(
-                                nodes[i].directory,
+                                node.directory,
                                 DirectoryIn::Membership(MembershipChanged {
-                                    node_id: ids[j],
+                                    node_id,
                                     state: MemberState::Alive,
                                     incarnation: 1,
                                 }),

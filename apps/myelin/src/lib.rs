@@ -1,8 +1,5 @@
-// Engine boundary enforcement: disallowed scheduling/time/core-driving methods
-// are hard errors in this crate (ENGINE_SPEC.md §2). The VastAI
-// provider adapter carries a module-level `#![allow]` pending its separate
-// redesign; unit tests that drive a raw Runtime in isolation are exempted
-// locally.
+// Engine boundary enforcement: disallowed scheduling, time, and core-driving
+// methods are hard errors in this crate (ENGINE_SPEC.md §2).
 #![deny(clippy::disallowed_methods)]
 #![recursion_limit = "256"]
 
@@ -23,8 +20,9 @@ pub fn run_worker_node_from_env() -> std::process::ExitCode {
     node::worker_node_runtime::run_from_env()
 }
 
-mod job_deploy;
+mod data_namespace;
 mod job_data_plane;
+mod job_deploy;
 
 /// `myelin-job-worker` — GPU-node side of the iroh job runner.
 pub fn run_job_worker_from_args<I>(args: I) -> std::process::ExitCode
@@ -84,16 +82,17 @@ where
             "--provider" => provider = it.next(),
             "--image" | "--node-image" => vastai.image = it.next(),
             "--vastai-api-key" => vastai.api_key = it.next(),
-            "--vastai-ssh-identity" => match it.next() {
-                Some(path) => match orchestration::app::expand_home_path(&path) {
-                    Ok(path) => vastai.ssh_identity = Some(path),
-                    Err(error) => {
-                        eprintln!("myelin-job: {error}");
-                        return std::process::ExitCode::from(2);
+            "--vastai-ssh-identity" => {
+                if let Some(path) = it.next() {
+                    match orchestration::app::expand_home_path(&path) {
+                        Ok(path) => vastai.ssh_identity = Some(path),
+                        Err(error) => {
+                            eprintln!("myelin-job: {error}");
+                            return std::process::ExitCode::from(2);
+                        }
                     }
-                },
-                None => {}
-            },
+                }
+            }
             "--remote-worker-bin" => {
                 vastai.remote_worker_bin = it.next().unwrap_or_default();
             }
@@ -227,12 +226,14 @@ where
 
 fn vastai_job_options_from_env() -> Result<orchestration::job_reconciler::VastAiJobOptions, String>
 {
-    let mut options = orchestration::job_reconciler::VastAiJobOptions::default();
-    options.api_key = first_env(["VAST_API_KEY", "MYELIN_VASTAI_API_KEY", "VASTAI_API_KEY"]);
-    options.image = env_optional("MYELIN_NODE_IMAGE");
-    options.ssh_identity = env_optional("MYELIN_VASTAI_SSH_IDENTITY")
-        .map(|path| orchestration::app::expand_home_path(&path))
-        .transpose()?;
+    let mut options = orchestration::job_reconciler::VastAiJobOptions {
+        api_key: first_env(["VAST_API_KEY", "MYELIN_VASTAI_API_KEY", "VASTAI_API_KEY"]),
+        image: env_optional("MYELIN_NODE_IMAGE"),
+        ssh_identity: env_optional("MYELIN_VASTAI_SSH_IDENTITY")
+            .map(|path| orchestration::app::expand_home_path(&path))
+            .transpose()?,
+        ..orchestration::job_reconciler::VastAiJobOptions::default()
+    };
     apply_env("MYELIN_JOB_REMOTE_WORKER_BIN", |value| {
         options.remote_worker_bin = value;
         Ok(())

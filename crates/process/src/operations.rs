@@ -189,13 +189,13 @@ impl ProcessIdentity {
             let Ok(environ) = std::fs::read(format!("/proc/{}/environ", self.pid)) else {
                 return false;
             };
-            return self.environment.iter().all(|(key, value)| {
+            self.environment.iter().all(|(key, value)| {
                 environ.split(|byte| *byte == 0).any(|entry| {
                     entry
                         .strip_prefix(format!("{key}=").as_bytes())
                         .is_some_and(|actual| actual == value.as_bytes())
                 })
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         false
@@ -553,7 +553,7 @@ pub fn find_process_identities_by_environment(
                 matches.push(identity);
             }
         }
-        return Ok(matches);
+        Ok(matches)
     }
     #[cfg(not(target_os = "linux"))]
     Ok(Vec::new())
@@ -863,9 +863,10 @@ mod properties {
     }
 
     fn runtime_host() -> (Runtime, SingleThreadRuntime) {
-        let mut config = RuntimeConfig::default();
-        config.worker_count = 1;
-        let parts = RuntimeParts::new(config);
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
         let runtime = parts.runtime().clone();
         (runtime, SingleThreadRuntime::new(parts))
     }

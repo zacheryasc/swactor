@@ -4,6 +4,9 @@
 //! in the directory, and exchanges its `EndpointAddr` + actor address
 //! out-of-band so each side can route to the other over the iroh actor plane.
 
+use crate::job_data_plane::{
+    ActorJobDataPlane, ActorJobDataPlaneConfig, MyelinChildRouteRegistrar,
+};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::env;
@@ -23,11 +26,12 @@ use swactor_job_runner::{
 };
 use swactor_transport::hex_encode;
 
-use data_plane::blob::BlobMetadata;
+use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
 use data_plane::edge_wire::WireEvent;
-use data_plane::host::BlobSource;
+use data_plane::namespace::NamespaceClient;
 use data_plane::path::{DataPath, JobContext};
 use data_plane::protocol::{JobCapability, register_data_plane_codecs};
+use data_plane::source::BlobSourcePublisher;
 use distribution::node::DistributedNodeConfig;
 use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{
@@ -37,7 +41,6 @@ use iroh_driver::{
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
-use crate::job_data_plane::{ActorJobDataPlane, MyelinChildRouteRegistrar};
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 
 const POLL: Duration = Duration::from_millis(25);
@@ -52,23 +55,14 @@ const DATA_PLANE_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const JOB_ARENA_BYTES: u64 = 1 << 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct InputBlobAssignment {
-    edge_id: u64,
-    path: DataPath,
-    metadata: BlobMetadata,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 struct EmbeddedDataPlaneAssignment {
     result_endpoint: EndpointAddr,
-    input_blobs: Vec<InputBlobAssignment>,
 }
 
 /// Actor-driven finite-blob ingress plus the retained temporary Unix output
 /// stream bridge. Remote bytes remain on `EDGE_ALPN`.
 #[derive(Clone)]
 pub(crate) struct EmbeddedJobDataPlane {
-    input_paths: Arc<Mutex<BTreeMap<u64, DataPath>>>,
     result_sink: Arc<Mutex<Option<EdgeSendHandle>>>,
     result_ready: Arc<Notify>,
     connector: EdgeConnector,
@@ -77,14 +71,32 @@ pub(crate) struct EmbeddedJobDataPlane {
     output_path: PathBuf,
 }
 
+pub(crate) struct EmbeddedJobDataPlaneConfig<'a> {
+    pub(crate) engine: EngineHandle,
+    pub(crate) connector: EdgeConnector,
+    pub(crate) root: &'a Path,
+    pub(crate) host_endpoint: EndpointAddr,
+    pub(crate) namespace: NamespaceClient,
+    pub(crate) transfer_receiver: Arc<dyn BlobTransferReceiver>,
+    pub(crate) source_sender: Arc<dyn BlobTransferSender>,
+    pub(crate) source_publisher: Arc<dyn BlobSourcePublisher>,
+}
+
 impl EmbeddedJobDataPlane {
     pub(crate) fn start(
-        engine: EngineHandle,
-        connector: EdgeConnector,
-        root: &Path,
         stack: &DistributionRuntimeStack,
-        host_endpoint: EndpointAddr,
+        config: EmbeddedJobDataPlaneConfig<'_>,
     ) -> Result<Self, String> {
+        let EmbeddedJobDataPlaneConfig {
+            engine,
+            connector,
+            root,
+            host_endpoint,
+            namespace,
+            transfer_receiver,
+            source_sender,
+            source_publisher,
+        } = config;
         std::fs::create_dir_all(root)
             .map_err(|error| format!("create job data-plane root {}: {error}", root.display()))?;
         let output_path = root.join(JOB_OUTPUT_SOCKET);
@@ -97,22 +109,26 @@ impl EmbeddedJobDataPlane {
         ));
         let actor_plane = Arc::new(ActorJobDataPlane::new(
             &stack.runtime,
-            JOB_ARENA_BYTES,
-            1,
-            1,
-            capability,
-            JobContext {
-                run_id: "unconfigured".to_owned(),
-                read_prefixes: vec![DataPath::parse("/models").expect("static model prefix")],
-                write_prefixes: vec![DataPath::parse("/runs").expect("static run prefix")],
+            ActorJobDataPlaneConfig {
+                arena_bytes: JOB_ARENA_BYTES,
+                arena_generation: 1,
+                session_generation: 1,
+                capability,
+                job_context: JobContext {
+                    run_id: "unconfigured".to_owned(),
+                    read_prefixes: vec![DataPath::parse("/models").expect("static model prefix")],
+                    write_prefixes: vec![DataPath::parse("/runs").expect("static run prefix")],
+                },
+                namespace: Some(namespace),
+                transfer_receiver: Some(transfer_receiver),
+                source_sender: Some(source_sender),
+                source_publisher: Some(source_publisher),
+                route_registrar: Some(route_registrar),
             },
-            BTreeMap::<DataPath, BlobSource>::new(),
-            Some(route_registrar),
         )?);
         let host_endpoint_json = serde_json::to_string(&host_endpoint)
             .map_err(|error| format!("serialize host data-plane endpoint: {error}"))?;
 
-        let input_paths = Arc::new(Mutex::new(BTreeMap::new()));
         let result_sink: Arc<Mutex<Option<EdgeSendHandle>>> = Arc::new(Mutex::new(None));
         let result_ready = Arc::new(Notify::new());
 
@@ -147,7 +163,6 @@ impl EmbeddedJobDataPlane {
         .map_err(|error| format!("bind job data-plane output: {error}"))?;
 
         Ok(Self {
-            input_paths,
             result_sink,
             result_ready,
             connector,
@@ -155,40 +170,6 @@ impl EmbeddedJobDataPlane {
             actor_plane,
             host_endpoint_json,
         })
-    }
-
-    pub(crate) fn drain_input_events(&self, events: &Arc<Mutex<Vec<WireEvent>>>) {
-        let input_paths = self.input_paths.lock().clone();
-        let mut events = events.lock();
-        let mut remaining = Vec::with_capacity(events.len());
-        for event in events.drain(..) {
-            match event {
-                WireEvent::BytesRead { edge_id, bytes, .. }
-                    if input_paths.contains_key(&edge_id.0) =>
-                {
-                    let path = input_paths[&edge_id.0].clone();
-                    let _ = self.actor_plane.push_blob_chunk(path, bytes);
-                }
-                WireEvent::StreamEnded { edge_id, .. } if input_paths.contains_key(&edge_id.0) => {
-                    let path = input_paths[&edge_id.0].clone();
-                    let _ = self.actor_plane.finish_blob_source(path);
-                }
-                WireEvent::StreamFault {
-                    edge_id: Some(edge_id),
-                    reason,
-                    ..
-                } if input_paths.contains_key(&edge_id.0) => {
-                    let path = input_paths[&edge_id.0].clone();
-                    let _ = self
-                        .actor_plane
-                        .fail_blob_source(path, format!("{reason:?}"));
-                }
-                WireEvent::StreamArrived { edge_id, .. }
-                    if input_paths.contains_key(&edge_id.0) => {}
-                event => remaining.push(event),
-            }
-        }
-        events.extend(remaining);
     }
 }
 
@@ -208,24 +189,6 @@ impl JobDataPlanePort for EmbeddedJobDataPlane {
         *self.result_sink.lock() = Some(sink);
         self.result_ready.notify_one();
         self.actor_plane.configure_run(job_id.to_string())?;
-        let mut input_paths = BTreeMap::new();
-        for input in assignment.input_blobs {
-            if input_paths
-                .insert(input.edge_id, input.path.clone())
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate input blob edge id {} in job assignment",
-                    input.edge_id
-                ));
-            }
-            self.actor_plane.begin_blob_source(
-                input.path,
-                input.metadata.length,
-                input.metadata.digest,
-            )?;
-        }
-        *self.input_paths.lock() = input_paths;
         let mut env = self.actor_plane.handoff_env(&self.host_endpoint_json);
         env.insert(
             "SWACTOR_DATA_PLANE_OUTPUT".to_owned(),
@@ -235,7 +198,6 @@ impl JobDataPlanePort for EmbeddedJobDataPlane {
     }
 
     fn session_ended(&self, _job_id: u64) {
-        self.input_paths.lock().clear();
         self.result_sink.lock().take();
         self.actor_plane.close();
     }
@@ -307,15 +269,15 @@ fn build_composition_with_relay(relay_mode: RelayMode) -> Result<JobComposition,
         DistributedNodeConfig::default(),
         engine.handle(),
     );
-    driver.enable_actor_bridge(
-        stack.runtime.clone(),
-        stack.codec.clone(),
-        stack.actor_bridge_routes(),
-        stack.actors.swim,
-        stack.relay_mirror.clone(),
-        stack.route_view.clone(),
-        stack.outbox.clone(),
-    );
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: stack.runtime.clone(),
+        codec: stack.codec.clone(),
+        routes: stack.actor_bridge_routes(),
+        swim: stack.actors.swim,
+        relay_mirror: stack.relay_mirror.clone(),
+        route_view: stack.route_view.clone(),
+        outbox: stack.outbox.clone(),
+    });
     stack.spawn_protocol_ticker(POLL);
     driver.install_actor_bridge_pump(POLL);
     Ok((engine, driver, stack))

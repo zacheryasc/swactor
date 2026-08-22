@@ -7,7 +7,7 @@
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId};
 use data_plane::byte_ring::{
-    self, attach, install, ByteRingSpec, FlowError, HeaderError, RecordKind, Role,
+    self, ByteRingSpec, FlowError, HeaderError, RecordKind, Role, attach, install,
 };
 
 fn arena() -> ArenaManager {
@@ -45,10 +45,7 @@ fn scribble_u64(arena: &ArenaManager, handle: &byte_ring::RingHandle, off: u64, 
 #[test]
 fn endpoints_are_send() {
     fn assert_send<T: Send>() {}
-    let (arena, handle) = installed(64, 1);
-    let producer = attach(&arena, handle, Role::Producer).expect("attach");
     assert_send::<byte_ring::Endpoint>();
-    drop(producer);
 }
 
 // ─── install ─────────────────────────────────────────────────────────────────
@@ -57,8 +54,8 @@ fn endpoints_are_send() {
 #[test]
 fn install_writes_valid_header_and_zeroed_data() {
     use data_plane::byte_ring::{
-        OFF_CAPACITY, OFF_COMMIT, OFF_CONSUME, OFF_GENERATION, OFF_MAGIC, OFF_VERSION,
-        RING_MAGIC, RING_VERSION,
+        OFF_CAPACITY, OFF_COMMIT, OFF_CONSUME, OFF_GENERATION, OFF_MAGIC, OFF_VERSION, RING_MAGIC,
+        RING_VERSION,
     };
 
     let (arena, handle) = installed(4096, 7);
@@ -83,6 +80,7 @@ fn install_writes_valid_header_and_zeroed_data() {
     assert!(data.iter().all(|&b| b == 0), "fresh data region is zero");
 }
 
+#[test]
 fn install_rejects_bad_specs() {
     let mut arena = arena();
     assert!(matches!(
@@ -101,9 +99,11 @@ fn install_rejects_bad_specs() {
 
 // ─── attach: untrusted-header containment (P5) ──────────────────────────────
 
+type CorruptHeaderCase = (Option<(u64, u64)>, (u64, u64), HeaderError);
+
 #[test]
 fn attach_rejects_corrupt_headers_without_trusting_them() {
-    let cases: Vec<(Option<(u64, u64)>, (u64, u64), HeaderError)> = vec![
+    let cases: Vec<CorruptHeaderCase> = vec![
         // (optional pre-scribble, (field, value), expected)
         (
             None,
@@ -113,27 +113,43 @@ fn attach_rejects_corrupt_headers_without_trusting_them() {
         (
             None,
             (byte_ring::OFF_VERSION, 2),
-            HeaderError::UnsupportedVersion { found: 2, supported: 1 },
+            HeaderError::UnsupportedVersion {
+                found: 2,
+                supported: 1,
+            },
         ),
         (
             None,
             (byte_ring::OFF_CAPACITY, 999),
-            HeaderError::CapacityMismatch { header: 999, handle: 512 },
+            HeaderError::CapacityMismatch {
+                header: 999,
+                handle: 512,
+            },
         ),
         (
             None,
             (byte_ring::OFF_GENERATION, 4),
-            HeaderError::GenerationMismatch { header: 4, handle: 3 },
+            HeaderError::GenerationMismatch {
+                header: 4,
+                handle: 3,
+            },
         ),
         (
             Some((byte_ring::OFF_CONSUME, 10)),
             (byte_ring::OFF_COMMIT, 5),
-            HeaderError::CommitBelowConsume { commit: 5, consume: 10 },
+            HeaderError::CommitBelowConsume {
+                commit: 5,
+                consume: 10,
+            },
         ),
         (
             None,
             (byte_ring::OFF_COMMIT, 600),
-            HeaderError::ReadableExceedsCapacity { commit: 600, consume: 0, capacity: 512 },
+            HeaderError::ReadableExceedsCapacity {
+                commit: 600,
+                consume: 0,
+                capacity: 512,
+            },
         ),
     ];
     for (pre, (field, value), expected) in cases {
@@ -164,7 +180,10 @@ fn basic_round_trip_preserves_bytes() {
         .send_record(RecordKind::Data, b"weights-bytes")
         .expect("send");
     let received = consumer.recv_record().expect("recv");
-    assert_eq!(received, Some((RecordKind::Data, b"weights-bytes".to_vec())));
+    assert_eq!(
+        received,
+        Some((RecordKind::Data, b"weights-bytes".to_vec()))
+    );
     assert_eq!(consumer.recv_record().expect("recv empty"), None);
 }
 
@@ -277,7 +296,10 @@ fn reserve_reports_exact_free_space_and_recovers() {
 
     assert_eq!(
         producer.reserve(50).unwrap_err(),
-        FlowError::InsufficientSpace { requested: 50, free: 28 }
+        FlowError::InsufficientSpace {
+            requested: 50,
+            free: 28
+        }
     );
 
     // Bytes are readable, intact, and consuming frees the space again.
@@ -315,7 +337,9 @@ fn records_delimit_completion_distinctly() {
     assert_eq!(consumer.recv_record().expect("post-eof"), None);
 
     // Fault is a distinct terminal, not a second EOF.
-    producer.send_record(RecordKind::Fault, b"reason").expect("send");
+    producer
+        .send_record(RecordKind::Fault, b"reason")
+        .expect("send");
     assert_eq!(
         consumer.recv_record().expect("recv fault"),
         Some((RecordKind::Fault, b"reason".to_vec()))
@@ -358,7 +382,10 @@ fn stale_reservations_are_rejected_after_generation_change() {
     scribble_u64(&arena, &handle, byte_ring::OFF_GENERATION, 2);
     assert_eq!(
         producer.commit(reservation).unwrap_err(),
-        FlowError::StaleReservation { reservation: 1, ring: 2 }
+        FlowError::StaleReservation {
+            reservation: 1,
+            ring: 2
+        }
     );
 }
 
@@ -372,7 +399,10 @@ fn wrong_role_operations_are_rejected() {
 
     assert_eq!(
         consumer.reserve(8).unwrap_err(),
-        FlowError::RoleViolation { operation: "reserve", role: Role::Consumer }
+        FlowError::RoleViolation {
+            operation: "reserve",
+            role: Role::Consumer
+        }
     );
     assert_eq!(
         consumer
@@ -382,15 +412,24 @@ fn wrong_role_operations_are_rejected() {
                 generation: 1,
             })
             .unwrap_err(),
-        FlowError::RoleViolation { operation: "commit", role: Role::Consumer }
+        FlowError::RoleViolation {
+            operation: "commit",
+            role: Role::Consumer
+        }
     );
     assert_eq!(
         producer.consume(8).unwrap_err(),
-        FlowError::RoleViolation { operation: "consume", role: Role::Producer }
+        FlowError::RoleViolation {
+            operation: "consume",
+            role: Role::Producer
+        }
     );
     assert_eq!(
         producer.readable().unwrap_err(),
-        FlowError::RoleViolation { operation: "readable", role: Role::Producer }
+        FlowError::RoleViolation {
+            operation: "readable",
+            role: Role::Producer
+        }
     );
 }
 
@@ -399,18 +438,24 @@ fn wrong_role_operations_are_rejected() {
 #[test]
 fn operations_revalidate_cursors_and_never_panic() {
     let (arena, handle) = installed(512, 1);
-    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
-    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+    let producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
 
     // Corrupt the cursors mid-protocol (consume beyond commit).
     scribble_u64(&arena, &handle, byte_ring::OFF_CONSUME, 5);
     assert_eq!(
         producer.reserve(8).unwrap_err(),
-        FlowError::Corrupt(HeaderError::CommitBelowConsume { commit: 0, consume: 5 })
+        FlowError::Corrupt(HeaderError::CommitBelowConsume {
+            commit: 0,
+            consume: 5
+        })
     );
     assert_eq!(
         consumer.readable().unwrap_err(),
-        FlowError::Corrupt(HeaderError::CommitBelowConsume { commit: 0, consume: 5 })
+        FlowError::Corrupt(HeaderError::CommitBelowConsume {
+            commit: 0,
+            consume: 5
+        })
     );
 
     // An impossible readable span is rejected at attach, not crashed on.

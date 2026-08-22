@@ -190,11 +190,11 @@ impl SwimNode {
     /// Alive at the same incarnation when the local entry is Dead.  Removing
     /// the stale Dead entry lets the fresh Alive record take effect.
     pub fn clear_dead_member(&mut self, node_id: NodeId) {
-        if let Some(entry) = self.members.get(&node_id) {
-            if entry.state == MemberState::Dead {
-                self.members.remove(&node_id);
-                self.dissemination.purge_node(&node_id);
-            }
+        if let Some(entry) = self.members.get(&node_id)
+            && entry.state == MemberState::Dead
+        {
+            self.members.remove(&node_id);
+            self.dissemination.purge_node(&node_id);
         }
     }
 

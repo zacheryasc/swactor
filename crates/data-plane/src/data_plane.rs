@@ -1,6 +1,6 @@
 //! Child-side data-plane session, per-operation actors, and native API.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +28,11 @@ pub enum ChildSessionState {
 pub struct DataPlaneBootstrap {
     pub arena: Arc<MappedArena>,
     pub data_plane: DataPlane,
+}
+
+pub struct AttachDeadline {
+    pub engine: EngineHandle,
+    pub timeout: Duration,
 }
 
 impl DataPlaneBootstrap {
@@ -94,8 +99,7 @@ impl DataPlaneBootstrap {
         host_session: ActorAddress,
         job_capability: JobCapability,
         child_node: Option<[u8; 32]>,
-        engine: EngineHandle,
-        timeout: Duration,
+        deadline: AttachDeadline,
     ) -> Result<Self, DataPlaneError> {
         let sender = runtime.create_sender();
         Self::attach_mapped_inner(
@@ -105,7 +109,7 @@ impl DataPlaneBootstrap {
             host_session,
             job_capability,
             child_node,
-            Some((engine, sender, timeout)),
+            Some((deadline.engine, sender, deadline.timeout)),
         )
         .await
     }
@@ -134,6 +138,7 @@ impl DataPlaneBootstrap {
                 session_generation: None,
                 attach_reply: Some(attach_reply),
                 operations: HashSet::new(),
+                read_operations: HashMap::new(),
                 state: ChildSessionState::Attaching,
             })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
@@ -150,6 +155,26 @@ impl DataPlaneBootstrap {
                 arena,
             },
         })
+    }
+}
+
+struct ReadCancellation {
+    runtime: Runtime,
+    child_session: ActorAddress,
+    reply_to: ActorAddress,
+    armed: bool,
+}
+
+impl Drop for ReadCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.runtime.send_to(
+                self.child_session,
+                ChildSessionIn::CancelRead {
+                    reply_to: self.reply_to,
+                },
+            );
+        }
     }
 }
 
@@ -170,16 +195,29 @@ impl DataPlane {
     }
 
     pub async fn read_blob(&self, path: &DataPath) -> Result<Blob, DataPlaneError> {
-        let ask = self
+        let inbox = self
             .runtime
-            .ask::<ChildSessionIn, Result<Blob, DataPlaneError>>(self.child_session, |reply_to| {
+            .new_inbox::<Result<Blob, DataPlaneError>>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        let reply_to = *inbox.addr();
+        self.runtime
+            .send_to(
+                self.child_session,
                 ChildSessionIn::ReadBlob {
                     path: path.clone(),
                     reply_to,
-                }
-            })
+                },
+            )
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        ask.await
+        let mut cancellation = ReadCancellation {
+            runtime: self.runtime.clone(),
+            child_session: self.child_session,
+            reply_to,
+            armed: true,
+        };
+        let result = inbox.recv().await;
+        cancellation.armed = false;
+        result
     }
 
     pub async fn read_blob_path(&self, path: &str) -> Result<Blob, DataPlaneError> {
@@ -259,7 +297,6 @@ impl BlobWriter {
 
     pub async fn seal(&mut self) -> Result<(), DataPlaneError> {
         let metadata = self.writable.seal()?;
-        self.finalized = true;
         let lease = self.writable.lease();
         let ask = self
             .runtime
@@ -271,7 +308,11 @@ impl BlobWriter {
                 }
             })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        ask.await
+        let result = ask.await;
+        if result.is_ok() {
+            self.finalized = true;
+        }
+        result
     }
 
     pub async fn abort(&mut self) -> Result<(), DataPlaneError> {
@@ -293,10 +334,11 @@ impl BlobWriter {
 
 impl Drop for BlobWriter {
     fn drop(&mut self) {
-        if self.finalized || self.writable.is_finished() {
+        if self.finalized {
             return;
         }
-        if self.writable.abort().is_ok() {
+        let should_abort = self.writable.is_finished() || self.writable.abort().is_ok();
+        if should_abort {
             let _ = self.runtime.send_to(
                 self.operation,
                 ChildOperationIn::AbortRequested {
@@ -318,6 +360,7 @@ pub struct ChildDataPlaneSessionActor {
     session_generation: Option<u64>,
     attach_reply: Option<ActorAddress>,
     operations: HashSet<ActorAddress>,
+    read_operations: HashMap<ActorAddress, ActorAddress>,
     state: ChildSessionState,
 }
 
@@ -408,12 +451,19 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 match ctx.spawn(operation) {
                     Ok(operation) => {
                         self.operations.insert(operation);
+                        self.read_operations.insert(reply_to, operation);
                     }
                     Err(error) => self.fail_local_open(
                         ctx,
                         reply_to,
                         DataPlaneError::SessionFailed(error.to_string()),
                     ),
+                }
+            }
+            ChildSessionIn::CancelRead { reply_to } => {
+                if let Some(operation) = self.read_operations.remove(&reply_to) {
+                    self.operations.remove(&operation);
+                    let _ = ctx.stop_actor(operation);
                 }
             }
             ChildSessionIn::OpenWriteBlob {
@@ -504,6 +554,8 @@ impl ActorInterface for ChildDataPlaneSessionActor {
             }
             ChildSessionIn::OperationDone { operation } => {
                 self.operations.remove(&operation);
+                self.read_operations
+                    .retain(|_, read_operation| *read_operation != operation);
             }
             ChildSessionIn::Close => {
                 if matches!(
@@ -516,6 +568,7 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 for operation in self.operations.iter().copied() {
                     let _ = ctx.stop_actor(operation);
                 }
+                self.read_operations.clear();
                 let _ = ctx.send(self.host_session, HostSessionIn::Close);
                 self.state = ChildSessionState::Closed;
             }
@@ -641,6 +694,12 @@ impl ActorInterface for ReadBlobOperationActor {
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
         if !self.replied {
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::CancelReadBlob {
+                    operation: ctx.self_addr(),
+                },
+            );
             let _ = ctx.send(
                 self.reply_to,
                 Err::<Blob, _>(DataPlaneError::OperationCancelled),
@@ -850,7 +909,10 @@ impl ActorInterface for WriteBlobOperationActor {
                 }
             }
             ChildOperationIn::AbortRequested { reply_to, lease }
-                if self.state == WriteOperationState::Filling =>
+                if matches!(
+                    self.state,
+                    WriteOperationState::Filling | WriteOperationState::Sealing
+                ) =>
             {
                 let Some((host_binding, expected_lease, _)) = self.grant.clone() else {
                     self.fail(ctx, DataPlaneError::OperationCancelled);

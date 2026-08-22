@@ -6,6 +6,8 @@
 //!
 //! Priority ordering: Dead > Suspect > Alive (most urgent first).
 
+use std::cmp::Reverse;
+
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId};
 
@@ -69,7 +71,7 @@ impl DisseminationQueue {
     pub fn take(&mut self, max_count: usize) -> Vec<MembershipUpdate> {
         // Sort by priority: Dead (2) > Suspect (1) > Alive (0), descending
         self.entries
-            .sort_by(|a, b| b.update.state.priority().cmp(&a.update.state.priority()));
+            .sort_by_key(|entry| Reverse(entry.update.state.priority()));
 
         let count = max_count.min(self.entries.len());
         let mut result = Vec::with_capacity(count);

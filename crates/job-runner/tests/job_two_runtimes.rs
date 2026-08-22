@@ -9,22 +9,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use swactor::actor::{ActorAddress, Message};
-use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts};
+use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts};
 use swactor::std::StdExtension;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use swactor_transport::{CodecRegistry, CodecRemoteSink, Transport, TransportRouter, WireEnvelope};
 
-use swactor_job_runner::model;
 use swactor_job_runner::{
     Job, JobDone, JobState, NodeJobActor, OrchestratorJobActor, OrchestratorJobMsg, Workspace,
     register_job_codecs,
-}; // ensure model path compiles; not used directly below
+};
 
 const POLL: Duration = Duration::from_millis(15);
 const DEADLINE: Duration = Duration::from_secs(20);
-
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Stands in for the iroh transport: carries a `WireEnvelope` from one runtime
 /// to another, decoding via the shared codec and performing the production
@@ -164,6 +160,3 @@ fn job_runs_across_two_swactor_runtimes_over_the_actor_plane() {
         "workspace crossed the runtime boundary through swactor"
     );
 }
-
-#[allow(dead_code)]
-fn _ensure_paths_compile(_a: ActorAddress, _e: BoxError, _m: model::Job) {}

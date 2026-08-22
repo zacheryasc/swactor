@@ -110,6 +110,10 @@ impl MemberList {
         self.members.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
     /// Apply an update. Returns `true` if the state changed (for dissemination).
     ///
     /// SWIM merge semantics:

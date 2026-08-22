@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +25,21 @@ const STATE_OFFSET: usize = 24;
 const DIGEST_OFFSET: usize = 32;
 const DIGEST_LEN: usize = 32;
 const RESERVED_OFFSET: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRegistration {
+    path: PathBuf,
+}
+
+impl FileRegistration {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub fn file(path: impl Into<PathBuf>) -> FileRegistration {
+    FileRegistration { path: path.into() }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -87,20 +103,6 @@ pub enum BlobSharedState {
     Sealed = 3,
     Aborted = 4,
     Released = 5,
-}
-
-impl BlobSharedState {
-    fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(Self::Vacant),
-            1 => Some(Self::Filling),
-            2 => Some(Self::Writable),
-            3 => Some(Self::Sealed),
-            4 => Some(Self::Aborted),
-            5 => Some(Self::Released),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,7 +251,7 @@ impl Blob {
         self.guard.lease
     }
 
-    pub fn map(&self) -> Result<ArenaView, BlobError> {
+    pub fn map(&self) -> Result<BlobView, BlobError> {
         validate_mapped_header(
             &self.guard.arena,
             self.guard.lease,
@@ -264,7 +266,7 @@ impl Blob {
             },
         )?;
         let range = mapped_range(&self.guard.arena, payload_offset, self.guard.lease.length)?;
-        Ok(ArenaView {
+        Ok(BlobView {
             guard: self.guard.clone(),
             payload_offset: range.start,
             length: range.len(),
@@ -272,13 +274,13 @@ impl Blob {
     }
 }
 
-pub struct ArenaView {
+pub struct BlobView {
     guard: Arc<BlobLeaseGuard>,
     payload_offset: usize,
     length: usize,
 }
 
-impl ArenaView {
+impl BlobView {
     pub fn len(&self) -> usize {
         self.length
     }
@@ -296,7 +298,7 @@ impl ArenaView {
     }
 }
 
-impl AsRef<[u8]> for ArenaView {
+impl AsRef<[u8]> for BlobView {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: construction bounds-checks the range, the arena mapping is
         // stable, and the shared guard prevents lease reuse while this view is
@@ -305,7 +307,7 @@ impl AsRef<[u8]> for ArenaView {
     }
 }
 
-impl Deref for ArenaView {
+impl Deref for BlobView {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -482,38 +484,6 @@ impl Drop for WritableArenaView {
     fn drop(&mut self) {
         self.owner.active_view.store(false, Ordering::Release);
     }
-}
-
-pub(crate) fn install_read_blob(
-    arena: &ArenaManager,
-    allocation: &RingLease,
-    generation: u64,
-    bytes: &[u8],
-    digest: Option<ContentDigest>,
-) -> Result<(BlobLease, BlobMetadata), BlobError> {
-    let length = u64::try_from(bytes.len()).map_err(|_| BlobError::InvalidHostLease)?;
-    let lease = descriptor_from_allocation(allocation, generation, length, BlobAccess::ReadOnly)?;
-    let metadata = BlobMetadata { length, digest };
-    let header = host_header_ptr(arena, lease)?;
-    write_header(header, lease, &metadata, BlobSharedState::Filling);
-
-    if let Some(expected) = &metadata.digest {
-        if !expected.matches(bytes) {
-            host_state(arena, lease)?.store(BlobSharedState::Aborted as u64, Ordering::Release);
-            return Err(BlobError::DigestMismatch);
-        }
-    }
-
-    let payload = arena
-        .region_ptr(lease.offset + BLOB_HEADER_LEN, length)
-        .ok_or(BlobError::InvalidHostLease)?;
-    // SAFETY: the allocation owns exactly `length` payload bytes and `bytes`
-    // has that same length. This is the only host-to-child process-boundary copy.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), payload.as_ptr(), bytes.len());
-    }
-    host_state(arena, lease)?.store(BlobSharedState::Sealed as u64, Ordering::Release);
-    Ok((lease, metadata))
 }
 
 pub(crate) fn install_filling_read_blob(
@@ -727,7 +697,7 @@ fn validate_header(
                 length: lease.length,
                 arena_size,
             })?;
-    if state_address as usize % std::mem::align_of::<AtomicU64>() != 0 {
+    if !(state_address as usize).is_multiple_of(std::mem::align_of::<AtomicU64>()) {
         return Err(BlobError::UnalignedHeader {
             offset: lease.offset,
         });
@@ -808,7 +778,7 @@ fn validate_header(
 fn mapped_state(arena: &MappedArena, lease: BlobLease) -> Result<&AtomicU64, BlobError> {
     let range = mapped_range(arena, lease.offset, BLOB_HEADER_LEN + lease.length)?;
     let state_offset = range.start + STATE_OFFSET;
-    if state_offset % std::mem::align_of::<AtomicU64>() != 0 {
+    if !state_offset.is_multiple_of(std::mem::align_of::<AtomicU64>()) {
         return Err(BlobError::UnalignedHeader {
             offset: lease.offset,
         });
@@ -826,7 +796,7 @@ fn host_header_ptr(arena: &ArenaManager, lease: BlobLease) -> Result<NonNull<u8>
 fn host_state(arena: &ArenaManager, lease: BlobLease) -> Result<&AtomicU64, BlobError> {
     let header = host_header_ptr(arena, lease)?;
     let address = lease.offset + STATE_OFFSET as u64;
-    if address as usize % std::mem::align_of::<AtomicU64>() != 0 {
+    if !(address as usize).is_multiple_of(std::mem::align_of::<AtomicU64>()) {
         return Err(BlobError::UnalignedHeader {
             offset: lease.offset,
         });
@@ -859,9 +829,4 @@ fn checked_raw_range(arena_size: u64, offset: u64, length: u64) -> Result<(), Bl
             length,
             arena_size,
         })
-}
-
-#[allow(dead_code)]
-fn state_name(value: u64) -> Option<BlobSharedState> {
-    BlobSharedState::from_u64(value)
 }

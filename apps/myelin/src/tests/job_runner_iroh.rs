@@ -9,62 +9,19 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use swactor_job_runner::{
     Job, JobDone, JobState, NodeJobActor, OrchestratorJobActor, OrchestratorJobMsg, Workspace,
-    register_job_codecs,
 };
 
-use distribution::node::DistributedNodeConfig;
-use iroh::RelayMode;
-use iroh_driver::{IrohDriver, IrohDriverConfig};
+use iroh_driver::IrohDriver;
 
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
+
+use crate::tests::harness::build_iroh_composition;
 
 const POLL: Duration = Duration::from_millis(25);
 const CONVERGE_DEADLINE: Duration = Duration::from_secs(30);
 const JOB_DEADLINE: Duration = Duration::from_secs(30);
-
-fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
-    let (parts, runtime, codec, transport_router) =
-        DistributionRuntimeStack::build_runtime(|c| register_job_codecs(c), None);
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
-    )
-    .expect("engine");
-    let mut driver = IrohDriver::with_engine(
-        engine.handle(),
-        IrohDriverConfig {
-            secret_key: None,
-            relay_mode: RelayMode::Disabled,
-            node: DistributedNodeConfig::default(),
-            peer_auth: None,
-            additional_alpns: vec![],
-        },
-    )
-    .expect("iroh driver");
-    let stack = DistributionRuntimeStack::new_from_runtime(
-        runtime.clone(),
-        codec,
-        transport_router,
-        driver.node_id(),
-        DistributedNodeConfig::default(),
-        engine.handle(),
-    );
-    driver.enable_actor_bridge(
-        stack.runtime.clone(),
-        stack.codec.clone(),
-        stack.actor_bridge_routes(),
-        stack.actors.swim,
-        stack.relay_mirror.clone(),
-        stack.route_view.clone(),
-        stack.outbox.clone(),
-    );
-    stack.spawn_protocol_ticker(POLL);
-    driver.install_actor_bridge_pump(POLL);
-    (engine, driver, stack)
-}
 
 #[test]
 fn job_runs_across_two_nodes_over_real_iroh() {
@@ -75,13 +32,13 @@ fn job_runs_across_two_nodes_over_real_iroh() {
 
     // Worker composition (B): spawn + register the NodeJobActor so peers can
     // route to it through the converged directory.
-    let (engine_b, driver_b, stack_b) = build_composition();
+    let (engine_b, driver_b, stack_b) = build_iroh_composition(POLL);
     let sender_b = stack_b.runtime.create_sender();
     // Placeholder orchestrator address: the real one is on A; the node only
     // needs it once the orchestrator submits. We point the node at A's
     // orchestrator after it exists (address is fixed below), but the node actor
     // captures the address at construction — so spawn it after A's orchestrator.
-    let (_engine_a, _driver_a, stack_a) = build_composition();
+    let (_engine_a, _driver_a, stack_a) = build_iroh_composition(POLL);
 
     let done = stack_a
         .runtime

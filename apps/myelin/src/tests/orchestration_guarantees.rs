@@ -193,7 +193,7 @@ mod run_fsm {
             invalid
                 .events()
                 .iter()
-                .any(|event| { matches!(event, fsm::LifecycleEvent::RunFaulted { .. }) })
+                .any(|event| { matches!(event, fsm::LifecycleEvent::Faulted { .. }) })
         );
     }
 
@@ -249,7 +249,7 @@ mod run_fsm {
                 fsm::RunCommand::InjectTokenObject { object, .. } => Some(object),
                 _ => None,
             })
-            .last()
+            .next_back()
             .expect("decode injection must be recorded");
         assert_eq!(
             *decode_object,
@@ -315,7 +315,7 @@ mod run_fsm {
             .events()
             .iter()
             .filter_map(|event| match event {
-                fsm::LifecycleEvent::RunFaulted { reason, .. } => Some(reason),
+                fsm::LifecycleEvent::Faulted { reason, .. } => Some(reason),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -344,7 +344,7 @@ mod run_fsm {
         assert!(membership_lost.events().iter().any(|event| {
             matches!(
                 event,
-                fsm::LifecycleEvent::RunFaulted {
+                fsm::LifecycleEvent::Faulted {
                     reason: fsm::RunFaultReason::MembershipLost {
                         node_id: fsm::NodeId(12)
                     },
@@ -380,12 +380,12 @@ mod run_fsm {
         let completed = harness
             .events()
             .iter()
-            .filter(|event| matches!(event, fsm::LifecycleEvent::RunCompleted { .. }))
+            .filter(|event| matches!(event, fsm::LifecycleEvent::Completed { .. }))
             .count();
         let faulted = harness
             .events()
             .iter()
-            .filter(|event| matches!(event, fsm::LifecycleEvent::RunFaulted { .. }))
+            .filter(|event| matches!(event, fsm::LifecycleEvent::Faulted { .. }))
             .count();
         assert_eq!(completed, 1);
         assert_eq!(faulted, 0);
@@ -432,12 +432,12 @@ mod run_fsm {
         let stopped_count = stopped
             .events()
             .iter()
-            .filter(|event| matches!(event, fsm::LifecycleEvent::RunOperatorStopped { .. }))
+            .filter(|event| matches!(event, fsm::LifecycleEvent::OperatorStopped { .. }))
             .count();
         let stopped_faults = stopped
             .events()
             .iter()
-            .filter(|event| matches!(event, fsm::LifecycleEvent::RunFaulted { .. }))
+            .filter(|event| matches!(event, fsm::LifecycleEvent::Faulted { .. }))
             .count();
         assert_eq!(stopped_count, 1);
         assert_eq!(stopped_faults, 0);
@@ -475,7 +475,7 @@ mod run_fsm {
             !harness
                 .events()
                 .iter()
-                .any(|event| { matches!(event, fsm::LifecycleEvent::RunTornDown { .. }) })
+                .any(|event| { matches!(event, fsm::LifecycleEvent::TornDown { .. }) })
         );
 
         // StageStopped for every stage still is not enough until local endpoints stop.
@@ -491,7 +491,7 @@ mod run_fsm {
             !harness
                 .events()
                 .iter()
-                .any(|event| { matches!(event, fsm::LifecycleEvent::RunTornDown { .. }) })
+                .any(|event| { matches!(event, fsm::LifecycleEvent::TornDown { .. }) })
         );
         harness.observe(fsm::RunEvent::TokenEndpointsStopped);
 
@@ -499,14 +499,14 @@ mod run_fsm {
         let torn_down_count = harness
             .events()
             .iter()
-            .filter(|event| matches!(event, fsm::LifecycleEvent::RunTornDown { .. }))
+            .filter(|event| matches!(event, fsm::LifecycleEvent::TornDown { .. }))
             .count();
         assert_eq!(torn_down_count, 1);
 
         // Ordering is proven over the lifecycle transcript.
         let fault_pos = position_of(
             harness.events(),
-            &fsm::LifecycleEvent::RunFaulted {
+            &fsm::LifecycleEvent::Faulted {
                 run_id: fsm::RunId(7),
                 reason: fsm::RunFaultReason::StageFault {
                     stage_index: 0,
@@ -516,7 +516,7 @@ mod run_fsm {
         );
         let torn_down_pos = position_of(
             harness.events(),
-            &fsm::LifecycleEvent::RunTornDown {
+            &fsm::LifecycleEvent::TornDown {
                 run_id: fsm::RunId(7),
             },
         );

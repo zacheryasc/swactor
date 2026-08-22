@@ -299,7 +299,7 @@ where
             "bytes_total":bytes_total,
         }));
     }
-    let metadata_prefix = fetch_http_range(&url, 0, plan.metadata_end)?;
+    let metadata_prefix = fetch_http_range(url, 0, plan.metadata_end)?;
     bytes_done = bytes_done.saturating_add(plan.metadata_end);
     if plan.metadata_end > 0 {
         emit(serde_json::json!({
@@ -348,7 +348,7 @@ where
             "bytes_done":bytes_done,
             "bytes_total":bytes_total,
         }));
-        let range_bytes = fetch_http_range(&url, range.start, range.len)?;
+        let range_bytes = fetch_http_range(url, range.start, range.len)?;
         bytes_done = bytes_done.saturating_add(range.len);
         emit(serde_json::json!({
             "type":"StageShardRangeFetchReady",

@@ -225,17 +225,29 @@ struct VastAiProviderMonitorActor {
     stopped: bool,
 }
 
+struct VastAiProviderMonitorConfig {
+    client: ToolsVastAiLeaseClient,
+    contract_id: u64,
+    label: String,
+    lifecycle: LifecyclePolicy,
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    sender: ExternalSender,
+    engine: EngineHandle,
+}
+
 impl VastAiProviderMonitorActor {
-    fn new(
-        client: ToolsVastAiLeaseClient,
-        contract_id: u64,
-        label: String,
-        lifecycle: LifecyclePolicy,
-        spec: NodeProvisionSpec,
-        sink: PluginSink,
-        sender: ExternalSender,
-        engine: EngineHandle,
-    ) -> Self {
+    fn new(config: VastAiProviderMonitorConfig) -> Self {
+        let VastAiProviderMonitorConfig {
+            client,
+            contract_id,
+            label,
+            lifecycle,
+            spec,
+            sink,
+            sender,
+            engine,
+        } = config;
         Self {
             client,
             contract_id,
@@ -592,14 +604,16 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         let sender = runtime.create_sender();
         let actor = runtime
             .spawn(VastAiProviderMonitorActor::new(
-                self.clone(),
-                contract_id,
-                label,
-                lifecycle,
-                spec,
-                sink,
-                sender,
-                engine,
+                VastAiProviderMonitorConfig {
+                    client: self.clone(),
+                    contract_id,
+                    label,
+                    lifecycle,
+                    spec,
+                    sink,
+                    sender,
+                    engine,
+                },
             ))
             .ok()?;
         Some(VastAiProviderMonitor::new(runtime, actor))
@@ -2355,21 +2369,23 @@ mod tests {
         let recording = Arc::new(RecordingSink::default());
         let actor = runtime
             .spawn(VastAiProviderMonitorActor::new(
-                client,
-                contract_id,
-                format!(
-                    "run-{}-node-{}-attempt-{}",
-                    spec.run_id, spec.node_id, spec.attempt_id
-                ),
-                LifecyclePolicy {
-                    lease_pace: Duration::ZERO,
-                    poll_interval: Duration::from_millis(1),
-                    state_timeout: Duration::from_millis(10),
+                VastAiProviderMonitorConfig {
+                    client,
+                    contract_id,
+                    label: format!(
+                        "run-{}-node-{}-attempt-{}",
+                        spec.run_id, spec.node_id, spec.attempt_id
+                    ),
+                    lifecycle: LifecyclePolicy {
+                        lease_pace: Duration::ZERO,
+                        poll_interval: Duration::from_millis(1),
+                        state_timeout: Duration::from_millis(10),
+                    },
+                    spec,
+                    sink: PluginSink::new(recording.clone()),
+                    sender: runtime.create_sender(),
+                    engine: engine.handle(),
                 },
-                spec,
-                PluginSink::new(recording.clone()),
-                runtime.create_sender(),
-                engine.handle(),
             ))
             .expect("spawn VastAI monitor");
         MonitorHarness {

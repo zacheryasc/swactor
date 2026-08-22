@@ -2,7 +2,7 @@
 //! reference `FakeBackend`. The harness, oracle, and generator live in
 //! `common`; this file is a thin client pinning named guarantees.
 
-mod common;
+pub mod common;
 
 use std::time::{Duration, UNIX_EPOCH};
 

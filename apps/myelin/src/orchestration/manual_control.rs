@@ -1458,20 +1458,32 @@ pub(crate) struct ManualActorControl {
     control_generation: u64,
 }
 
+pub(crate) struct ManualActorControlConfig {
+    pub(crate) state_dir: StateDir,
+    pub(crate) sink: PluginSink,
+    pub(crate) provider_factory: ProviderFactory,
+    pub(crate) spec_builder: SpecBuilder,
+    pub(crate) config_validator: Option<ConfigValidator>,
+    pub(crate) offer_searcher: Option<OfferSearcher>,
+    pub(crate) control_generation: u64,
+}
+
 impl ManualActorControl {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         core: ManualControl,
         runtime: Runtime,
         blocking_work: BlockingWorkSender,
-        state_dir: StateDir,
-        sink: PluginSink,
-        provider_factory: ProviderFactory,
-        spec_builder: SpecBuilder,
-        config_validator: Option<ConfigValidator>,
-        offer_searcher: Option<OfferSearcher>,
-        control_generation: u64,
+        config: ManualActorControlConfig,
     ) -> Self {
+        let ManualActorControlConfig {
+            state_dir,
+            sink,
+            provider_factory,
+            spec_builder,
+            config_validator,
+            offer_searcher,
+            control_generation,
+        } = config;
         let sender = runtime.create_sender();
         let work_actor = runtime
             .spawn(ManualWorkActor { blocking_work })
@@ -3038,7 +3050,7 @@ mod tests {
         }
 
         fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
-            if handle.id % 11 == 0 {
+            if handle.id.is_multiple_of(11) {
                 return Err("scripted bootstrap failure".to_owned());
             }
             Ok(())
@@ -3062,7 +3074,7 @@ mod tests {
         }
 
         fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
-            if spec.node_id % 5 == 0 {
+            if spec.node_id.is_multiple_of(5) {
                 String::new()
             } else {
                 format!("scripted-resource-{}", spec.node_id)
@@ -3484,13 +3496,15 @@ mod tests {
                 ready_core(),
                 runtime.clone(),
                 engine.handle().blocking_work_sender(),
-                StateDir::new(temp.path()),
-                PluginSink::new(Arc::new(DiscardObservations)),
-                provider_factory,
-                spec_builder,
-                Some(validator),
-                Some(searcher),
-                1,
+                ManualActorControlConfig {
+                    state_dir: StateDir::new(temp.path()),
+                    sink: PluginSink::new(Arc::new(DiscardObservations)),
+                    provider_factory,
+                    spec_builder,
+                    config_validator: Some(validator),
+                    offer_searcher: Some(searcher),
+                    control_generation: 1,
+                },
             );
             prop_assert_eq!(
                 runtime.stats().actors.len(),

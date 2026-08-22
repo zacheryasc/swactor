@@ -65,7 +65,7 @@ mod stage_controller {
         let mut harness = new_controller();
         harness.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(99),
-            provision: valid_provision(),
+            provision: Box::new(valid_provision()),
         });
         for event in preparation_ready_events() {
             harness.observe(event);
@@ -81,7 +81,7 @@ mod stage_controller {
         let mut harness = new_controller();
         harness.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(99),
-            provision: valid_provision(),
+            provision: Box::new(valid_provision()),
         });
 
         // Setup commands should be derived from the provided assignment.
@@ -108,7 +108,7 @@ mod stage_controller {
         let mut unauthorized = new_controller();
         unauthorized.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(123),
-            provision: valid_provision(),
+            provision: Box::new(valid_provision()),
         });
         assert!(unauthorized.events().iter().any(|event| {
             matches!(
@@ -134,7 +134,7 @@ mod stage_controller {
         let mut harness = new_controller();
         harness.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(99),
-            provision: valid_provision(),
+            provision: Box::new(valid_provision()),
         });
 
         // Feed every readiness event except the final one and prove no prefix is

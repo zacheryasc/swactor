@@ -91,7 +91,7 @@ pub(crate) struct ProvisionStage {
 pub(crate) enum StageEvent {
     ProvisionStage {
         from: NodeId,
-        provision: ProvisionStage,
+        provision: Box<ProvisionStage>,
     },
     WorkerReady,
     WeightsReady,
@@ -211,7 +211,7 @@ pub(crate) enum StageCommand {
     LoadWeights {
         source: WeightSource,
         range: LayerRange,
-        shard_plan: Option<StageShardPlan>,
+        shard_plan: Box<Option<StageShardPlan>>,
     },
     ExecuteStep(ExecuteStep),
     ReleaseInputHandle {
@@ -277,7 +277,7 @@ impl StageController {
 
     pub(crate) fn observe(&mut self, event: StageEvent) {
         match event {
-            StageEvent::ProvisionStage { from, provision } => self.provision(from, provision),
+            StageEvent::ProvisionStage { from, provision } => self.provision(from, *provision),
             StageEvent::WorkerReady => self.worker_ready = true,
             StageEvent::WeightsReady => self.weights_ready = true,
             StageEvent::InboundEdgeReady { edge_id } => {
@@ -353,7 +353,7 @@ impl StageController {
         self.commands.push(StageCommand::LoadWeights {
             source: provision.weight_source.clone(),
             range: provision.layer_range,
-            shard_plan: provision.shard_plan.clone(),
+            shard_plan: Box::new(provision.shard_plan.clone()),
         });
         self.provision = Some(provision);
     }

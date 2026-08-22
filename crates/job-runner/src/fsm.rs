@@ -192,6 +192,7 @@ mod tests {
     fn no_workspace_jumps_setup_or_run() {
         let c = ctx(false, true, None);
         let (s, cmd) = transition(JobState::Pending, &JobEvent::NodeReady, c);
+        assert_eq!(s, JobState::Running);
         assert_eq!(cmd, Some(JobCommand::RunSetup));
 
         let c = ctx(false, false, None);

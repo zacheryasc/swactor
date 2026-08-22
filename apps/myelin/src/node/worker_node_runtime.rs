@@ -22,6 +22,7 @@ use telemetry::{
 };
 
 use crate::codecs::register_myelin_actor_codecs;
+use crate::data_namespace::install_namespace_client;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
 use crate::job_data_plane::MyelinChildRouteRegistrar;
 use crate::job_deploy::EmbeddedJobDataPlane;
@@ -40,6 +41,7 @@ use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_en
 use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
 use data_plane::arena;
+use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
 use data_plane::edge_lifecycle as edge;
 use data_plane::edge_runtime;
 use data_plane::object_record as ingress;
@@ -47,7 +49,10 @@ use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
-use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, spawn_pull_server};
+use iroh_driver::{
+    EDGE_ALPN, IrohBlobTransferReceiver, IrohBlobTransferSender, IrohDriver, IrohDriverConfig,
+    TELEMETRY_ALPN, spawn_pull_server,
+};
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -702,9 +707,7 @@ fn submit_sampler_sample_health(
 #[derive(Clone)]
 struct SamplerTick;
 
-struct BlockingSamplerActor<S> {
-    engine: EngineHandle,
-    sender: ExternalSender,
+struct BlockingSamplerConfig<Sample> {
     producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
@@ -712,172 +715,127 @@ struct BlockingSamplerActor<S> {
     sampler: &'static str,
     sample_channel: &'static str,
     interval: Duration,
-    sample_fn: fn(u64) -> S,
-    error_of: fn(&S) -> Option<&str>,
-    seq: u64,
+    error_of: fn(&Sample) -> Option<&str>,
 }
 
-impl<S> BlockingSamplerActor<S> {
-    fn schedule(&self, ctx: &Ctx)
-    where
-        S: Record + Send + 'static,
-    {
-        self.engine.send_after(
-            self.interval,
-            self.sender.clone(),
-            ctx.self_addr(),
-            SamplerTick,
-        );
-    }
-}
-
-impl<S> ActorInterface for BlockingSamplerActor<S>
-where
-    S: Record + Send + 'static,
+fn spawn_blocking_sampler_task<State, Sample>(
+    engine: EngineHandle,
+    state: State,
+    sample_fn: fn(State, u64) -> (State, Sample),
+    config: BlockingSamplerConfig<Sample>,
+) where
+    State: Send + 'static,
+    Sample: Record + Send + 'static,
 {
-    type Incoming = SamplerTick;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        submit_sampler_started(
-            &self.producer,
-            self.health_channel,
-            self.health_context,
-            self.sampler,
-            self.sample_channel,
-            self.interval,
-        );
-        self.schedule(ctx);
-    }
-
-    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
-        let sample = (self.sample_fn)(self.seq);
-        submit_sampler_sample_health(
-            &self.producer,
-            self.health_channel,
-            self.health_context,
-            self.sampler,
-            self.sample_channel,
-            self.seq,
-            (self.error_of)(&sample),
-        );
-        self.seq = self.seq.saturating_add(1);
-        self.producer.submit_record(self.channel, &sample);
-        self.schedule(ctx);
-    }
-}
-
-fn spawn_blocking_sampler<S: Record + Send + 'static>(
-    runtime: Runtime,
-    engine: EngineHandle,
-    producer: TelemetryProducer,
-    channel: ChannelId,
-    health_channel: ChannelId,
-    health_context: SamplerHealthContext,
-    sampler: &'static str,
-    sample_channel: &'static str,
-    interval: Duration,
-    sample_fn: fn(u64) -> S,
-    error_of: fn(&S) -> Option<&str>,
-) {
-    runtime
-        .spawn(BlockingSamplerActor {
-            engine,
-            sender: runtime.create_sender(),
-            producer,
-            channel,
-            health_channel,
-            health_context,
-            sampler,
-            sample_channel,
-            interval,
-            sample_fn,
-            error_of,
-            seq: 0,
-        })
-        .expect("spawn telemetry sampler actor");
-}
-
-fn spawn_host_gpu_sampler(
-    runtime: Runtime,
-    engine: EngineHandle,
-    producer: TelemetryProducer,
-    channel: ChannelId,
-    health_channel: ChannelId,
-    health_context: SamplerHealthContext,
-) {
-    spawn_blocking_sampler(
-        runtime,
-        engine,
+    let BlockingSamplerConfig {
         producer,
         channel,
         health_channel,
         health_context,
-        "gpu",
-        telemetry::hardware::gpu::HOST_GPU_CHANNEL,
-        telemetry::hardware::gpu::GPU_SAMPLE_INTERVAL,
-        telemetry::hardware::gpu::sample,
-        |sample| sample.error.as_deref(),
+        sampler,
+        sample_channel,
+        interval,
+        error_of,
+    } = config;
+    let started_producer = producer.clone();
+    telemetry::hardware::spawn_blocking_sampler(
+        engine,
+        interval,
+        state,
+        sample_fn,
+        move || {
+            submit_sampler_started(
+                &started_producer,
+                health_channel,
+                health_context,
+                sampler,
+                sample_channel,
+                interval,
+            );
+        },
+        move |seq, sample| {
+            submit_sampler_sample_health(
+                &producer,
+                health_channel,
+                health_context,
+                sampler,
+                sample_channel,
+                seq,
+                error_of(&sample),
+            );
+            producer.submit_record(channel, &sample);
+        },
     );
 }
 
-struct HostCpuSamplerActor {
+fn sample_host_gpu((): (), seq: u64) -> ((), telemetry::hardware::gpu::HostGpuSample) {
+    ((), telemetry::hardware::gpu::sample(seq))
+}
+
+fn spawn_host_gpu_sampler(
     engine: EngineHandle,
-    sender: ExternalSender,
     producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
-    sampler: telemetry::hardware::cpu::CpuSampler,
+) {
+    spawn_blocking_sampler_task(
+        engine,
+        (),
+        sample_host_gpu,
+        BlockingSamplerConfig {
+            producer,
+            channel,
+            health_channel,
+            health_context,
+            sampler: "gpu",
+            sample_channel: telemetry::hardware::gpu::HOST_GPU_CHANNEL,
+            interval: telemetry::hardware::gpu::GPU_SAMPLE_INTERVAL,
+            error_of: |sample| sample.error.as_deref(),
+        },
+    );
+}
+
+fn sample_host_memory((): (), seq: u64) -> ((), telemetry::hardware::memory::HostMemorySample) {
+    ((), telemetry::hardware::memory::sample(seq))
+}
+
+fn spawn_host_memory_sampler(
+    engine: EngineHandle,
+    producer: TelemetryProducer,
+    channel: ChannelId,
+    health_channel: ChannelId,
+    health_context: SamplerHealthContext,
+) {
+    spawn_blocking_sampler_task(
+        engine,
+        (),
+        sample_host_memory,
+        BlockingSamplerConfig {
+            producer,
+            channel,
+            health_channel,
+            health_context,
+            sampler: "memory",
+            sample_channel: telemetry::hardware::memory::HOST_MEMORY_CHANNEL,
+            interval: telemetry::hardware::memory::MEMORY_SAMPLE_INTERVAL,
+            error_of: |sample| sample.error.as_deref(),
+        },
+    );
+}
+
+fn sample_host_cpu(
+    mut sampler: telemetry::hardware::cpu::CpuSampler,
     seq: u64,
-}
-
-impl ActorInterface for HostCpuSamplerActor {
-    type Incoming = SamplerTick;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        submit_sampler_started(
-            &self.producer,
-            self.health_channel,
-            self.health_context,
-            "cpu",
-            telemetry::hardware::cpu::HOST_CPU_CHANNEL,
-            telemetry::hardware::cpu::CPU_SAMPLE_INTERVAL,
-        );
-        self.schedule(ctx);
-    }
-
-    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
-        let sample = self.sampler.sample(self.seq);
-        submit_sampler_sample_health(
-            &self.producer,
-            self.health_channel,
-            self.health_context,
-            "cpu",
-            telemetry::hardware::cpu::HOST_CPU_CHANNEL,
-            self.seq,
-            sample.error.as_deref(),
-        );
-        self.seq = self.seq.saturating_add(1);
-        self.producer.submit_record(self.channel, &sample);
-        self.schedule(ctx);
-    }
-}
-
-impl HostCpuSamplerActor {
-    fn schedule(&self, ctx: &Ctx) {
-        self.engine.send_after(
-            telemetry::hardware::cpu::CPU_SAMPLE_INTERVAL,
-            self.sender.clone(),
-            ctx.self_addr(),
-            SamplerTick,
-        );
-    }
+) -> (
+    telemetry::hardware::cpu::CpuSampler,
+    telemetry::hardware::cpu::HostCpuSample,
+) {
+    let sample = sampler.sample(seq);
+    (sampler, sample)
 }
 
 fn spawn_host_cpu_sampler(
-    runtime: Runtime,
     engine: EngineHandle,
     producer: TelemetryProducer,
     channel: ChannelId,
@@ -885,40 +843,76 @@ fn spawn_host_cpu_sampler(
     health_context: SamplerHealthContext,
     watched_pids: Vec<u32>,
 ) {
-    runtime
-        .spawn(HostCpuSamplerActor {
-            engine,
-            sender: runtime.create_sender(),
+    spawn_blocking_sampler_task(
+        engine,
+        telemetry::hardware::cpu::CpuSampler::new(watched_pids),
+        sample_host_cpu,
+        BlockingSamplerConfig {
             producer,
             channel,
             health_channel,
             health_context,
-            sampler: telemetry::hardware::cpu::CpuSampler::new(watched_pids),
-            seq: 0,
-        })
-        .expect("spawn CPU sampler actor");
+            sampler: "cpu",
+            sample_channel: telemetry::hardware::cpu::HOST_CPU_CHANNEL,
+            interval: telemetry::hardware::cpu::CPU_SAMPLE_INTERVAL,
+            error_of: |sample| sample.error.as_deref(),
+        },
+    );
+}
+
+fn sample_host_net((): (), seq: u64) -> ((), telemetry::hardware::net::HostNetSample) {
+    ((), telemetry::hardware::net::sample(seq))
 }
 
 fn spawn_host_net_sampler(
-    runtime: Runtime,
     engine: EngineHandle,
     producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
 ) {
-    spawn_blocking_sampler(
-        runtime,
+    spawn_blocking_sampler_task(
         engine,
-        producer,
-        channel,
-        health_channel,
-        health_context,
-        "net",
-        telemetry::hardware::net::HOST_NET_CHANNEL,
-        telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
-        telemetry::hardware::net::sample,
-        |sample| sample.error.as_deref(),
+        (),
+        sample_host_net,
+        BlockingSamplerConfig {
+            producer,
+            channel,
+            health_channel,
+            health_context,
+            sampler: "net",
+            sample_channel: telemetry::hardware::net::HOST_NET_CHANNEL,
+            interval: telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
+            error_of: |sample| sample.error.as_deref(),
+        },
+    );
+}
+
+fn sample_host_storage((): (), seq: u64) -> ((), telemetry::hardware::storage::HostStorageSample) {
+    ((), telemetry::hardware::storage::sample(seq))
+}
+
+fn spawn_host_storage_sampler(
+    engine: EngineHandle,
+    producer: TelemetryProducer,
+    channel: ChannelId,
+    health_channel: ChannelId,
+    health_context: SamplerHealthContext,
+) {
+    spawn_blocking_sampler_task(
+        engine,
+        (),
+        sample_host_storage,
+        BlockingSamplerConfig {
+            producer,
+            channel,
+            health_channel,
+            health_context,
+            sampler: "storage",
+            sample_channel: telemetry::hardware::storage::HOST_STORAGE_CHANNEL,
+            interval: telemetry::hardware::storage::STORAGE_SAMPLE_INTERVAL,
+            error_of: |sample| sample.error.as_deref(),
+        },
     );
 }
 
@@ -984,6 +978,19 @@ struct LoadedObject {
     handle_id: u64,
 }
 
+struct ExecuteStepRequest {
+    role_id: u64,
+    step_id: u64,
+    input_object_id: u64,
+    input_sequence: u64,
+    input_handle_id: u64,
+    output_ring_id: u64,
+    output_object_id: u64,
+    output_sequence: u64,
+    final_stage: bool,
+    output_spec: StageObjectSpecWire,
+}
+
 /// All edge logic — lifecycle, wire bookkeeping, ingress parsing, arena and
 /// worker orchestration — lives in the data-plane edge runtime. This wrapper
 /// only supplies myelin effects (tinygrad worker port, telemetry, node-agent
@@ -1030,12 +1037,14 @@ impl edge_runtime::WorkerPort for TinygradRingPort<'_> {
             alignment: 4,
         });
         self.worker.install_ring(
-            ring_id.0,
-            edge_id.0,
-            port,
-            direction_name,
-            layout.clone(),
-            wire_spec,
+            InstallRingRequest {
+                ring_id: ring_id.0,
+                edge_id: edge_id.0,
+                port,
+                direction: direction_name,
+                layout: layout.clone(),
+                object_spec: wire_spec,
+            },
             self.config,
             self.telemetry,
         )
@@ -1073,6 +1082,49 @@ impl edge_runtime::WorkerPort for TinygradRingPort<'_> {
     }
 }
 
+struct WorkerRuntimeContext<'a> {
+    config: &'a DeploymentConfig,
+    stack: &'a DistributionRuntimeStack,
+    driver: &'a mut IrohDriver,
+    node_actor: ActorAddress,
+    worker: &'a mut TinygradWorker,
+    arena_manager: &'a Arc<Mutex<arena::ArenaManager>>,
+    telemetry: &'a mut NodeTelemetry,
+}
+
+struct EdgeStepRequest {
+    step_id: u64,
+    input_edge_id: u64,
+    object_id: u64,
+    sequence: u64,
+}
+
+struct PromptRequest {
+    request_id: u64,
+    prompt: String,
+    max_tokens: u32,
+    reply_to: ActorAddress,
+}
+
+struct EncodePromptRequest {
+    request_id: u64,
+    prompt: String,
+    reply_to: ActorAddress,
+}
+
+struct DecodeTokensRequest {
+    request_id: u64,
+    tokens: Vec<u32>,
+    reply_to: ActorAddress,
+}
+
+struct WorkerStageServices<'a> {
+    config: &'a DeploymentConfig,
+    stack: &'a DistributionRuntimeStack,
+    node_actor: ActorAddress,
+    arena_manager: &'a Arc<Mutex<arena::ArenaManager>>,
+}
+
 impl WorkerEdgeRuntime {
     fn new(local_node_id: u64) -> Self {
         Self {
@@ -1086,17 +1138,14 @@ impl WorkerEdgeRuntime {
     /// telemetry and node-agent messages. The poll error (if any) propagates
     /// after the observations are reported, mirroring the previous
     /// composition's report-then-halt behavior.
-    #[allow(clippy::too_many_arguments)]
-    fn poll_and_report(
-        &mut self,
-        driver: &mut IrohDriver,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-    ) -> Result<(), String> {
+    fn poll_and_report(&mut self, context: &mut WorkerRuntimeContext<'_>) -> Result<(), String> {
+        let config = context.config;
+        let stack = context.stack;
+        let driver = &mut *context.driver;
+        let node_actor = context.node_actor;
+        let worker = &mut *context.worker;
+        let arena_manager = context.arena_manager;
+        let telemetry = &mut *context.telemetry;
         let result = {
             let mut arena = arena_manager.lock();
             let mut port = TinygradRingPort {
@@ -1275,38 +1324,16 @@ impl WorkerEdgeRuntime {
         Ok(())
     }
 
-    fn poll_iroh(
-        &mut self,
-        driver: &mut IrohDriver,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-    ) -> Result<(), String> {
-        self.poll_and_report(
-            driver,
-            stack,
-            node_actor,
-            worker,
-            arena_manager,
-            config,
-            telemetry,
-        )
+    fn poll_iroh(&mut self, context: &mut WorkerRuntimeContext<'_>) -> Result<(), String> {
+        self.poll_and_report(context)
     }
 
     fn establish_inbound(
         &mut self,
         edge_wire: StageInboundEdgeWire,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-        driver: &mut IrohDriver,
+        context: &mut WorkerRuntimeContext<'_>,
     ) -> Result<(), String> {
+        let config = context.config;
         let parse_spec = ingress::ObjectSpec {
             max_extent: edge_wire.object_spec.max_extent,
             alignment: u64::from(edge_wire.object_spec.alignment),
@@ -1331,28 +1358,17 @@ impl WorkerEdgeRuntime {
             parse_spec,
         );
         self.inbound_edge = Some(edge_wire);
-        self.poll_and_report(
-            driver,
-            stack,
-            node_actor,
-            worker,
-            arena_manager,
-            config,
-            telemetry,
-        )
+        self.poll_and_report(context)
     }
 
     fn establish_outbound(
         &mut self,
         edge_wire: StageOutboundEdgeWire,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-        driver: &mut IrohDriver,
+        context: &mut WorkerRuntimeContext<'_>,
     ) -> Result<(), String> {
+        let config = context.config;
+        let stack = context.stack;
+        let node_actor = context.node_actor;
         if edge_wire.consumer_endpoint.is_none() {
             stack
                 .runtime
@@ -1390,31 +1406,26 @@ impl WorkerEdgeRuntime {
             peer,
         );
         self.outbound_edge = Some(edge_wire);
-        self.poll_and_report(
-            driver,
-            stack,
-            node_actor,
-            worker,
-            arena_manager,
-            config,
-            telemetry,
-        )
+        self.poll_and_report(context)
     }
 
     fn execute_step(
         &mut self,
-        step_id: u64,
-        input_edge_id: u64,
-        object_id: u64,
-        sequence: u64,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-        _driver: &mut IrohDriver,
+        request: EdgeStepRequest,
+        context: &mut WorkerRuntimeContext<'_>,
     ) -> Result<(), String> {
+        let EdgeStepRequest {
+            step_id,
+            input_edge_id,
+            object_id,
+            sequence,
+        } = request;
+        let config = context.config;
+        let stack = context.stack;
+        let node_actor = context.node_actor;
+        let worker = &mut *context.worker;
+        let arena_manager = context.arena_manager;
+        let telemetry = &mut *context.telemetry;
         let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
         };
@@ -1447,16 +1458,18 @@ impl WorkerEdgeRuntime {
         );
         let step_started = Instant::now();
         let committed_bytes = match worker.execute_step(
-            u64::from(config.stage_index) + 1,
-            step_id,
-            object_id,
-            sequence,
-            loaded.handle_id,
-            output_ring_id,
-            output_object_id,
-            sequence,
-            final_stage,
-            outbound.object_spec,
+            ExecuteStepRequest {
+                role_id: u64::from(config.stage_index) + 1,
+                step_id,
+                input_object_id: object_id,
+                input_sequence: sequence,
+                input_handle_id: loaded.handle_id,
+                output_ring_id,
+                output_object_id,
+                output_sequence: sequence,
+                final_stage,
+                output_spec: outbound.object_spec,
+            },
             config,
             telemetry,
         ) {
@@ -1740,15 +1753,15 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
     )?;
-    driver.enable_actor_bridge(
-        stack.runtime.clone(),
-        stack.codec.clone(),
-        stack.actor_bridge_routes(),
-        stack.actors.swim,
-        stack.relay_mirror.clone(),
-        stack.route_view.clone(),
-        stack.outbox.clone(),
-    );
+    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+        runtime: stack.runtime.clone(),
+        codec: stack.codec.clone(),
+        routes: stack.actor_bridge_routes(),
+        swim: stack.actors.swim,
+        relay_mirror: stack.relay_mirror.clone(),
+        route_view: stack.route_view.clone(),
+        outbox: stack.outbox.clone(),
+    });
     // Engine owns protocol tick injection and core progression; the application
     // loop only drains integration-owned queues (ENGINE_SPEC.md).
     stack.spawn_protocol_ticker(PUMP_INTERVAL);
@@ -1797,18 +1810,30 @@ fn run() -> Result<(), String> {
     let sampler_health_channel = telemetry.channel_by_name(NODE_SAMPLER_CHANNEL);
     let sampler_health_context = SamplerHealthContext::from_config(&config);
     spawn_host_gpu_sampler(
-        runtime.clone(),
         engine.handle(),
         telemetry.producer.clone(),
         telemetry.channels.host_gpu,
         sampler_health_channel,
         sampler_health_context,
     );
+    spawn_host_memory_sampler(
+        engine.handle(),
+        telemetry.producer.clone(),
+        telemetry.channels.host_memory,
+        sampler_health_channel,
+        sampler_health_context,
+    );
     spawn_host_net_sampler(
-        runtime.clone(),
         engine.handle(),
         telemetry.producer.clone(),
         telemetry.channels.host_net,
+        sampler_health_channel,
+        sampler_health_context,
+    );
+    spawn_host_storage_sampler(
+        engine.handle(),
+        telemetry.producer.clone(),
+        telemetry.channels.host_storage,
         sampler_health_channel,
         sampler_health_context,
     );
@@ -1929,14 +1954,44 @@ fn run() -> Result<(), String> {
         }
     };
     stack.register_local_actor(driver.register_actor(node_actor, 1));
+    // Agent-only nodes do not launch the legacy Tinygrad child, but they still
+    // need host CPU telemetry. The sampler's host totals are independent of
+    // the watched process list; watch the node process itself for process detail.
+    if config.agent_only {
+        spawn_host_cpu_sampler(
+            engine.handle(),
+            telemetry.producer.clone(),
+            telemetry.channels.host_cpu,
+            sampler_health_channel,
+            sampler_health_context,
+            vec![std::process::id()],
+        );
+    }
     let job_services = if config.agent_only {
         let workdir = PathBuf::from("/var/cache/myelin-jobs");
-        let data_plane = EmbeddedJobDataPlane::start(
-            engine.handle(),
-            driver.edge_connector(),
-            &workdir,
-            &stack,
+        let namespace = install_namespace_client(&stack, &driver)?;
+        let blob_receiver = Arc::new(IrohBlobTransferReceiver::new(
             driver.endpoint_addr(),
+            driver.edge_events_handle(),
+        ));
+        blob_receiver.install_pump(&engine.handle(), stack.runtime.clone(), PUMP_INTERVAL);
+        let transfer_receiver: Arc<dyn BlobTransferReceiver> = blob_receiver;
+        let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
+            driver.edge_connector(),
+            &engine.handle(),
+        ));
+        let data_plane = EmbeddedJobDataPlane::start(
+            &stack,
+            crate::job_deploy::EmbeddedJobDataPlaneConfig {
+                engine: engine.handle(),
+                connector: driver.edge_connector(),
+                root: &workdir,
+                host_endpoint: driver.endpoint_addr(),
+                namespace: namespace.client,
+                transfer_receiver,
+                source_sender,
+                source_publisher: namespace.source_publisher,
+            },
         )?;
         let job_route_registrar = Arc::new(MyelinChildRouteRegistrar::new(
             stack.route_view.clone(),
@@ -2039,7 +2094,7 @@ fn run() -> Result<(), String> {
                     runtime_stats: runtime_stats.clone(),
                     pending_control_rejoin,
                     rejoin_replies,
-                    job_data_plane,
+                    _job_data_plane: job_data_plane,
                 },
                 reports,
                 pending_runtime_ready,
@@ -2081,7 +2136,6 @@ fn run() -> Result<(), String> {
             }
         };
     spawn_host_cpu_sampler(
-        runtime.clone(),
         engine.handle(),
         telemetry.producer.clone(),
         telemetry.channels.host_cpu,
@@ -2238,13 +2292,11 @@ struct AgentNodeRuntimeLive {
     runtime_stats: RuntimeStatsInspector,
     pending_control_rejoin: PendingControlRejoin,
     rejoin_replies: Inbox<ManualControlReply>,
-    job_data_plane: EmbeddedJobDataPlane,
+    _job_data_plane: EmbeddedJobDataPlane,
 }
 
 impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
     fn tick_before_reports(&mut self, node_actor: ActorAddress) -> Result<(), String> {
-        self.job_data_plane
-            .drain_input_events(&self.driver.edge_events_handle());
         self.pending_control_rejoin
             .drive(&self.stack, node_actor, &self.rejoin_replies)?;
         emit_swim_telemetry(&mut self.telemetry, &self.stack, "agent_loop");
@@ -2472,15 +2524,15 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
         self.telemetry.tick();
         serve_telemetry_pulls(&self.driver, &self.stack.engine, &self.telemetry.endpoint);
         drain_worker_stderr(&self.worker.stderr_rx, &self.config, &mut self.telemetry);
-        self.edge_runtime.poll_iroh(
-            &mut self.driver,
-            &self.stack,
+        self.edge_runtime.poll_iroh(&mut WorkerRuntimeContext {
+            config: &self.config,
+            stack: &self.stack,
+            driver: &mut self.driver,
             node_actor,
-            &mut self.worker,
-            &self.arena_manager,
-            &self.config,
-            &mut self.telemetry,
-        )
+            worker: &mut self.worker,
+            arena_manager: &self.arena_manager,
+            telemetry: &mut self.telemetry,
+        })
     }
 
     fn handle_report(
@@ -2490,13 +2542,15 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
     ) -> Result<NodeReportOutcome, String> {
         handle_node_report(
             report,
-            &self.config,
-            &self.stack,
+            WorkerStageServices {
+                config: &self.config,
+                stack: &self.stack,
+                node_actor,
+                arena_manager: &self.arena_manager,
+            },
             &mut self.driver,
-            node_actor,
             &mut self.worker,
             &mut self.edge_runtime,
-            &self.arena_manager,
             &mut self.telemetry,
         )
     }
@@ -2511,12 +2565,9 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
             json!({
                 "readiness_id":pending.readiness_id,
                 "attempts":pending.attempts,
-                "endpoint":&pending.endpoint,
-                "node_actor":pending.node_actor,
+                "ready":ready,
             }),
         );
-        self.telemetry
-            .submit_text(self.telemetry.channels.node_ready, ready.to_string());
         emit_node_event(
             &mut self.telemetry,
             &self.config,
@@ -2730,9 +2781,11 @@ struct TelemetryChannelSet {
     worker_stderr: ChannelId,
     host_cpu: ChannelId,
     host_gpu: ChannelId,
+    host_memory: ChannelId,
     membership: ChannelId,
     swim_probes: ChannelId,
     host_net: ChannelId,
+    host_storage: ChannelId,
     arena: ChannelId,
 }
 
@@ -2821,7 +2874,17 @@ impl NodeTelemetry {
                 &mut by_name,
                 &mut by_id,
             ),
+            host_memory: register_record_channel::<telemetry::hardware::memory::HostMemorySample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
             host_net: register_record_channel::<telemetry::hardware::net::HostNetSample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+            host_storage: register_record_channel::<telemetry::hardware::storage::HostStorageSample>(
                 &producer,
                 &mut by_name,
                 &mut by_id,
@@ -3199,15 +3262,18 @@ impl PendingRuntimeReady {
 
 fn handle_node_report(
     report: NodeAgentReport,
-    config: &DeploymentConfig,
-    stack: &DistributionRuntimeStack,
+    services: WorkerStageServices<'_>,
     driver: &mut IrohDriver,
-    node_actor: ActorAddress,
     worker: &mut TinygradWorker,
     edge_runtime: &mut WorkerEdgeRuntime,
-    arena_manager: &Arc<Mutex<arena::ArenaManager>>,
     telemetry: &mut NodeTelemetry,
 ) -> Result<NodeReportOutcome, String> {
+    let WorkerStageServices {
+        config,
+        stack,
+        node_actor,
+        arena_manager,
+    } = services;
     let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
     };
@@ -3231,14 +3297,16 @@ fn handle_node_report(
     match report {
         NodeAgentReport::Command(command) => {
             handle_stage_command(
-                command,
-                config,
-                stack,
+                *command,
+                WorkerStageServices {
+                    config,
+                    stack,
+                    node_actor,
+                    arena_manager,
+                },
                 driver,
-                node_actor,
                 worker,
                 edge_runtime,
-                arena_manager,
                 telemetry,
             )?;
             Ok(NodeReportOutcome::None)
@@ -3259,7 +3327,16 @@ fn handle_node_report(
             reply_to,
         } => {
             handle_prompt_request(
-                request_id, prompt, max_tokens, reply_to, config, stack, driver, worker, telemetry,
+                PromptRequest {
+                    request_id,
+                    prompt,
+                    max_tokens,
+                    reply_to,
+                },
+                config,
+                stack,
+                worker,
+                telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -3269,7 +3346,15 @@ fn handle_node_report(
             reply_to,
         } => {
             handle_encode_prompt_request(
-                request_id, prompt, reply_to, config, stack, driver, worker, telemetry,
+                EncodePromptRequest {
+                    request_id,
+                    prompt,
+                    reply_to,
+                },
+                config,
+                stack,
+                worker,
+                telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -3279,7 +3364,15 @@ fn handle_node_report(
             reply_to,
         } => {
             handle_decode_tokens_request(
-                request_id, tokens, reply_to, config, stack, driver, worker, telemetry,
+                DecodeTokensRequest {
+                    request_id,
+                    tokens,
+                    reply_to,
+                },
+                config,
+                stack,
+                worker,
+                telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -3299,16 +3392,18 @@ fn handle_node_report(
 }
 
 fn handle_prompt_request(
-    request_id: u64,
-    prompt: String,
-    max_tokens: u32,
-    reply_to: ActorAddress,
+    request: PromptRequest,
     config: &DeploymentConfig,
     stack: &DistributionRuntimeStack,
-    _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
     telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
+    let PromptRequest {
+        request_id,
+        prompt,
+        max_tokens,
+        reply_to,
+    } = request;
     let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
@@ -3444,15 +3539,17 @@ fn handle_prompt_request(
 }
 
 fn handle_encode_prompt_request(
-    request_id: u64,
-    prompt: String,
-    reply_to: ActorAddress,
+    request: EncodePromptRequest,
     config: &DeploymentConfig,
     stack: &DistributionRuntimeStack,
-    _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
     telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
+    let EncodePromptRequest {
+        request_id,
+        prompt,
+        reply_to,
+    } = request;
     let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
@@ -3489,15 +3586,17 @@ fn handle_encode_prompt_request(
 }
 
 fn handle_decode_tokens_request(
-    request_id: u64,
-    tokens: Vec<u32>,
-    reply_to: ActorAddress,
+    request: DecodeTokensRequest,
     config: &DeploymentConfig,
     stack: &DistributionRuntimeStack,
-    _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
     telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
+    let DecodeTokensRequest {
+        request_id,
+        tokens,
+        reply_to,
+    } = request;
     let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
@@ -3617,7 +3716,7 @@ impl StageShardFetchActor {
             }
         };
         let mut child = match swactor_process::command_spawn(
-            &mut Command::new(exe)
+            Command::new(exe)
                 .arg("stage-shard-fetcher")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -3959,15 +4058,18 @@ fn materialize_stage_shard_with_process(
 
 fn handle_stage_command(
     command: StageCommandWire,
-    config: &DeploymentConfig,
-    stack: &DistributionRuntimeStack,
+    services: WorkerStageServices<'_>,
     driver: &mut IrohDriver,
-    node_actor: ActorAddress,
     worker: &mut TinygradWorker,
     edge_runtime: &mut WorkerEdgeRuntime,
-    arena_manager: &Arc<Mutex<arena::ArenaManager>>,
     telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
+    let WorkerStageServices {
+        config,
+        stack,
+        node_actor,
+        arena_manager,
+    } = services;
     let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
     };
@@ -4074,11 +4176,13 @@ fn handle_stage_command(
                 json!({"model_id":&model_id,"gguf_source":gguf_source_kind,"tokenizer":tokenizer_kind,"stage_shard":using_stage_shard,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
             );
             match worker.load_weights(
-                model_id.clone(),
-                resolved_gguf_source,
-                tokenizer,
-                layer_start,
-                layer_end_exclusive,
+                LoadWeightsRequest {
+                    model_id: model_id.clone(),
+                    gguf_source: resolved_gguf_source,
+                    tokenizer,
+                    layer_start,
+                    layer_end_exclusive,
+                },
                 config,
                 telemetry,
             ) {
@@ -4154,13 +4258,15 @@ fn handle_stage_command(
             );
             edge_runtime.establish_inbound(
                 edge,
-                stack,
-                node_actor,
-                worker,
-                arena_manager,
-                config,
-                telemetry,
-                driver,
+                &mut WorkerRuntimeContext {
+                    config,
+                    stack,
+                    driver,
+                    node_actor,
+                    worker,
+                    arena_manager,
+                    telemetry,
+                },
             )?;
             node_stage(
                 telemetry,
@@ -4179,13 +4285,15 @@ fn handle_stage_command(
             );
             edge_runtime.establish_outbound(
                 edge,
-                stack,
-                node_actor,
-                worker,
-                arena_manager,
-                config,
-                telemetry,
-                driver,
+                &mut WorkerRuntimeContext {
+                    config,
+                    stack,
+                    driver,
+                    node_actor,
+                    worker,
+                    arena_manager,
+                    telemetry,
+                },
             )?;
             node_stage(
                 telemetry,
@@ -4212,17 +4320,21 @@ fn handle_stage_command(
                 json!({"step_id":step_id,"input_edge_id":input_edge_id,"object_id":object_id,"sequence":sequence}),
             );
             edge_runtime.execute_step(
-                step_id,
-                input_edge_id,
-                object_id,
-                sequence,
-                stack,
-                node_actor,
-                worker,
-                arena_manager,
-                config,
-                telemetry,
-                driver,
+                EdgeStepRequest {
+                    step_id,
+                    input_edge_id,
+                    object_id,
+                    sequence,
+                },
+                &mut WorkerRuntimeContext {
+                    config,
+                    stack,
+                    driver,
+                    node_actor,
+                    worker,
+                    arena_manager,
+                    telemetry,
+                },
             )?;
             node_stage(
                 telemetry,
@@ -4260,11 +4372,13 @@ fn run_self_test(
         telemetry,
     )?;
     worker.load_weights(
-        config.model_id.clone(),
-        config.gguf_source.clone(),
-        config.tokenizer.clone(),
-        0,
-        config.self_test_layer_end,
+        LoadWeightsRequest {
+            model_id: config.model_id.clone(),
+            gguf_source: config.gguf_source.clone(),
+            tokenizer: config.tokenizer.clone(),
+            layer_start: 0,
+            layer_end_exclusive: config.self_test_layer_end,
+        },
         config,
         telemetry,
     )?;
@@ -4608,20 +4722,34 @@ impl ActorInterface for HelperWaitActor {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn wait_for_helper_event(
-    runtime: &Runtime,
+struct HelperWaitRequest<'a> {
     stdout_rx: Arc<Mutex<Receiver<HelperStdoutEvent>>>,
     stderr_rx: Option<Arc<Mutex<Receiver<String>>>>,
-    expected: &str,
-    command_type: &str,
-    config: &DeploymentConfig,
-    telemetry: &mut NodeTelemetry,
+    expected: &'a str,
+    command_type: &'a str,
+    config: &'a DeploymentConfig,
     channel: ChannelId,
-    channel_name: &str,
-    engine: &EngineHandle,
+    channel_name: &'a str,
+    engine: &'a EngineHandle,
     wait_config: HelperCommandWaitConfig,
+}
+
+fn wait_for_helper_event(
+    runtime: &Runtime,
+    telemetry: &mut NodeTelemetry,
+    request: HelperWaitRequest<'_>,
 ) -> Result<Value, String> {
+    let HelperWaitRequest {
+        stdout_rx,
+        stderr_rx,
+        expected,
+        command_type,
+        config,
+        channel,
+        channel_name,
+        engine,
+        wait_config,
+    } = request;
     emit_node_event(
         telemetry,
         config,
@@ -4734,6 +4862,23 @@ fn wait_for_helper_event(
     outcome.result
 }
 
+struct LoadWeightsRequest {
+    model_id: String,
+    gguf_source: GgufSource,
+    tokenizer: TokenizerSource,
+    layer_start: u32,
+    layer_end_exclusive: u32,
+}
+
+struct InstallRingRequest<'a> {
+    ring_id: u64,
+    edge_id: u64,
+    port: &'a str,
+    direction: &'a str,
+    layout: arena::RingLayout,
+    object_spec: StageObjectSpecWire,
+}
+
 struct TinygradWorker {
     child: Child,
     stdin: ChildStdin,
@@ -4751,7 +4896,7 @@ impl TinygradWorker {
         engine: EngineHandle,
     ) -> Result<Self, String> {
         let mut child = swactor_process::command_spawn(
-            &mut Command::new("python3")
+            Command::new("python3")
                 .arg(&config.worker_script)
                 .env("DEV", &config.device)
                 .env("MYELIN_RUN_ID", config.run_id.to_string())
@@ -4855,14 +5000,17 @@ impl TinygradWorker {
 
     fn load_weights(
         &mut self,
-        model_id: String,
-        gguf_source: GgufSource,
-        tokenizer: TokenizerSource,
-        layer_start: u32,
-        layer_end_exclusive: u32,
+        request: LoadWeightsRequest,
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
+        let LoadWeightsRequest {
+            model_id,
+            gguf_source,
+            tokenizer,
+            layer_start,
+            layer_end_exclusive,
+        } = request;
         self.command(
             json!({
                 "type":"LoadWeights",
@@ -4949,15 +5097,18 @@ impl TinygradWorker {
 
     fn install_ring(
         &mut self,
-        ring_id: u64,
-        edge_id: u64,
-        port: &str,
-        direction: &str,
-        layout: arena::RingLayout,
-        object_spec: StageObjectSpecWire,
+        request: InstallRingRequest<'_>,
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
+        let InstallRingRequest {
+            ring_id,
+            edge_id,
+            port,
+            direction,
+            layout,
+            object_spec,
+        } = request;
         self.command(
             json!({
                 "type":"InstallRing",
@@ -5033,22 +5184,24 @@ impl TinygradWorker {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_step(
         &mut self,
-        role_id: u64,
-        step_id: u64,
-        input_object_id: u64,
-        input_sequence: u64,
-        input_handle_id: u64,
-        output_ring_id: u64,
-        output_object_id: u64,
-        output_sequence: u64,
-        final_stage: bool,
-        output_spec: StageObjectSpecWire,
+        request: ExecuteStepRequest,
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
     ) -> Result<usize, String> {
+        let ExecuteStepRequest {
+            role_id,
+            step_id,
+            input_object_id,
+            input_sequence,
+            input_handle_id,
+            output_ring_id,
+            output_object_id,
+            output_sequence,
+            final_stage,
+            output_spec,
+        } = request;
         let event = self.command(
             json!({
                 "type":"ExecuteStep",
@@ -5181,16 +5334,18 @@ impl TinygradWorker {
     ) -> Result<Value, String> {
         wait_for_helper_event(
             &self.runtime,
-            Arc::clone(&self.stdout_rx),
-            Some(Arc::clone(&self.stderr_rx)),
-            expected,
-            command_type,
-            config,
             telemetry,
-            channel,
-            channel_name,
-            &self.engine,
-            HelperCommandWaitConfig::production(),
+            HelperWaitRequest {
+                stdout_rx: Arc::clone(&self.stdout_rx),
+                stderr_rx: Some(Arc::clone(&self.stderr_rx)),
+                expected,
+                command_type,
+                config,
+                channel,
+                channel_name,
+                engine: &self.engine,
+                wait_config: HelperCommandWaitConfig::production(),
+            },
         )
     }
 }
@@ -5217,7 +5372,7 @@ mod control_flow_properties {
     use swactor::actor::ActorAddress;
     use swactor::config::RuntimeConfig;
     use swactor::runtime::{Runtime, RuntimeParts};
-    use swactor_engine::{ActorCompletion, Engine, SteppingBackend};
+    use swactor_engine::{ActorCompletion, Engine, SteppingBackend, TokioBackend, TokioConfig};
 
     use super::*;
     use crate::node_actor::StageLifecycleWire;
@@ -5225,6 +5380,131 @@ mod control_flow_properties {
 
     const DRIVE_PER_ACTION: usize = 16;
     const FINAL_DRIVE_BUDGET: usize = 256;
+
+    #[test]
+    fn hardware_sampler_runs_as_engine_task_not_actor() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
+        let producer = TelemetryEndpoint::with_descriptor(
+            StreamDescriptor {
+                stream: StreamId::new(NodeId::new("sampler-test"), Lifetime(1)),
+                label: None,
+                origin: StreamOrigin::RemoteNode,
+            },
+            8,
+            8,
+        )
+        .producer();
+        let sample_channel = producer.register_record::<telemetry::hardware::net::HostNetSample>();
+        let health_channel = producer.register_channel(
+            NODE_SAMPLER_CHANNEL,
+            ChannelContent::JsonRecord {
+                schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
+            },
+        );
+        let baseline_actors = runtime.stats().actors.len();
+        let baseline_tasks = backend.pending_task_count();
+
+        spawn_blocking_sampler_task(
+            engine.handle(),
+            (),
+            sample_host_net,
+            BlockingSamplerConfig {
+                producer,
+                channel: sample_channel,
+                health_channel,
+                health_context: SamplerHealthContext {
+                    run_id: 1,
+                    node_id: 1,
+                    stage_index: 0,
+                },
+                sampler: "net",
+                sample_channel: telemetry::hardware::net::HOST_NET_CHANNEL,
+                interval: telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
+                error_of: |sample| sample.error.as_deref(),
+            },
+        );
+        backend.step();
+
+        assert_eq!(runtime.stats().actors.len(), baseline_actors);
+        assert_eq!(backend.pending_task_count(), baseline_tasks + 1);
+    }
+
+    #[test]
+    fn agent_cpu_sampler_emits_decodable_host_stats() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let _runtime = parts.runtime().clone();
+        let engine = Engine::new(
+            parts,
+            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+        )
+        .expect("engine");
+        let endpoint = TelemetryEndpoint::with_descriptor(
+            StreamDescriptor {
+                stream: StreamId::new(NodeId::new("agent-sampler-test"), Lifetime(1)),
+                label: None,
+                origin: StreamOrigin::RemoteNode,
+            },
+            8,
+            8,
+        );
+        let producer = endpoint.producer();
+        let sample_channel = producer.register_record::<telemetry::hardware::cpu::HostCpuSample>();
+        let health_channel = producer.register_channel(
+            NODE_SAMPLER_CHANNEL,
+            ChannelContent::JsonRecord {
+                schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
+            },
+        );
+        let subscription = endpoint.subscribe_all("agent-cpu-sampler-test");
+
+        spawn_host_cpu_sampler(
+            engine.handle(),
+            producer,
+            sample_channel,
+            health_channel,
+            SamplerHealthContext {
+                run_id: 1,
+                node_id: 1,
+                stage_index: 0,
+            },
+            vec![std::process::id()],
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            endpoint.tick();
+            for event in subscription.drain_available() {
+                if let TelemetryEvent::Frame(delivery) = event
+                    && delivery.channel.channel == sample_channel
+                {
+                    let sample = telemetry::hardware::cpu::HostCpuSample::decode(&delivery.payload)
+                        .expect("host CPU sample");
+                    assert_eq!(sample.seq, 0);
+                    assert!(
+                        sample
+                            .host
+                            .as_ref()
+                            .is_some_and(|host| host.logical_cpus > 0)
+                    );
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent CPU sampler did not emit within three intervals"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn check_runtime_clean(
         runtime: &Runtime,
@@ -5504,9 +5784,10 @@ mod control_flow_properties {
         fn runtime_actors_generated_transitions_complete_once_on_one_worker(
             actions in runtime_actions()
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
@@ -5861,9 +6142,10 @@ mod control_flow_properties {
             actions in helper_actions(),
             extra_ticks in 0_usize..=8,
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
@@ -6177,9 +6459,10 @@ mod control_flow_properties {
         fn stage_fetch_generated_observations_complete_once_on_one_worker(
             actions in stage_actions()
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");

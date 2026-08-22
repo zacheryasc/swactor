@@ -48,7 +48,6 @@
 //! into a live attempt — is the attempt-fact-ownership oracle line.
 
 // Shared across test binaries; each binary uses a different subset.
-#![allow(dead_code)]
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -264,9 +263,9 @@ impl EffectBackend for FakeBackend {
         }
         let endpoint = !matches!(reply, Reply::NoEndpoint);
         Ok(match &effect.command {
-            NodeManagerCommand::CreateLease(_) => {
-                OperationOutcome::LeaseCreated(lease_result(effect.operation.attempt, endpoint))
-            }
+            NodeManagerCommand::CreateLease(_) => OperationOutcome::LeaseCreated(Box::new(
+                lease_result(effect.operation.attempt, endpoint),
+            )),
             NodeManagerCommand::LookupEndpoint(_) => {
                 OperationOutcome::EndpointLookup(Some(ssh_endpoint()))
             }
@@ -402,10 +401,10 @@ impl<P: TestablePlugin + 'static> EffectBackend for PluginBackendAdapter<P> {
                     // Adoption: the resource for this attempt already
                     // exists; return it without touching the plugin.
                     let endpoint = lease.endpoint.clone();
-                    return Ok(OperationOutcome::LeaseCreated(lease_result(
+                    return Ok(OperationOutcome::LeaseCreated(Box::new(lease_result(
                         effect.operation.attempt,
                         endpoint.is_some(),
-                    )));
+                    ))));
                 }
                 let spec = NodeProvisionSpec {
                     run_id: request.spec.run_id.0,
@@ -430,10 +429,10 @@ impl<P: TestablePlugin + 'static> EffectBackend for PluginBackendAdapter<P> {
                         endpoint: endpoint.clone(),
                     },
                 );
-                Ok(OperationOutcome::LeaseCreated(lease_result(
+                Ok(OperationOutcome::LeaseCreated(Box::new(lease_result(
                     effect.operation.attempt,
                     endpoint.is_some(),
-                )))
+                ))))
             }
             NodeManagerCommand::LookupEndpoint(_) => {
                 // A provider resolves the node's address on each probe;
@@ -1058,7 +1057,7 @@ impl<B: HarnessedBackend> Drop for Harness<B> {
 pub struct Rng(u64);
 
 impl Rng {
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1073,13 +1072,13 @@ pub struct GenCtx {
 }
 
 fn gen_input(ctx: &mut GenCtx, rng: &mut Rng) -> Input {
-    match rng.next() % 100 {
+    match rng.next_u64() % 100 {
         0..=39 => Input::Tick(Duration::from_secs(
-            [1, 10, 61, 130, 3_600][(rng.next() % 5) as usize],
+            [1, 10, 61, 130, 3_600][(rng.next_u64() % 5) as usize],
         )),
         40..=61 => Input::Run,
         62..=79 => {
-            let reply = match rng.next() % 100 {
+            let reply = match rng.next_u64() % 100 {
                 0..=59 => Reply::Succeed,
                 60..=74 => Reply::NoEndpoint,
                 75..=84 => Reply::Definite("scripted definite failure"),
@@ -1088,15 +1087,15 @@ fn gen_input(ctx: &mut GenCtx, rng: &mut Rng) -> Input {
             };
             Input::Reply(reply)
         }
-        80..=86 => Input::Boot(match rng.next() % 3 {
+        80..=86 => Input::Boot(match rng.next_u64() % 3 {
             0 => BootEvent::Joined,
             1 => BootEvent::Closed,
             _ => BootEvent::Failed,
         }),
         _ => {
             ctx.generation += 1;
-            ctx.role_alt ^= rng.next().is_multiple_of(2);
-            let count = (rng.next() % 4) as u32;
+            ctx.role_alt ^= rng.next_u64().is_multiple_of(2);
+            let count = (rng.next_u64() % 4) as u32;
             let role = if ctx.role_alt { "worker-alt" } else { "worker" };
             Input::Shape(shape(
                 ctx.generation,

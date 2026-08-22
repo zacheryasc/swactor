@@ -16,7 +16,6 @@
 //! Membership is observed through the harness `membership_mirror` (a
 //! `MemberList` filled by the [`MembershipFanout`] from SWIM's
 //! `MembershipChanged` stream). The driver snapshot no longer carries members.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
@@ -80,15 +79,15 @@ impl ActorInterface for MembershipFanout {
 /// the four protocol actors. Owns everything that must stay alive and be pumped.
 pub struct IrohNode {
     pub driver: IrohDriver,
-    rt: Runtime,
-    outbox: Outbox,
-    swim_addr: ActorAddress,
-    registry_addr: ActorAddress,
-    metadata_addr: ActorAddress,
-    directory_addr: ActorAddress,
+    _rt: Runtime,
+    _outbox: Outbox,
+    _swim_addr: ActorAddress,
+    _registry_addr: ActorAddress,
+    _metadata_addr: ActorAddress,
+    _directory_addr: ActorAddress,
     membership_mirror: Arc<Mutex<MemberList>>,
-    relay_mirror: RelayMirror,
-    route_view: RouteView,
+    _relay_mirror: RelayMirror,
+    _route_view: RouteView,
     /// The engine that owns this node's Tokio substrate and drives the core
     /// runtime. Declared last so it drops after the driver on teardown.
     _engine: Engine,
@@ -215,15 +214,15 @@ impl IrohNode {
         routes.insert("swactor_dist::RegistryGossip".to_string(), registry_addr);
         routes.insert("swactor_dist::MetadataGossip".to_string(), metadata_addr);
         routes.insert("swactor_dist::DirectoryGossip".to_string(), directory_addr);
-        driver.enable_actor_bridge(
-            rt.clone(),
-            Arc::clone(&actor_codec),
+        driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+            runtime: rt.clone(),
+            codec: Arc::clone(&actor_codec),
             routes,
-            swim_addr,
-            Arc::clone(&relay_mirror),
-            Arc::clone(&route_view),
-            Arc::clone(&outbox),
-        );
+            swim: swim_addr,
+            relay_mirror: Arc::clone(&relay_mirror),
+            route_view: Arc::clone(&route_view),
+            outbox: Arc::clone(&outbox),
+        });
         // Engine-hosted adapter pump: drains ingress/egress/telemetry/edge on
         // a timer so the synchronous test loop no longer pumps these by hand.
         driver.install_actor_bridge_pump(Duration::from_millis(10));
@@ -248,15 +247,15 @@ impl IrohNode {
 
         Self {
             driver,
-            rt,
-            outbox,
-            swim_addr,
-            registry_addr,
-            metadata_addr,
-            directory_addr,
+            _rt: rt,
+            _outbox: outbox,
+            _swim_addr: swim_addr,
+            _registry_addr: registry_addr,
+            _metadata_addr: metadata_addr,
+            _directory_addr: directory_addr,
             membership_mirror,
-            relay_mirror,
-            route_view,
+            _relay_mirror: relay_mirror,
+            _route_view: route_view,
             _engine: engine,
         }
     }
@@ -465,8 +464,8 @@ impl IrohTestCluster {
         let mut nodes: Vec<IrohNode> = (0..n).map(|_| make_driver()).collect();
 
         let addr_0 = nodes[0].endpoint_addr();
-        for i in 1..n {
-            nodes[i].join(&[addr_0.clone()]);
+        for node in nodes.iter_mut().skip(1) {
+            node.join(std::slice::from_ref(&addr_0));
         }
 
         Self { nodes }
@@ -475,6 +474,10 @@ impl IrohTestCluster {
     /// Number of nodes in the cluster.
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
     }
 
     /// The public key (SWIM/gossip identity) of node `idx`.

@@ -555,7 +555,7 @@ impl Default for RetryPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationOutcome {
-    LeaseCreated(CreateLeaseResult),
+    LeaseCreated(Box<CreateLeaseResult>),
     EndpointLookup(Option<SshEndpoint>),
     BootstrapStarted { session_id: BootstrapSessionId },
     BootstrapConvergenceAccepted,
@@ -584,7 +584,6 @@ pub struct ExecutorResult {
 }
 
 // Keeping outcomes inline avoids allocating on every executor result.
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeObservation {
     OperationSucceeded {

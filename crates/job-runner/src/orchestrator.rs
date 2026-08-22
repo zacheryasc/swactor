@@ -317,10 +317,10 @@ impl ActorInterface for OrchestratorJobActor {
                 entry.extend_from_slice(&chunk.data);
                 if chunk.eof {
                     let bytes = self.output_bufs.remove(&chunk.name).unwrap_or_default();
-                    if !bytes.is_empty() {
-                        if let Err(e) = extract_tar(&bytes, &self.landing) {
-                            eprintln!("job-runner: untar output `{}` failed: {e}", chunk.name);
-                        }
+                    if !bytes.is_empty()
+                        && let Err(e) = extract_tar(&bytes, &self.landing)
+                    {
+                        eprintln!("job-runner: untar output `{}` failed: {e}", chunk.name);
                     }
                     self.pending_outputs.remove(&chunk.name);
                     self.finish_if_output_collection_complete(ctx);

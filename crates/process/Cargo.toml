@@ -21,3 +21,6 @@ signal-hook = "0.3"
 [dev-dependencies]
 parking_lot = "0.12"
 proptest = "1"
+
+[lints]
+workspace = true

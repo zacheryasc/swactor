@@ -104,7 +104,6 @@ pub enum DataPlaneError {
         operation: DataOperation,
     },
     PathNotFound(DataPath),
-    PathAlreadyExists(DataPath),
     SourceFailure(String),
     ArenaExhausted,
     Blob(BlobFailure),
@@ -124,7 +123,6 @@ impl fmt::Display for DataPlaneError {
                 write!(f, "{operation:?} is not authorized for {path}")
             }
             Self::PathNotFound(path) => write!(f, "data path not found: {path}"),
-            Self::PathAlreadyExists(path) => write!(f, "data path already exists: {path}"),
             Self::SourceFailure(reason) => write!(f, "blob source failed: {reason}"),
             Self::ArenaExhausted => f.write_str("data-plane arena is exhausted"),
             Self::Blob(reason) => write!(f, "blob lease failure: {reason:?}"),
@@ -142,14 +140,6 @@ impl From<BlobError> for DataPlaneError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishedBlobInfo {
-    pub path: DataPath,
-    pub binding: ActorAddress,
-    pub lease: BlobLease,
-    pub metadata: BlobMetadata,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HostSessionIn {
     Attach {
@@ -161,6 +151,9 @@ pub enum HostSessionIn {
     OpenReadBlob {
         path: DataPath,
         child_session: ActorAddress,
+        operation: ActorAddress,
+    },
+    CancelReadBlob {
         operation: ActorAddress,
     },
     OpenWriteBlob {
@@ -186,13 +179,6 @@ pub enum HostSessionIn {
         lease_id: BlobLeaseId,
         generation: u64,
     },
-    BindingPublished {
-        binding: ActorAddress,
-        operation: ActorAddress,
-        path: DataPath,
-        lease: BlobLease,
-        metadata: BlobMetadata,
-    },
     BindingFaulted {
         binding: ActorAddress,
         operation: ActorAddress,
@@ -201,39 +187,8 @@ pub enum HostSessionIn {
     BindingDone {
         binding: ActorAddress,
     },
-    InspectPublished {
-        path: DataPath,
-        reply_to: ActorAddress,
-    },
-    ReleasePublished {
-        path: DataPath,
-    },
-    BeginBlobSource {
-        path: DataPath,
-        metadata: BlobMetadata,
-        reply_to: ActorAddress,
-    },
-    BlobSourceChunk {
-        path: DataPath,
-        bytes: Vec<u8>,
-    },
-    FinishBlobSource {
-        path: DataPath,
-    },
-    FailBlobSource {
-        path: DataPath,
-        reason: String,
-    },
-    SourceReady {
-        path: DataPath,
-        source: ActorAddress,
-        lease: BlobLease,
-        metadata: BlobMetadata,
-    },
-    SourceFaulted {
-        path: DataPath,
-        source: ActorAddress,
-        error: DataPlaneError,
+    BindingDetached {
+        binding: ActorAddress,
     },
     ConfigureRun {
         run_id: String,
@@ -259,6 +214,9 @@ pub enum ChildSessionIn {
     AttachmentDeadline,
     ReadBlob {
         path: DataPath,
+        reply_to: ActorAddress,
+    },
+    CancelRead {
         reply_to: ActorAddress,
     },
     OpenWriteBlob {
@@ -303,4 +261,7 @@ impl NetworkMessage for ChildSessionIn {
 pub fn register_data_plane_codecs(registry: &mut CodecRegistry) {
     registry.register::<HostSessionIn, _>(JsonCodec::default());
     registry.register::<ChildSessionIn, _>(JsonCodec::default());
+    crate::namespace::register_namespace_codecs(registry);
+    crate::blob_transfer::register_blob_transfer_codecs(registry);
+    crate::source::register_blob_source_codecs(registry);
 }

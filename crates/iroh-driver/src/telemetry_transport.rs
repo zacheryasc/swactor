@@ -144,6 +144,15 @@ impl Drop for PullCollectorCompletion {
     }
 }
 
+pub struct PullCollectorConfig {
+    pub endpoint: Endpoint,
+    pub peer: EndpointAddr,
+    pub flow_id: [u8; 16],
+    pub token: Vec<u8>,
+    pub request: telemetry::SubscriptionRequest,
+    pub fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+}
+
 /// Supervisor side: retain a pull subscription to a node on `TELEMETRY_ALPN`.
 ///
 /// A transport interruption reconnects with bounded backoff. Returning after
@@ -151,24 +160,10 @@ impl Drop for PullCollectorCompletion {
 /// easy to trigger while several freshly-bootstrapped nodes answer at once.
 pub fn spawn_pull_collector(
     engine: &EngineHandle,
-    endpoint: Endpoint,
-    peer: EndpointAddr,
-    flow_id: [u8; 16],
-    token: Vec<u8>,
-    request: telemetry::SubscriptionRequest,
-    fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+    config: PullCollectorConfig,
     on_header: std::sync::mpsc::Sender<TelemetryQuicHeader>,
 ) -> PullCollectorHandle {
-    spawn_pull_collector_with_sink(
-        engine,
-        endpoint,
-        peer,
-        flow_id,
-        token,
-        request,
-        fanout,
-        PullHeaderSink::Channel(on_header),
-    )
+    spawn_pull_collector_with_sink(engine, config, PullHeaderSink::Channel(on_header))
 }
 
 /// Supervisor side variant that delivers each connection header directly to
@@ -176,25 +171,11 @@ pub fn spawn_pull_collector(
 /// stream identity changes domain state.
 pub fn spawn_pull_collector_to_actor(
     engine: &EngineHandle,
-    endpoint: Endpoint,
-    peer: EndpointAddr,
-    flow_id: [u8; 16],
-    token: Vec<u8>,
-    request: telemetry::SubscriptionRequest,
-    fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+    config: PullCollectorConfig,
     sender: ExternalSender,
     actor: ActorAddress,
 ) -> PullCollectorHandle {
-    spawn_pull_collector_with_sink(
-        engine,
-        endpoint,
-        peer,
-        flow_id,
-        token,
-        request,
-        fanout,
-        PullHeaderSink::Actor { sender, actor },
-    )
+    spawn_pull_collector_with_sink(engine, config, PullHeaderSink::Actor { sender, actor })
 }
 
 enum PullHeaderSink {
@@ -214,17 +195,19 @@ impl PullHeaderSink {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_pull_collector_with_sink(
     engine: &EngineHandle,
-    endpoint: Endpoint,
-    peer: EndpointAddr,
-    flow_id: [u8; 16],
-    token: Vec<u8>,
-    request: telemetry::SubscriptionRequest,
-    fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+    config: PullCollectorConfig,
     on_header: PullHeaderSink,
 ) -> PullCollectorHandle {
+    let PullCollectorConfig {
+        endpoint,
+        peer,
+        flow_id,
+        token,
+        request,
+        fanout,
+    } = config;
     let (cancellation, mut cancellation_rx) = tokio::sync::watch::channel(false);
     let (completion, completion_rx) = tokio::sync::watch::channel(false);
     let engine_handle = engine.clone();
@@ -486,11 +469,8 @@ pub async fn read_stream_header(recv: &mut RecvStream) -> Result<TelemetryQuicHe
 pub async fn read_events_from_stream(mut recv: RecvStream) -> Result<TelemetryQuicRead, BoxError> {
     let header = read_header(&mut recv).await?;
     let mut events = Vec::new();
-    loop {
-        match read_next_event(&mut recv, &header.stream).await? {
-            Some(event) => events.push(event),
-            None => break,
-        }
+    while let Some(event) = read_next_event(&mut recv, &header.stream).await? {
+        events.push(event);
     }
     Ok(TelemetryQuicRead { header, events })
 }

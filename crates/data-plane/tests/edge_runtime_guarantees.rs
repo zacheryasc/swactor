@@ -187,10 +187,10 @@ fn arena_runtime(
     (runtime, transport, boot_arena(), MockWorker::default())
 }
 
-fn find_observation<'a>(
-    observations: &'a [Observation],
+fn find_observation(
+    observations: &[Observation],
     predicate: impl Fn(&Observation) -> bool,
-) -> Option<&'a Observation> {
+) -> Option<&Observation> {
     observations.iter().find(|obs| predicate(obs))
 }
 
@@ -267,13 +267,13 @@ fn outbound_edge_opens_writer_and_allocates_object_ids() {
         .expect("poll");
     let observations = runtime.take_observations();
 
-    assert!(matches!(
+    assert!(
         find_observation(&observations, |obs| matches!(
             obs,
             Observation::EdgeReady { .. }
-        )),
-        Some(_)
-    ));
+        ))
+        .is_some()
+    );
     assert_eq!(transport.opened, vec![EdgeId(7002)]);
     assert_eq!(runtime.outbound_ring_id().map(|ring| ring.0), Some(1));
     assert!(runtime.outbound_writer().is_some());
@@ -296,13 +296,13 @@ fn early_stream_waits_for_recv_establishment() {
         .poll(&mut transport, &mut arena, &mut worker)
         .expect("poll");
     let observations = runtime.take_observations();
-    assert!(matches!(
+    assert!(
         find_observation(&observations, |obs| matches!(
             obs,
             Observation::EdgeReady { .. }
-        )),
-        Some(_)
-    ));
+        ))
+        .is_some()
+    );
 }
 
 // A malformed ingress record must fault: ObjectFailed observation with no
@@ -321,7 +321,7 @@ fn malformed_ingress_record_is_fatal_and_reported() {
     let result = runtime.poll(&mut transport, &mut arena, &mut worker);
     assert!(result.is_err(), "malformed record must be fatal");
     let observations = runtime.take_observations();
-    assert!(matches!(
+    assert!(
         find_observation(&observations, |obs| {
             matches!(
                 obs,
@@ -330,9 +330,9 @@ fn malformed_ingress_record_is_fatal_and_reported() {
                     ..
                 }
             )
-        }),
-        Some(_)
-    ));
+        })
+        .is_some()
+    );
 }
 
 // A worker load failure must surface ObjectFailed with the object id and
@@ -351,7 +351,7 @@ fn worker_load_failure_reports_object_and_is_fatal() {
     let result = runtime.poll(&mut transport, &mut arena, &mut worker);
     assert!(result.is_err(), "load failure must be fatal");
     let observations = runtime.take_observations();
-    assert!(matches!(
+    assert!(
         find_observation(&observations, |obs| {
             matches!(
                 obs,
@@ -360,7 +360,7 @@ fn worker_load_failure_reports_object_and_is_fatal() {
                     ..
                 }
             )
-        }),
-        Some(_)
-    ));
+        })
+        .is_some()
+    );
 }

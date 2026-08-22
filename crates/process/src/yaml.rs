@@ -144,12 +144,12 @@ pub fn matching_pipelines(ci: &CiYaml, event: &WebhookEvent) -> Vec<String> {
 /// Check whether a single trigger matches a webhook event.
 fn trigger_matches(trigger: &TriggerDef, event: &WebhookEvent) -> bool {
     // Event type must match.
-    let event_matches = match (&trigger.event, &event.event_type) {
-        (TriggerEvent::Push, EventType::Push) => true,
-        (TriggerEvent::Tag, EventType::Tag) => true,
-        (TriggerEvent::Merge, EventType::Merge) => true,
-        _ => false,
-    };
+    let event_matches = matches!(
+        (&trigger.event, &event.event_type),
+        (TriggerEvent::Push, EventType::Push)
+            | (TriggerEvent::Tag, EventType::Tag)
+            | (TriggerEvent::Merge, EventType::Merge)
+    );
     if !event_matches {
         return false;
     }

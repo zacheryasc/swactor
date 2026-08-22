@@ -402,10 +402,10 @@ impl SwimProbe {
     }
 
     fn maybe_start_probe(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
-        if let Some(at) = self.next_probe_at {
-            if self.now < at {
-                return;
-            }
+        if let Some(at) = self.next_probe_at
+            && self.now < at
+        {
+            return;
         }
         if !matches!(self.phase, ProbePhase::Idle) {
             return;
@@ -639,10 +639,10 @@ impl SwimProbe {
         if self.config.dead_reprobe_interval == Duration::ZERO {
             return;
         }
-        if let Some(at) = self.next_reprobe_at {
-            if self.now < at {
-                return;
-            }
+        if let Some(at) = self.next_reprobe_at
+            && self.now < at
+        {
+            return;
         }
 
         self.next_reprobe_at = Some(self.now + self.config.dead_reprobe_interval);
@@ -750,10 +750,10 @@ impl SwimProbe {
 
     /// At safety_sweep_interval, probe one random alive member.
     fn maybe_safety_sweep(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
-        if let Some(at) = self.next_sweep_at {
-            if self.now < at {
-                return;
-            }
+        if let Some(at) = self.next_sweep_at
+            && self.now < at
+        {
+            return;
         }
         let interval = match &self.config.probe_mode {
             ProbeMode::Reactive {

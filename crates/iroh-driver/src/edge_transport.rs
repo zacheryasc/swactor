@@ -108,7 +108,7 @@ pub(crate) fn spawn_edge_send_pump(
                 .map_err(|_| format!("finish edge stream {edge_id}: timed out"))?
                 .map_err(|e| format!("finish edge stream {edge_id}: {e}"))?
             {
-                Some(code) => return Err(format!("peer stopped edge stream {edge_id}: {code}")),
+                Some(code) => Err(format!("peer stopped edge stream {edge_id}: {code}")),
                 None => Ok(()),
             }
         }
