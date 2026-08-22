@@ -3,7 +3,7 @@
 //! Uses proptest for randomized testing and proptest-state-machine for
 //! stateful property testing with automatic shrinking of failing sequences.
 
-mod common;
+pub mod common;
 use common::plain_host;
 
 use std::collections::HashMap;

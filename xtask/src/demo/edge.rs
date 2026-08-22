@@ -503,7 +503,6 @@ pub struct NodeEdgeAgent {
 }
 
 impl NodeEdgeAgent {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         attempt: u64,
         logical_node: String,
@@ -756,7 +755,7 @@ impl swactor::actor::ActorInterface for EdgeAckRelay {
         if let Some(addr) = self.supervisor.get() {
             let _ = self
                 .sender
-                .send_to(addr.clone(), crate::demo::feed::SupervisorMsg::EdgeAck(ack));
+                .send_to(*addr, crate::demo::feed::SupervisorMsg::EdgeAck(ack));
         }
     }
 }

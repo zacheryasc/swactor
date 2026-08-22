@@ -118,6 +118,10 @@ impl<T: Message> Admin<T> {
 }
 
 pub(crate) type AdminBoxedReply = Box<dyn Any + Send>;
+pub(crate) type AdminGetState =
+    Box<dyn FnOnce(ActorAddress, &dyn AnyActor, ActorTypeMetadata) -> AdminBoxedReply + Send>;
+pub(crate) type AdminReplaceState =
+    Box<dyn FnOnce(&mut dyn AnyActor, ActorTypeMetadata) -> AdminResult<OperationResult> + Send>;
 
 pub(crate) enum AdminCommand {
     ListActors {
@@ -130,17 +134,13 @@ pub(crate) enum AdminCommand {
     GetActorState {
         actor: ActorAddress,
         reply_to: ActorAddress,
-        get: Box<
-            dyn FnOnce(ActorAddress, &dyn AnyActor, ActorTypeMetadata) -> AdminBoxedReply + Send,
-        >,
+        get: AdminGetState,
         not_found: Box<dyn FnOnce(ActorAddress) -> AdminBoxedReply + Send>,
     },
     ReplaceActorState {
         actor: ActorAddress,
         reply_to: ActorAddress,
-        replace: Box<
-            dyn FnOnce(&mut dyn AnyActor, ActorTypeMetadata) -> AdminResult<OperationResult> + Send,
-        >,
+        replace: AdminReplaceState,
     },
     StopActor {
         actor: ActorAddress,

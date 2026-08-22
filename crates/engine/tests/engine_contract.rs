@@ -10,7 +10,7 @@
 //! These tests exercise the native Tokio backend specifically; the
 //! non-Tokio portability proof lives in `engine_unit.rs`.
 
-mod common;
+pub mod common;
 use common::*;
 
 use std::sync::Arc;

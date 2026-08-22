@@ -50,8 +50,8 @@ use provisioning::reconciler::ClusterDriver;
 use provisioning::{ClusterShape, RunId};
 
 use feed::{
-    EngineSpawner, SupervisorActor, SupervisorMsg, SupervisorTelemetry, demo_retry_policy,
-    initial_slots,
+    EngineSpawner, SupervisorActor, SupervisorConfig, SupervisorMsg, SupervisorTelemetry,
+    demo_retry_policy, initial_slots,
 };
 use provider::{DemoBackend, DemoProvider, NodeManager};
 
@@ -68,9 +68,10 @@ pub const DEFAULT_NODES: u64 = 3;
 pub(super) fn shared_test_driver() -> Arc<IrohDriver> {
     thread_local! {
         static DRIVER: (Arc<IrohDriver>, Engine) = {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let backend = TokioBackend::new(TokioConfig::default())
                 .expect("create shared demo test backend");
             let engine =
@@ -99,10 +100,10 @@ pub(super) fn shared_test_driver() -> Arc<IrohDriver> {
 /// replaced by a rebuild while this process runs, so fall back through
 /// argv[0] and PATH.
 fn resolve_exe() -> std::path::PathBuf {
-    if let Ok(path) = std::env::current_exe() {
-        if !path.to_string_lossy().ends_with(" (deleted)") {
-            return path;
-        }
+    if let Ok(path) = std::env::current_exe()
+        && !path.to_string_lossy().ends_with(" (deleted)")
+    {
+        return path;
     }
     if let Some(arg0) = std::env::args_os().next() {
         let candidate = std::path::PathBuf::from(&arg0);
@@ -189,12 +190,14 @@ impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
         };
         iroh_driver::spawn_pull_collector_to_actor(
             &self.engine,
-            self.endpoint.clone(),
-            addr,
-            flow_id,
-            Vec::new(),
-            telemetry::SubscriptionRequest::all(),
-            Arc::clone(&self.fanout),
+            iroh_driver::PullCollectorConfig {
+                endpoint: self.endpoint.clone(),
+                peer: addr,
+                flow_id,
+                token: Vec::new(),
+                request: telemetry::SubscriptionRequest::all(),
+                fanout: Arc::clone(&self.fanout),
+            },
             self.sender.clone(),
             header_actor,
         );
@@ -347,15 +350,15 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         let route_view: RouteView =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let outbox: Outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
-        driver.enable_actor_bridge(
-            runtime.clone(),
-            Arc::new(codec),
+        driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+            runtime: runtime.clone(),
+            codec: Arc::new(codec),
             routes,
-            announce,
+            swim: announce,
             relay_mirror,
             route_view,
             outbox,
-        );
+        });
         driver.install_actor_bridge_pump(Duration::from_millis(250));
     }
 
@@ -458,23 +461,23 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         sender.clone(),
         supervisor_slot.clone(),
     )?;
-    let supervisor = SupervisorActor::new(
-        cluster_driver,
+    let supervisor = SupervisorActor::new(SupervisorConfig {
+        driver: cluster_driver,
         executor,
-        manager.clone(),
+        manager: manager.clone(),
         driver_handle,
         telemetry,
-        dashboard.clone(),
-        sender.clone(),
-        bootstrap_registry,
+        dashboard: dashboard.clone(),
+        sender: sender.clone(),
+        registry: bootstrap_registry,
         collector,
-        engine.handle(),
+        engine: engine.handle(),
         remote_sub,
-        slots,
-        RunId(1),
-        launch.clone(),
+        initial_slots: slots,
+        run_id: RunId(1),
+        launch: launch.clone(),
         edge_actor,
-    );
+    });
 
     // Control plane: dashboard → supervisor.
     control::install(&runtime, supervisor_slot.clone());
@@ -483,7 +486,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         .spawn(supervisor)
         .map_err(|e| format!("spawn supervisor actor: {e}"))?;
     supervisor_slot
-        .set(supervisor_addr.clone())
+        .set(supervisor_addr)
         .expect("supervisor address slot set once");
     manager.set_spawn_actor(sender.clone(), supervisor_slot.clone());
 
@@ -650,9 +653,10 @@ mod properties {
         let pid = child.id() as i32;
         let stdout = child.stdout.take().expect("capture demo supervisor stdout");
 
-        let mut config = RuntimeConfig::default();
-        config.worker_count = 1;
-        let parts = RuntimeParts::new(config);
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
         let runtime = parts.runtime().clone();
         let engine = Engine::new(
             parts,

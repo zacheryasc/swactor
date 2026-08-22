@@ -83,14 +83,14 @@ fn next_eligible_offer<'a>(
     failed_host_ids: &HashSet<u64>,
     preferred_offer_id: Option<u64>,
 ) -> Option<&'a Offer> {
-    if let Some(offer_id) = preferred_offer_id {
-        if let Some(offer) = pool.iter().find(|o| o.id == offer_id) {
-            if !tried_offer_ids.contains(&offer.id)
-                && offer.host_id.is_none_or(|h| !failed_host_ids.contains(&h))
-            {
-                return Some(offer);
-            }
-        }
+    if let Some(offer_id) = preferred_offer_id
+        && let Some(offer) = pool.iter().find(|offer| offer.id == offer_id)
+        && !tried_offer_ids.contains(&offer.id)
+        && offer
+            .host_id
+            .is_none_or(|host| !failed_host_ids.contains(&host))
+    {
+        return Some(offer);
     }
 
     pool.iter().find(|o| {
@@ -108,18 +108,32 @@ fn env_for_index(req: &ProvisionRequest, index: u32) -> BTreeMap<String, String>
     env
 }
 
-async fn provision_one(
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    req: &ProvisionRequest,
-    pool: &[Offer],
+struct ProvisionOneRequest<'a> {
+    client: &'a reqwest::Client,
+    base_url: &'a str,
+    api_key: &'a str,
+    request: &'a ProvisionRequest,
+    pool: &'a [Offer],
     index: u32,
-    tried_offer_ids: &mut Vec<u64>,
-    used_host_ids: &mut HashSet<u64>,
-    failed_host_ids: &mut HashSet<u64>,
+    tried_offer_ids: &'a mut Vec<u64>,
+    used_host_ids: &'a mut HashSet<u64>,
+    failed_host_ids: &'a mut HashSet<u64>,
     preferred_offer_id: Option<u64>,
-) -> Result<ProvisionedInstance, String> {
+}
+
+async fn provision_one(request: ProvisionOneRequest<'_>) -> Result<ProvisionedInstance, String> {
+    let ProvisionOneRequest {
+        client,
+        base_url,
+        api_key,
+        request: req,
+        pool,
+        index,
+        tried_offer_ids,
+        used_host_ids,
+        failed_host_ids,
+        preferred_offer_id,
+    } = request;
     let mut attempt = 1_u64;
     loop {
         let offer = match next_eligible_offer(
@@ -230,20 +244,21 @@ pub async fn provision_fleet(
     let mut used_host_ids = HashSet::new();
     let mut failed_host_ids = HashSet::new();
     for index in 0..req.count {
-        match provision_one(
+        match provision_one(ProvisionOneRequest {
             client,
             base_url,
             api_key,
-            &req,
-            &pool,
+            request: &req,
+            pool: &pool,
             index,
-            &mut tried_offer_ids,
-            &mut used_host_ids,
-            &mut failed_host_ids,
-            req.preferred_offer_id
+            tried_offer_ids: &mut tried_offer_ids,
+            used_host_ids: &mut used_host_ids,
+            failed_host_ids: &mut failed_host_ids,
+            preferred_offer_id: req
+                .preferred_offer_id
                 .filter(|_| req.count == 1)
                 .or_else(|| first_wave.get(index as usize).map(|offer| offer.id)),
-        )
+        })
         .await
         {
             Ok(info) => created.push(info),
@@ -279,18 +294,18 @@ pub async fn provision_fleet(
                         );
                     }
                     eprintln!("lease_chain: replacing index {index}");
-                    match provision_one(
+                    match provision_one(ProvisionOneRequest {
                         client,
                         base_url,
                         api_key,
-                        &req,
-                        &pool,
+                        request: &req,
+                        pool: &pool,
                         index,
-                        &mut tried_offer_ids,
-                        &mut used_host_ids,
-                        &mut failed_host_ids,
-                        None,
-                    )
+                        tried_offer_ids: &mut tried_offer_ids,
+                        used_host_ids: &mut used_host_ids,
+                        failed_host_ids: &mut failed_host_ids,
+                        preferred_offer_id: None,
+                    })
                     .await
                     {
                         Ok(info) => created[idx] = info,

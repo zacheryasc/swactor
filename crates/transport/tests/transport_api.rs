@@ -352,7 +352,9 @@ fn round_trip_across_two_runtimes() {
 
     // Verify all 3 replies
     for i in 0..3u32 {
-        let pong = inbox_a.try_recv().expect(&format!("missing pong #{i}"));
+        let pong = inbox_a
+            .try_recv()
+            .unwrap_or_else(|| panic!("missing pong #{i}"));
         assert_eq!(pong, Pong { value: i * 10 + 1 });
     }
     assert!(inbox_a.try_recv().is_none(), "no extra messages");

@@ -485,10 +485,12 @@ impl EffectBackend for DemoBackend {
                     .expect("demo provider")
                     .create_node(spec, null_sink())
                     .map_err(EffectError::definite)?;
-                Ok(OperationOutcome::LeaseCreated(CreateLeaseResult {
-                    lease: demo_lease(attempt),
-                    endpoint: Some(demo_endpoint()),
-                }))
+                Ok(OperationOutcome::LeaseCreated(Box::new(
+                    CreateLeaseResult {
+                        lease: demo_lease(attempt),
+                        endpoint: Some(demo_endpoint()),
+                    },
+                )))
             }
             NodeManagerCommand::LookupEndpoint(_) => {
                 Ok(OperationOutcome::EndpointLookup(Some(demo_endpoint())))
@@ -701,9 +703,10 @@ mod properties {
                     actions.push(terminal);
                 }
             }
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let _engine =

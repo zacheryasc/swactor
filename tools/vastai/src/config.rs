@@ -48,50 +48,53 @@ fn env_optional_positive_f64(name: &str) -> Option<f64> {
 impl SelectionPolicy {
     /// Build selection policy from the historical `PP_*` environment knobs.
     pub fn from_env() -> Self {
-        let mut policy = Self::default();
-        policy.min_gpu_ram_mb = env_positive_u64(ENV_GPU_MIN_RAM_MB);
-        if let Some(min_compute_cap) = env_positive_u64(ENV_MIN_COMPUTE_CAP) {
-            policy.min_compute_cap = Some(min_compute_cap);
-        }
-        policy.min_down_mbps = env_nonnegative_f64(ENV_MIN_INET_DOWN_MBPS, 100.0);
-        policy.min_reliability = std::env::var(ENV_MIN_RELIABILITY)
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|&v| (0.0..=1.0).contains(&v))
-            .unwrap_or(0.95);
-        policy.require_verified = truthy_env(ENV_REQUIRE_VERIFIED);
-        policy.min_up_mbps = env_optional_positive_f64(ENV_MIN_INET_UP_MBPS);
-        policy.max_dph_total = env_optional_positive_f64(ENV_MAX_DPH_TOTAL);
-        policy.drop_cheap_frac = std::env::var(ENV_DROP_CHEAP_FRAC)
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 0.99))
-            .unwrap_or(0.30);
-        policy.image_size_gb = env_optional_positive_f64(ENV_IMAGE_SIZE_GB);
+        let defaults = Self::default();
+        let mut blacklist_hosts = defaults.blacklist_hosts;
         if let Ok(raw) = std::env::var(ENV_BLACKLIST_HOSTS) {
-            policy
-                .blacklist_hosts
-                .extend(raw.split(',').filter_map(|s| s.trim().parse::<u64>().ok()));
+            blacklist_hosts.extend(
+                raw.split(',')
+                    .filter_map(|value| value.trim().parse::<u64>().ok()),
+            );
         }
-        policy
+        Self {
+            gpu_name: defaults.gpu_name,
+            min_gpu_ram_mb: env_positive_u64(ENV_GPU_MIN_RAM_MB),
+            min_compute_cap: env_positive_u64(ENV_MIN_COMPUTE_CAP).or(defaults.min_compute_cap),
+            min_down_mbps: env_nonnegative_f64(ENV_MIN_INET_DOWN_MBPS, 100.0),
+            min_reliability: std::env::var(ENV_MIN_RELIABILITY)
+                .ok()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|&value| (0.0..=1.0).contains(&value))
+                .unwrap_or(0.95),
+            require_verified: truthy_env(ENV_REQUIRE_VERIFIED),
+            min_up_mbps: env_optional_positive_f64(ENV_MIN_INET_UP_MBPS),
+            max_dph_total: env_optional_positive_f64(ENV_MAX_DPH_TOTAL),
+            blacklist_hosts,
+            drop_cheap_frac: std::env::var(ENV_DROP_CHEAP_FRAC)
+                .ok()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 0.99))
+                .unwrap_or(0.30),
+            image_size_gb: env_optional_positive_f64(ENV_IMAGE_SIZE_GB),
+        }
     }
 }
 
 impl LifecyclePolicy {
     /// Build lifecycle policy from environment, using caller-provided poll cadence.
     pub fn from_env(poll_interval: Duration) -> Self {
-        let mut policy = Self::default();
-        policy.lease_pace = Duration::from_millis(
-            std::env::var(ENV_LEASE_PACE_MS)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(600),
-        );
-        policy.poll_interval = poll_interval;
-        if let Some(state_timeout_secs) = env_positive_u64(ENV_STATE_TIMEOUT_SECS) {
-            policy.state_timeout = Duration::from_secs(state_timeout_secs);
+        Self {
+            lease_pace: Duration::from_millis(
+                std::env::var(ENV_LEASE_PACE_MS)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .unwrap_or(600),
+            ),
+            poll_interval,
+            state_timeout: env_positive_u64(ENV_STATE_TIMEOUT_SECS)
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| Self::default().state_timeout),
         }
-        policy
     }
 }

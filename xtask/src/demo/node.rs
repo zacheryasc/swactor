@@ -179,15 +179,15 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         let route_view: RouteView =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let outbox: Outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
-        driver.enable_actor_bridge(
-            runtime.clone(),
-            Arc::new(codec),
+        driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+            runtime: runtime.clone(),
+            codec: Arc::new(codec),
             routes,
-            edge_agent,
+            swim: edge_agent,
             relay_mirror,
             route_view,
             outbox,
-        );
+        });
         driver.install_actor_bridge_pump(Duration::from_millis(250));
     }
     let driver = Arc::new(driver);
@@ -199,7 +199,7 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
 
     // Join, then announce identity + advertised address to the supervisor's
     // bootstrap actor over the control plane (readiness + telemetry dial).
-    driver.join(&[supervisor_addr.clone()]);
+    driver.join(std::slice::from_ref(&supervisor_addr));
     let addr_json =
         serde_json::to_string(&driver.endpoint_addr()).map_err(|e| format!("addr: {e}"))?;
 
@@ -546,9 +546,10 @@ mod properties {
             actions in node_actions(),
             attempt in any::<u64>(),
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine =

@@ -8,7 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.9"
 
 [dependency-groups]
-dev = ["jupyter", "ipykernel", "pytest"]
+dev = ["jupyter", "ipykernel", "maturin>=1.7,<2", "pytest", "pytest-timeout"]
 
 [tool.uv]
 cache-keys = [

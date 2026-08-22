@@ -611,7 +611,6 @@ pub(crate) struct ResumeSignal;
 /// Minimal core interface: send, spawn, stop, and extension access.
 /// Registry methods (naming, monitoring, groups) and timer scheduling
 /// are provided by extension traits in `swactor-std`.
-#[allow(private_interfaces)]
 pub trait ContextInner {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
     fn spawn_any(&self, request: SpawnRequest);

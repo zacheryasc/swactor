@@ -1,6 +1,6 @@
 //! Runtime Admin API tests — inventory, typed actor state, lifecycle control, and scheduling.
 
-mod common;
+pub mod common;
 use common::*;
 
 use std::collections::HashSet;

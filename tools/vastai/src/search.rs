@@ -151,10 +151,10 @@ pub fn plan_distinct_host_first_wave(
         if selected.len() == target {
             break;
         }
-        if let Some(host_id) = offer.host_id {
-            if !selected_hosts.insert(host_id) {
-                continue;
-            }
+        if let Some(host_id) = offer.host_id
+            && !selected_hosts.insert(host_id)
+        {
+            continue;
         }
         selected_ids.insert(offer.id);
         selected.push(offer.clone());

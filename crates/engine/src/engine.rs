@@ -18,8 +18,7 @@ use swactor::runtime::{ExternalSender, Runtime, RuntimeParts};
 pub struct Engine {
     /// Retained so the engine owns the runtime handle it drives for its full
     /// lifetime. Core workers are moved into substrate tasks at construction.
-    #[allow(dead_code)]
-    runtime: Runtime,
+    _runtime: Runtime,
     backend: Arc<dyn ExecutionBackend>,
 }
 
@@ -41,7 +40,10 @@ impl Engine {
         // no Tokio feature gate — so core progression does not silently
         // disappear when an alternate backend is used (ENGINE_SPEC.md).
         crate::core_driver::install(workers, &backend);
-        Ok(Engine { runtime, backend })
+        Ok(Engine {
+            _runtime: runtime,
+            backend,
+        })
     }
 
     /// Return a clonable handle for scheduling engine work.

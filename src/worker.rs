@@ -1,6 +1,7 @@
 use crate::Instant;
 use std::any::Any;
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -124,7 +125,7 @@ impl Worker {
             || self
                 .worker_ext
                 .as_ref()
-                .map_or(false, |e| e.has_pending_work())
+                .is_some_and(|extension| extension.has_pending_work())
     }
 
     /// Run one synchronous worker pass. Returns `true` if any work was done.
@@ -928,7 +929,7 @@ impl ActorPool {
             let snap_depth = slot.mailbox.len();
             let mut snap_type_counts: Vec<(&'static str, u64)> =
                 slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
-            snap_type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+            snap_type_counts.sort_by_key(|&(_, count)| Reverse(count));
 
             let ctx = Ctx::new(
                 wctx,
@@ -1132,7 +1133,7 @@ impl ActorPool {
                 if is_on_stop_eligible(slot.stopping, slot.poisoned) {
                     let mut type_counts: Vec<(&'static str, u64)> =
                         slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
-                    type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    type_counts.sort_by_key(|&(_, count)| Reverse(count));
                     let ctx = Ctx::new(
                         inner,
                         addr,
@@ -1159,7 +1160,7 @@ impl ActorPool {
         out.extend(self.actors.iter().map(|(&addr, slot)| {
             let mut type_counts: Vec<(&'static str, u64)> =
                 slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
-            type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+            type_counts.sort_by_key(|&(_, count)| Reverse(count));
             let metadata = slot.actor.metadata();
             ActorSnapshot {
                 address: addr,

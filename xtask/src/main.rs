@@ -1,4 +1,5 @@
-use std::process::{Command, ExitCode};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 struct TestStep {
@@ -6,46 +7,27 @@ struct TestStep {
     args: &'static [&'static str],
 }
 
-const BASIC_TESTS: &[TestStep] = &[
+const TEST_STEPS: &[TestStep] = &[
     TestStep {
-        label: "root crate",
-        args: &["test"],
+        label: "strict workspace lint",
+        args: &["lint"],
     },
     TestStep {
-        label: "telemetry",
-        args: &["test", "-p", "telemetry"],
+        label: "all Rust tests (60s per-test timeout)",
+        args: &["nextest", "run", "--workspace", "--all-features"],
     },
     TestStep {
-        label: "distribution",
-        args: &["test", "-p", "distribution"],
-    },
-    TestStep {
-        label: "iroh-driver",
-        args: &["test", "-p", "iroh-driver"],
-    },
-    TestStep {
-        label: "myelin",
-        args: &["test", "-p", "myelin"],
-    },
-    TestStep {
-        label: "swactor-process",
-        args: &["test", "-p", "swactor-process"],
-    },
-    TestStep {
-        label: "swactor-transport",
-        args: &["test", "-p", "swactor-transport"],
-    },
-    TestStep {
-        label: "dashboard",
-        args: &["test", "-p", "dashboard"],
-    },
-    TestStep {
-        label: "swactor-vastai",
-        args: &["test", "-p", "swactor-vastai"],
-    },
-    TestStep {
-        label: "xtask",
-        args: &["test", "-p", "xtask"],
+        label: "all Rust doctests",
+        args: &[
+            "test",
+            "--workspace",
+            "--all-features",
+            "--doc",
+            "--exclude",
+            "python",
+            "--exclude",
+            "wasm-runtime",
+        ],
     },
 ];
 
@@ -65,16 +47,20 @@ COMMANDS:
                       Run the visual provisioning-reconciler demo.
   check-telemetry-isolation
                       Verify no frame types appear in control-plane modules.
-  test                Run the non-binding repository test barrier."
+  test                Run strict lint plus every Rust and Python test."
     );
 }
 
-fn run_step(step: &TestStep) -> bool {
+fn run_step(step: &TestStep, python: &Path) -> bool {
     println!("\n=== {} ===", step.label);
     println!("    cargo {}", step.args.join(" "));
     println!();
 
-    match swactor_process::command_status(Command::new(cargo_bin()).args(step.args)) {
+    match swactor_process::command_status(
+        Command::new(cargo_bin())
+            .args(step.args)
+            .env("PYO3_PYTHON", python),
+    ) {
         Ok(status) => status.success(),
         Err(error) => {
             eprintln!("Failed to execute cargo: {error}");
@@ -85,8 +71,17 @@ fn run_step(step: &TestStep) -> bool {
 
 fn run_tests() -> ExitCode {
     let start = Instant::now();
-    for (index, step) in BASIC_TESTS.iter().enumerate() {
-        if !run_step(step) {
+    let Some(python) = PythonTestTools::discover() else {
+        return ExitCode::from(1);
+    };
+    if !nextest_available() {
+        return ExitCode::from(1);
+    }
+    if !check_telemetry_isolation() {
+        return ExitCode::from(1);
+    }
+    for (index, step) in TEST_STEPS.iter().enumerate() {
+        if !run_step(step, &python.python) {
             eprintln!(
                 "\n--- FAILED after {:.1}s ({index} passed, 1 failed) ---",
                 start.elapsed().as_secs_f64()
@@ -94,18 +89,99 @@ fn run_tests() -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    if !python.run() {
+        eprintln!(
+            "\n--- FAILED after {:.1}s (Python tests failed) ---",
+            start.elapsed().as_secs_f64()
+        );
+        return ExitCode::from(1);
+    }
 
     println!(
         "\n--- All {} step(s) passed in {:.1}s ---",
-        BASIC_TESTS.len(),
+        TEST_STEPS.len() + 1,
         start.elapsed().as_secs_f64()
     );
     ExitCode::SUCCESS
 }
 
+fn nextest_available() -> bool {
+    let available = swactor_process::command_status(
+        Command::new(cargo_bin())
+            .args(["nextest", "--version"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|status| status.success());
+    if !available {
+        eprintln!("cargo-nextest is required; install it from https://nexte.st/docs/installation/");
+    }
+    available
+}
+
+struct PythonTestTools {
+    directory: PathBuf,
+    maturin: PathBuf,
+    python: PathBuf,
+}
+
+impl PythonTestTools {
+    fn discover() -> Option<Self> {
+        let directory = workspace_root().join("crates/bindings/python");
+        let tools = Self {
+            maturin: directory.join(".venv/bin/maturin"),
+            python: directory.join(".venv/bin/python"),
+            directory,
+        };
+        if tools.maturin.is_file() && tools.python.is_file() {
+            Some(tools)
+        } else {
+            eprintln!(
+                "Python test environment is missing; run `uv sync --project {}` first",
+                tools.directory.display()
+            );
+            None
+        }
+    }
+
+    fn run(&self) -> bool {
+        println!("\n=== all Python tests ===");
+        let built = swactor_process::command_status(
+            Command::new(&self.maturin)
+                .current_dir(&self.directory)
+                .arg("develop")
+                .env("PYO3_PYTHON", &self.python),
+        )
+        .is_ok_and(|status| status.success());
+        if !built {
+            return false;
+        }
+        swactor_process::command_status(
+            Command::new(&self.python)
+                .current_dir(&self.directory)
+                .args([
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--timeout=60",
+                    "tests/test_bootstrap.py",
+                    "../../../tests/test_python.py",
+                ]),
+        )
+        .is_ok_and(|status| status.success())
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask must live directly under the workspace root")
+        .to_path_buf()
+}
+
 /// Verify that control-plane modules never import telemetry frame/read-side
 /// types. They may emit through the producer API only.
-fn check_telemetry_isolation() -> ExitCode {
+fn check_telemetry_isolation() -> bool {
     const CONTROL_DIRS: &[&str] = &[
         "apps/myelin/src/orchestration",
         "crates/distribution/src",
@@ -150,10 +226,10 @@ fn check_telemetry_isolation() -> ExitCode {
             "\ntelemetry-isolation: control-plane code must not import frame types \
              or read-side modules. Use the telemetry producer API for emission."
         );
-        ExitCode::from(1)
+        false
     } else {
         println!("telemetry-isolation: OK — no frame types in control-plane modules.");
-        ExitCode::SUCCESS
+        true
     }
 }
 
@@ -180,7 +256,13 @@ mod demo;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("check-telemetry-isolation") => check_telemetry_isolation(),
+        Some("check-telemetry-isolation") => {
+            if check_telemetry_isolation() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Some("test") if args.next().is_none() => run_tests(),
         Some("demo") => demo::run(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") | None => {

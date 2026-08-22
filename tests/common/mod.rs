@@ -1,7 +1,5 @@
 // Shared types and helpers for runtime test files.
 
-#![allow(dead_code, unused_imports)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -3,7 +3,7 @@
 //! Covers: high-volume delivery, panic isolation under load, and sustained
 //! throughput with no message loss. All tests are tick-driven (single worker).
 
-mod common;
+pub mod common;
 use common::*;
 
 use std::sync::Arc;

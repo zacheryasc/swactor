@@ -75,4 +75,15 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 proptest-state-machine = "0.3"
 loom = "0.7"
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "visit"] }
 
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+allow_attributes = "forbid"
+
+[lints]
+workspace = true

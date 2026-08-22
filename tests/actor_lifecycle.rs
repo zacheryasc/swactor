@@ -3,7 +3,7 @@
 //! Covers: spawning, on_start, lifecycle decision paths, parent-child delegation,
 //! graceful stop, panic isolation, dead actor cleanup, and watching (ActorExited).
 
-mod common;
+pub mod common;
 use common::*;
 
 use parking_lot::Mutex;

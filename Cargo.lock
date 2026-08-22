@@ -962,7 +962,9 @@ dependencies = [
  "futures-lite",
  "libc",
  "parking_lot",
+ "proptest",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "swactor",
  "swactor-engine",
@@ -4335,9 +4337,11 @@ dependencies = [
  "getrandom 0.2.17",
  "loom",
  "parking_lot",
+ "proc-macro2",
  "proptest",
  "proptest-state-machine",
  "serde",
+ "syn",
  "tracing",
  "web-time 0.2.4",
 ]
@@ -4489,11 +4493,13 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "futures-channel",
  "iroh",
  "libc",
  "serde",
  "serde_json",
  "swactor",
+ "swactor-engine",
  "swactor-transport",
 ]
 

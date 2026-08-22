@@ -107,9 +107,10 @@ mod properties {
             codes in prop::collection::vec(any::<u8>(), 0..=32),
             registration in 0_usize..=32,
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let _engine =

@@ -1,4 +1,3 @@
-#![allow(clippy::disallowed_methods, dead_code, unused_must_use)]
 
 use std::thread::sleep as renamed_sleep;
 use std::time::Duration;

@@ -64,10 +64,6 @@ impl RuntimeExtension for SeamExtension {
         &self,
         dead: &[(ActorAddress, StopReason, Option<ExitValue>)],
     ) -> Vec<(ActorAddress, Box<dyn Any + Send>)> {
-        let _ = dead
-            .iter()
-            .map(|(_, reason, value)| (reason, value))
-            .count();
         let Some(report_to) = *self.state.death_report_to.lock() else {
             return Vec::new();
         };

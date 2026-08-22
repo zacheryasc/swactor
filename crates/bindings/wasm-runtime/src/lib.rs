@@ -103,6 +103,12 @@ pub struct WasmRuntime {
     backend: SteppingBackend,
 }
 
+impl Default for WasmRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[wasm_bindgen]
 impl WasmRuntime {
     #[wasm_bindgen(constructor)]

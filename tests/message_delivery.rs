@@ -3,7 +3,7 @@
 //! Covers: routing correctness at scale, send-from-within-handler patterns,
 //! address error handling, and fairness/budgets.
 
-mod common;
+pub mod common;
 use common::*;
 
 use std::sync::Arc;

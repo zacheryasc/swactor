@@ -5,7 +5,7 @@
 //! These tests exercise internal logic directly and use the [`SteppingBackend`]
 //! to prove substrate independence without Tokio (ENGINE_SPEC.md).
 
-mod common;
+pub mod common;
 use common::*;
 
 use std::sync::Arc;
@@ -1318,8 +1318,7 @@ fn engine_instant_is_ordered() {
 /// A tasks-only probe backend that shares a sentinel `Arc<()>` so the test can
 /// observe exactly when the engine's strong backend reference is released.
 struct SentinelBackend {
-    #[allow(dead_code)]
-    sentinel: Arc<()>,
+    _sentinel: Arc<()>,
 }
 
 impl ExecutionBackend for SentinelBackend {
@@ -1347,7 +1346,7 @@ fn dropping_engine_releases_backend_even_with_live_handles() {
     let engine = Engine::new(
         parts,
         SentinelBackend {
-            sentinel: sentinel.clone(),
+            _sentinel: sentinel.clone(),
         },
     )
     .expect("tasks capability present");

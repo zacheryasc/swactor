@@ -9,9 +9,9 @@ pub(crate) fn reachable_offers(offers: Vec<Offer>, policy: &SelectionPolicy) -> 
         .filter(|o| {
             o.geolocation
                 .as_deref()
-                .map_or(false, |g| !g.to_uppercase().contains("CN"))
+                .is_some_and(|geolocation| !geolocation.to_uppercase().contains("CN"))
         })
-        .filter(|o| o.host_id.map_or(true, |h| !blacklist.contains(&h)))
+        .filter(|offer| offer.host_id.is_none_or(|host| !blacklist.contains(&host)))
         .filter(|o| o.verification.as_deref() != Some("deverified"))
         .filter(|o| policy.max_dph_total.is_none_or(|max| o.dph_total <= max))
         .filter(|o| {

@@ -215,25 +215,43 @@ pub struct SupervisorActor {
     shutdown: Option<ShutdownState>,
 }
 
+pub struct SupervisorConfig {
+    pub driver: ClusterDriver,
+    pub executor: IdempotentEffectExecutor<DemoBackend, EngineSpawner>,
+    pub manager: NodeManager,
+    pub driver_handle: std::sync::Arc<crate::demo::DemoDriverHandle>,
+    pub telemetry: SupervisorTelemetry,
+    pub dashboard: dashboard::DashboardHandle,
+    pub sender: swactor::runtime::ExternalSender,
+    pub registry: provisioning::BootstrapRegistry,
+    pub collector: std::sync::Arc<dyn provisioning::NodeTelemetryCollector>,
+    pub engine: EngineHandle,
+    pub remote_sub: telemetry::TelemetrySubscription,
+    pub initial_slots: Vec<String>,
+    pub run_id: RunId,
+    pub launch: crate::demo::LaunchStyle,
+    pub edge_actor: ActorAddress,
+}
+
 impl SupervisorActor {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        driver: ClusterDriver,
-        executor: IdempotentEffectExecutor<DemoBackend, EngineSpawner>,
-        manager: NodeManager,
-        driver_handle: std::sync::Arc<crate::demo::DemoDriverHandle>,
-        mut telemetry: SupervisorTelemetry,
-        dashboard: dashboard::DashboardHandle,
-        sender: swactor::runtime::ExternalSender,
-        registry: provisioning::BootstrapRegistry,
-        collector: std::sync::Arc<dyn provisioning::NodeTelemetryCollector>,
-        engine: EngineHandle,
-        remote_sub: telemetry::TelemetrySubscription,
-        initial_slots: Vec<String>,
-        run_id: RunId,
-        launch: crate::demo::LaunchStyle,
-        edge_actor: ActorAddress,
-    ) -> Self {
+    pub fn new(config: SupervisorConfig) -> Self {
+        let SupervisorConfig {
+            driver,
+            executor,
+            manager,
+            driver_handle,
+            mut telemetry,
+            dashboard,
+            sender,
+            registry,
+            collector,
+            engine,
+            remote_sub,
+            initial_slots,
+            run_id,
+            launch,
+            edge_actor,
+        } = config;
         let events_channel = telemetry.register("prov.reconciler.events");
         let snapshot_channel = telemetry.register("prov.reconciler.snapshot");
         Self {
@@ -814,7 +832,7 @@ impl SupervisorActor {
     /// cards and the control view stay live between lifecycle transitions.
     fn emit_node_status(&mut self, now: SystemTime) {
         self.status_tick = self.status_tick.wrapping_add(1);
-        if self.status_tick % 4 != 0 {
+        if !self.status_tick.is_multiple_of(4) {
             return; // 250ms ticks → heartbeat every second
         }
         let attempts: Vec<u64> = self.nodes.keys().copied().collect();
@@ -968,7 +986,6 @@ impl SupervisorActor {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn publish_frame(
     dashboard: &dashboard::DashboardHandle,
     stream: &telemetry::frame::StreamId,
@@ -1489,7 +1506,7 @@ mod properties {
 
     fn control_command(kind: u8, attempt: u64, index: usize) -> dashboard::control::ControlCommand {
         let command_id = format!("generated-command-{index}");
-        if kind % 2 == 0 {
+        if kind.is_multiple_of(2) {
             dashboard::control::ControlCommand::Kill {
                 command_id,
                 node: format!("node-{attempt}"),
@@ -1568,9 +1585,10 @@ mod properties {
         fn generated_supervisor_transitions_are_once_only_nonblocking_and_clean(
             actions in supervisor_actions(),
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let sender = runtime.create_sender();
             let backend = SteppingBackend::new();
@@ -1644,25 +1662,25 @@ mod properties {
                 .spawn(AnnounceActor::new(manager.clone(), sender.clone()))
                 .expect("spawn generated announce actor");
             let supervisor = runtime
-                .spawn(SupervisorActor::new(
+                .spawn(SupervisorActor::new(SupervisorConfig {
                     driver,
                     executor,
-                    manager.clone(),
+                    manager: manager.clone(),
                     driver_handle,
                     telemetry,
                     dashboard,
-                    sender.clone(),
+                    sender: sender.clone(),
                     registry,
-                    Arc::new(evidence.clone()),
-                    engine.handle(),
+                    collector: Arc::new(evidence.clone()),
+                    engine: engine.handle(),
                     remote_sub,
-                    Vec::new(),
-                    RunId(1),
-                    crate::demo::LaunchStyle::Process {
+                    initial_slots: Vec::new(),
+                    run_id: RunId(1),
+                    launch: crate::demo::LaunchStyle::Process {
                         exe: "generated-demo-node".into(),
                     },
-                    *edge_inbox.addr(),
-                ))
+                    edge_actor: *edge_inbox.addr(),
+                }))
                 .expect("spawn generated supervisor actor");
             drive(&backend, 8);
 

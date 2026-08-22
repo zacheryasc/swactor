@@ -3,7 +3,7 @@
 //! Tests only the std APIs used by production crates: runtime naming,
 //! runtime groups, actor-side watch, actor-side group join, and extension install.
 
-mod common;
+pub mod common;
 use common::*;
 
 #[derive(Clone)]

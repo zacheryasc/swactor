@@ -4,7 +4,7 @@
 //! `docs/specs/drafts/MULTICORE_SPEC.md`. They observe behavior through public
 //! APIs only — never inspecting source layout.
 
-mod common;
+pub mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -157,9 +157,10 @@ fn worker_of(stats: &swactor::stats::RuntimeStats, addr: ActorAddress) -> usize 
 }
 
 fn config_with(workers: usize) -> RuntimeConfig {
-    let mut c = RuntimeConfig::default();
-    c.worker_count = workers;
-    c
+    RuntimeConfig {
+        worker_count: workers,
+        ..RuntimeConfig::default()
+    }
 }
 
 // ─── Phase 1: single-thread host advances every worker once ─────────────────

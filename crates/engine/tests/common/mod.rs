@@ -3,8 +3,6 @@
 //! Imports only public `swactor` APIs and exposes no private engine state. See
 //! `ENGINE_SPEC.md`.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -23,9 +21,10 @@ pub fn default_runtime_parts() -> (RuntimeParts, Runtime) {
     runtime_parts(RuntimeConfig::default())
 }
 pub fn runtime_parts_with_workers(worker_count: usize) -> (RuntimeParts, Runtime) {
-    let mut config = RuntimeConfig::default();
-    config.worker_count = worker_count;
-    runtime_parts(config)
+    runtime_parts(RuntimeConfig {
+        worker_count,
+        ..RuntimeConfig::default()
+    })
 }
 
 pub fn default_parts() -> RuntimeParts {
