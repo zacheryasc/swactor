@@ -43,6 +43,15 @@ pub(crate) struct OrchTelemetry {
     descriptor: StreamDescriptor,
 }
 
+pub(crate) struct BootstrapEmission<'a> {
+    pub(crate) dashboard: Option<&'a DashboardSupport>,
+    pub(crate) channel: &'a str,
+    pub(crate) run_id: u64,
+    pub(crate) node_id: u64,
+    pub(crate) phase: &'a str,
+    pub(crate) status: &'a str,
+    pub(crate) detail: Value,
+}
 impl OrchTelemetry {
     pub(crate) fn new(run_id: u64, frame_log: Option<&Path>) -> Result<Self, String> {
         let stream = StreamId::new(NodeId::new("myelin-orchestrator"), Lifetime(run_id));
@@ -110,6 +119,10 @@ impl OrchTelemetry {
         id
     }
 
+    pub(crate) fn producer(&self) -> TelemetryProducer {
+        self.producer.clone()
+    }
+
     pub(crate) fn emit_event(
         &mut self,
         dashboard: Option<&DashboardSupport>,
@@ -140,27 +153,27 @@ impl OrchTelemetry {
         status: &str,
         detail: Value,
     ) {
-        self.emit_bootstrap_to_channel(
+        self.emit_bootstrap_to_channel(BootstrapEmission {
             dashboard,
-            MYELIN_ORCH_BOOTSTRAP,
+            channel: MYELIN_ORCH_BOOTSTRAP,
             run_id,
             node_id,
             phase,
             status,
             detail,
-        );
+        });
     }
 
-    pub(crate) fn emit_bootstrap_to_channel(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        channel: &str,
-        run_id: u64,
-        node_id: u64,
-        phase: &str,
-        status: &str,
-        detail: Value,
-    ) {
+    pub(crate) fn emit_bootstrap_to_channel(&mut self, emission: BootstrapEmission<'_>) {
+        let BootstrapEmission {
+            dashboard,
+            channel,
+            run_id,
+            node_id,
+            phase,
+            status,
+            detail,
+        } = emission;
         let benchmark = benchmark::stamp("myelin-orchestrator");
         let payload = serde_json::to_vec(&json!({
             "schema_version": benchmark["schema_version"].clone(),

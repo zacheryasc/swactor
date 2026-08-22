@@ -10,7 +10,7 @@ use telemetry::ingest::Consumer;
 use telemetry::mux::Mux;
 use telemetry::transport::Delivery;
 use telemetry::wire::{decode_delivery, encode_delivery};
-use telemetry::{ChannelId, Lifetime, NodeId, Position, Record, StreamId};
+use telemetry::{ChannelId, Lifetime, NodeId, Record, StreamId};
 
 const RESOURCE_CHANNEL: ChannelId = ChannelId(1);
 const LOG_CHANNEL: ChannelId = ChannelId(2);

@@ -4,7 +4,7 @@
 //! payloads into a bounded queue first, then assigns a single monotonic position
 //! sequence while draining accepted payloads.
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::frame::{ChannelId, Frame, Position, StreamId};
@@ -26,7 +26,7 @@ pub struct Mux {
 impl Mux {
     /// Create a mux for `stream` with a bounded outgoing queue.
     pub fn new(stream: StreamId, capacity: usize) -> Self {
-        let capacity = capacity.max(1).min(1_048_576);
+        let capacity = capacity.clamp(1, 1_048_576);
         let (tx, rx) = bounded(capacity);
         Mux {
             stream,
@@ -61,20 +61,15 @@ impl Mux {
     /// Pull all currently queued frames in mux queue order.
     pub fn drain(&self) -> Vec<Frame> {
         let mut frames = Vec::new();
-        loop {
-            match self.rx.try_recv() {
-                Ok(pending) => {
-                    // Position is consumed only after a pending frame has left
-                    // the queue; failed submit never reaches this point.
-                    let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
-                    frames.push(Frame {
-                        channel: pending.channel,
-                        position,
-                        payload: pending.payload,
-                    });
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(pending) = self.rx.try_recv() {
+            // Position is consumed only after a pending frame has left
+            // the queue; failed submit never reaches this point.
+            let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
+            frames.push(Frame {
+                channel: pending.channel,
+                position,
+                payload: pending.payload,
+            });
         }
         frames
     }

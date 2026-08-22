@@ -8,7 +8,9 @@ use telemetry::hardware::cpu::{
 use telemetry::hardware::gpu::{
     GpuDeviceSample, GpuProcessSample, HOST_GPU_CHANNEL, HostGpuSample,
 };
+use telemetry::hardware::memory::{HOST_MEMORY_CHANNEL, HostMemorySample};
 use telemetry::hardware::net::{HOST_NET_CHANNEL, HostNetSample, NetInterfaceSample};
+use telemetry::hardware::storage::{HOST_STORAGE_CHANNEL, HostStorageSample};
 
 use serde::Serialize;
 
@@ -27,7 +29,9 @@ pub(crate) struct NodeHardwareState {
     decode_errors: BTreeMap<&'static str, String>,
     pub(crate) cpu: Option<HostCpuSample>,
     pub(crate) gpu: Option<HostGpuSample>,
+    pub(crate) memory: Option<HostMemorySample>,
     pub(crate) net: Option<NetSnapshot>,
+    pub(crate) storage: Option<HostStorageSample>,
     pub(crate) process: Option<ProcessSnapshot>,
     pub(crate) history: VecDeque<HardwareHistoryState>,
 }
@@ -39,7 +43,9 @@ impl NodeHardwareState {
             decode_errors: BTreeMap::new(),
             cpu: None,
             gpu: None,
+            memory: None,
             net: None,
+            storage: None,
             process: None,
             history: VecDeque::with_capacity(HISTORY_CAP),
         }
@@ -64,6 +70,14 @@ impl NodeHardwareState {
                 }
                 Err(error) => self.store_decode_error(HOST_GPU_CHANNEL, error),
             },
+            HOST_MEMORY_CHANNEL => match HostMemorySample::decode(payload) {
+                Ok(sample) => {
+                    self.memory = Some(sample);
+                    self.decode_errors.remove(HOST_MEMORY_CHANNEL);
+                    self.update_history(now);
+                }
+                Err(error) => self.store_decode_error(HOST_MEMORY_CHANNEL, error),
+            },
             HOST_NET_CHANNEL => match HostNetSample::decode(payload) {
                 Ok(sample) => {
                     self.net = Some(NetSnapshot::from_sample(sample, self.net.as_ref()));
@@ -71,6 +85,14 @@ impl NodeHardwareState {
                     self.update_history(now);
                 }
                 Err(error) => self.store_decode_error(HOST_NET_CHANNEL, error),
+            },
+            HOST_STORAGE_CHANNEL => match HostStorageSample::decode(payload) {
+                Ok(sample) => {
+                    self.storage = Some(sample);
+                    self.decode_errors.remove(HOST_STORAGE_CHANNEL);
+                    self.update_history(now);
+                }
+                Err(error) => self.store_decode_error(HOST_STORAGE_CHANNEL, error),
             },
             _ => {
                 if channel.starts_with("proc.") && channel.ends_with(".lifecycle") {
@@ -99,6 +121,35 @@ impl NodeHardwareState {
             .as_ref()
             .and_then(|sample| sample.host.as_ref())
             .and_then(|host| host.total_percent);
+        let cpu_cores_percent = self
+            .cpu
+            .as_ref()
+            .map(|sample| {
+                sample
+                    .cores
+                    .iter()
+                    .map(|core| core.total_percent)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let memory_used_percent = self.memory.as_ref().and_then(|sample| {
+            Some(sample.used_bytes? as f64 * 100.0 / sample.total_bytes?.max(1) as f64)
+        });
+        let memory_pressure_some_avg10 = self
+            .memory
+            .as_ref()
+            .and_then(|sample| sample.pressure.as_ref())
+            .map(|pressure| pressure.some_avg10);
+        let storage_used_percent = self
+            .storage
+            .as_ref()
+            .and_then(|sample| sample.filesystems.first())
+            .and_then(|filesystem| filesystem.used_percent);
+        let io_pressure_some_avg10 = self
+            .storage
+            .as_ref()
+            .and_then(|sample| sample.pressure.as_ref())
+            .map(|pressure| pressure.some_avg10);
 
         let mut gpu_max_percent = None;
         let mut gpu_memory_used_mib = 0_u64;
@@ -128,17 +179,24 @@ impl NodeHardwareState {
             sample_unix_ms: [
                 self.cpu.as_ref().map(|sample| sample.sample_unix_ms),
                 self.gpu.as_ref().map(|sample| sample.sample_unix_ms),
+                self.memory.as_ref().map(|sample| sample.sample_unix_ms),
                 self.net.as_ref().map(|sample| sample.sample_unix_ms),
+                self.storage.as_ref().map(|sample| sample.sample_unix_ms),
             ]
             .into_iter()
             .flatten()
             .max(),
             cpu_total_percent,
+            cpu_cores_percent,
             gpu_max_percent,
             gpu_memory_used_mib,
             gpu_memory_total_mib,
             net_rx_bps,
             net_tx_bps,
+            memory_used_percent,
+            memory_pressure_some_avg10,
+            storage_used_percent,
+            io_pressure_some_avg10,
         }
     }
 
@@ -149,11 +207,16 @@ impl NodeHardwareState {
         {
             last.sample_unix_ms = summary.sample_unix_ms;
             last.cpu_total_percent = summary.cpu_total_percent;
+            last.cpu_cores_percent = summary.cpu_cores_percent.clone();
             last.gpu_max_percent = summary.gpu_max_percent;
             last.gpu_memory_used_mib = summary.gpu_memory_used_mib;
             last.gpu_memory_total_mib = summary.gpu_memory_total_mib;
             last.net_rx_bps = summary.net_rx_bps;
             last.net_tx_bps = summary.net_tx_bps;
+            last.memory_used_percent = summary.memory_used_percent;
+            last.memory_pressure_some_avg10 = summary.memory_pressure_some_avg10;
+            last.storage_used_percent = summary.storage_used_percent;
+            last.io_pressure_some_avg10 = summary.io_pressure_some_avg10;
             return;
         }
 
@@ -164,11 +227,16 @@ impl NodeHardwareState {
             at: now,
             sample_unix_ms: summary.sample_unix_ms,
             cpu_total_percent: summary.cpu_total_percent,
+            cpu_cores_percent: summary.cpu_cores_percent,
             gpu_max_percent: summary.gpu_max_percent,
             gpu_memory_used_mib: summary.gpu_memory_used_mib,
             gpu_memory_total_mib: summary.gpu_memory_total_mib,
             net_rx_bps: summary.net_rx_bps,
             net_tx_bps: summary.net_tx_bps,
+            memory_used_percent: summary.memory_used_percent,
+            memory_pressure_some_avg10: summary.memory_pressure_some_avg10,
+            storage_used_percent: summary.storage_used_percent,
+            io_pressure_some_avg10: summary.io_pressure_some_avg10,
         });
     }
 
@@ -180,8 +248,22 @@ impl NodeHardwareState {
         if let Some(error) = self.gpu.as_ref().and_then(|sample| sample.error.as_ref()) {
             errors.push(format!("{HOST_GPU_CHANNEL}: {error}"));
         }
+        if let Some(error) = self
+            .memory
+            .as_ref()
+            .and_then(|sample| sample.error.as_ref())
+        {
+            errors.push(format!("{HOST_MEMORY_CHANNEL}: {error}"));
+        }
         if let Some(error) = self.net.as_ref().and_then(|sample| sample.error.as_ref()) {
             errors.push(format!("{HOST_NET_CHANNEL}: {error}"));
+        }
+        if let Some(error) = self
+            .storage
+            .as_ref()
+            .and_then(|sample| sample.error.as_ref())
+        {
+            errors.push(format!("{HOST_STORAGE_CHANNEL}: {error}"));
         }
         errors
     }
@@ -308,26 +390,36 @@ impl NetInterfaceSnapshot {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct HardwareSummary {
     pub(crate) sample_unix_ms: Option<u64>,
     pub(crate) cpu_total_percent: Option<f64>,
+    pub(crate) cpu_cores_percent: Vec<Option<f64>>,
     pub(crate) gpu_max_percent: Option<u64>,
     pub(crate) gpu_memory_used_mib: u64,
     pub(crate) gpu_memory_total_mib: u64,
     pub(crate) net_rx_bps: f64,
     pub(crate) net_tx_bps: f64,
+    pub(crate) memory_used_percent: Option<f64>,
+    pub(crate) memory_pressure_some_avg10: Option<f64>,
+    pub(crate) storage_used_percent: Option<f64>,
+    pub(crate) io_pressure_some_avg10: Option<f64>,
 }
 
 pub(crate) struct HardwareHistoryState {
     pub(crate) at: Instant,
     pub(crate) sample_unix_ms: Option<u64>,
     pub(crate) cpu_total_percent: Option<f64>,
+    pub(crate) cpu_cores_percent: Vec<Option<f64>>,
     pub(crate) gpu_max_percent: Option<u64>,
     pub(crate) gpu_memory_used_mib: u64,
     pub(crate) gpu_memory_total_mib: u64,
     pub(crate) net_rx_bps: f64,
     pub(crate) net_tx_bps: f64,
+    pub(crate) memory_used_percent: Option<f64>,
+    pub(crate) memory_pressure_some_avg10: Option<f64>,
+    pub(crate) storage_used_percent: Option<f64>,
+    pub(crate) io_pressure_some_avg10: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -383,11 +475,16 @@ pub(crate) struct HardwareHistorySnapshot {
     pub(crate) ms_ago: u64,
     pub(crate) sample_unix_ms: Option<u64>,
     pub(crate) cpu_total_percent: Option<f64>,
+    pub(crate) cpu_cores_percent: Vec<Option<f64>>,
     pub(crate) gpu_max_percent: Option<u64>,
     pub(crate) gpu_memory_used_mib: u64,
     pub(crate) gpu_memory_total_mib: u64,
     pub(crate) net_rx_bps: f64,
     pub(crate) net_tx_bps: f64,
+    pub(crate) memory_used_percent: Option<f64>,
+    pub(crate) memory_pressure_some_avg10: Option<f64>,
+    pub(crate) storage_used_percent: Option<f64>,
+    pub(crate) io_pressure_some_avg10: Option<f64>,
 }
 
 pub(crate) fn duration_ms(duration: Duration) -> u64 {

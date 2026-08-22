@@ -538,7 +538,7 @@ async fn submit_node_job(
         ManualControlMsg::Query { reply_to }
     }) {
         Ok(response_rx) => response_rx,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let model = match response_rx.await {
         Ok(ManualControlReply::Status(model)) => model,
@@ -689,7 +689,7 @@ async fn request_reply(
 ) -> Response {
     let response_rx = match begin_request_reply(state, timeout, build) {
         Ok(response_rx) => response_rx,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     match response_rx.await {
@@ -718,7 +718,7 @@ fn begin_request_reply(
     state: &ControlHttpState,
     timeout: Duration,
     build: impl FnOnce(ActorAddress) -> ManualControlMsg,
-) -> Result<tokio::sync::oneshot::Receiver<ManualControlReply>, Response> {
+) -> Result<tokio::sync::oneshot::Receiver<ManualControlReply>, Box<Response>> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     let response_tx = Arc::new(Mutex::new(Some(response_tx)));
     let reply_to = state
@@ -730,26 +730,30 @@ fn begin_request_reply(
             timeout,
         })
         .map_err(|error| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: format!("create control reply observer: {error}"),
-                }),
+            Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: format!("create control reply observer: {error}"),
+                    }),
+                )
+                    .into_response(),
             )
-                .into_response()
         })?;
     if let Err(error) = state
         .runtime
         .send_to(state.orchestrator, OrchestratorMsg::Manual(build(reply_to)))
     {
         let _ = state.runtime.stop_actor(reply_to);
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("orchestrator control actor unavailable: {error}"),
-            }),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("orchestrator control actor unavailable: {error}"),
+                }),
+            )
+                .into_response(),
+        ));
     }
     Ok(response_rx)
 }
@@ -998,7 +1002,7 @@ mod properties {
                 status,
             })
         };
-        let reply = |result: Result<_, Response>| match result {
+        let reply = |result: Result<_, Box<Response>>| match result {
             Ok(receiver) => PendingHttpObservation::Reply {
                 index,
                 action: action.clone(),
@@ -1191,9 +1195,10 @@ mod properties {
                     HttpAction::from_raw(kind, command_slot, value)
                 })
                 .collect::<Vec<_>>();
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine =
@@ -1294,9 +1299,10 @@ mod properties {
         fn generated_duplicate_control_replies_deliver_first_once_and_remove_observer(
             replies in prop::collection::vec(any::<u8>(), 0..=16)
         ) {
-            let mut config = RuntimeConfig::default();
-            config.worker_count = 1;
-            let parts = RuntimeParts::new(config);
+            let parts = RuntimeParts::new(RuntimeConfig {
+                worker_count: 1,
+                ..RuntimeConfig::default()
+            });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
             let engine =
@@ -1380,9 +1386,10 @@ mod properties {
 
     #[test]
     fn reply_observer_disappearance_returns_a_bounded_terminal_http_response() {
-        let mut config = RuntimeConfig::default();
-        config.worker_count = 1;
-        let parts = RuntimeParts::new(config);
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
         let runtime = parts.runtime().clone();
         let backend = SteppingBackend::new();
         let engine =

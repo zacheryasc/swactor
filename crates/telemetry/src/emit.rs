@@ -17,6 +17,7 @@ pub trait FrameSink: Send {
     /// Ship one positioned frame for `stream`. Best-effort: a sink may drop.
     fn ship(&mut self, stream: &StreamId, frame: &Frame);
 }
+pub type ProcessChannelRouter = dyn Fn(&str, bool) -> ChannelId + Send + Sync;
 
 /// Static identity a node needs to build its mux.
 pub struct EmitterConfig {
@@ -27,7 +28,7 @@ pub struct EmitterConfig {
 
 struct MuxProcObserver {
     mux: Arc<Mux>,
-    channel_for: Arc<dyn Fn(&str, bool) -> ChannelId + Send + Sync>,
+    channel_for: Arc<ProcessChannelRouter>,
 }
 
 impl ProcessOutputObserver for MuxProcObserver {

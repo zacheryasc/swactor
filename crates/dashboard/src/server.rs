@@ -469,7 +469,7 @@ mod tests {
         }
 
         fn is_valid_for_route(&self) -> bool {
-            self.payload % 5 == 0
+            self.payload.is_multiple_of(5)
         }
     }
 

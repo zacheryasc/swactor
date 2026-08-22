@@ -23,3 +23,6 @@ demo-control = []
 [dev-dependencies]
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

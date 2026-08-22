@@ -20,6 +20,7 @@
 //! out. Receipts are bounded and interval-spaced so noisy actors cannot flood
 //! the page.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -172,8 +173,10 @@ impl RuntimeState {
     }
 
     pub(crate) fn totals(&self) -> Totals {
-        let mut totals = Totals::default();
-        totals.actors = self.actors.len().min(u32::MAX as usize) as u32;
+        let mut totals = Totals {
+            actors: self.actors.len().min(u32::MAX as usize) as u32,
+            ..Totals::default()
+        };
         for actor in self.actors.values() {
             totals.mailbox_depth = totals.mailbox_depth.saturating_add(actor.mailbox_depth);
             totals.msg_per_sec += actor.msg_per_sec;
@@ -449,7 +452,7 @@ fn parse_message_type_counts(value: Option<&Value>) -> Option<Vec<(String, u64)>
             .iter()
             .filter_map(|(name, count)| value_to_u64(count).map(|count| (name.clone(), count)))
             .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|&(_, count)| Reverse(count));
         return Some(out);
     }
     None

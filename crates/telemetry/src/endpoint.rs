@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::stats::{ActorSnapshot, StatsHook};
 
+use crate::emit::ProcessChannelRouter;
 use crate::frame::{
     ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, FrameDelivery,
     SourceFilter, StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest, TelemetryEvent,
@@ -721,7 +722,7 @@ fn register_channel(
 /// Legacy/custom process-output observer adapter that submits stdout/stderr chunks as frames.
 pub struct TelemetryProcessObserver {
     producer: TelemetryProducer,
-    channel_for: Arc<dyn Fn(&str, bool) -> ChannelId + Send + Sync>,
+    channel_for: Arc<ProcessChannelRouter>,
 }
 
 impl ProcessOutputObserver for TelemetryProcessObserver {

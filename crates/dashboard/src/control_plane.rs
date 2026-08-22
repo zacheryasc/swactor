@@ -236,7 +236,9 @@ struct NodeCard {
     errors: Vec<String>,
     cpu: Option<CpuSnapshot>,
     gpu: Option<GpuSnapshot>,
+    memory: Option<telemetry::hardware::memory::HostMemorySample>,
     net: Option<crate::hardware_view::NetSnapshot>,
+    storage: Option<telemetry::hardware::storage::HostStorageSample>,
     process: Option<crate::hardware_view::ProcessSnapshot>,
     history: Vec<HardwareHistorySnapshot>,
     actor_summary: ActorSummarySnapshot,
@@ -329,15 +331,9 @@ fn stream_key(stream: &StreamEvent) -> String {
 fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
     let summary = node.hardware.summary();
     let totals = node.actors.totals();
-    let mut roster: Vec<RosterRow> = node.actors.actors.values().map(roster_row).collect();
-    // Busiest actors first; ties fall back to address for stable rendering.
-    roster.sort_by(|left, right| {
-        right
-            .msg_per_sec
-            .partial_cmp(&left.msg_per_sec)
-            .map_or(std::cmp::Ordering::Equal, |order| order)
-            .then_with(|| left.address.cmp(&right.address))
-    });
+    // Address-keyed map order is the stable default. Volatile telemetry must
+    // not move a row out from under the pointer; the page offers explicit sorts.
+    let roster: Vec<RosterRow> = node.actors.actors.values().map(roster_row).collect();
     NodeCard {
         stream: StreamKeySnapshot {
             key: stream_key(&node.stream),
@@ -352,7 +348,9 @@ fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
         errors: node.hardware.errors(),
         cpu: node.hardware.cpu.as_ref().map(CpuSnapshot::from),
         gpu: node.hardware.gpu.as_ref().map(GpuSnapshot::from),
+        memory: node.hardware.memory.clone(),
         net: node.hardware.net.clone(),
+        storage: node.hardware.storage.clone(),
         process: node.hardware.process.clone(),
         history: node
             .hardware
@@ -362,11 +360,16 @@ fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
                 ms_ago: duration_ms(now.duration_since(sample.at)),
                 sample_unix_ms: sample.sample_unix_ms,
                 cpu_total_percent: sample.cpu_total_percent,
+                cpu_cores_percent: sample.cpu_cores_percent.clone(),
                 gpu_max_percent: sample.gpu_max_percent,
                 gpu_memory_used_mib: sample.gpu_memory_used_mib,
                 gpu_memory_total_mib: sample.gpu_memory_total_mib,
                 net_rx_bps: sample.net_rx_bps,
                 net_tx_bps: sample.net_tx_bps,
+                memory_used_percent: sample.memory_used_percent,
+                memory_pressure_some_avg10: sample.memory_pressure_some_avg10,
+                storage_used_percent: sample.storage_used_percent,
+                io_pressure_some_avg10: sample.io_pressure_some_avg10,
             })
             .collect(),
         actor_summary: ActorSummarySnapshot {
@@ -668,6 +671,191 @@ mod tests {
     }
 
     #[test]
+    fn hardware_channels_fold_into_fleet_snapshot() {
+        let view = ControlPlaneView::default();
+        let stream = StreamId::new(NodeId::new("worker"), Lifetime(1));
+        let cpu = json!({
+            "schema":"host.cpu.v1",
+            "seq":1,
+            "sample_unix_ms":1_000,
+            "query_elapsed_ms":1,
+            "host":{
+                "logical_cpus":8,
+                "total_percent":42.5,
+                "idle_percent":57.5,
+                "iowait_percent":0.0,
+                "steal_percent":0.0,
+                "load1":1.0,
+                "load5":0.5,
+                "load15":0.25
+            },
+            "cores":[
+                {"index":0,"total_percent":25.0,"idle_percent":75.0,"iowait_percent":0.0,"steal_percent":0.0},
+                {"index":1,"total_percent":60.0,"idle_percent":40.0,"iowait_percent":0.0,"steal_percent":0.0}
+            ],
+            "processes":[],
+            "error":null
+        });
+        let gpu = json!({
+            "schema":"host.gpu.v1",
+            "seq":1,
+            "sample_unix_ms":1_000,
+            "query_elapsed_ms":2,
+            "gpus":[{
+                "index":0,
+                "uuid":"gpu-0",
+                "name":"test gpu",
+                "memory_used_mib":512,
+                "memory_total_mib":4096,
+                "utilization_gpu_percent":71,
+                "utilization_memory_percent":12,
+                "temperature_c":55,
+                "power_draw_w":25.0
+            }],
+            "processes":[],
+            "error":null
+        });
+        let memory = json!({
+            "schema":"host.memory.v1",
+            "seq":1,
+            "sample_unix_ms":2_000,
+            "query_elapsed_ms":1,
+            "total_bytes":16_000,
+            "available_bytes":4_000,
+            "used_bytes":12_000,
+            "cached_bytes":2_000,
+            "swap_total_bytes":8_000,
+            "swap_used_bytes":1_000,
+            "pressure":{
+                "some_avg10":1.25,
+                "some_avg60":0.75,
+                "some_avg300":0.5,
+                "some_total_us":100,
+                "full_avg10":0.1,
+                "full_avg60":0.05,
+                "full_avg300":0.01,
+                "full_total_us":10
+            },
+            "error":null
+        });
+        let net_sample = |seq, sample_unix_ms, rx_bytes, tx_bytes| {
+            json!({
+                "schema":"host.net.v1",
+                "seq":seq,
+                "sample_unix_ms":sample_unix_ms,
+                "interfaces":[{
+                    "name":"eth0",
+                    "rx_bytes":rx_bytes,
+                    "tx_bytes":tx_bytes,
+                    "rx_packets":10,
+                    "tx_packets":10,
+                    "rx_errors":0,
+                    "tx_errors":0,
+                    "rx_dropped":0,
+                    "tx_dropped":0
+                }],
+                "error":null
+            })
+        };
+        let storage = json!({
+            "schema":"host.storage.v1",
+            "seq":1,
+            "sample_unix_ms":2_000,
+            "query_elapsed_ms":1,
+            "filesystems":[{
+                "mount":"/",
+                "total_bytes":100_000,
+                "used_bytes":80_000,
+                "available_bytes":20_000,
+                "used_percent":80.0
+            }],
+            "pressure":{
+                "some_avg10":2.5,
+                "some_avg60":1.5,
+                "some_avg300":0.5,
+                "some_total_us":200,
+                "full_avg10":0.2,
+                "full_avg60":0.1,
+                "full_avg300":0.05,
+                "full_total_us":20
+            },
+            "error":null
+        });
+
+        for (position, channel, payload) in [
+            (0, "host.cpu", cpu),
+            (1, "host.gpu", gpu),
+            (2, "host.memory", memory),
+            (3, "host.net", net_sample(0, 1_000, 1_000, 2_000)),
+            (4, "host.net", net_sample(1, 2_000, 2_000, 3_500)),
+            (5, "host.storage", storage),
+        ] {
+            ingest_json(
+                &view,
+                &stream,
+                position,
+                channel,
+                serde_json::to_vec(&payload).expect("hardware payload"),
+            );
+        }
+
+        let snapshot = view.snapshot_json();
+        let node = &snapshot["live"][0];
+        assert_eq!(node["cpu"]["host"]["total_percent"], json!(42.5));
+        assert_eq!(node["gpu"]["gpus"][0]["utilization_gpu_percent"], json!(71));
+        assert_eq!(node["cpu"]["cores"][1]["total_percent"], json!(60.0));
+        assert_eq!(node["memory"]["used_bytes"], json!(12_000));
+        assert_eq!(node["net"]["interfaces"][0]["rx_bps"], json!(1_000.0));
+        assert_eq!(node["net"]["interfaces"][0]["tx_bps"], json!(1_500.0));
+        assert_eq!(
+            node["storage"]["filesystems"][0]["used_percent"],
+            json!(80.0)
+        );
+        assert_eq!(node["history"][0]["cpu_cores_percent"], json!([25.0, 60.0]));
+        assert_eq!(
+            node["history"][0]["memory_pressure_some_avg10"],
+            json!(1.25)
+        );
+        assert_eq!(node["history"][0]["io_pressure_some_avg10"], json!(2.5));
+        assert_eq!(node["last_sample_unix_ms"], json!(2_000));
+        assert!(node["errors"].as_array().expect("errors").is_empty());
+    }
+
+    #[test]
+    fn roster_default_order_does_not_follow_volatile_throughput() {
+        let view = ControlPlaneView::default();
+        let stream = StreamId::new(NodeId::new("node"), Lifetime(1));
+        ingest_json(
+            &view,
+            &stream,
+            0,
+            "runtime.actors",
+            actors_payload(
+                0,
+                json!([
+                    { "address": "zz", "messages_processed": 100 },
+                    { "address": "aa", "messages_processed": 1 }
+                ]),
+            ),
+        );
+        {
+            let mut state = view.state.write();
+            let actors = &mut state.streams.get_mut("node#1").expect("node").actors.actors;
+            actors.get_mut("zz").expect("zz actor").msg_per_sec = 10_000.0;
+            actors.get_mut("aa").expect("aa actor").msg_per_sec = 1.0;
+        }
+
+        let snapshot = view.snapshot_json();
+        let addresses: Vec<&str> = snapshot["live"][0]["roster"]
+            .as_array()
+            .expect("roster")
+            .iter()
+            .map(|actor| actor["address"].as_str().expect("address"))
+            .collect();
+        assert_eq!(addresses, vec!["aa", "zz"]);
+    }
+
+    #[test]
     fn newer_life_generation_evicts_superseded_stream() {
         let view = ControlPlaneView::default();
         let old = StreamId::new(NodeId::new("node"), Lifetime(1));
@@ -701,7 +889,7 @@ mod tests {
     fn stale_pool_is_hard_capped() {
         let view = ControlPlaneView::default();
         for index in 0..(STALE_POOL_CAP as u64 + 5) {
-            let stream = StreamId::new(NodeId::new(&format!("old-{index}")), Lifetime(1));
+            let stream = StreamId::new(NodeId::new(format!("old-{index}")), Lifetime(1));
             ingest_json(
                 &view,
                 &stream,

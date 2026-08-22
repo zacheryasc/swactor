@@ -87,6 +87,12 @@
     table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
     th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--divider); font-variant-numeric: tabular-nums; }
     th { color: var(--amber); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+    .roster-sort-controls { display: inline-flex; gap: 2px; margin-left: 4px; vertical-align: middle; }
+    .roster-sort-button { position: relative; width: 14px; height: 14px; padding: 0; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: var(--r); font-size: 0; line-height: 0; cursor: pointer; }
+    .roster-sort-button::before { content: ""; position: absolute; left: 3px; width: 0; height: 0; border-left: 3px solid transparent; border-right: 3px solid transparent; }
+    .roster-sort-button[data-direction="asc"]::before { top: 3px; border-bottom: 5px solid currentColor; }
+    .roster-sort-button[data-direction="desc"]::before { bottom: 3px; border-top: 5px solid currentColor; }
+    .roster-sort-button:hover, .roster-sort-button[aria-pressed="true"] { color: var(--cyan); border-color: var(--cyan); background: var(--panel-hover); }
     tbody tr[data-addr] { cursor: pointer; transition: background var(--t); }
     tbody tr[data-addr]:hover { background: var(--row-hover); }
     tbody tr[data-selected="true"] { background: var(--selected); box-shadow: inset 2px 0 0 var(--selected-edge); }
@@ -102,6 +108,33 @@
     .empty { padding: 24px; border: 1px dashed var(--border); border-radius: var(--r); color: var(--muted); font-family: var(--mono); font-size: 12px; }
     .notice { font-size: 12px; color: var(--muted); margin: 6px 0; }
     canvas { width: 100%; height: 64px; background: var(--inset); border: 1px solid var(--border); border-radius: var(--r); }
+    .hardware-source { margin-bottom: 8px; }
+    .hardware-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 8px; }
+    .hw-card { min-width: 0; padding: 10px; background: var(--inset); border: 1px solid var(--divider); border-radius: var(--r); }
+    .hw-card.cpu { grid-column: span 7; }
+    .hw-card.memory { grid-column: span 5; }
+    .hw-card.storage, .hw-card.gpu, .hw-card.network { grid-column: span 4; }
+    .hw-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
+    .hw-card-title { color: var(--muted); font: 700 10px/1.2 var(--mono); text-transform: uppercase; letter-spacing: .09em; }
+    .hw-card-value { color: var(--text); font: 700 16px/1 var(--mono); font-variant-numeric: tabular-nums; }
+    .hw-card-subtitle { margin-top: 5px; color: var(--muted); font: 11px/1.35 var(--mono); }
+    .metric-pair { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; color: var(--muted); font: 11px/1.3 var(--mono); }
+    .metric-pair strong { color: var(--text); font-weight: 600; }
+    .pressure-value.ok { color: var(--ok); } .pressure-value.warn { color: var(--amber); } .pressure-value.bad { color: var(--bad); }
+    canvas.thread-graph { height: 72px; background: var(--bg); border-color: var(--divider); image-rendering: pixelated; }
+    .thread-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(26px, 1fr)); gap: 3px; margin-top: 5px; }
+    .thread-cell { min-width: 0; height: 20px; display: grid; place-items: center; border: 1px solid var(--divider); border-radius: var(--r); color: var(--text); font: 9px/1 var(--mono); font-variant-numeric: tabular-nums; }
+    .network-list { display: grid; gap: 6px; }
+    .network-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; font: 11px/1.25 var(--mono); }
+    .network-row .interface { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+    .hw-empty { color: var(--muted); font: 11px/1.35 var(--mono); }
+    @media (max-width: 900px) {
+      .hw-card.cpu { grid-column: span 12; }
+      .hw-card.memory, .hw-card.storage, .hw-card.gpu, .hw-card.network { grid-column: span 6; }
+    }
+    @media (max-width: 600px) {
+      .hw-card.cpu, .hw-card.memory, .hw-card.storage, .hw-card.gpu, .hw-card.network { grid-column: span 12; }
+    }
     .err { color: var(--bad); }
     @media (prefers-reduced-motion: reduce) { * { transition-duration: 0.01ms !important; animation: none !important; } }
   </style>
@@ -134,6 +167,8 @@ const params = new URLSearchParams(window.location.search);
 let selectedStream = params.get('stream') || null;
 let selectedActor = params.get('actor') || null;
 let rosterFilter = '';
+let rosterSort = { key: 'address', direction: 'asc' };
+let hardwareSource = 'node';
 let lastSnapshot = null;
 let detailTimer = null;
 // A1: last-rendered HTML per region. A poll that yields identical markup
@@ -143,6 +178,14 @@ let lastPageHtml = null;
 let lastRosterHtml = null;
 let lastMachineHtml = null;
 let lastDossierHtml = null;
+
+window.addEventListener('dashboard-hardware-source', event => {
+  const next = event.detail?.source === 'orchestrator' ? 'orchestrator' : 'node';
+  if (next === hardwareSource) return;
+  hardwareSource = next;
+  lastMachineHtml = null;
+  if (lastSnapshot) render();
+});
 
 // Receipt ages (dossier) render as empty spans carrying an absolute epoch —
 // stable across polls — and a 1 Hz pass rewrites their textContent. All other
@@ -172,6 +215,17 @@ function fmtRate(value) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + ' M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + ' k';
   return n.toFixed(n < 10 ? 1 : 0);
+}
+function fmtBytes(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let scaled = Math.max(0, n), unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return scaled.toFixed(scaled < 10 && unit > 0 ? 1 : 0) + ' ' + units[unit];
 }
 function typeShort(name) {
   if (!name) return '—';
@@ -291,6 +345,14 @@ function updateCardTexts(nodes) {
   }
 }
 
+function hardwareNodeFor(node, live, stale) {
+  if (hardwareSource !== 'orchestrator' || node.stream.origin === 'orchestrator') {
+    return { node, mirrored: false };
+  }
+  const orchestrator = live.concat(stale).find(candidate => candidate.stream.origin === 'orchestrator');
+  return orchestrator ? { node: orchestrator, mirrored: true } : { node, mirrored: false };
+}
+
 function renderNode(page, node, live, stale) {
   const summary = node.actor_summary || {};
   const active = document.activeElement;
@@ -333,7 +395,8 @@ function renderNode(page, node, live, stale) {
   if (actorCount) actorCount.textContent = fmt(summary.actors);
   const seen = page.querySelector('h2 [data-seen]');
   if (seen) seen.textContent = node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago';
-  const machine = machineDetail(node);
+  const machineSource = hardwareNodeFor(node, live, stale);
+  const machine = machineDetail(machineSource.node, machineSource.mirrored);
   const machineSlot = document.getElementById('machine-detail');
   if (machineSlot && machine !== lastMachineHtml) {
     machineSlot.innerHTML = machine;
@@ -347,67 +410,192 @@ function renderNode(page, node, live, stale) {
   }
 }
 
-function machineDetail(node) {
-  const cpu = node.cpu, gpu = node.gpu, net = node.net;
-  const rows = [];
-  const cpuTotal = cpu && cpu.host ? cpu.host.total_percent : null;
-  rows.push(`<div class="bar-row"><span class="name">CPU</span>${bar(cpuTotal)}<span class="num">${cpuTotal == null ? '—' : fmt(cpuTotal, 1) + '%'}</span></div>`);
-  if (gpu && gpu.gpus) {
-    gpu.gpus.forEach((device, index) => {
-      const util = device.utilization_gpu_percent;
-      const used = device.memory_used_mib || 0, total = device.memory_total_mib || 0;
-      rows.push(`<div class="bar-row"><span class="name">GPU ${fmt(index)}</span>${bar(util)}<span class="num">${util == null ? '—' : fmt(util) + '%'}</span></div>`);
-      if (total) rows.push(`<div class="bar-row"><span class="name">&nbsp;</span>${bar(used, total)}<span class="num">${fmt(used)}/${fmt(total)} MiB</span></div>`);
-    });
-  }
-  if (net && net.interfaces) {
-    net.interfaces.slice(0, 4).forEach(nic => {
-      rows.push(`<div class="bar-row"><span class="name" title="${esc(nic.name)}">${esc(nic.name.slice(0, 12))}</span><span class="num" style="width:auto;flex:1">${fmtRate(nic.rx_bps)}↓ ${fmtRate(nic.tx_bps)}↑</span></div>`);
-    });
-  }
-  if (node.history && node.history.length) drawMachineHistory(node.history);
-  const errors = (node.errors || []).map(e => `<div class="notice err">${esc(e)}</div>`).join('');
-  return `<div class="bars">${rows.join('')}</div><canvas id="machine-spark" width="600" height="64"></canvas>${errors}`;
+function percentOf(used, total) {
+  const numerator = Number(used), denominator = Number(total);
+  return Number.isFinite(numerator) && Number.isFinite(denominator) && denominator > 0
+    ? numerator * 100 / denominator
+    : null;
 }
 
-function drawMachineHistory(history) {
+function pressureTone(value, warn = 1, bad = 5) {
+  const pressure = Number(value);
+  if (!Number.isFinite(pressure)) return '';
+  return pressure >= bad ? 'bad' : pressure >= warn ? 'warn' : 'ok';
+}
+
+function machineDetail(node, mirrored = false) {
+  const cpu = node.cpu, gpu = node.gpu, memory = node.memory, net = node.net, storage = node.storage;
+  const cpuHost = cpu?.host;
+  const cpuTotal = cpuHost?.total_percent;
+  const cores = [...(cpu?.cores || [])].sort((left, right) => left.index - right.index);
+  const threadHeight = Math.min(92, Math.max(42, cores.length * 4));
+  drawThreadGraph(node.history || [], cores.map(core => core.total_percent));
+  const threadCells = cores.map(core => {
+    const value = core.total_percent;
+    const load = value == null ? 0 : Math.max(0, Math.min(100, Number(value)));
+    const label = value == null ? '—' : fmt(value);
+    return `<span class="thread-cell" title="Thread ${fmt(core.index)} · ${value == null ? 'no sample' : fmt(value, 1) + '%'}" style="background:linear-gradient(to top,var(--ok) 0%,var(--ok) ${load}%,var(--bg) ${load}%,var(--bg) 100%)">${label}</span>`;
+  }).join('');
+  const load = [cpuHost?.load1, cpuHost?.load5, cpuHost?.load15].map(value => fmt(value, 2)).join(' / ');
+  const cpuLabel = cpuTotal == null ? '—' : fmt(cpuTotal, 1) + '%';
+
+  const memoryPercent = percentOf(memory?.used_bytes, memory?.total_bytes);
+  const memoryPressure = memory?.pressure?.some_avg10;
+  const swapPercent = percentOf(memory?.swap_used_bytes, memory?.swap_total_bytes);
+  const memoryLabel = memoryPercent == null ? '—' : fmt(memoryPercent, 1) + '%';
+
+  const filesystem = storage?.filesystems?.[0];
+  const storagePercent = filesystem?.used_percent;
+  const ioPressure = storage?.pressure?.some_avg10;
+  const storageLabel = storagePercent == null ? '—' : fmt(storagePercent, 1) + '%';
+
+  const gpuDevices = gpu?.gpus || [];
+  const gpuMax = gpuDevices.reduce((maximum, device) => {
+    const value = Number(device.utilization_gpu_percent);
+    return Number.isFinite(value) ? Math.max(maximum, value) : maximum;
+  }, 0);
+  const gpuRows = gpuDevices.map((device, index) => {
+    const utilization = device.utilization_gpu_percent;
+    const memoryPercent = percentOf(device.memory_used_mib, device.memory_total_mib);
+    return `<div class="metric-pair"><span>GPU ${fmt(index)}</span><strong>${utilization == null ? '—' : fmt(utilization) + '%'}</strong></div>
+      ${bar(utilization)}
+      <div class="metric-pair"><span>Memory</span><strong>${device.memory_total_mib ? fmt(device.memory_used_mib) + ' / ' + fmt(device.memory_total_mib) + ' MiB' : '—'}</strong></div>
+      ${device.memory_total_mib ? bar(memoryPercent) : ''}`;
+  }).join('');
+
+  const networkRows = (net?.interfaces || []).slice(0, 4).map(nic => `
+    <div class="network-row">
+      <span class="interface" title="${esc(nic.name)}">${esc(nic.name)}</span>
+      <span>${fmtRate(nic.rx_bps)}↓&nbsp; ${fmtRate(nic.tx_bps)}↑</span>
+    </div>`).join('');
+
+  const source = mirrored ? '<div class="hardware-source muted">Mock node · local orchestrator hardware</div>' : '';
+  const errors = (node.errors || []).map(error => `<div class="notice err">${esc(error)}</div>`).join('');
+  return `${source}<div class="hardware-grid">
+    <section class="hw-card cpu">
+      <div class="hw-card-head"><span class="hw-card-title">CPU · ${fmt(cores.length)} threads</span><span class="hw-card-value">${cpuLabel}</span></div>
+      <canvas id="thread-graph" class="thread-graph" width="560" height="${threadHeight}" style="height:${threadHeight}px" role="img" aria-label="Per-thread CPU utilization history"></canvas>
+      <div class="thread-strip">${threadCells || '<span class="hw-empty">Waiting for per-thread samples</span>'}</div>
+      <div class="hw-card-subtitle">Load 1 / 5 / 15 min&nbsp; ${load}</div>
+    </section>
+    <section class="hw-card memory">
+      <div class="hw-card-head"><span class="hw-card-title">Memory</span><span class="hw-card-value">${memoryLabel}</span></div>
+      ${bar(memoryPercent)}
+      <div class="metric-pair"><span>Used</span><strong>${fmtBytes(memory?.used_bytes)} / ${fmtBytes(memory?.total_bytes)}</strong></div>
+      <div class="metric-pair"><span>Available</span><strong>${fmtBytes(memory?.available_bytes)}</strong></div>
+      <div class="metric-pair"><span>Swap</span><strong>${swapPercent == null ? '—' : fmt(swapPercent, 1) + '%'}</strong></div>
+      <div class="metric-pair"><span>PSI some · 10s</span><strong class="pressure-value ${pressureTone(memoryPressure)}">${memoryPressure == null ? '—' : fmt(memoryPressure, 2) + '%'}</strong></div>
+    </section>
+    <section class="hw-card storage">
+      <div class="hw-card-head"><span class="hw-card-title">Storage · ${esc(filesystem?.mount || '/')}</span><span class="hw-card-value">${storageLabel}</span></div>
+      ${bar(storagePercent)}
+      <div class="metric-pair"><span>Used</span><strong>${fmtBytes(filesystem?.used_bytes)} / ${fmtBytes(filesystem?.total_bytes)}</strong></div>
+      <div class="metric-pair"><span>Available</span><strong>${fmtBytes(filesystem?.available_bytes)}</strong></div>
+      <div class="metric-pair"><span>I/O PSI · 10s</span><strong class="pressure-value ${pressureTone(ioPressure)}">${ioPressure == null ? '—' : fmt(ioPressure, 2) + '%'}</strong></div>
+    </section>
+    <section class="hw-card gpu">
+      <div class="hw-card-head"><span class="hw-card-title">GPU · ${fmt(gpuDevices.length)} devices</span><span class="hw-card-value">${gpuDevices.length ? fmt(gpuMax) + '%' : '—'}</span></div>
+      ${gpuRows || '<div class="hw-empty">No GPU telemetry</div>'}
+    </section>
+    <section class="hw-card network">
+      <div class="hw-card-head"><span class="hw-card-title">Network</span><span class="hw-card-value">${fmt(net?.interfaces?.length || 0)}</span></div>
+      <div class="network-list">${networkRows || '<div class="hw-empty">No interface telemetry</div>'}</div>
+    </section>
+  </div>${errors}`;
+}
+
+function drawThreadGraph(history, currentCores) {
   requestAnimationFrame(() => {
-    const canvas = document.getElementById('machine-spark');
+    const canvas = document.getElementById('thread-graph');
     if (!canvas) return;
+    const ratio = Math.max(1, window.devicePixelRatio || 1);
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width));
+    const height = Math.max(1, Math.round(rect.height));
+    const pixelWidth = Math.round(width * ratio), pixelHeight = Math.round(height * ratio);
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+    }
     const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const points = history.map(h => ({ cpu: h.cpu_total_percent, gpu: h.gpu_max_percent }));
-    drawLine(ctx, points.map(p => p.gpu), '#fbbf24');
-    drawLine(ctx, points.map(p => p.cpu), '#34d399');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    const styles = getComputedStyle(document.documentElement);
+    const background = styles.getPropertyValue('--bg').trim() || '#00060c';
+    const divider = styles.getPropertyValue('--divider').trim() || '#0d2c4a';
+    const foreground = styles.getPropertyValue('--ok').trim() || '#00d400';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, width, height);
+
+    const threadCount = Math.max(currentCores.length, ...history.map(point => point.cpu_cores_percent?.length || 0));
+    if (!threadCount) return;
+    const rowHeight = height / threadCount;
+    ctx.fillStyle = divider;
+    for (let row = 1; row < threadCount; row += 1) {
+      ctx.fillRect(0, Math.floor(row * rowHeight), width, 1);
+    }
+    const slot = 2;
+    const points = history
+      .map(point => point.cpu_cores_percent || [])
+      .slice(-Math.floor(width / slot));
+    if (!points.length) points.push(currentCores);
+    ctx.fillStyle = foreground;
+    points.forEach((values, pointIndex) => {
+      const x = width - (points.length - pointIndex) * slot;
+      values.forEach((value, threadIndex) => {
+        if (value == null || !Number.isFinite(Number(value))) return;
+        const utilization = Math.max(0, Math.min(100, Number(value)));
+        ctx.globalAlpha = 0.10 + utilization * 0.009;
+        const y = Math.ceil(threadIndex * rowHeight);
+        ctx.fillRect(x, y, slot, Math.max(1, Math.floor(rowHeight) - 1));
+      });
+    });
+    ctx.globalAlpha = 1;
   });
 }
 
-function drawLine(ctx, values, color) {
-  const valid = values.filter(v => v != null);
-  if (valid.length < 2) return;
-  const max = Math.max(100, ...valid);
-  const step = ctx.canvas.width / (values.length - 1 || 1);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  let started = false;
-  values.forEach((value, index) => {
-    if (value == null) return;
-    const x = index * step;
-    const y = ctx.canvas.height - (value / max) * (ctx.canvas.height - 6) - 3;
-    if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
+function rosterSortControls(key, label) {
+  return `<span class="roster-sort-controls">
+    <button type="button" class="roster-sort-button" data-sort="${key}" data-direction="asc" aria-label="Sort ${label} ascending" title="Sort ${label} ascending" aria-pressed="${rosterSort.key === key && rosterSort.direction === 'asc'}">↑</button>
+    <button type="button" class="roster-sort-button" data-sort="${key}" data-direction="desc" aria-label="Sort ${label} descending" title="Sort ${label} descending" aria-pressed="${rosterSort.key === key && rosterSort.direction === 'desc'}">↓</button>
+  </span>`;
+}
+
+function compareRosterValues(left, right) {
+  const leftMissing = left == null || left === '';
+  const rightMissing = right == null || right === '';
+  if (leftMissing || rightMissing) return leftMissing === rightMissing ? 0 : leftMissing ? 1 : -1;
+  if (typeof left === 'number' && typeof right === 'number') return left - right;
+  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
+  return String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function isLegacyHardwareSampler(actor) {
+  const actorType = String(actor.actor_type || '');
+  return (actorType.includes('BlockingSamplerActor') && actorType.includes('telemetry::hardware'))
+    || /Host(?:Cpu|Gpu|Net)SamplerActor/.test(actorType);
 }
 
 function renderRoster(node) {
   const wrap = document.getElementById('roster-wrap');
   if (!wrap) return;
-  let rows = node.roster || [];
+  let rows = [...(node.roster || [])];
+  if (hardwareSource === 'orchestrator') {
+    // Mock containers may come from an older local image. Current samplers are
+    // engine tasks; do not leak legacy sampler actors into the simulated roster.
+    rows = rows.filter(actor => !isLegacyHardwareSampler(actor));
+    const actorCount = document.querySelector('[data-actor-count]');
+    if (actorCount) actorCount.textContent = fmt(rows.length);
+  }
   if (rosterFilter) {
     const q = rosterFilter.toLowerCase();
     rows = rows.filter(a => `${a.name || ''} ${a.actor_type || ''} ${a.address} ${a.worker_id ?? ''}`.toLowerCase().includes(q));
   }
+  rows.sort((left, right) => {
+    const compared = compareRosterValues(left[rosterSort.key], right[rosterSort.key]);
+    return (rosterSort.direction === 'asc' ? compared : -compared)
+      || String(left.address).localeCompare(String(right.address));
+  });
   const capped = rows.slice(0, ROSTER_RENDER_CAP);
   const notice = rows.length > capped.length
     ? `<div class="notice">showing ${fmt(capped.length)} of ${fmt(rows.length)} — refine the filter to see more</div>`
@@ -417,7 +605,7 @@ function renderRoster(node) {
     html = '<div class="empty">No actors on this stream (or none match the filter).</div>';
   } else {
     html = notice + `<table>
-    <thead><tr><th>Actor</th><th>Type</th><th>State</th><th>Mailbox</th><th>Msg/s</th><th>Processed</th><th>Worker</th><th>Last message</th></tr></thead>
+    <thead><tr><th>Actor${rosterSortControls('address', 'actor')}</th><th>Type${rosterSortControls('actor_type', 'type')}</th><th>State${rosterSortControls('poisoned', 'state')}</th><th>Mailbox${rosterSortControls('mailbox_depth', 'mailbox')}</th><th>Msg/s${rosterSortControls('msg_per_sec', 'throughput')}</th><th>Processed${rosterSortControls('messages_processed', 'processed count')}</th><th>Worker${rosterSortControls('worker_id', 'worker')}</th><th>Last message${rosterSortControls('last_msg_type', 'last message')}</th></tr></thead>
     <tbody>${capped.map(a => `<tr data-addr="${esc(a.address)}" tabindex="0" ${a.address === selectedActor ? 'data-selected="true"' : ''}>
       <td class="mono">${esc(shortAddr(a.address))}${a.name ? `<br><span class="muted">${esc(a.name)}</span>` : ''}</td>
       <td><span class="muted" title="${esc(a.actor_type || '')}">${typeShort(a.actor_type)}</span></td>
@@ -549,6 +737,12 @@ pageEl.addEventListener('click', e => {
   if (e.target.closest('#dossier-close')) {
     selectedActor = null;
     pushUrl();
+    render();
+    return;
+  }
+  const sortButton = e.target.closest('.roster-sort-button');
+  if (sortButton) {
+    rosterSort = { key: sortButton.dataset.sort, direction: sortButton.dataset.direction };
     render();
     return;
   }

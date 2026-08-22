@@ -10,7 +10,7 @@ use crate::provisioning::{
 };
 
 pub(crate) fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
-    StreamId::new(NodeId::new(&node_id.to_string()), Lifetime(run_id))
+    StreamId::new(NodeId::new(node_id.to_string()), Lifetime(run_id))
 }
 
 #[derive(Clone)]

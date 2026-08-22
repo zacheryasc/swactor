@@ -7,6 +7,7 @@
 //! only through these closures.
 
 use iroh::EndpointAddr;
+use iroh_driver::telemetry_transport::PullCollectorConfig;
 use iroh_driver::{IrohDriver, PullCollectorHandle, TelemetryQuicHeader, spawn_pull_collector};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,12 +83,14 @@ impl FrameCollector {
         flow_id[8..].copy_from_slice(&node_id.to_le_bytes());
         let collector = spawn_pull_collector(
             engine,
-            endpoint,
-            peer,
-            flow_id,
-            Vec::new(),
-            SubscriptionRequest::all(),
-            Arc::clone(&self.pull_fanout),
+            PullCollectorConfig {
+                endpoint,
+                peer,
+                flow_id,
+                token: Vec::new(),
+                request: SubscriptionRequest::all(),
+                fanout: Arc::clone(&self.pull_fanout),
+            },
             self.pull_header_tx.clone(),
         );
         if let Some(previous) = self

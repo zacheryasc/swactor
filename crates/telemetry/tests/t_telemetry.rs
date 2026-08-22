@@ -27,17 +27,6 @@ impl Record for ResourceSample {
     const CHANNEL: &'static str = "host.resource";
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct MembershipTransition {
-    peer: String,
-    from: String,
-    to: String,
-}
-
-impl Record for MembershipTransition {
-    const CHANNEL: &'static str = "membership";
-}
-
 fn stream() -> StreamId {
     StreamId::new(NodeId::new("node-alpha"), Lifetime(1))
 }

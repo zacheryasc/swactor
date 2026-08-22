@@ -1,14 +1,50 @@
 (() => {
   const CONTROL_ID = 'myelin-fleet-control';
+  const CONFIRM_ID = 'myelin-confirm-dialog';
+  const CONFIRM_STYLE_ID = 'myelin-confirm-dialog-style';
   const selectedJobs = new Map();
 
-  async function syncControl() {
-    const nodeView = document.querySelector('.node-view[data-node]');
-    if (!nodeView) return;
-    const rawNodeId = nodeView.getAttribute('data-node') || '';
-    if (!/^\d+$/.test(rawNodeId)) return;
-    const logicalNodeId = Number(rawNodeId);
+  function confirmKill(logicalNodeId) {
+    let dialog = document.getElementById(CONFIRM_ID);
+    if (!dialog) {
+      const style = document.createElement('style');
+      style.id = CONFIRM_STYLE_ID;
+      style.textContent = `
+        .myelin-confirm { width:min(440px,calc(100vw - 32px));padding:0;color:var(--text);background:var(--panel);border:1px solid var(--bad);border-radius:var(--r);box-shadow:0 18px 60px rgba(0,0,0,.55) }
+        .myelin-confirm::backdrop { background:rgba(0,6,12,.78) }
+        .myelin-confirm form { display:grid;gap:14px;padding:18px }
+        .myelin-confirm h2,.myelin-confirm p { margin:0 }
+        .myelin-confirm h2 { color:var(--bad) }
+        .myelin-confirm-actions { display:flex;justify-content:flex-end;gap:8px }
+        .myelin-confirm button { padding:6px 12px;background:transparent;color:var(--text);border:1px solid var(--border);border-radius:var(--r);cursor:pointer;font:600 13px var(--mono) }
+        .myelin-confirm button[value="confirm"] { color:var(--danger-ink);background:var(--danger-fill);border-color:var(--danger-border) }
+      `;
+      document.head.append(style);
+      dialog = document.createElement('dialog');
+      dialog.id = CONFIRM_ID;
+      dialog.className = 'myelin-confirm';
+      dialog.setAttribute('aria-labelledby', 'myelin-confirm-title');
+      dialog.setAttribute('aria-describedby', 'myelin-confirm-message');
+      dialog.innerHTML = `<form method="dialog">
+        <h2 id="myelin-confirm-title">Terminate managed node?</h2>
+        <p id="myelin-confirm-message"></p>
+        <div class="myelin-confirm-actions">
+          <button value="cancel" autofocus>Cancel</button>
+          <button value="confirm">Terminate node</button>
+        </div>
+      </form>`;
+      document.body.append(dialog);
+    }
+    dialog.querySelector('#myelin-confirm-message').textContent =
+      `Terminate managed node ${logicalNodeId}? Vast.ai contracts are destroyed and billing stops.`;
+    dialog.returnValue = 'cancel';
+    return new Promise(resolve => {
+      dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
+      dialog.showModal();
+    });
+  }
 
+  async function syncControl() {
     let model;
     try {
       const response = await fetch('/api/control/status', { cache: 'no-store' });
@@ -18,6 +54,17 @@
     } catch (_) {
       return;
     }
+    window.dispatchEvent(new CustomEvent('dashboard-hardware-source', {
+      detail: {
+        source: model?.provider?.provisioning_mode === 'mock' ? 'orchestrator' : 'node',
+      },
+    }));
+
+    const nodeView = document.querySelector('.node-view[data-node]');
+    if (!nodeView) return;
+    const rawNodeId = nodeView.getAttribute('data-node') || '';
+    if (!/^\d+$/.test(rawNodeId)) return;
+    const logicalNodeId = Number(rawNodeId);
     const node = model?.nodes?.find(candidate => candidate.logical_node_id === logicalNodeId);
     if (!node) return;
 
@@ -130,7 +177,7 @@
     };
 
     killButton.onclick = async () => {
-      if (!window.confirm(`Kill managed node ${logicalNodeId}? Vast.ai contracts are destroyed and billing stops.`)) return;
+      if (!await confirmKill(logicalNodeId)) return;
       killButton.disabled = true;
       message.textContent = 'Submitting kill…';
       const commandId = `fleet-kill-${globalThis.crypto?.randomUUID?.() || Date.now()}`;

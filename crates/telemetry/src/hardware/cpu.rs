@@ -324,10 +324,9 @@ fn parse_cpu_snapshot(raw: &str) -> Option<CpuSnapshot> {
         } else if let Some(index) = label
             .strip_prefix("cpu")
             .and_then(|suffix| suffix.parse::<u32>().ok())
+            && let Some(times) = parse_cpu_times(line)
         {
-            if let Some(times) = parse_cpu_times(line) {
-                cores.push(CpuCoreTimes { index, times });
-            }
+            cores.push(CpuCoreTimes { index, times });
         }
     }
 
