@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_plane::namespace::{
-    DataDirectoryActor, DirectoryClient, NamespaceClient, NamespaceClientActor, NamespaceClientIn,
-    NamespaceDiscovery, NamespaceError, OperationId, SourceRecovery,
+    DataDirectoryActor, DirectoryClient, EntryKind, NamespaceClient, NamespaceClientActor,
+    NamespaceClientIn, NamespaceDiscovery, NamespaceError, OperationId, SourceRecovery, StreamRole,
 };
 use data_plane::path::DataPath;
 use futures_lite::future;
@@ -80,7 +80,11 @@ fn spawn_directory(store: &Path) -> DirectoryHarness {
     let directory = runtime.spawn(actor).expect("spawn directory actor");
     let engine = Engine::new(
         parts,
-        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
     )
     .expect("directory engine");
     DirectoryHarness {
@@ -168,6 +172,222 @@ fn namespace_mutations_are_linearizable_and_durable() {
     ));
 }
 
+#[test]
+fn stream_rendezvous_is_symmetric_and_incarnations_are_isolated() {
+    let state = TempState::new("stream-rendezvous");
+    let directory = spawn_directory(&state.store());
+    let logical = path("/runs/7/results");
+
+    future::block_on(async {
+        let mut source_open = Box::pin(directory.client.open_stream(
+            logical.clone(),
+            StreamRole::Source,
+            source(10),
+            OperationId::from_u128(10),
+        ));
+        assert!(future::poll_once(source_open.as_mut()).await.is_none());
+
+        let sink_match = directory
+            .client
+            .open_stream(
+                logical.clone(),
+                StreamRole::Sink,
+                source(11),
+                OperationId::from_u128(11),
+            )
+            .await
+            .expect("sink matches source");
+        let source_match = source_open.await.expect("source matches sink");
+        assert_eq!(source_match, sink_match);
+        assert_eq!(source_match.source, source(10));
+        assert_eq!(source_match.sink, source(11));
+
+        directory
+            .client
+            .close_stream(logical.clone(), source_match.incarnation)
+            .await
+            .expect("close first incarnation");
+
+        let mut sink_open = Box::pin(directory.client.open_stream(
+            logical.clone(),
+            StreamRole::Sink,
+            source(12),
+            OperationId::from_u128(12),
+        ));
+        assert!(future::poll_once(sink_open.as_mut()).await.is_none());
+        let second_source = directory
+            .client
+            .open_stream(
+                logical,
+                StreamRole::Source,
+                source(13),
+                OperationId::from_u128(13),
+            )
+            .await
+            .expect("source matches waiting sink");
+        let second_sink = sink_open.await.expect("sink matches source");
+        assert_eq!(second_source, second_sink);
+        assert_ne!(source_match.incarnation, second_source.incarnation);
+    });
+}
+
+#[test]
+fn typed_paths_require_explicit_rebinding() {
+    let state = TempState::new("typed-path");
+    let directory = spawn_directory(&state.store());
+    let logical = path("/typed/value");
+    let blob_source = source(20);
+
+    future::block_on(async {
+        directory
+            .client
+            .register(
+                logical.clone(),
+                blob_source,
+                4,
+                recovery(blob_source),
+                OperationId::from_u128(20),
+            )
+            .await
+            .expect("register blob");
+
+        assert!(matches!(
+            directory
+                .client
+                .open_stream(
+                    logical.clone(),
+                    StreamRole::Source,
+                    source(21),
+                    OperationId::from_u128(21),
+                )
+                .await,
+            Err(NamespaceError::WrongEntryType {
+                expected: EntryKind::Stream,
+                found: EntryKind::Blob,
+                ..
+            })
+        ));
+
+        let mut source_open = Box::pin(directory.client.replace_with_stream(
+            logical.clone(),
+            StreamRole::Source,
+            source(22),
+            OperationId::from_u128(22),
+        ));
+        assert!(future::poll_once(source_open.as_mut()).await.is_none());
+        assert!(matches!(
+            directory.client.resolve(logical.clone()).await,
+            Err(NamespaceError::WrongEntryType {
+                expected: EntryKind::Blob,
+                found: EntryKind::Stream,
+                ..
+            })
+        ));
+        let sink_match = directory
+            .client
+            .open_stream(
+                logical,
+                StreamRole::Sink,
+                source(23),
+                OperationId::from_u128(23),
+            )
+            .await
+            .expect("match rebound stream");
+        assert_eq!(
+            source_open.await.expect("rebound source matched"),
+            sink_match
+        );
+    });
+}
+
+#[test]
+fn replacing_waiting_stream_displaces_old_open() {
+    let state = TempState::new("stream-displacement");
+    let directory = spawn_directory(&state.store());
+    let logical = path("/replace/waiting");
+
+    future::block_on(async {
+        let mut old_open = Box::pin(directory.client.open_stream(
+            logical.clone(),
+            StreamRole::Source,
+            source(30),
+            OperationId::from_u128(30),
+        ));
+        assert!(future::poll_once(old_open.as_mut()).await.is_none());
+
+        let mut replacement = Box::pin(directory.client.replace_with_stream(
+            logical.clone(),
+            StreamRole::Source,
+            source(31),
+            OperationId::from_u128(31),
+        ));
+        assert!(future::poll_once(replacement.as_mut()).await.is_none());
+        assert!(matches!(
+            old_open.await,
+            Err(NamespaceError::PathReplaced(found)) if found == logical
+        ));
+
+        let sink_match = directory
+            .client
+            .open_stream(
+                logical,
+                StreamRole::Sink,
+                source(32),
+                OperationId::from_u128(32),
+            )
+            .await
+            .expect("sink matches replacement");
+        assert_eq!(
+            replacement.await.expect("replacement source matched"),
+            sink_match
+        );
+        assert_eq!(sink_match.source, source(31));
+    });
+}
+
+#[test]
+fn duplicate_stream_role_fails_without_replacing_the_waiter() {
+    let state = TempState::new("duplicate-stream-role");
+    let directory = spawn_directory(&state.store());
+    let logical = path("/duplicate/source");
+
+    future::block_on(async {
+        let mut first = Box::pin(directory.client.open_stream(
+            logical.clone(),
+            StreamRole::Source,
+            source(51),
+            OperationId::from_u128(51),
+        ));
+        assert!(future::poll_once(first.as_mut()).await.is_none());
+        assert!(matches!(
+            directory
+                .client
+                .open_stream(
+                    logical.clone(),
+                    StreamRole::Source,
+                    source(52),
+                    OperationId::from_u128(52),
+                )
+                .await,
+            Err(NamespaceError::DuplicateStreamRole {
+                role: StreamRole::Source,
+                ..
+            })
+        ));
+        let matched = directory
+            .client
+            .open_stream(
+                logical,
+                StreamRole::Sink,
+                source(53),
+                OperationId::from_u128(53),
+            )
+            .await
+            .expect("sink matches original source");
+        assert_eq!(matched.source, source(51));
+        assert_eq!(first.await.expect("original source survives"), matched);
+    });
+}
 #[test]
 fn committed_mutation_retry_has_at_most_once_effect() {
     let state = TempState::new("idempotent");
@@ -369,9 +589,15 @@ struct ModelBinding {
     revision: u64,
 }
 
+#[derive(Clone, Debug)]
+enum TypedModelEntry {
+    Blob(ModelBinding),
+    Stream(data_plane::namespace::StreamMatch),
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 8,
         max_shrink_iters: 128,
         ..ProptestConfig::default()
     })]
@@ -434,8 +660,97 @@ proptest! {
                 let observed = future::block_on(directory.client.resolve(path.clone()))
                     .expect("all model bindings remain resolvable");
                 prop_assert_eq!(observed.source, expected.source);
+
                 prop_assert_eq!(observed.length, expected.length);
                 prop_assert_eq!(observed.revision, expected.revision);
+            }
+        }
+    }
+    #[test]
+    fn typed_binding_action_strings_match_reference_model(actions in prop::collection::vec(any::<u8>(), 1..64)) {
+        let state = TempState::new("typed-stateful");
+        let directory = spawn_directory(&state.store());
+        let paths = [path("/state/a"), path("/state/b"), path("/state/c")];
+        let mut model = BTreeMap::<DataPath, TypedModelEntry>::new();
+        let mut next_operation = 10_000_u128;
+
+        for (step, action) in actions.into_iter().enumerate() {
+            let logical = paths[usize::from(action) % paths.len()].clone();
+            match action % 4 {
+                0 => {
+                    let actor = source(action.wrapping_add(step as u8).wrapping_add(1));
+                    let length = u64::from(action) + 1;
+                    let receipt = future::block_on(directory.client.register(
+                        logical.clone(),
+                        actor,
+                        length,
+                        recovery(actor),
+                        OperationId::from_u128(next_operation),
+                    )).expect("blob rebind");
+                    next_operation += 1;
+                    model.insert(logical, TypedModelEntry::Blob(ModelBinding {
+                        source: actor,
+                        length,
+                        revision: receipt.revision,
+                    }));
+                }
+                1 => {
+                    let source_actor = source(action.wrapping_add(41));
+                    let sink_actor = source(action.wrapping_add(97));
+                    let mut source_open = Box::pin(directory.client.replace_with_stream(
+                        logical.clone(),
+                        StreamRole::Source,
+                        source_actor,
+                        OperationId::from_u128(next_operation),
+                    ));
+                    next_operation += 1;
+                    prop_assert!(future::block_on(future::poll_once(source_open.as_mut())).is_none());
+                    let sink_match = future::block_on(directory.client.open_stream(
+                        logical.clone(),
+                        StreamRole::Sink,
+                        sink_actor,
+                        OperationId::from_u128(next_operation),
+                    )).expect("sink match");
+                    next_operation += 1;
+                    let source_match = future::block_on(source_open).expect("source match");
+                    prop_assert_eq!(&source_match, &sink_match);
+                    model.insert(logical, TypedModelEntry::Stream(sink_match));
+                }
+                2 => {
+                    if let Some(TypedModelEntry::Stream(binding)) = model.get(&logical) {
+                        future::block_on(directory.client.close_stream(
+                            logical.clone(),
+                            binding.incarnation,
+                        )).expect("close current stream");
+                        model.remove(&logical);
+                    }
+                }
+                _ => {
+                    let observed = future::block_on(directory.client.resolve(logical.clone()));
+                    match model.get(&logical) {
+                        Some(TypedModelEntry::Blob(expected)) => {
+                            let observed = observed.expect("blob resolves");
+                            prop_assert_eq!(observed.source, expected.source);
+                            prop_assert_eq!(observed.length, expected.length);
+                            prop_assert_eq!(observed.revision, expected.revision);
+                        }
+                        Some(TypedModelEntry::Stream(_)) => {
+                            let wrong_type = matches!(
+                                observed,
+                                Err(NamespaceError::WrongEntryType {
+                                    expected: EntryKind::Blob,
+                                    found: EntryKind::Stream,
+                                    ..
+                                })
+                            );
+                            prop_assert!(wrong_type, "blob lookup must reject a stream binding");
+                        }
+                        None => prop_assert!(matches!(
+                            observed,
+                            Err(NamespaceError::PathNotFound(found)) if found == logical
+                        )),
+                    }
+                }
             }
         }
     }

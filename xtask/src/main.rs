@@ -37,6 +37,41 @@ fn cargo_bin() -> String {
         .unwrap_or_else(|| "cargo".to_string())
 }
 
+fn remove_inherited_build_context(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        let name_text = name.to_string_lossy();
+        let package_scoped = name_text.starts_with("CARGO_PKG_")
+            || name_text.starts_with("CARGO_FEATURE_")
+            || name_text.starts_with("CARGO_CFG_")
+            || name_text.starts_with("DEP_");
+        let build_scoped = matches!(
+            name_text.as_ref(),
+            "CARGO_BIN_NAME"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_PRIMARY_PACKAGE"
+                | "DEBUG"
+                | "HOST"
+                | "NUM_JOBS"
+                | "OPT_LEVEL"
+                | "OUT_DIR"
+                | "PROFILE"
+                | "PYO3_ENVIRONMENT_SIGNATURE"
+                | "TARGET"
+        );
+        if package_scoped || build_scoped {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn cargo_command() -> Command {
+    let mut command = Command::new(cargo_bin());
+    remove_inherited_build_context(&mut command);
+    command
+}
+
 fn print_usage() {
     println!(
         "\
@@ -57,9 +92,7 @@ fn run_step(step: &TestStep, python: &Path) -> bool {
     println!();
 
     match swactor_process::command_status(
-        Command::new(cargo_bin())
-            .args(step.args)
-            .env("PYO3_PYTHON", python),
+        cargo_command().args(step.args).env("PYO3_PYTHON", python),
     ) {
         Ok(status) => status.success(),
         Err(error) => {
@@ -107,7 +140,7 @@ fn run_tests() -> ExitCode {
 
 fn nextest_available() -> bool {
     let available = swactor_process::command_status(
-        Command::new(cargo_bin())
+        cargo_command()
             .args(["nextest", "--version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
@@ -146,8 +179,10 @@ impl PythonTestTools {
 
     fn run(&self) -> bool {
         println!("\n=== all Python tests ===");
+        let mut build_command = Command::new(&self.maturin);
+        remove_inherited_build_context(&mut build_command);
         let built = swactor_process::command_status(
-            Command::new(&self.maturin)
+            build_command
                 .current_dir(&self.directory)
                 .arg("develop")
                 .env("PYO3_PYTHON", &self.python),

@@ -202,12 +202,20 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
     }));
     let host_engine = Engine::new(
         host_parts,
-        TokioBackend::new(TokioConfig::default()).unwrap(),
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .unwrap(),
     )
     .unwrap();
     let child_engine = Engine::new(
         child_parts,
-        TokioBackend::new(TokioConfig::default()).unwrap(),
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .unwrap(),
     )
     .unwrap();
 
@@ -264,6 +272,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
                 source_sender: Some(Arc::clone(&sender)),
                 source_publisher: Some(Arc::clone(&source_publisher)),
                 route_registrar: None,
+                stream_transport: None,
             })
             .unwrap(),
         )
@@ -296,6 +305,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
                 source_sender: Some(Arc::clone(&sender)),
                 source_publisher: Some(source_publisher),
                 route_registrar: None,
+                stream_transport: None,
             })
             .unwrap(),
         )

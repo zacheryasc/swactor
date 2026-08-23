@@ -7,8 +7,11 @@ use swactor::actor::ActorAddress;
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
 use crate::blob::{BlobError, BlobLease, BlobMetadata};
+use crate::byte_ring::{RingHandle, Role};
 use crate::ids::BlobLeaseId;
+use crate::namespace::{EntryKind, NamespaceError, StreamIncarnation, StreamMatch};
 use crate::path::DataPath;
+use crate::stream_transport::{StreamPeerDescriptor, StreamTransportEvent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCapability([u8; 32]);
@@ -108,7 +111,15 @@ pub enum DataPlaneError {
     ArenaExhausted,
     Blob(BlobFailure),
     OperationCancelled,
-    StreamsDeferred,
+    WrongEntryType {
+        path: DataPath,
+        expected: EntryKind,
+        found: EntryKind,
+    },
+    PathReplaced(DataPath),
+    PeerLost,
+    StreamFault(String),
+    StreamClosed,
 }
 
 impl fmt::Display for DataPlaneError {
@@ -127,7 +138,18 @@ impl fmt::Display for DataPlaneError {
             Self::ArenaExhausted => f.write_str("data-plane arena is exhausted"),
             Self::Blob(reason) => write!(f, "blob lease failure: {reason:?}"),
             Self::OperationCancelled => f.write_str("data-plane operation was cancelled"),
-            Self::StreamsDeferred => f.write_str("actor-driven streams are not installed"),
+            Self::WrongEntryType {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "data path {path} has entry kind {found:?}, expected {expected:?}"
+            ),
+            Self::PathReplaced(path) => write!(f, "data path was replaced: {path}"),
+            Self::PeerLost => f.write_str("stream peer was lost"),
+            Self::StreamFault(reason) => write!(f, "stream fault: {reason}"),
+            Self::StreamClosed => f.write_str("stream is closed"),
         }
     }
 }
@@ -161,6 +183,25 @@ pub enum HostSessionIn {
         length: u64,
         child_session: ActorAddress,
         operation: ActorAddress,
+    },
+    OpenReadStream {
+        path: DataPath,
+        child_session: ActorAddress,
+        operation: ActorAddress,
+        replace: bool,
+    },
+    OpenWriteStream {
+        path: DataPath,
+        child_session: ActorAddress,
+        operation: ActorAddress,
+        replace: bool,
+    },
+    CancelStream {
+        operation: ActorAddress,
+    },
+    StreamControl {
+        binding: ActorAddress,
+        message: HostStreamIn,
     },
     ReleaseBlob {
         binding: ActorAddress,
@@ -224,6 +265,33 @@ pub enum ChildSessionIn {
         length: u64,
         reply_to: ActorAddress,
     },
+    OpenReadStream {
+        path: DataPath,
+        reply_to: ActorAddress,
+        replace: bool,
+    },
+    OpenWriteStream {
+        path: DataPath,
+        reply_to: ActorAddress,
+        replace: bool,
+    },
+    CancelStream {
+        reply_to: ActorAddress,
+    },
+    StreamWake {
+        reply_to: ActorAddress,
+        result: Result<(), DataPlaneError>,
+    },
+    StreamControl {
+        binding: ActorAddress,
+        message: HostStreamIn,
+    },
+    ReleaseBlob {
+        binding: ActorAddress,
+        lease_id: BlobLeaseId,
+        generation: u64,
+    },
+    BlobReleased,
     BlobOpened {
         operation: ActorAddress,
         host_binding: ActorAddress,
@@ -235,6 +303,12 @@ pub enum ChildSessionIn {
         host_binding: ActorAddress,
         lease: BlobLease,
         metadata: BlobMetadata,
+    },
+    StreamOpened {
+        operation: ActorAddress,
+        host_binding: ActorAddress,
+        ring: RingHandle,
+        role: Role,
     },
     OperationFailed {
         operation: ActorAddress,
@@ -258,9 +332,44 @@ impl NetworkMessage for ChildSessionIn {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum HostStreamIn {
+    NamespaceMatched(Result<StreamMatch, NamespaceError>),
+    Allocated(Result<RingHandle, DataPlaneError>),
+    PeerOffer {
+        incarnation: StreamIncarnation,
+        descriptor: StreamPeerDescriptor,
+    },
+    Transport(StreamTransportEvent),
+    DataAvailable,
+    CapacityAvailable,
+    WaitData {
+        reply_to: ActorAddress,
+    },
+    WaitCapacity {
+        reply_to: ActorAddress,
+    },
+    Close {
+        clean: bool,
+        reply_to: Option<ActorAddress>,
+    },
+    PeerTerminated {
+        incarnation: StreamIncarnation,
+        error: DataPlaneError,
+    },
+    ReleaseComplete(Result<(), DataPlaneError>),
+}
+
+impl NetworkMessage for HostStreamIn {
+    fn type_tag() -> &'static str {
+        "data-plane.host-stream.v1"
+    }
+}
+
 pub fn register_data_plane_codecs(registry: &mut CodecRegistry) {
     registry.register::<HostSessionIn, _>(JsonCodec::default());
     registry.register::<ChildSessionIn, _>(JsonCodec::default());
+    registry.register::<HostStreamIn, _>(JsonCodec::default());
     crate::namespace::register_namespace_codecs(registry);
     crate::blob_transfer::register_blob_transfer_codecs(registry);
     crate::source::register_blob_source_codecs(registry);

@@ -24,6 +24,7 @@ const CAPABILITY: JobCapability = JobCapability::new([9; 32]);
 const ARENA_GENERATION: u64 = 17;
 const SESSION_GENERATION: u64 = 29;
 const WEIGHTS: &[u8] = b"0123456789abcdefghijklmn";
+static STREAM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 struct DirectRuntimeSink {
     destination: Runtime,
@@ -167,7 +168,54 @@ impl data_plane::source::BlobSourcePublisher for NoopSourceRegistrar {
     }
 }
 
+struct RejectingStreamTransport;
+
+impl data_plane::stream_transport::StreamTransport for RejectingStreamTransport {
+    fn descriptor(&self) -> Result<data_plane::stream_transport::StreamPeerDescriptor, String> {
+        Ok(data_plane::stream_transport::StreamPeerDescriptor(vec![1]))
+    }
+
+    fn install_source(
+        &self,
+        _request: data_plane::stream_transport::StreamSourceRequest,
+    ) -> Result<(), String> {
+        Err("injected source transport failure".to_owned())
+    }
+
+    fn install_sink(
+        &self,
+        _request: data_plane::stream_transport::StreamSinkRequest,
+    ) -> Result<(), String> {
+        Err("injected sink transport failure".to_owned())
+    }
+
+    fn source_progress(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
+
+    fn sink_progress(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
+
+    fn terminate(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
+}
+
+struct CollectBytes(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl data_plane::data_plane::StreamConsumer for CollectBytes {
+    fn consume(&self, bytes: &[u8]) -> Result<(), String> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 fn harness(arena_bytes: u64) -> Harness {
+    harness_with_transport(
+        arena_bytes,
+        Arc::new(data_plane::stream_transport::LocalStreamTransport::new()),
+    )
+}
+
+fn harness_with_transport(
+    arena_bytes: u64,
+    stream_transport: Arc<dyn data_plane::stream_transport::StreamTransport>,
+) -> Harness {
     let temp = TempState::new();
     let mut arena = ArenaManager::boot(ArenaConfig {
         node_id: NodeId(1),
@@ -194,12 +242,20 @@ fn harness(arena_bytes: u64) -> Harness {
     }));
     let host_engine = Engine::new(
         host_parts,
-        TokioBackend::new(TokioConfig::default()).expect("host backend"),
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("host backend"),
     )
     .expect("host engine");
     let child_engine = Engine::new(
         child_parts,
-        TokioBackend::new(TokioConfig::default()).expect("child backend"),
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("child backend"),
     )
     .expect("child engine");
 
@@ -269,6 +325,7 @@ fn harness(arena_bytes: u64) -> Harness {
                 source_sender: Some(sender),
                 source_publisher: Some(Arc::new(NoopSourceRegistrar)),
                 route_registrar: None,
+                stream_transport: Some(stream_transport),
             })
             .expect("host session config"),
         )
@@ -314,7 +371,15 @@ fn attachment_without_a_host_reply_fails_on_actor_deadline() {
     .unwrap();
     let (parts, runtime) = runtime_parts();
     runtime.set_remote_sink(Arc::new(BlackHoleSink));
-    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
     let (mapped, resolved) = DataPlaneBootstrap::map_arena(handoff.arena_fd).unwrap();
     let result = future::block_on(DataPlaneBootstrap::attach_mapped_with_deadline(
         mapped,
@@ -617,4 +682,195 @@ fn write_blob_seals_once_and_abort_publishes_nothing() {
         ),
         Err(DataPlaneError::PathNotFound(_))
     ));
+}
+
+#[test]
+fn stream_endpoints_open_only_after_match_and_deliver_eof_in_order() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/inference");
+
+    future::block_on(async {
+        let mut reader_open = Box::pin(data_plane.read_stream(&logical));
+        assert!(
+            future::poll_once(reader_open.as_mut()).await.is_none(),
+            "reader open waits for its source"
+        );
+        let mut writer_open = Box::pin(data_plane.write_stream(&logical));
+        let mut writer = writer_open.as_mut().await.expect("writer opens");
+        let mut reader = reader_open.await.expect("reader opens");
+
+        writer.write(b"first").await.expect("write first");
+        writer.write(b"second").await.expect("write second");
+        assert_eq!(
+            reader.read().await.expect("read first"),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            reader.read().await.expect("read second"),
+            Some(b"second".to_vec())
+        );
+        writer.close().await.expect("clean writer close");
+        assert!(matches!(
+            writer.write(b"late").await,
+            Err(DataPlaneError::StreamClosed)
+        ));
+        assert_eq!(reader.read().await.expect("read eof"), None);
+        assert_eq!(reader.read().await.expect("sticky eof"), None);
+    });
+}
+
+#[test]
+fn stream_writer_suspends_until_reader_releases_bounded_capacity() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/backpressure");
+
+    future::block_on(async {
+        let mut reader_open = Box::pin(data_plane.read_stream(&logical));
+        assert!(future::poll_once(reader_open.as_mut()).await.is_none());
+        let mut writer = data_plane
+            .write_stream(&logical)
+            .await
+            .expect("writer opens");
+        let mut reader = reader_open.await.expect("reader opens");
+
+        let capacity = writer.capacity() as usize;
+        let payload: Vec<u8> = (0..(capacity * 2 + 97))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut writing = Box::pin(writer.write(&payload));
+        assert!(
+            future::poll_once(writing.as_mut()).await.is_none(),
+            "bounded source and destination rings must eventually suspend the writer"
+        );
+
+        let mut observed = reader
+            .read()
+            .await
+            .expect("read releases destination capacity")
+            .expect("first data");
+        writing.await.expect("writer resumes");
+        while observed.len() < payload.len() {
+            observed.extend(
+                reader
+                    .read()
+                    .await
+                    .expect("read remaining")
+                    .expect("remaining data"),
+            );
+        }
+        assert_eq!(observed, payload);
+        writer.close().await.expect("close");
+        assert_eq!(reader.read().await.expect("eof"), None);
+    });
+}
+#[test]
+fn transport_startup_failure_faults_both_pending_opens() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness_with_transport(2 << 20, Arc::new(RejectingStreamTransport));
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/faulted");
+
+    future::block_on(async {
+        let mut reader_open = Box::pin(data_plane.read_stream(&logical));
+        assert!(future::poll_once(reader_open.as_mut()).await.is_none());
+        let writer_error = match data_plane.write_stream(&logical).await {
+            Ok(_) => panic!("writer must not open when transport setup fails"),
+            Err(error) => error,
+        };
+        let reader_error = match reader_open.await {
+            Ok(_) => panic!("reader must not open when transport setup fails"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            writer_error,
+            DataPlaneError::PeerLost | DataPlaneError::StreamFault(_)
+        ));
+        assert!(matches!(
+            reader_error,
+            DataPlaneError::PeerLost | DataPlaneError::StreamFault(_)
+        ));
+    });
+}
+
+#[test]
+fn peer_replacement_requires_and_supports_a_fresh_incarnation() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/failover");
+
+    future::block_on(async {
+        let mut first_reader_open = Box::pin(data_plane.read_stream(&logical));
+        assert!(
+            future::poll_once(first_reader_open.as_mut())
+                .await
+                .is_none()
+        );
+        let mut first_writer = data_plane
+            .write_stream(&logical)
+            .await
+            .expect("first writer");
+        let mut first_reader = first_reader_open.await.expect("first reader");
+        first_writer.write(b"old").await.expect("old write");
+        assert_eq!(
+            first_reader.read().await.expect("old read"),
+            Some(b"old".to_vec())
+        );
+        first_writer.abort().expect("abort first incarnation");
+        assert!(matches!(
+            first_reader.read().await,
+            Err(DataPlaneError::PeerLost)
+        ));
+
+        let mut replacement_writer_open = Box::pin(data_plane.write_stream_replacing(&logical));
+        assert!(
+            future::poll_once(replacement_writer_open.as_mut())
+                .await
+                .is_none(),
+            "replacement writer waits for an explicit new reader"
+        );
+        let mut replacement_reader = data_plane
+            .read_stream(&logical)
+            .await
+            .expect("replacement reader");
+        let mut replacement_writer = replacement_writer_open.await.expect("replacement writer");
+        replacement_writer.write(b"new").await.expect("new write");
+        assert_eq!(
+            replacement_reader.read().await.expect("new read"),
+            Some(b"new".to_vec())
+        );
+        replacement_writer.close().await.expect("new close");
+        assert_eq!(replacement_reader.read().await.expect("new eof"), None);
+    });
+}
+
+#[test]
+fn actor_stream_consumer_registers_before_writer_and_collects_to_eof() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/collector");
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let consumer: Arc<dyn data_plane::data_plane::StreamConsumer> =
+        Arc::new(CollectBytes(Arc::clone(&observed)));
+    let completion = data_plane
+        .collect_stream(logical.clone(), consumer)
+        .expect("spawn collector");
+
+    future::block_on(async {
+        let mut writer = data_plane
+            .write_stream(&logical)
+            .await
+            .expect("writer matches collector");
+        writer.write(b"actor-").await.expect("first write");
+        writer.write(b"consumer").await.expect("second write");
+        writer.close().await.expect("close");
+    });
+
+    completion.wait().expect("collector completes");
+    assert_eq!(&*observed.lock(), b"actor-consumer");
 }

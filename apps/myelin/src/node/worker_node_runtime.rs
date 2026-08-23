@@ -1983,14 +1983,12 @@ fn run() -> Result<(), String> {
         let data_plane = EmbeddedJobDataPlane::start(
             &stack,
             crate::job_deploy::EmbeddedJobDataPlaneConfig {
-                engine: engine.handle(),
-                connector: driver.edge_connector(),
-                root: &workdir,
                 host_endpoint: driver.endpoint_addr(),
                 namespace: namespace.client,
                 transfer_receiver,
                 source_sender,
                 source_publisher: namespace.source_publisher,
+                stream_transport: driver.stream_transport(),
             },
         )?;
         let job_route_registrar = Arc::new(MyelinChildRouteRegistrar::new(

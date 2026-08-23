@@ -4,6 +4,7 @@
 //! in the directory, and exchanges its `EndpointAddr` + actor address
 //! out-of-band so each side can route to the other over the iroh actor plane.
 
+use crate::data_namespace::{DataNamespaceAuthority, install_namespace_client};
 use crate::job_data_plane::{
     ActorJobDataPlane, ActorJobDataPlaneConfig, MyelinChildRouteRegistrar,
 };
@@ -11,7 +12,7 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -21,25 +22,25 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender};
 use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor_job_runner::{
-    INFERENCE_RESULTS_EDGE_ID, Job, JobDataPlanePort, JobDone, NodeJobActor, OUTPUTS_EDGE_ID,
-    OrchestratorJobActor, OrchestratorJobMsg, WORKSPACE_EDGE_ID, register_job_codecs,
+    Job, JobDataPlanePort, JobDone, NodeJobActor, OUTPUTS_EDGE_ID, OrchestratorJobActor,
+    OrchestratorJobMsg, WORKSPACE_EDGE_ID, register_job_codecs,
 };
 use swactor_transport::hex_encode;
 
 use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
+use data_plane::data_plane::StreamConsumer;
 use data_plane::edge_wire::WireEvent;
 use data_plane::namespace::NamespaceClient;
 use data_plane::path::{DataPath, JobContext};
+use data_plane::protocol::DataPlaneError;
 use data_plane::protocol::{JobCapability, register_data_plane_codecs};
 use data_plane::source::BlobSourcePublisher;
 use distribution::node::DistributedNodeConfig;
 use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{
-    EDGE_ALPN, EdgeConnector, EdgeSendHandle, EndpointAddrMask, IrohDriver, IrohDriverConfig,
-    MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
+    EDGE_ALPN, EndpointAddrMask, IrohDriver, IrohDriverConfig, MVP_IROH_ENDPOINT_ADDR_MASK_ENV,
+    advertised_endpoint,
 };
-use tokio::io::AsyncReadExt;
-use tokio::sync::Notify;
 
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 
@@ -50,57 +51,37 @@ const RELAY_WAIT_DEADLINE: Duration = Duration::from_secs(30);
 const MYELIN_IROH_RELAY_MODE_ENV: &str = "MYELIN_IROH_RELAY_MODE";
 const MYELIN_IROH_RELAY_URL_ENV: &str = "MYELIN_IROH_RELAY_URL";
 const SWACTOR_IROH_RELAY_URL_ENV: &str = "SWACTOR_IROH_RELAY_URL";
-const JOB_OUTPUT_SOCKET: &str = "inference-results.sock";
-const DATA_PLANE_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const JOB_ARENA_BYTES: u64 = 1 << 20;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct EmbeddedDataPlaneAssignment {
-    result_endpoint: EndpointAddr,
-}
-
-/// Actor-driven finite-blob ingress plus the retained temporary Unix output
-/// stream bridge. Remote bytes remain on `EDGE_ALPN`.
+/// Actor-driven finite-blob ingress and namespace-addressed result streams.
 #[derive(Clone)]
 pub(crate) struct EmbeddedJobDataPlane {
-    result_sink: Arc<Mutex<Option<EdgeSendHandle>>>,
-    result_ready: Arc<Notify>,
-    connector: EdgeConnector,
     actor_plane: Arc<ActorJobDataPlane>,
     host_endpoint_json: String,
-    output_path: PathBuf,
 }
 
-pub(crate) struct EmbeddedJobDataPlaneConfig<'a> {
-    pub(crate) engine: EngineHandle,
-    pub(crate) connector: EdgeConnector,
-    pub(crate) root: &'a Path,
+pub(crate) struct EmbeddedJobDataPlaneConfig {
     pub(crate) host_endpoint: EndpointAddr,
     pub(crate) namespace: NamespaceClient,
     pub(crate) transfer_receiver: Arc<dyn BlobTransferReceiver>,
     pub(crate) source_sender: Arc<dyn BlobTransferSender>,
     pub(crate) source_publisher: Arc<dyn BlobSourcePublisher>,
+    pub(crate) stream_transport: Arc<dyn data_plane::stream_transport::StreamTransport>,
 }
 
 impl EmbeddedJobDataPlane {
     pub(crate) fn start(
         stack: &DistributionRuntimeStack,
-        config: EmbeddedJobDataPlaneConfig<'_>,
+        config: EmbeddedJobDataPlaneConfig,
     ) -> Result<Self, String> {
         let EmbeddedJobDataPlaneConfig {
-            engine,
-            connector,
-            root,
             host_endpoint,
             namespace,
             transfer_receiver,
             source_sender,
             source_publisher,
+            stream_transport,
         } = config;
-        std::fs::create_dir_all(root)
-            .map_err(|error| format!("create job data-plane root {}: {error}", root.display()))?;
-        let output_path = root.join(JOB_OUTPUT_SOCKET);
-        remove_stale_socket(&output_path)?;
         let capability = JobCapability::new(ActorAddress::new_random().0);
         let route_registrar = Arc::new(MyelinChildRouteRegistrar::new(
             stack.route_view.clone(),
@@ -124,49 +105,13 @@ impl EmbeddedJobDataPlane {
                 source_sender: Some(source_sender),
                 source_publisher: Some(source_publisher),
                 route_registrar: Some(route_registrar),
+                stream_transport: Some(stream_transport),
             },
         )?);
         let host_endpoint_json = serde_json::to_string(&host_endpoint)
             .map_err(|error| format!("serialize host data-plane endpoint: {error}"))?;
 
-        let result_sink: Arc<Mutex<Option<EdgeSendHandle>>> = Arc::new(Mutex::new(None));
-        let result_ready = Arc::new(Notify::new());
-
-        let output_slot = Arc::clone(&result_sink);
-        let output_ready = Arc::clone(&result_ready);
-        swactor_process::spawn_unix_stream_listener(engine, &output_path, move |mut stream| {
-            let output_slot = Arc::clone(&output_slot);
-            let output_ready = Arc::clone(&output_ready);
-            async move {
-                let sink = loop {
-                    let notified = output_ready.notified();
-                    if let Some(sink) = output_slot.lock().take() {
-                        break sink;
-                    }
-                    notified.await;
-                };
-                let mut bytes = vec![0_u8; 64 * 1024];
-                loop {
-                    match stream.read(&mut bytes).await {
-                        Ok(0) => break,
-                        Ok(count) => {
-                            if sink.send(bytes[..count].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                drop(sink);
-            }
-        })
-        .map_err(|error| format!("bind job data-plane output: {error}"))?;
-
         Ok(Self {
-            result_sink,
-            result_ready,
-            connector,
-            output_path,
             actor_plane,
             host_endpoint_json,
         })
@@ -177,40 +122,14 @@ impl JobDataPlanePort for EmbeddedJobDataPlane {
     fn configure(
         &self,
         job_id: u64,
-        result_peer: &str,
+        _result_peer: &str,
     ) -> Result<BTreeMap<String, String>, String> {
-        let assignment = serde_json::from_str::<EmbeddedDataPlaneAssignment>(result_peer)
-            .map_err(|error| format!("parse job data-plane assignment: {error}"))?;
-        let sink = self.connector.connect(
-            assignment.result_endpoint,
-            INFERENCE_RESULTS_EDGE_ID,
-            DATA_PLANE_CONNECT_DEADLINE,
-        )?;
-        *self.result_sink.lock() = Some(sink);
-        self.result_ready.notify_one();
         self.actor_plane.configure_run(job_id.to_string())?;
-        let mut env = self.actor_plane.handoff_env(&self.host_endpoint_json);
-        env.insert(
-            "SWACTOR_DATA_PLANE_OUTPUT".to_owned(),
-            self.output_path.to_string_lossy().into_owned(),
-        );
-        Ok(env)
+        Ok(self.actor_plane.handoff_env(&self.host_endpoint_json))
     }
 
     fn session_ended(&self, _job_id: u64) {
-        self.result_sink.lock().take();
         self.actor_plane.close();
-    }
-}
-
-fn remove_stale_socket(path: &Path) -> Result<(), String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "remove stale job data-plane socket {}: {error}",
-            path.display()
-        )),
     }
 }
 
@@ -221,6 +140,17 @@ pub struct NodeIdentity {
     pub actor_hex: String,
 }
 
+struct OrchestratorResultSink {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl StreamConsumer for OrchestratorResultSink {
+    fn consume(&self, bytes: &[u8]) -> Result<(), String> {
+        self.bytes.lock().extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 pub(crate) struct JobOrchestratorSession {
     _engine: Engine,
     driver: IrohDriver,
@@ -229,6 +159,10 @@ pub(crate) struct JobOrchestratorSession {
     orch: ActorAddress,
     identity: NodeIdentity,
     landing: PathBuf,
+    _namespace_authority: DataNamespaceAuthority,
+    _result_plane: Arc<ActorJobDataPlane>,
+    _result_completion: ActorCompletion<Result<(), DataPlaneError>>,
+    _result_bytes: Arc<Mutex<Vec<u8>>>,
 }
 
 type JobComposition = (Engine, IrohDriver, DistributionRuntimeStack);
@@ -611,6 +545,47 @@ fn start_orchestrator_mode(
         Some(relay_mode) => build_composition_with_relay(relay_mode)?,
         None => build_composition()?,
     };
+    let namespace_authority = DataNamespaceAuthority::start(
+        &stack,
+        &driver,
+        landing.join(".swactor-data-namespace.json"),
+    )?;
+    let namespace = install_namespace_client(&stack, &driver)?;
+    let result_capability = JobCapability::new(ActorAddress::new_random().0);
+    let result_transport: Arc<dyn data_plane::stream_transport::StreamTransport> =
+        driver.stream_transport();
+    let result_plane = Arc::new(ActorJobDataPlane::new(
+        &stack.runtime,
+        ActorJobDataPlaneConfig {
+            arena_bytes: JOB_ARENA_BYTES,
+            arena_generation: 2,
+            session_generation: 2,
+            capability: result_capability,
+            job_context: JobContext {
+                run_id: "unconfigured".to_owned(),
+                read_prefixes: vec![DataPath::parse("/runs").expect("static run prefix")],
+                write_prefixes: Vec::new(),
+            },
+            namespace: Some(namespace.client),
+            transfer_receiver: None,
+            source_sender: None,
+            source_publisher: Some(namespace.source_publisher),
+            route_registrar: None,
+            stream_transport: Some(result_transport),
+        },
+    )?);
+    result_plane.configure_run("0".to_owned())?;
+    let result_client = result_plane.attach_local()?;
+    let result_bytes = Arc::new(Mutex::new(Vec::new()));
+    let result_consumer: Arc<dyn StreamConsumer> = Arc::new(OrchestratorResultSink {
+        bytes: Arc::clone(&result_bytes),
+    });
+    let result_completion = result_client
+        .collect_stream(
+            DataPath::parse("/runs/0/results/inference").expect("static result path"),
+            result_consumer,
+        )
+        .map_err(|error| format!("register inference result sink: {error}"))?;
     let done = stack
         .runtime
         .new_inbox::<JobDone>()
@@ -630,6 +605,10 @@ fn start_orchestrator_mode(
         orch,
         identity,
         landing,
+        _namespace_authority: namespace_authority,
+        _result_plane: result_plane,
+        _result_completion: result_completion,
+        _result_bytes: result_bytes,
     })
 }
 

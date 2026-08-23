@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_int, c_void};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use data_plane::blob::{Blob, BlobView, ContentDigest, WritableArenaView};
 use data_plane::bootstrap as dp_bootstrap;
-use data_plane::data_plane::{BlobWriter, DataPlane, DataPlaneBootstrap, parse_actor_address};
+use data_plane::data_plane::{
+    BlobWriter, DataPlane, DataPlaneBootstrap, StreamReader, StreamWriter, parse_actor_address,
+};
 use data_plane::path::DataPath;
 use data_plane::protocol::{
     BlobFailure, DataPlaneError, JobCapability, register_data_plane_codecs,
@@ -23,24 +26,22 @@ use parking_lot::Mutex as ParkingMutex;
 use pyo3::exceptions::{PyBufferError, PyPermissionError, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyModule};
+use pyo3::types::{PyAny, PyBytes, PyModule};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Runtime, RuntimeParts};
 use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor_transport::{CodecRegistry, CodecRemoteSink, TransportRouter};
-use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::net::UnixStream;
 
 const ROUTE_POLL: Duration = Duration::from_millis(5);
 const ROUTE_DEADLINE: Duration = Duration::from_secs(5);
-const LEGACY_OUTPUT_ENV: &str = "SWACTOR_DATA_PLANE_OUTPUT";
 
 pyo3::create_exception!(swactor, SwactorError, pyo3::exceptions::PyException);
 pyo3::create_exception!(swactor, BootstrapError, SwactorError);
 pyo3::create_exception!(swactor, DataPathError, SwactorError);
 pyo3::create_exception!(swactor, BlobError, SwactorError);
 pyo3::create_exception!(swactor, SessionError, SwactorError);
+pyo3::create_exception!(swactor, StreamError, SwactorError);
 
 fn bootstrap_error(message: impl Into<String>) -> PyErr {
     PyErr::new::<BootstrapError, _>(message.into())
@@ -56,6 +57,11 @@ fn data_plane_error(error: DataPlaneError) -> PyErr {
             PyErr::new::<DataPathError, _>(format!("data path not found: {path}"))
         }
         DataPlaneError::Blob(reason) => PyErr::new::<BlobError, _>(format!("{reason:?}")),
+        DataPlaneError::WrongEntryType { .. }
+        | DataPlaneError::PathReplaced(_)
+        | DataPlaneError::PeerLost
+        | DataPlaneError::StreamFault(_)
+        | DataPlaneError::StreamClosed => PyErr::new::<StreamError, _>(error.to_string()),
         DataPlaneError::Attachment(reason) => {
             PyErr::new::<SessionError, _>(format!("attachment failed: {reason:?}"))
         }
@@ -229,7 +235,6 @@ fn build_child_routing(
 pub struct PyDataPlane {
     inner: Arc<DataPlane>,
     _routing: Arc<JobRouting>,
-    legacy_output: Option<String>,
 }
 
 #[pymethods]
@@ -257,20 +262,34 @@ impl PyDataPlane {
         })
     }
 
-    fn read_stream(&self, _path: String) -> PyResult<()> {
-        Err(PyRuntimeError::new_err(
-            "actor-driven stream reads are not installed",
-        ))
+    fn read_stream<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let path = DataPath::parse(path)
+            .map_err(|error| PyErr::new::<DataPathError, _>(error.to_string()))?;
+        let data_plane = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let reader = data_plane
+                .read_stream(&path)
+                .await
+                .map_err(data_plane_error)?;
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    PyStreamReader {
+                        reader: Arc::new(tokio::sync::Mutex::new(reader)),
+                    },
+                )
+            })
+        })
     }
 
     fn write_stream(&self, path: String) -> PyResult<PyStreamContext> {
-        DataPath::parse(path).map_err(|error| PyErr::new::<DataPathError, _>(error.to_string()))?;
-        let socket = self.legacy_output.clone().ok_or_else(|| {
-            PyRuntimeError::new_err("temporary deployment stream bridge is not configured")
-        })?;
+        let path = DataPath::parse(path)
+            .map_err(|error| PyErr::new::<DataPathError, _>(error.to_string()))?;
         Ok(PyStreamContext {
-            socket,
+            data_plane: self.inner.clone(),
+            path,
             stream: Arc::new(tokio::sync::Mutex::new(None)),
+            entered: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -618,9 +637,25 @@ unsafe fn release_buffer_format(view: *mut ffi::Py_buffer) {
     }
 }
 
+#[pyclass(name = "StreamReader")]
+pub struct PyStreamReader {
+    reader: Arc<tokio::sync::Mutex<StreamReader>>,
+}
+
+#[pymethods]
+impl PyStreamReader {
+    fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let reader = self.reader.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bytes = reader.lock().await.read().await.map_err(data_plane_error)?;
+            Python::with_gil(|py| Ok(bytes.map(|bytes| PyBytes::new(py, &bytes).unbind())))
+        })
+    }
+}
+
 #[pyclass(name = "StreamWriter")]
 pub struct PyStreamWriter {
-    stream: Arc<tokio::sync::Mutex<Option<BufWriter<UnixStream>>>>,
+    stream: Arc<tokio::sync::Mutex<Option<StreamWriter>>>,
 }
 
 #[pymethods]
@@ -629,56 +664,67 @@ impl PyStreamWriter {
         let stream = self.stream.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut stream = stream.lock().await;
-            let stream = stream
+            let writer = stream
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("stream writer is closed"))?;
-            stream
-                .write_all(&bytes)
-                .await
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Ok(())
+            writer.write(&bytes).await.map_err(data_plane_error)
         })
     }
 }
 
 #[pyclass(name = "_StreamWriteContext")]
 pub struct PyStreamContext {
-    socket: String,
-    stream: Arc<tokio::sync::Mutex<Option<BufWriter<UnixStream>>>>,
+    data_plane: Arc<DataPlane>,
+    path: DataPath,
+    stream: Arc<tokio::sync::Mutex<Option<StreamWriter>>>,
+    entered: Arc<AtomicBool>,
 }
 
 #[pymethods]
 impl PyStreamContext {
     fn __aenter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let socket = self.socket.clone();
+        if self.entered.swap(true, Ordering::AcqRel) {
+            return Err(PyRuntimeError::new_err(
+                "stream write context cannot be entered twice",
+            ));
+        }
+        let data_plane = self.data_plane.clone();
+        let path = self.path.clone();
         let state = self.stream.clone();
+        let entered = self.entered.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let stream = UnixStream::connect(&socket).await.map_err(|error| {
-                PyRuntimeError::new_err(format!("connect output stream: {error}"))
-            })?;
-            *state.lock().await = Some(BufWriter::new(stream));
-            Python::with_gil(|py| Py::new(py, PyStreamWriter { stream: state }))
+            match data_plane.write_stream(&path).await {
+                Ok(writer) => {
+                    *state.lock().await = Some(writer);
+                    Python::with_gil(|py| Py::new(py, PyStreamWriter { stream: state }))
+                }
+                Err(error) => {
+                    entered.store(false, Ordering::Release);
+                    Err(data_plane_error(error))
+                }
+            }
         })
     }
 
     fn __aexit__<'py>(
         &self,
         py: Python<'py>,
-        _exception_type: &Bound<'_, PyAny>,
+        exception_type: &Bound<'_, PyAny>,
         _exception: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let clean = exception_type.is_none();
         let state = self.stream.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Some(mut stream) = state.lock().await.take() {
-                stream
-                    .flush()
-                    .await
-                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-                stream
-                    .shutdown()
-                    .await
-                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let mut writer = state
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("stream write context is not active"))?;
+            if clean {
+                writer.close().await.map_err(data_plane_error)?;
+            } else {
+                writer.abort().map_err(data_plane_error)?;
             }
             Ok(false)
         })
@@ -736,7 +782,6 @@ fn run(py: Python<'_>, main: Bound<'_, PyAny>) -> PyResult<()> {
         PyDataPlane {
             inner: Arc::new(bootstrap.data_plane),
             _routing: Arc::new(routing),
-            legacy_output: std::env::var(LEGACY_OUTPUT_ENV).ok(),
         },
     )?;
     let context = Py::new(py, PyContext { data })?;
@@ -849,12 +894,26 @@ impl data_plane::source::BlobSourcePublisher for DebugSourceRegistrar {
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
+struct DebugStreamCaptureConsumer {
+    bytes: Arc<ParkingMutex<Vec<u8>>>,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl data_plane::data_plane::StreamConsumer for DebugStreamCaptureConsumer {
+    fn consume(&self, bytes: &[u8]) -> Result<(), String> {
+        self.bytes.lock().extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
 #[pyclass(name = "_TestDataPlaneHost")]
 struct PyTestDataPlaneHost {
     _driver: Arc<IrohDriver>,
     _engine: Engine,
     handoff: data_plane::bootstrap::JobHandoff,
     namespace_root: std::path::PathBuf,
+    stream_data_plane: Arc<DataPlane>,
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -878,6 +937,57 @@ impl PyTestDataPlaneHost {
 
     fn arena_fd(&self) -> RawFd {
         std::os::fd::AsRawFd::as_raw_fd(&self.handoff.arena_fd)
+    }
+
+    fn read_stream<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let path = DataPath::parse(path)
+            .map_err(|error| PyErr::new::<DataPathError, _>(error.to_string()))?;
+        let data_plane = self.stream_data_plane.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let reader = data_plane
+                .read_stream(&path)
+                .await
+                .map_err(data_plane_error)?;
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    PyStreamReader {
+                        reader: Arc::new(tokio::sync::Mutex::new(reader)),
+                    },
+                )
+            })
+        })
+    }
+
+    fn capture_stream(&self, path: String) -> PyResult<PyTestStreamCapture> {
+        let path = DataPath::parse(path)
+            .map_err(|error| PyErr::new::<DataPathError, _>(error.to_string()))?;
+        let bytes = Arc::new(ParkingMutex::new(Vec::new()));
+        let consumer: Arc<dyn data_plane::data_plane::StreamConsumer> =
+            Arc::new(DebugStreamCaptureConsumer {
+                bytes: Arc::clone(&bytes),
+            });
+        let completion = self
+            .stream_data_plane
+            .collect_stream(path, consumer)
+            .map_err(data_plane_error)?;
+        Ok(PyTestStreamCapture { completion, bytes })
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[pyclass(name = "_TestStreamCapture")]
+struct PyTestStreamCapture {
+    completion: ActorCompletion<Result<(), DataPlaneError>>,
+    bytes: Arc<ParkingMutex<Vec<u8>>>,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[pymethods]
+impl PyTestStreamCapture {
+    fn result<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.completion.wait().map_err(data_plane_error)?;
+        Ok(PyBytes::new(py, &self.bytes.lock()))
     }
 }
 
@@ -976,6 +1086,8 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
         ))
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let namespace = data_plane::namespace::NamespaceClient::new(runtime.clone(), namespace_proxy);
+    let stream_transport: Arc<dyn data_plane::stream_transport::StreamTransport> =
+        Arc::new(data_plane::stream_transport::LocalStreamTransport::new());
     let host_session = runtime
         .spawn(
             data_plane::host::HostDataPlaneSessionActor::new(
@@ -998,17 +1110,71 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
                                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
                         ],
                     },
-                    namespace: Some(namespace),
+                    namespace: Some(namespace.clone()),
                     transfer_receiver: Some(Arc::new(DebugBlobReceiver)),
-                    source_sender: Some(source_sender),
-                    source_publisher: Some(source_publisher),
+                    source_sender: Some(Arc::clone(&source_sender)),
+                    source_publisher: Some(Arc::clone(&source_publisher)),
                     route_registrar: Some(registrar),
+                    stream_transport: Some(Arc::clone(&stream_transport)),
                 },
             )
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
         )
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     data_plane::host::install_session_env(&mut handoff, host_session, capability);
+
+    let mut sink_arena = data_plane::arena::ArenaManager::boot(data_plane::arena::ArenaConfig {
+        node_id: data_plane::arena::NodeId(2),
+        reservation_ceiling: 1 << 20,
+        base_alignment: 64,
+    })
+    .map_err(|error| PyRuntimeError::new_err(format!("debug sink arena: {error:?}")))?;
+    let sink_handoff = data_plane::bootstrap::write_bootstrap(
+        &mut sink_arena,
+        data_plane::bootstrap::BootstrapSpec {
+            arena_generation: 2,
+            alignment: 64,
+        },
+    )
+    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let sink_session = runtime
+        .spawn(
+            data_plane::host::HostDataPlaneSessionActor::new(
+                data_plane::host::HostDataPlaneConfig {
+                    runtime: runtime.clone(),
+                    arena: sink_arena,
+                    arena_generation: 2,
+                    session_generation: 2,
+                    capability,
+                    job_context: data_plane::path::JobContext {
+                        run_id: "test-run".to_owned(),
+                        read_prefixes: vec![
+                            DataPath::parse("/runs/test-run/results")
+                                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+                        ],
+                        write_prefixes: Vec::new(),
+                    },
+                    namespace: Some(namespace),
+                    transfer_receiver: None,
+                    source_sender: None,
+                    source_publisher: None,
+                    route_registrar: None,
+                    stream_transport: Some(stream_transport),
+                },
+            )
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+        )
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let stream_data_plane = Arc::new(
+        future::block_on(DataPlaneBootstrap::attach(
+            sink_handoff.arena_fd,
+            runtime.clone(),
+            sink_session,
+            capability,
+        ))
+        .map_err(data_plane_error)?
+        .data_plane,
+    );
 
     driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
         runtime: runtime.clone(),
@@ -1031,6 +1197,7 @@ fn _test_data_plane_host() -> PyResult<PyTestDataPlaneHost> {
         _engine: engine,
         handoff,
         namespace_root,
+        stream_data_plane,
     })
 }
 
@@ -1040,14 +1207,17 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("DataPathError", module.py().get_type::<DataPathError>())?;
     module.add("BlobError", module.py().get_type::<BlobError>())?;
     module.add("SessionError", module.py().get_type::<SessionError>())?;
+    module.add("StreamError", module.py().get_type::<StreamError>())?;
     module.add_class::<PyDataPlane>()?;
     module.add_class::<PyBlob>()?;
     module.add_class::<PyBlobView>()?;
     module.add_class::<PyStreamWriter>()?;
+    module.add_class::<PyStreamReader>()?;
     module.add_class::<PyContext>()?;
     module.add_function(wrap_pyfunction!(run, module)?)?;
     #[cfg(all(debug_assertions, target_os = "linux"))]
     {
+        module.add_class::<PyTestStreamCapture>()?;
         module.add_class::<PyTestDataPlaneHost>()?;
         module.add_function(wrap_pyfunction!(_test_data_plane_host, module)?)?;
     }

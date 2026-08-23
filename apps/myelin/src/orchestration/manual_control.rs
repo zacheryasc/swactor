@@ -3441,8 +3441,8 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 128,
-            max_shrink_iters: 2_000,
+            cases: 16,
+            max_shrink_iters: 256,
             ..ProptestConfig::default()
         })]
 

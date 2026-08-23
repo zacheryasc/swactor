@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId as ArenaNodeId};
 use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
 use data_plane::bootstrap::{self, BootstrapSpec, ENV_DATA_PLANE_ENDPOINT, JobHandoff};
+use data_plane::data_plane::{DataPlane, DataPlaneBootstrap};
 use data_plane::host::{
     HostDataPlaneConfig, HostDataPlaneSessionActor, HostRouteRegistrar, install_session_env,
 };
@@ -11,6 +13,7 @@ use data_plane::namespace::NamespaceClient;
 use data_plane::path::JobContext;
 use data_plane::protocol::JobCapability;
 use data_plane::source::BlobSourcePublisher;
+use data_plane::stream_transport::StreamTransport;
 use distribution::transport_bridge::{OutboxRouteBinder, RouteBinder, RouteView};
 use distribution::types::NodeId;
 use swactor::actor::ActorAddress;
@@ -76,6 +79,7 @@ const ARENA_ALIGNMENT: u64 = 64;
 pub(crate) struct ActorJobDataPlane {
     handoff: JobHandoff,
     host_session: ActorAddress,
+    capability: JobCapability,
     runtime: Runtime,
 }
 
@@ -90,6 +94,7 @@ pub(crate) struct ActorJobDataPlaneConfig {
     pub(crate) source_sender: Option<Arc<dyn BlobTransferSender>>,
     pub(crate) source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
     pub(crate) route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
+    pub(crate) stream_transport: Option<Arc<dyn StreamTransport>>,
 }
 
 impl ActorJobDataPlane {
@@ -105,6 +110,7 @@ impl ActorJobDataPlane {
             source_sender,
             source_publisher,
             route_registrar,
+            stream_transport,
         } = config;
         let mut arena = ArenaManager::boot(ArenaConfig {
             node_id: ArenaNodeId(1),
@@ -134,6 +140,7 @@ impl ActorJobDataPlane {
                     source_sender,
                     source_publisher,
                     route_registrar,
+                    stream_transport,
                 })
                 .map_err(|error| format!("configure host data-plane session: {error}"))?,
             )
@@ -141,9 +148,29 @@ impl ActorJobDataPlane {
         install_session_env(&mut handoff, host_session, capability);
         Ok(Self {
             handoff,
-            runtime: runtime.clone(),
             host_session,
+            capability,
+            runtime: runtime.clone(),
         })
+    }
+
+    pub(crate) fn attach_local(&self) -> Result<DataPlane, String> {
+        let fd = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&self.handoff.arena_fd)) };
+        if fd < 0 {
+            return Err(format!(
+                "duplicate local data-plane arena: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        futures_lite::future::block_on(DataPlaneBootstrap::attach(
+            owned,
+            self.runtime.clone(),
+            self.host_session,
+            self.capability,
+        ))
+        .map(|bootstrap| bootstrap.data_plane)
+        .map_err(|error| format!("attach local data-plane client: {error}"))
     }
 
     pub(crate) fn configure_run(&self, run_id: String) -> Result<(), String> {

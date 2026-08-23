@@ -72,6 +72,9 @@ pub enum MutationRequest {
         length: u64,
         recovery: SourceRecovery,
     },
+    BindStream {
+        path: DataPath,
+    },
     Unregister {
         path: DataPath,
     },

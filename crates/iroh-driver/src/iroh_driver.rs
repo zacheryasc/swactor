@@ -33,6 +33,7 @@ use distribution::types::NodeId;
 
 use crate::edge_transport::spawn_edge_send_pump as spawn_edge_sender_task;
 use crate::edge_transport::{EDGE_ALPN, EdgeSendHandle, spawn_edge_recv_pump};
+use crate::stream_transport::{IrohStreamTransport, STREAM_ALPN};
 use crate::telemetry_transport::{
     TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
     spawn_subscription_writer,
@@ -327,6 +328,7 @@ pub struct IrohDriver {
     /// iroh work is scheduled through this handle; it never exposes the raw
     /// Tokio runtime (ENGINE_SPEC.md §7).
     engine: EngineHandle,
+    stream_transport: Arc<IrohStreamTransport>,
     conns: Arc<Mutex<ConnCache>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     /// Collects connections from background join tasks.
@@ -450,7 +452,7 @@ impl IrohDriver {
         let secret_key = config.secret_key;
         let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel::<Result<Endpoint, String>>();
         engine.spawn(async move {
-            let mut all_alpns = vec![ALPN.to_vec()];
+            let mut all_alpns = vec![ALPN.to_vec(), STREAM_ALPN.to_vec()];
             all_alpns.extend(additional_alpns);
             let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .relay_mode(effective_relay_mode)
@@ -481,6 +483,7 @@ impl IrohDriver {
                 format!("engine endpoint-bind task dropped: {e}").into()
             })?
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let stream_transport = Arc::new(IrohStreamTransport::new(engine.clone(), endpoint.clone()));
         let relay_url = endpoint
             .addr()
             .relay_urls()
@@ -504,6 +507,7 @@ impl IrohDriver {
             let peer_auth = config.peer_auth.clone();
             let swim_buf = Arc::clone(&accepted_conns);
             let other_buf = Arc::clone(&other_accepted_conns);
+            let accepted_streams = Arc::clone(&stream_transport);
             engine.spawn(async move {
                 while let Some(incoming) = ep.accept().await {
                     if let Ok(conn) = incoming.await {
@@ -522,6 +526,8 @@ impl IrohDriver {
                         let negotiated_alpn = conn.alpn().to_vec();
                         if negotiated_alpn == ALPN {
                             swim_buf.lock().push((node_id, conn));
+                        } else if negotiated_alpn == STREAM_ALPN {
+                            accepted_streams.accept_connection(conn);
                         } else {
                             other_buf.lock().push((node_id, negotiated_alpn, conn));
                         }
@@ -534,6 +540,7 @@ impl IrohDriver {
             keypair,
             endpoint,
             engine,
+            stream_transport,
             conns: Arc::new(Mutex::new(ConnCache {
                 connections: HashMap::new(),
                 next_generation: 1,
@@ -559,6 +566,10 @@ impl IrohDriver {
     /// Clone the iroh endpoint for creating outbound connections.
     pub fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
+    }
+
+    pub fn stream_transport(&self) -> Arc<IrohStreamTransport> {
+        Arc::clone(&self.stream_transport)
     }
 
     /// Drain accepted connections whose negotiated ALPN exactly matches `alpn`.

@@ -25,3 +25,4 @@ pub mod path;
 pub mod protocol;
 pub mod ring;
 pub mod source;
+pub mod stream_transport;

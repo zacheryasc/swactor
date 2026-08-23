@@ -99,6 +99,7 @@ impl DataNode {
                     source_sender: Some(Arc::clone(&self.sender)),
                     source_publisher: Some(Arc::clone(&self.namespace.source_publisher)),
                     route_registrar: None,
+                    stream_transport: None,
                 })
                 .expect("host session"),
             )

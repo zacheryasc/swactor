@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import json
 import os
 import struct
 import subprocess
 import importlib
-import socket
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 import pytest
@@ -215,39 +214,29 @@ def test_missing_path_and_authorization_are_typed(monkeypatch, host):
     swactor.run(main)
 
 
-def test_temporary_output_stream_bridge_remains_available(monkeypatch, host, tmp_path):
+def test_native_stream_round_trip_has_ordered_eof(monkeypatch, host):
     install_host_env(monkeypatch, host)
-    socket_path = tmp_path / "output.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    listener.listen(1)
-    monkeypatch.setenv("SWACTOR_DATA_PLANE_OUTPUT", str(socket_path))
     received = []
 
-    def receive():
-        connection, _ = listener.accept()
-        with connection:
-            chunks = []
-            while chunk := connection.recv(4096):
-                chunks.append(chunk)
-        received.append(b"".join(chunks))
-
-    receiver = threading.Thread(target=receive)
-    receiver.start()
-
     async def main(ctx):
+        async def receive():
+            reader = await ctx.data.read_stream(
+                "/runs/self/results/predictions"
+            )
+            while (chunk := await reader.read()) is not None:
+                received.append(chunk)
+
+        receiver = asyncio.create_task(receive())
         async with ctx.data.write_stream(
             "/runs/self/results/predictions"
         ) as stream:
-            await stream.write(b"temporary-result")
+            await stream.write(b"native-")
+            await stream.write(b"result")
+        await receiver
 
-    try:
-        swactor.run(main)
-        receiver.join(timeout=2)
-        assert not receiver.is_alive()
-        assert received == [b"temporary-result"]
-    finally:
-        listener.close()
+    swactor.run(main)
+    assert b"".join(received) == b"native-result"
+    assert "SWACTOR_DATA_PLANE_OUTPUT" not in host.env()
 
 
 def test_invalid_capability_prevents_main(monkeypatch, host):
@@ -350,34 +339,18 @@ def test_real_exec_attachment_and_blob_mapping(host):
     not Path("/dev/nvidia0").exists(),
     reason="CUDA device is unavailable",
 )
-def test_real_exec_tinygrad_cuda_scenario(host, tmp_path):
-    socket_path = tmp_path / "cuda-output.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    listener.listen(1)
-    received = []
-
-    def receive():
-        connection, _ = listener.accept()
-        with connection:
-            chunks = []
-            while chunk := connection.recv(4096):
-                chunks.append(chunk)
-        received.append(b"".join(chunks))
-
-    receiver = threading.Thread(target=receive)
-    receiver.start()
+def test_real_exec_tinygrad_cuda_scenario(host):
+    capture = host.capture_stream("/runs/self/results/inference")
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in (*BOOTSTRAP_ENV, *OLD_WAKE_ENV)
+        if key not in (*BOOTSTRAP_ENV, *OLD_WAKE_ENV, "SWACTOR_DATA_PLANE_OUTPUT")
     }
     env.update(dict(host.env()))
     env.update(
         {
             "CUDA_PTX": "1",
             "DEV": "CUDA",
-            "SWACTOR_DATA_PLANE_OUTPUT": str(socket_path),
         }
     )
     script = (
@@ -387,21 +360,16 @@ def test_real_exec_tinygrad_cuda_scenario(host, tmp_path):
         / "jobs"
         / "tiny_linear_inference.py"
     )
-    try:
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            env=env,
-            pass_fds=(host.arena_fd(),),
-            text=True,
-            capture_output=True,
-            timeout=45,
-            check=False,
-        )
-        receiver.join(timeout=2)
-        assert result.returncode == 0, result.stderr
-        assert not receiver.is_alive()
-        payload = json.loads(received[0])
-        assert payload["device"].startswith("CUDA")
-        assert payload["output"] == pytest.approx([2.75, -8.75])
-    finally:
-        listener.close()
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        env=env,
+        pass_fds=(host.arena_fd(),),
+        text=True,
+        capture_output=True,
+        timeout=45,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(capture.result())
+    assert payload["device"].startswith("CUDA")
+    assert payload["output"] == pytest.approx([2.75, -8.75])

@@ -13,6 +13,7 @@ pub mod blob_transfer;
 pub mod edge_transport;
 pub mod endpoint_advertisement;
 pub mod iroh_driver;
+pub mod stream_transport;
 pub mod telemetry_transport;
 
 pub use blob_transfer::{IrohBlobTransferReceiver, IrohBlobTransferSender};
@@ -25,6 +26,7 @@ pub use iroh_driver::{
 };
 
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};
+pub use stream_transport::{IrohStreamTransport, STREAM_ALPN};
 
 pub use telemetry_transport::{
     PullCollectorConfig, PullCollectorHandle, TELEMETRY_ALPN, TelemetryQuicHeader,

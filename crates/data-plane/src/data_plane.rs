@@ -1,6 +1,6 @@
 //! Child-side data-plane session, per-operation actors, and native API.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,14 +8,15 @@ use std::time::Duration;
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::{ExternalSender, Runtime};
-use swactor_engine::EngineHandle;
+use swactor_engine::{ActorCompletion, EngineHandle};
 
 use crate::blob::{
     Blob, BlobLease, BlobMetadata, LeaseReleaser, WritableArenaView, WritableBlobLease,
 };
+use crate::byte_ring::{Endpoint, FlowError, RecordKind, RingHandle, Role, attach_mapped};
 use crate::mapped_arena::MappedArena;
 use crate::path::DataPath;
-use crate::protocol::{ChildSessionIn, DataPlaneError, HostSessionIn, JobCapability};
+use crate::protocol::{ChildSessionIn, DataPlaneError, HostSessionIn, HostStreamIn, JobCapability};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSessionState {
@@ -140,6 +141,9 @@ impl DataPlaneBootstrap {
                 operations: HashSet::new(),
                 read_operations: HashMap::new(),
                 state: ChildSessionState::Attaching,
+                stream_operations: HashMap::new(),
+                pending_blob_releases: 0,
+                deferred_blob_opens: VecDeque::new(),
             })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
         if let Some((engine, sender, timeout)) = deadline {
@@ -171,6 +175,26 @@ impl Drop for ReadCancellation {
             let _ = self.runtime.send_to(
                 self.child_session,
                 ChildSessionIn::CancelRead {
+                    reply_to: self.reply_to,
+                },
+            );
+        }
+    }
+}
+
+struct StreamOpenCancellation {
+    runtime: Runtime,
+    child_session: ActorAddress,
+    reply_to: ActorAddress,
+    armed: bool,
+}
+
+impl Drop for StreamOpenCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.runtime.send_to(
+                self.child_session,
+                ChildSessionIn::CancelStream {
                     reply_to: self.reply_to,
                 },
             );
@@ -264,12 +288,94 @@ impl DataPlane {
         self.write_blob(&path, length).await
     }
 
-    pub async fn read_stream(&self, _path: &DataPath) -> Result<(), DataPlaneError> {
-        Err(DataPlaneError::StreamsDeferred)
+    async fn open_stream(
+        &self,
+        path: &DataPath,
+        role: Role,
+        replace: bool,
+    ) -> Result<StreamOpenGrant, DataPlaneError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<ChildStreamIn>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        let reply_to = *inbox.addr();
+        let message = match role {
+            Role::Consumer => ChildSessionIn::OpenReadStream {
+                path: path.clone(),
+                reply_to,
+                replace,
+            },
+            Role::Producer => ChildSessionIn::OpenWriteStream {
+                path: path.clone(),
+                reply_to,
+                replace,
+            },
+        };
+        self.runtime
+            .send_to(self.child_session, message)
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        let mut cancellation = StreamOpenCancellation {
+            runtime: self.runtime.clone(),
+            child_session: self.child_session,
+            reply_to,
+            armed: true,
+        };
+        let result = match inbox.recv().await {
+            ChildStreamIn::Opened(result) => result,
+            ChildStreamIn::Wake(_) => Err(DataPlaneError::StreamFault(
+                "received stream wake before open completed".to_owned(),
+            )),
+        };
+        cancellation.armed = false;
+        result
     }
 
-    pub async fn write_stream(&self, _path: &DataPath) -> Result<(), DataPlaneError> {
-        Err(DataPlaneError::StreamsDeferred)
+    pub async fn read_stream(&self, path: &DataPath) -> Result<StreamReader, DataPlaneError> {
+        let grant = self.open_stream(path, Role::Consumer, false).await?;
+        let endpoint = attach_mapped(&self.arena, grant.ring, Role::Consumer).map_err(|error| {
+            DataPlaneError::StreamFault(format!("attach stream reader: {error:?}"))
+        })?;
+        Ok(StreamReader {
+            runtime: self.runtime.clone(),
+            child_session: self.child_session,
+            operation: grant.operation,
+            host_binding: grant.host_binding,
+            endpoint,
+            terminal: None,
+        })
+    }
+
+    pub async fn write_stream(&self, path: &DataPath) -> Result<StreamWriter, DataPlaneError> {
+        let grant = self.open_stream(path, Role::Producer, false).await?;
+        let endpoint = attach_mapped(&self.arena, grant.ring, Role::Producer).map_err(|error| {
+            DataPlaneError::StreamFault(format!("attach stream writer: {error:?}"))
+        })?;
+        Ok(StreamWriter {
+            runtime: self.runtime.clone(),
+            child_session: self.child_session,
+            operation: grant.operation,
+            host_binding: grant.host_binding,
+            endpoint,
+            closed: false,
+        })
+    }
+
+    pub async fn write_stream_replacing(
+        &self,
+        path: &DataPath,
+    ) -> Result<StreamWriter, DataPlaneError> {
+        let grant = self.open_stream(path, Role::Producer, true).await?;
+        let endpoint = attach_mapped(&self.arena, grant.ring, Role::Producer).map_err(|error| {
+            DataPlaneError::StreamFault(format!("attach stream writer: {error:?}"))
+        })?;
+        Ok(StreamWriter {
+            runtime: self.runtime.clone(),
+            child_session: self.child_session,
+            operation: grant.operation,
+            host_binding: grant.host_binding,
+            endpoint,
+            closed: false,
+        })
     }
 
     pub fn close(&self) -> Result<(), DataPlaneError> {
@@ -279,6 +385,34 @@ impl DataPlane {
     }
 }
 
+pub trait StreamConsumer: Send + Sync + 'static {
+    fn consume(&self, bytes: &[u8]) -> Result<(), String>;
+}
+
+impl DataPlane {
+    pub fn collect_stream(
+        &self,
+        path: DataPath,
+        consumer: Arc<dyn StreamConsumer>,
+    ) -> Result<ActorCompletion<Result<(), DataPlaneError>>, DataPlaneError> {
+        let completion = ActorCompletion::new();
+        self.runtime
+            .spawn(StreamConsumerActor {
+                child_session: self.child_session,
+                arena: self.arena.clone(),
+                path,
+                consumer,
+                completion: completion.clone(),
+                operation: None,
+                host_binding: None,
+                endpoint: None,
+                pending_result: None,
+                finished: false,
+            })
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        Ok(completion)
+    }
+}
 pub struct BlobWriter {
     runtime: Runtime,
     operation: ActorAddress,
@@ -350,6 +484,608 @@ impl Drop for BlobWriter {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct StreamOpenGrant {
+    operation: ActorAddress,
+    host_binding: ActorAddress,
+    ring: RingHandle,
+}
+
+#[derive(Clone)]
+pub(crate) enum ChildStreamIn {
+    Opened(Result<StreamOpenGrant, DataPlaneError>),
+    Wake(Result<(), DataPlaneError>),
+}
+
+pub struct StreamWriter {
+    runtime: Runtime,
+    child_session: ActorAddress,
+    operation: ActorAddress,
+    host_binding: ActorAddress,
+    endpoint: Endpoint,
+    closed: bool,
+}
+
+impl StreamWriter {
+    pub fn capacity(&self) -> u64 {
+        self.endpoint.capacity()
+    }
+    fn send_control(&self, message: HostStreamIn) -> Result<(), DataPlaneError> {
+        self.runtime
+            .send_to(
+                self.child_session,
+                ChildSessionIn::StreamControl {
+                    binding: self.host_binding,
+                    message,
+                },
+            )
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))
+    }
+
+    async fn send_one(&mut self, kind: RecordKind, bytes: &[u8]) -> Result<(), DataPlaneError> {
+        loop {
+            match self.endpoint.send_record(kind, bytes) {
+                Ok(()) => {
+                    self.send_control(HostStreamIn::DataAvailable)?;
+                    return Ok(());
+                }
+                Err(FlowError::InsufficientSpace { .. }) => {
+                    let inbox = self
+                        .runtime
+                        .new_inbox::<ChildStreamIn>()
+                        .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+                    self.send_control(HostStreamIn::WaitCapacity {
+                        reply_to: *inbox.addr(),
+                    })?;
+                    match self.endpoint.send_record(kind, bytes) {
+                        Ok(()) => {
+                            self.send_control(HostStreamIn::DataAvailable)?;
+                            return Ok(());
+                        }
+                        Err(FlowError::InsufficientSpace { .. }) => match inbox.recv().await {
+                            ChildStreamIn::Wake(result) => result?,
+                            ChildStreamIn::Opened(_) => {
+                                return Err(DataPlaneError::StreamFault(
+                                    "received stream-open result while waiting for capacity"
+                                        .to_owned(),
+                                ));
+                            }
+                        },
+                        Err(error) => {
+                            return Err(DataPlaneError::StreamFault(format!(
+                                "write stream ring: {error:?}"
+                            )));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(DataPlaneError::StreamFault(format!(
+                        "write stream ring: {error:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    pub async fn flush(&mut self) -> Result<(), DataPlaneError> {
+        let target = self
+            .endpoint
+            .positions()
+            .map_err(|error| {
+                DataPlaneError::StreamFault(format!("observe stream flush position: {error:?}"))
+            })?
+            .0;
+        loop {
+            let consumed = self
+                .endpoint
+                .positions()
+                .map_err(|error| {
+                    DataPlaneError::StreamFault(format!("observe stream flush progress: {error:?}"))
+                })?
+                .1;
+            if consumed >= target {
+                return Ok(());
+            }
+            let inbox = self
+                .runtime
+                .new_inbox::<ChildStreamIn>()
+                .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+            self.send_control(HostStreamIn::WaitCapacity {
+                reply_to: *inbox.addr(),
+            })?;
+            self.send_control(HostStreamIn::DataAvailable)?;
+            if self
+                .endpoint
+                .positions()
+                .map_err(|error| {
+                    DataPlaneError::StreamFault(format!("observe stream flush progress: {error:?}"))
+                })?
+                .1
+                >= target
+            {
+                return Ok(());
+            }
+            match inbox.recv().await {
+                ChildStreamIn::Wake(result) => {
+                    if let Err(error) = result
+                        && self
+                            .endpoint
+                            .positions()
+                            .map_err(|flow| {
+                                DataPlaneError::StreamFault(format!(
+                                    "observe terminal flush progress: {flow:?}"
+                                ))
+                            })?
+                            .1
+                            < target
+                    {
+                        return Err(error);
+                    }
+                }
+                ChildStreamIn::Opened(_) => {
+                    return Err(DataPlaneError::StreamFault(
+                        "received stream-open result while flushing".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), DataPlaneError> {
+        if self.closed {
+            return Err(DataPlaneError::StreamClosed);
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let max_payload = usize::try_from(self.endpoint.capacity().saturating_sub(5))
+            .map_err(|_| DataPlaneError::StreamFault("stream capacity exceeds usize".to_owned()))?;
+        if max_payload == 0 {
+            return Err(DataPlaneError::StreamFault(
+                "stream ring cannot hold a framed byte".to_owned(),
+            ));
+        }
+        for chunk in bytes.chunks(max_payload) {
+            self.send_one(RecordKind::Data, chunk).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn close(&mut self) -> Result<(), DataPlaneError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.send_one(RecordKind::Eof, &[]).await?;
+        self.flush().await?;
+        self.closed = true;
+        let _ = self.runtime.send_to(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: self.operation,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn abort(&mut self) -> Result<(), DataPlaneError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.send_control(HostStreamIn::Close {
+            clean: false,
+            reply_to: None,
+        })
+    }
+}
+
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.send_control(HostStreamIn::Close {
+                clean: false,
+                reply_to: None,
+            });
+        }
+        let _ = self.runtime.send_to(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: self.operation,
+            },
+        );
+    }
+}
+
+#[derive(Clone)]
+enum StreamReadTerminal {
+    Eof,
+    Error(DataPlaneError),
+}
+
+pub struct StreamReader {
+    runtime: Runtime,
+    child_session: ActorAddress,
+    operation: ActorAddress,
+    host_binding: ActorAddress,
+    endpoint: Endpoint,
+    terminal: Option<StreamReadTerminal>,
+}
+
+impl StreamReader {
+    pub fn capacity(&self) -> u64 {
+        self.endpoint.capacity()
+    }
+
+    fn send_control(&self, message: HostStreamIn) -> Result<(), DataPlaneError> {
+        self.runtime
+            .send_to(
+                self.child_session,
+                ChildSessionIn::StreamControl {
+                    binding: self.host_binding,
+                    message,
+                },
+            )
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))
+    }
+    async fn close_clean(&mut self) -> Result<(), DataPlaneError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<ChildStreamIn>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        self.send_control(HostStreamIn::Close {
+            clean: true,
+            reply_to: Some(*inbox.addr()),
+        })?;
+        match inbox.recv().await {
+            ChildStreamIn::Wake(result) => result,
+            ChildStreamIn::Opened(_) => Err(DataPlaneError::StreamFault(
+                "received stream-open result while closing reader".to_owned(),
+            )),
+        }
+    }
+
+    async fn finish_read(
+        &mut self,
+        result: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, DataPlaneError> {
+        if result.is_none() {
+            self.close_clean().await?;
+            let _ = self.runtime.send_to(
+                self.child_session,
+                ChildSessionIn::OperationDone {
+                    operation: self.operation,
+                },
+            );
+        }
+        Ok(result)
+    }
+
+    fn terminal_result(&self) -> Option<Result<Option<Vec<u8>>, DataPlaneError>> {
+        self.terminal.as_ref().map(|terminal| match terminal {
+            StreamReadTerminal::Eof => Ok(None),
+            StreamReadTerminal::Error(error) => Err(error.clone()),
+        })
+    }
+
+    fn try_read(&mut self) -> Result<Option<Option<Vec<u8>>>, DataPlaneError> {
+        let Some(view) = self
+            .endpoint
+            .peek_record()
+            .map_err(|error| DataPlaneError::StreamFault(format!("read stream ring: {error:?}")))?
+        else {
+            return Ok(None);
+        };
+        let kind = view.kind();
+        let (first, second) = view.spans();
+        let mut bytes = Vec::with_capacity(first.len() + second.len());
+        bytes.extend_from_slice(first);
+        bytes.extend_from_slice(second);
+        view.release().map_err(|error| {
+            DataPlaneError::StreamFault(format!("consume stream ring: {error:?}"))
+        })?;
+        self.send_control(HostStreamIn::CapacityAvailable)?;
+        match kind {
+            RecordKind::Data => Ok(Some(Some(bytes))),
+            RecordKind::Eof => {
+                self.terminal = Some(StreamReadTerminal::Eof);
+                Ok(Some(None))
+            }
+            RecordKind::Fault => {
+                let error =
+                    DataPlaneError::StreamFault(String::from_utf8_lossy(&bytes).into_owned());
+                self.terminal = Some(StreamReadTerminal::Error(error.clone()));
+                let _ = self.send_control(HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                });
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn read(&mut self) -> Result<Option<Vec<u8>>, DataPlaneError> {
+        if let Some(result) = self.terminal_result() {
+            return result;
+        }
+        loop {
+            if let Some(result) = self.try_read()? {
+                return self.finish_read(result).await;
+            }
+            let inbox = self
+                .runtime
+                .new_inbox::<ChildStreamIn>()
+                .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+            self.send_control(HostStreamIn::WaitData {
+                reply_to: *inbox.addr(),
+            })?;
+            if let Some(result) = self.try_read()? {
+                return self.finish_read(result).await;
+            }
+            match inbox.recv().await {
+                ChildStreamIn::Wake(Ok(())) => {}
+                ChildStreamIn::Wake(Err(error)) => {
+                    self.terminal = Some(StreamReadTerminal::Error(error.clone()));
+                    return Err(error);
+                }
+                ChildStreamIn::Opened(_) => {
+                    return Err(DataPlaneError::StreamFault(
+                        "received stream-open result while waiting for data".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StreamReader {
+    fn drop(&mut self) {
+        if self.terminal.is_none() {
+            let _ = self.send_control(HostStreamIn::Close {
+                clean: false,
+                reply_to: None,
+            });
+        }
+        let _ = self.runtime.send_to(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: self.operation,
+            },
+        );
+    }
+}
+
+struct StreamConsumerActor {
+    child_session: ActorAddress,
+    arena: Arc<MappedArena>,
+    path: DataPath,
+    consumer: Arc<dyn StreamConsumer>,
+    completion: ActorCompletion<Result<(), DataPlaneError>>,
+    operation: Option<ActorAddress>,
+    host_binding: Option<ActorAddress>,
+    endpoint: Option<Endpoint>,
+    pending_result: Option<Result<(), DataPlaneError>>,
+    finished: bool,
+}
+
+enum ConsumerDrainStep {
+    Empty,
+    Data,
+    Eof,
+    Fault(String),
+}
+
+fn consume_next_record(
+    endpoint: &mut Endpoint,
+    consumer: &dyn StreamConsumer,
+) -> Result<ConsumerDrainStep, DataPlaneError> {
+    let Some(view) = endpoint
+        .peek_record()
+        .map_err(|error| DataPlaneError::StreamFault(format!("collect stream ring: {error:?}")))?
+    else {
+        return Ok(ConsumerDrainStep::Empty);
+    };
+    let kind = view.kind();
+    let (first, second) = view.spans();
+    let fault = (kind == RecordKind::Fault).then(|| {
+        let mut reason = Vec::with_capacity(first.len() + second.len());
+        reason.extend_from_slice(first);
+        reason.extend_from_slice(second);
+        String::from_utf8_lossy(&reason).into_owned()
+    });
+    if kind == RecordKind::Data {
+        consumer
+            .consume(first)
+            .and_then(|()| consumer.consume(second))
+            .map_err(DataPlaneError::StreamFault)?;
+    }
+    view.release().map_err(|error| {
+        DataPlaneError::StreamFault(format!("release collected stream ring: {error:?}"))
+    })?;
+    Ok(match kind {
+        RecordKind::Data => ConsumerDrainStep::Data,
+        RecordKind::Eof => ConsumerDrainStep::Eof,
+        RecordKind::Fault => ConsumerDrainStep::Fault(fault.expect("fault payload captured")),
+    })
+}
+
+impl StreamConsumerActor {
+    fn send_control(&self, ctx: &Ctx<'_>, binding: ActorAddress, message: HostStreamIn) {
+        let _ = ctx.send(
+            self.child_session,
+            ChildSessionIn::StreamControl { binding, message },
+        );
+    }
+
+    fn complete_now(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(operation) = self.operation {
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::OperationDone { operation },
+            );
+        }
+        let _ = self.completion.complete(result);
+        ctx.stop_self();
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>, clean: bool) {
+        if self.finished || self.pending_result.is_some() {
+            return;
+        }
+        if clean && let Some(host_binding) = self.host_binding {
+            self.pending_result = Some(result);
+            self.send_control(
+                ctx,
+                host_binding,
+                HostStreamIn::Close {
+                    clean: true,
+                    reply_to: Some(ctx.self_addr()),
+                },
+            );
+            return;
+        }
+        if let Some(host_binding) = self.host_binding {
+            self.send_control(
+                ctx,
+                host_binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            );
+        }
+        self.complete_now(ctx, result);
+    }
+
+    fn drain(&mut self, ctx: &Ctx<'_>) {
+        loop {
+            let step = consume_next_record(
+                self.endpoint
+                    .as_mut()
+                    .expect("collector endpoint is installed before drain"),
+                self.consumer.as_ref(),
+            );
+            match step {
+                Ok(ConsumerDrainStep::Empty) => {
+                    if let Some(host_binding) = self.host_binding {
+                        self.send_control(
+                            ctx,
+                            host_binding,
+                            HostStreamIn::WaitData {
+                                reply_to: ctx.self_addr(),
+                            },
+                        );
+                    }
+                    return;
+                }
+                Ok(ConsumerDrainStep::Data) => {
+                    if let Some(host_binding) = self.host_binding {
+                        self.send_control(ctx, host_binding, HostStreamIn::CapacityAvailable);
+                    }
+                }
+                Ok(ConsumerDrainStep::Eof) => {
+                    if let Some(host_binding) = self.host_binding {
+                        self.send_control(ctx, host_binding, HostStreamIn::CapacityAvailable);
+                    }
+                    self.finish(ctx, Ok(()), true);
+                    return;
+                }
+                Ok(ConsumerDrainStep::Fault(reason)) => {
+                    self.finish(ctx, Err(DataPlaneError::StreamFault(reason)), false);
+                    return;
+                }
+                Err(error) => {
+                    self.finish(ctx, Err(error), false);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl ActorInterface for StreamConsumerActor {
+    type Incoming = ChildStreamIn;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        let _ = ctx.send(
+            self.child_session,
+            ChildSessionIn::OpenReadStream {
+                path: self.path.clone(),
+                reply_to: ctx.self_addr(),
+                replace: false,
+            },
+        );
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: ChildStreamIn) {
+        match message {
+            ChildStreamIn::Opened(Ok(grant)) => {
+                match attach_mapped(&self.arena, grant.ring, Role::Consumer) {
+                    Ok(endpoint) => {
+                        self.operation = Some(grant.operation);
+                        self.host_binding = Some(grant.host_binding);
+                        self.endpoint = Some(endpoint);
+                        self.drain(ctx);
+                    }
+                    Err(error) => self.finish(
+                        ctx,
+                        Err(DataPlaneError::StreamFault(format!(
+                            "attach stream collector: {error:?}"
+                        ))),
+                        false,
+                    ),
+                }
+            }
+            ChildStreamIn::Opened(Err(error)) => {
+                self.finish(ctx, Err(error), false);
+            }
+            ChildStreamIn::Wake(result) => {
+                if let Some(pending) = self.pending_result.take() {
+                    let completed = match result {
+                        Ok(()) => pending,
+                        Err(error) => Err(error),
+                    };
+                    self.complete_now(ctx, completed);
+                } else {
+                    match result {
+                        Ok(()) => self.drain(ctx),
+                        Err(error) => self.finish(ctx, Err(error), false),
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if !self.finished {
+            if let Some(host_binding) = self.host_binding {
+                self.send_control(
+                    ctx,
+                    host_binding,
+                    HostStreamIn::Close {
+                        clean: false,
+                        reply_to: None,
+                    },
+                );
+            } else {
+                let _ = ctx.send(
+                    self.child_session,
+                    ChildSessionIn::CancelStream {
+                        reply_to: ctx.self_addr(),
+                    },
+                );
+            }
+            let _ = self
+                .completion
+                .complete(Err(DataPlaneError::OperationCancelled));
+        }
+    }
+}
+
 pub struct ChildDataPlaneSessionActor {
     runtime: Runtime,
     host_session: ActorAddress,
@@ -362,6 +1098,9 @@ pub struct ChildDataPlaneSessionActor {
     operations: HashSet<ActorAddress>,
     read_operations: HashMap<ActorAddress, ActorAddress>,
     state: ChildSessionState,
+    stream_operations: HashMap<ActorAddress, ActorAddress>,
+    pending_blob_releases: usize,
+    deferred_blob_opens: VecDeque<ChildSessionIn>,
 }
 
 impl ChildDataPlaneSessionActor {
@@ -371,6 +1110,44 @@ impl ChildDataPlaneSessionActor {
 
     fn fail_local_open(&self, ctx: &Ctx<'_>, reply_to: ActorAddress, error: DataPlaneError) {
         let _ = ctx.send(reply_to, Err::<Blob, _>(error));
+    }
+
+    fn start_stream_open(
+        &mut self,
+        ctx: &Ctx<'_>,
+        path: DataPath,
+        reply_to: ActorAddress,
+        role: Role,
+        replace: bool,
+    ) {
+        if self.state != ChildSessionState::Running {
+            let _ = ctx.send(
+                reply_to,
+                Err::<StreamOpenGrant, _>(DataPlaneError::SessionNotRunning),
+            );
+            return;
+        }
+        let actor = StreamOpenOperationActor {
+            host_session: self.host_session,
+            child_session: ctx.self_addr(),
+            path,
+            role,
+            replace,
+            reply_to,
+            replied: false,
+        };
+        match ctx.spawn(actor) {
+            Ok(operation) => {
+                self.operations.insert(operation);
+                self.stream_operations.insert(reply_to, operation);
+            }
+            Err(error) => {
+                let _ = ctx.send(
+                    reply_to,
+                    Err::<StreamOpenGrant, _>(DataPlaneError::SessionFailed(error.to_string())),
+                );
+            }
+        }
     }
 }
 
@@ -435,6 +1212,11 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 ctx.stop_self();
             }
             ChildSessionIn::ReadBlob { path, reply_to } => {
+                if self.pending_blob_releases != 0 {
+                    self.deferred_blob_opens
+                        .push_back(ChildSessionIn::ReadBlob { path, reply_to });
+                    return;
+                }
                 if self.state != ChildSessionState::Running {
                     self.fail_local_open(ctx, reply_to, DataPlaneError::SessionNotRunning);
                     return;
@@ -471,6 +1253,15 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 length,
                 reply_to,
             } => {
+                if self.pending_blob_releases != 0 {
+                    self.deferred_blob_opens
+                        .push_back(ChildSessionIn::OpenWriteBlob {
+                            path,
+                            length,
+                            reply_to,
+                        });
+                    return;
+                }
                 if self.state != ChildSessionState::Running {
                     let _ = ctx.send(
                         reply_to,
@@ -502,6 +1293,62 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                         );
                     }
                 }
+            }
+            ChildSessionIn::OpenReadStream {
+                path,
+                reply_to,
+                replace,
+            } => {
+                self.start_stream_open(ctx, path, reply_to, Role::Consumer, replace);
+            }
+            ChildSessionIn::OpenWriteStream {
+                path,
+                reply_to,
+                replace,
+            } => {
+                self.start_stream_open(ctx, path, reply_to, Role::Producer, replace);
+            }
+            ChildSessionIn::CancelStream { reply_to } => {
+                if let Some(operation) = self.stream_operations.remove(&reply_to) {
+                    self.operations.remove(&operation);
+                    let _ = ctx.send(self.host_session, HostSessionIn::CancelStream { operation });
+                    let _ = ctx.stop_actor(operation);
+                }
+            }
+            ChildSessionIn::StreamWake { reply_to, result } => {
+                let _ = ctx.send(reply_to, ChildStreamIn::Wake(result));
+            }
+            ChildSessionIn::StreamControl { binding, message } => {
+                let _ = ctx.send(
+                    self.host_session,
+                    HostSessionIn::StreamControl { binding, message },
+                );
+            }
+            ChildSessionIn::BlobReleased => {
+                self.pending_blob_releases = self.pending_blob_releases.saturating_sub(1);
+                if self.pending_blob_releases == 0 {
+                    while let Some(deferred) = self.deferred_blob_opens.pop_front() {
+                        self.handle(ctx, deferred);
+                        if self.pending_blob_releases != 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            ChildSessionIn::ReleaseBlob {
+                binding,
+                lease_id,
+                generation,
+            } => {
+                self.pending_blob_releases = self.pending_blob_releases.saturating_add(1);
+                let _ = ctx.send(
+                    self.host_session,
+                    HostSessionIn::ReleaseBlob {
+                        binding,
+                        lease_id,
+                        generation,
+                    },
+                );
             }
             ChildSessionIn::BlobOpened {
                 operation,
@@ -537,6 +1384,23 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                     );
                 }
             }
+            ChildSessionIn::StreamOpened {
+                operation,
+                host_binding,
+                ring,
+                role,
+            } => {
+                if self.operations.contains(&operation) {
+                    let _ = ctx.send(
+                        operation,
+                        ChildOperationIn::StreamOpened {
+                            host_binding,
+                            ring,
+                            role,
+                        },
+                    );
+                }
+            }
             ChildSessionIn::OperationFailed { operation, error } => {
                 if self.operations.contains(&operation) {
                     let _ = ctx.send(operation, ChildOperationIn::Failed(error));
@@ -556,6 +1420,8 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 self.operations.remove(&operation);
                 self.read_operations
                     .retain(|_, read_operation| *read_operation != operation);
+                self.stream_operations
+                    .retain(|_, stream_operation| *stream_operation != operation);
             }
             ChildSessionIn::Close => {
                 if matches!(
@@ -569,6 +1435,7 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                     let _ = ctx.stop_actor(operation);
                 }
                 self.read_operations.clear();
+                self.stream_operations.clear();
                 let _ = ctx.send(self.host_session, HostSessionIn::Close);
                 self.state = ChildSessionState::Closed;
             }
@@ -589,6 +1456,11 @@ enum ChildOperationIn {
         lease: BlobLease,
         metadata: BlobMetadata,
     },
+    StreamOpened {
+        host_binding: ActorAddress,
+        ring: RingHandle,
+        role: Role,
+    },
     Failed(DataPlaneError),
     SealRequested {
         reply_to: ActorAddress,
@@ -603,17 +1475,106 @@ enum ChildOperationIn {
     WriteAborted,
 }
 
+struct StreamOpenOperationActor {
+    host_session: ActorAddress,
+    child_session: ActorAddress,
+    path: DataPath,
+    role: Role,
+    reply_to: ActorAddress,
+    replace: bool,
+    replied: bool,
+}
+
+impl StreamOpenOperationActor {
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<StreamOpenGrant, DataPlaneError>) {
+        self.replied = true;
+        let _ = ctx.send(self.reply_to, ChildStreamIn::Opened(result));
+        let _ = ctx.send(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: ctx.self_addr(),
+            },
+        );
+        ctx.stop_self();
+    }
+}
+
+impl ActorInterface for StreamOpenOperationActor {
+    type Incoming = ChildOperationIn;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        let message = match self.role {
+            Role::Consumer => HostSessionIn::OpenReadStream {
+                path: self.path.clone(),
+                child_session: self.child_session,
+                operation: ctx.self_addr(),
+                replace: self.replace,
+            },
+            Role::Producer => HostSessionIn::OpenWriteStream {
+                path: self.path.clone(),
+                child_session: self.child_session,
+                operation: ctx.self_addr(),
+                replace: self.replace,
+            },
+        };
+        if let Err(error) = ctx.send(self.host_session, message) {
+            self.finish(ctx, Err(DataPlaneError::SessionFailed(error.to_string())));
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: ChildOperationIn) {
+        match message {
+            ChildOperationIn::StreamOpened {
+                host_binding,
+                ring,
+                role,
+            } if role == self.role => self.finish(
+                ctx,
+                Ok(StreamOpenGrant {
+                    operation: ctx.self_addr(),
+                    host_binding,
+                    ring,
+                }),
+            ),
+            ChildOperationIn::StreamOpened { .. } => self.finish(
+                ctx,
+                Err(DataPlaneError::StreamFault(
+                    "host opened stream with the wrong ring role".to_owned(),
+                )),
+            ),
+            ChildOperationIn::Failed(error) => self.finish(ctx, Err(error)),
+            _ => {}
+        }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if !self.replied {
+            let _ = ctx.send(
+                self.reply_to,
+                ChildStreamIn::Opened(Err(DataPlaneError::OperationCancelled)),
+            );
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::CancelStream {
+                    operation: ctx.self_addr(),
+                },
+            );
+        }
+    }
+}
+
 struct RuntimeLeaseReleaser {
     runtime: Runtime,
-    host_session: ActorAddress,
+    child_session: ActorAddress,
     host_binding: ActorAddress,
 }
 
 impl LeaseReleaser for RuntimeLeaseReleaser {
     fn release(&self, lease: BlobLease) {
         let _ = self.runtime.send_to(
-            self.host_session,
-            HostSessionIn::ReleaseBlob {
+            self.child_session,
+            ChildSessionIn::ReleaseBlob {
                 binding: self.host_binding,
                 lease_id: lease.lease_id,
                 generation: lease.generation,
@@ -680,7 +1641,7 @@ impl ActorInterface for ReadBlobOperationActor {
             } => {
                 let releaser: Arc<dyn LeaseReleaser> = Arc::new(RuntimeLeaseReleaser {
                     runtime: self.runtime.clone(),
-                    host_session: self.host_session,
+                    child_session: self.child_session,
                     host_binding,
                 });
                 let result = Blob::from_sealed_lease(self.arena.clone(), lease, metadata, releaser)

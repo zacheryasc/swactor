@@ -470,3 +470,90 @@ fn operations_revalidate_cursors_and_never_panic() {
         })
     );
 }
+
+#[test]
+fn pinned_record_blocks_capacity_until_release() {
+    let (arena, handle) = installed(32, 1);
+    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+
+    producer
+        .send_record(RecordKind::Data, &[7; 20])
+        .expect("send");
+    let view = consumer
+        .peek_record()
+        .expect("peek")
+        .expect("record must be visible");
+    assert_eq!(view.kind(), RecordKind::Data);
+    assert_eq!(view.len(), 20);
+    assert!(view.spans().1.is_empty());
+    assert_eq!(
+        producer.reserve(8).unwrap_err(),
+        FlowError::InsufficientSpace {
+            requested: 8,
+            free: 7,
+        }
+    );
+
+    drop(view);
+    assert_eq!(producer.reserve(8).expect("capacity released").len, 8);
+}
+
+#[test]
+fn pinned_record_exposes_wrapped_payload_as_two_spans() {
+    let (arena, handle) = installed(32, 1);
+    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+
+    producer
+        .send_record(RecordKind::Data, &[1; 18])
+        .expect("first");
+    assert_eq!(
+        consumer.recv_record().expect("consume first"),
+        Some((RecordKind::Data, vec![1; 18]))
+    );
+    let expected: Vec<u8> = (0..15).collect();
+    producer
+        .send_record(RecordKind::Data, &expected)
+        .expect("wrapped record");
+
+    let view = consumer
+        .peek_record()
+        .expect("peek")
+        .expect("wrapped record visible");
+    let (first, second) = view.spans();
+    assert!(!first.is_empty());
+    assert!(!second.is_empty());
+    let observed: Vec<u8> = first.iter().chain(second).copied().collect();
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn writable_record_is_invisible_until_commit() {
+    let (arena, handle) = installed(64, 1);
+    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+
+    let mut reservation = producer
+        .reserve_record(RecordKind::Data, 17)
+        .expect("reserve record");
+    let (first, second) = reservation.spans_mut();
+    for (index, byte) in first.iter_mut().chain(second).enumerate() {
+        *byte = index as u8;
+    }
+    assert!(consumer.peek_record().expect("peek uncommitted").is_none());
+    reservation.commit().expect("commit");
+
+    let view = consumer
+        .peek_record()
+        .expect("peek")
+        .expect("committed record");
+    let observed: Vec<u8> = view
+        .spans()
+        .0
+        .iter()
+        .chain(view.spans().1)
+        .copied()
+        .collect();
+    assert_eq!(observed, (0..17).collect::<Vec<_>>());
+}
