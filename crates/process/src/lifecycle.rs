@@ -54,30 +54,54 @@ pub(crate) struct PreparedProcessOutput {
 }
 
 pub(crate) struct LifecycleTelemetryMirror {
-    channel: telemetry::ChannelId,
+    lifecycle: telemetry::ChannelId,
+    stdout: telemetry::ChannelId,
+    stderr: telemetry::ChannelId,
     producer: TelemetryProducer,
 }
 
 impl LifecycleTelemetryMirror {
     pub(crate) fn submit(&self, output: &ProcessOutput) {
-        let payload = match output {
-            ProcessOutput::Started { pid } => json!({"event": "started", "pid": pid}),
-            ProcessOutput::SpawnFailed { error } => {
-                json!({"event": "spawn_failed", "error": error})
+        match output {
+            ProcessOutput::Stdout(bytes) => {
+                let _ = self.producer.submit_bytes(self.stdout, bytes.clone());
             }
-            ProcessOutput::Exited { status } => match status {
-                ExitStatus::Code(value) => {
-                    json!({"event": "exited", "status": {"kind": "code", "value": value}})
-                }
-                ExitStatus::Signal(value) => {
-                    json!({"event": "exited", "status": {"kind": "signal", "value": value}})
-                }
-                ExitStatus::Unknown => json!({"event": "exited", "status": {"kind": "unknown"}}),
-            },
-            ProcessOutput::Error { error } => json!({"event": "error", "error": error}),
-        };
-        let bytes = serde_json::to_vec(&payload).expect("process lifecycle record serializes");
-        let _ = self.producer.submit_bytes(self.channel, bytes);
+            ProcessOutput::Stderr(bytes) => {
+                let _ = self.producer.submit_bytes(self.stderr, bytes.clone());
+            }
+            output => {
+                let payload = match output {
+                    ProcessOutput::Started { pid } => json!({"event": "started", "pid": pid}),
+                    ProcessOutput::SpawnFailed { error } => {
+                        json!({"event": "spawn_failed", "error": error})
+                    }
+                    ProcessOutput::Exited { status } => match status {
+                        ExitStatus::Code(value) => {
+                            json!({"event": "exited", "status": {"kind": "code", "value": value}})
+                        }
+                        ExitStatus::Signal(value) => {
+                            json!({"event": "exited", "status": {"kind": "signal", "value": value}})
+                        }
+                        ExitStatus::Unknown => {
+                            json!({"event": "exited", "status": {"kind": "unknown"}})
+                        }
+                    },
+                    ProcessOutput::Error { error } => json!({"event": "error", "error": error}),
+                    ProcessOutput::Stdout(_) | ProcessOutput::Stderr(_) => unreachable!(),
+                };
+                let bytes =
+                    serde_json::to_vec(&payload).expect("process lifecycle record serializes");
+                let _ = self.producer.submit_bytes(self.lifecycle, bytes);
+            }
+        }
+    }
+}
+
+fn channel_registration_error(error: telemetry::ChannelRegistrationError) -> swactor::Error {
+    match error {
+        telemetry::ChannelRegistrationError::ConflictingName { name } => swactor::Error::from(
+            format!("conflicting telemetry channel registration for {name}"),
+        ),
     }
 }
 
@@ -98,25 +122,29 @@ pub(crate) fn prepare_process_output(
                 .expect("telemetry mirror config stores producer");
             let reservation =
                 LifecycleLabelReservation::reserve(producer.stream_id().clone(), &label)?;
-            let channel_name = label.channel_name();
-            let channel = producer
+            let lifecycle = producer
                 .try_register_channel(
-                    channel_name,
+                    label.channel_name(),
                     ChannelContent::JsonRecord {
                         schema: Some("swactor_process.lifecycle.v1".to_owned()),
                     },
                 )
-                .map_err(|err| match err {
-                    telemetry::ChannelRegistrationError::ConflictingName { name } => {
-                        swactor::Error::from(format!(
-                            "conflicting telemetry channel registration for {name}"
-                        ))
-                    }
-                })?;
+                .map_err(channel_registration_error)?;
+            let stdout = producer
+                .try_register_channel(label.stdout_channel_name(), ChannelContent::TextStream)
+                .map_err(channel_registration_error)?;
+            let stderr = producer
+                .try_register_channel(label.stderr_channel_name(), ChannelContent::TextStream)
+                .map_err(channel_registration_error)?;
 
             Ok(PreparedProcessOutput {
                 upstream: config.upstream,
-                mirror: Some(LifecycleTelemetryMirror { channel, producer }),
+                mirror: Some(LifecycleTelemetryMirror {
+                    lifecycle,
+                    stdout,
+                    stderr,
+                    producer,
+                }),
                 _label_reservation: Some(reservation),
             })
         }
@@ -133,6 +161,14 @@ impl LifecycleLabel {
 
     pub(crate) fn channel_name(&self) -> String {
         format!("proc.{}.lifecycle", self.0)
+    }
+
+    pub(crate) fn stdout_channel_name(&self) -> String {
+        format!("proc.{}.stdout", self.0)
+    }
+
+    pub(crate) fn stderr_channel_name(&self) -> String {
+        format!("proc.{}.stderr", self.0)
     }
 }
 

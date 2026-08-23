@@ -262,6 +262,12 @@ pub(crate) struct ManualReadModel {
     pub nodes: Vec<SnapshotNode>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FleetReadModel {
+    pub provider: ProviderReadiness,
+    pub nodes: Vec<SnapshotNode>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum EffectKind {
     Create,
@@ -426,6 +432,13 @@ impl ManualControl {
         ManualReadModel {
             provider: self.provider.clone(),
             commands,
+            nodes: self.snapshot.nodes.clone(),
+        }
+    }
+
+    pub(crate) fn fleet_read_model(&self) -> FleetReadModel {
+        FleetReadModel {
+            provider: self.provider.clone(),
             nodes: self.snapshot.nodes.clone(),
         }
     }
@@ -1297,6 +1310,9 @@ pub(crate) enum ManualControlMsg {
     Query {
         reply_to: ActorAddress,
     },
+    QueryFleet {
+        reply_to: ActorAddress,
+    },
     Flush {
         reply_to: ActorAddress,
     },
@@ -1329,6 +1345,7 @@ pub(crate) enum ManualControlReply {
     Accepted(CommandRecord),
     Provider(ProviderReadiness),
     Status(ManualReadModel),
+    FleetStatus(FleetReadModel),
     Offers(Vec<OfferDto>),
     Rejoined(RejoinBinding),
     Flushed,
@@ -1701,6 +1718,12 @@ impl ManualActorControl {
             }
             ManualControlMsg::Query { reply_to } => {
                 let _ = ctx.send(reply_to, ManualControlReply::Status(self.core.read_model()));
+            }
+            ManualControlMsg::QueryFleet { reply_to } => {
+                let _ = ctx.send(
+                    reply_to,
+                    ManualControlReply::FleetStatus(self.core.fleet_read_model()),
+                );
             }
             ManualControlMsg::PersistenceFinished { generation, error } => {
                 if self.persistence_in_flight != Some(generation) {

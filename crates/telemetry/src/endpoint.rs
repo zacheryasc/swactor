@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossbeam_channel::{
     Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded,
@@ -14,7 +15,7 @@ use crossbeam_channel::{
 
 use serde::{Deserialize, Serialize};
 use swactor::process_observer::ProcessOutputObserver;
-use swactor::stats::{ActorSnapshot, StatsHook};
+use swactor::stats::{ActorSnapshot, StatsHook, StatsSnapshotKind};
 
 use crate::emit::ProcessChannelRouter;
 use crate::frame::{
@@ -28,6 +29,8 @@ use crate::transport::Delivery;
 const DEFAULT_MUX_CAPACITY: usize = 4096;
 const DEFAULT_SUBSCRIBER_CAPACITY: usize = 1024;
 const DEFAULT_STATS_CHANNEL: &str = "runtime.actors";
+const ACTOR_MAILBOX_WARNING: usize = 1_024;
+const ACTOR_MAILBOX_RECOVERY: usize = 512;
 
 /// Stable handle identifying a local telemetry subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -686,6 +689,7 @@ impl TelemetryProducer {
         Arc::new(TelemetryStatsHook {
             producer: self.clone(),
             channel,
+            state: Mutex::new(TelemetryStatsState::default()),
         })
     }
 }
@@ -732,53 +736,256 @@ impl ProcessOutputObserver for TelemetryProcessObserver {
     }
 }
 
-/// Runtime stats hook that submits one JSON record per productive worker tick.
+/// Runtime actor observer implementing the census/vital/activity protocol.
 pub struct TelemetryStatsHook {
     producer: TelemetryProducer,
     channel: ChannelId,
+    state: Mutex<TelemetryStatsState>,
 }
 
-impl StatsHook for TelemetryStatsHook {
-    fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]) {
-        let payload = RuntimeActorStatsRecord::from_snapshots(worker_id, snapshots);
-        let bytes = serde_json::to_vec(&payload).expect("runtime stats record serializes");
-        self.producer.submit_bytes(self.channel, bytes);
-    }
+#[derive(Default)]
+struct TelemetryStatsState {
+    sequence: u64,
+    workers: BTreeMap<usize, WorkerTelemetryState>,
 }
 
-#[derive(Debug, Serialize)]
-struct RuntimeActorStatsRecord<'a> {
-    worker_id: usize,
-    actors: Vec<RuntimeActorSnapshotRecord<'a>>,
+#[derive(Default)]
+struct WorkerTelemetryState {
+    actors: BTreeMap<String, RetainedActor>,
+    last_activity: Option<Instant>,
 }
 
-impl<'a> RuntimeActorStatsRecord<'a> {
-    fn from_snapshots(worker_id: usize, snapshots: &'a [ActorSnapshot]) -> Self {
+#[derive(Clone)]
+struct RetainedActor {
+    mailbox_depth: usize,
+    mailbox_max_depth: usize,
+    last_msg_type: Option<&'static str>,
+    actor_type: Option<&'static str>,
+    message_type: Option<&'static str>,
+    messages_processed: u64,
+    poisoned: bool,
+    under_pressure: bool,
+    activity_baseline: u64,
+    message_type_counts: Vec<(&'static str, u64)>,
+}
+
+impl RetainedActor {
+    fn from_snapshot(snapshot: &ActorSnapshot, previous: Option<&Self>) -> Self {
+        let under_pressure = match previous {
+            Some(previous) if previous.under_pressure => {
+                snapshot.mailbox_depth > ACTOR_MAILBOX_RECOVERY
+            }
+            _ => snapshot.mailbox_max_depth >= ACTOR_MAILBOX_WARNING,
+        };
         Self {
-            worker_id,
-            actors: snapshots
+            mailbox_depth: snapshot.mailbox_depth,
+            mailbox_max_depth: snapshot.mailbox_max_depth,
+            last_msg_type: snapshot.last_msg_type,
+            actor_type: snapshot.actor_type,
+            message_type: snapshot.message_type,
+            messages_processed: snapshot.messages_processed,
+            poisoned: snapshot.poisoned,
+            under_pressure,
+            activity_baseline: previous
+                .map(|actor| actor.activity_baseline)
+                .unwrap_or(snapshot.messages_processed),
+            message_type_counts: snapshot.message_type_counts.clone(),
+        }
+    }
+
+    fn full_record(&self, address: String) -> RuntimeActorSnapshotRecord {
+        RuntimeActorSnapshotRecord {
+            address,
+            mailbox_depth: self.mailbox_depth,
+            last_msg_type: self.last_msg_type,
+            actor_type: self.actor_type,
+            message_type: self.message_type,
+            messages_processed: self.messages_processed,
+            poisoned: self.poisoned,
+            message_type_counts: self
+                .message_type_counts
                 .iter()
-                .map(|snapshot| RuntimeActorSnapshotRecord {
-                    address: snapshot.address.to_full_hex(),
-                    mailbox_depth: snapshot.mailbox_depth,
-                    last_msg_type: snapshot.last_msg_type,
-                    actor_type: snapshot.actor_type,
-                    message_type: snapshot.message_type,
-                    messages_processed: snapshot.messages_processed,
-                    poisoned: snapshot.poisoned,
-                    message_type_counts: snapshot
-                        .message_type_counts
-                        .iter()
-                        .map(|(ty, count)| RuntimeMessageTypeCount { ty, count: *count })
-                        .collect(),
-                })
+                .map(|(ty, count)| RuntimeMessageTypeCount { ty, count: *count })
                 .collect(),
         }
     }
 }
 
+impl StatsHook for TelemetryStatsHook {
+    fn on_snapshot(&self, worker_id: usize, snapshots: &[ActorSnapshot], kind: StatsSnapshotKind) {
+        let now = Instant::now();
+        let generation = self.producer.stream_id().life.0;
+        let mut state = self.state.lock().expect("actor telemetry state poisoned");
+        let mut payloads = Vec::new();
+
+        {
+            let worker = state.workers.entry(worker_id).or_default();
+            let previous = std::mem::take(&mut worker.actors);
+            let mut current = BTreeMap::new();
+            let mut full_state_emitted = BTreeMap::new();
+
+            for snapshot in snapshots {
+                let address = snapshot.address.to_full_hex();
+                let before = previous.get(&address);
+                let actor = RetainedActor::from_snapshot(snapshot, before);
+                match before {
+                    None => {
+                        payloads.push(json_record(
+                            "vital",
+                            worker_id,
+                            serde_json::json!({
+                                "event": "started",
+                                "actor": actor.full_record(address.clone()),
+                            }),
+                        ));
+                        full_state_emitted.insert(address.clone(), ());
+                    }
+                    Some(before) => {
+                        if before.poisoned != actor.poisoned {
+                            payloads.push(json_record(
+                                "vital",
+                                worker_id,
+                                serde_json::json!({
+                                    "event": if actor.poisoned { "poisoned" } else { "recovered" },
+                                    "actor": actor.full_record(address.clone()),
+                                }),
+                            ));
+                            full_state_emitted.insert(address.clone(), ());
+                        }
+                        if before.under_pressure != actor.under_pressure {
+                            payloads.push(json_record(
+                                "vital",
+                                worker_id,
+                                serde_json::json!({
+                                    "event": if actor.under_pressure {
+                                        "mailbox_pressure"
+                                    } else {
+                                        "mailbox_recovered"
+                                    },
+                                    "actor": actor.full_record(address.clone()),
+                                    "warning_depth": ACTOR_MAILBOX_WARNING,
+                                    "recovery_depth": ACTOR_MAILBOX_RECOVERY,
+                                }),
+                            ));
+                            full_state_emitted.insert(address.clone(), ());
+                        }
+                    }
+                }
+                current.insert(address, actor);
+            }
+
+            for (address, actor) in &previous {
+                if !current.contains_key(address) {
+                    payloads.push(json_record(
+                        "vital",
+                        worker_id,
+                        serde_json::json!({
+                            "event": "stopped",
+                            "actor": actor.full_record(address.clone()),
+                        }),
+                    ));
+                }
+            }
+
+            if kind.census {
+                payloads.push(json_record(
+                    "census",
+                    worker_id,
+                    serde_json::json!({
+                        "actors": current
+                            .iter()
+                            .map(|(address, actor)| actor.full_record(address.clone()))
+                            .collect::<Vec<_>>(),
+                    }),
+                ));
+            }
+
+            if kind.activity && !kind.census {
+                let interval_ms = worker
+                    .last_activity
+                    .map(|last| now.duration_since(last).as_millis().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0);
+                let mut actors = Vec::new();
+                for (address, actor) in &current {
+                    if full_state_emitted.contains_key(address) {
+                        continue;
+                    }
+                    let before = previous.get(address);
+                    let delta = actor
+                        .messages_processed
+                        .saturating_sub(actor.activity_baseline);
+                    let mailbox_changed =
+                        before.is_none_or(|before| before.mailbox_depth != actor.mailbox_depth);
+                    let max_depth = actor.mailbox_max_depth;
+                    if delta > 0 || mailbox_changed || max_depth > actor.mailbox_depth {
+                        actors.push(RuntimeActorActivityRecord {
+                            address: address.clone(),
+                            messages_processed_delta: delta,
+                            mailbox_depth: actor.mailbox_depth,
+                            mailbox_max_depth: max_depth,
+                            last_msg_type: actor.last_msg_type,
+                            poisoned: actor.poisoned.then_some(true),
+                        });
+                    }
+                }
+                if !actors.is_empty() {
+                    payloads.push(json_record(
+                        "activity",
+                        worker_id,
+                        serde_json::json!({
+                            "interval_ms": interval_ms,
+                            "actors": actors,
+                        }),
+                    ));
+                }
+            }
+            if kind.activity {
+                worker.last_activity = Some(now);
+            }
+
+            for (address, actor) in &mut current {
+                if kind.census
+                    || kind.activity
+                    || full_state_emitted.contains_key(address)
+                    || !previous.contains_key(address)
+                {
+                    actor.activity_baseline = actor.messages_processed;
+                }
+            }
+            worker.actors = current;
+        }
+
+        for mut payload in payloads {
+            state.sequence = state.sequence.wrapping_add(1);
+            let object = payload
+                .as_object_mut()
+                .expect("actor telemetry record is an object");
+            object.insert("generation".to_owned(), generation.into());
+            object.insert("sequence".to_owned(), state.sequence.into());
+            let bytes = serde_json::to_vec(&payload).expect("actor telemetry record serializes");
+            self.producer.submit_bytes(self.channel, bytes);
+        }
+    }
+}
+
+fn json_record(
+    kind: &'static str,
+    worker_id: usize,
+    fields: serde_json::Value,
+) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "protocol": "swactor.actor-telemetry.v1",
+        "kind": kind,
+        "worker_id": worker_id,
+    });
+    if let (Some(record), Some(fields)) = (record.as_object_mut(), fields.as_object()) {
+        record.extend(fields.clone());
+    }
+    record
+}
+
 #[derive(Debug, Serialize)]
-struct RuntimeActorSnapshotRecord<'a> {
+struct RuntimeActorSnapshotRecord {
     address: String,
     mailbox_depth: usize,
     last_msg_type: Option<&'static str>,
@@ -786,12 +993,23 @@ struct RuntimeActorSnapshotRecord<'a> {
     message_type: Option<&'static str>,
     messages_processed: u64,
     poisoned: bool,
-    message_type_counts: Vec<RuntimeMessageTypeCount<'a>>,
+    message_type_counts: Vec<RuntimeMessageTypeCount>,
 }
 
 #[derive(Debug, Serialize)]
-struct RuntimeMessageTypeCount<'a> {
-    ty: &'a str,
+struct RuntimeActorActivityRecord {
+    address: String,
+    messages_processed_delta: u64,
+    mailbox_depth: usize,
+    mailbox_max_depth: usize,
+    last_msg_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poisoned: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeMessageTypeCount {
+    ty: &'static str,
     count: u64,
 }
 

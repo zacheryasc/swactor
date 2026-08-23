@@ -108,6 +108,8 @@
     .empty { padding: 24px; border: 1px dashed var(--border); border-radius: var(--r); color: var(--muted); font-family: var(--mono); font-size: 12px; }
     .notice { font-size: 12px; color: var(--muted); margin: 6px 0; }
     canvas { width: 100%; height: 64px; background: var(--inset); border: 1px solid var(--border); border-radius: var(--r); }
+    .output-head { display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:8px; }
+    .output-tail { margin:0; height:180px; overflow:auto; padding:10px; background:var(--inset); border:1px solid var(--divider); border-radius:var(--r); color:var(--text); font:11px/1.45 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; }
     .hardware-source { margin-bottom: 8px; }
     .hardware-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 8px; }
     .hw-card { min-width: 0; padding: 10px; background: var(--inset); border: 1px solid var(--divider); border-radius: var(--r); }
@@ -316,7 +318,7 @@ function nodeCard(node) {
   // The stats line (actors · msg/s · uptime) jitters every frame on busy
   // supervisors; it renders as a pass-filled span so the card markup — and
   // with it the whole grid — stays byte-identical between polls.
-  return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
+  return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-node="${esc(node.stream.node)}" data-origin="${esc(origin)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
     ${role}
     <h3>${esc(node.stream.node)} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
     <div class="meta">${proc}seen <span data-seen></span> ago · <span data-stats></span>${label}</div>
@@ -362,10 +364,14 @@ function renderNode(page, node, live, stale) {
   const html = `
     <a class="focus-back" href="/">← Fleet (<span data-live-count></span> live, <span data-stale-count></span> stale)</a>
     <div class="layout ${selectedActor ? 'with-dossier' : ''}">
-      <div class="node-view" data-node="${esc(node.stream.node)}">
+      <div class="node-view" data-node="${esc(node.stream.node)}" data-origin="${esc(node.stream.origin || '')}">
         <section class="panel">
           <h2 style="margin:0 0 8px">${esc(node.stream.node)}${node.stream.label ? ` <span class="muted" style="font-size:13px">${esc(node.stream.label)}</span>` : ''} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · <span data-seen></span></span></h2>
           <div id="machine-detail"></div>
+        </section>
+        <section class="panel">
+          <div class="output-head"><h2 style="margin:0">Node output</h2><span class="muted mono" id="output-meta"></span></div>
+          <pre class="output-tail" id="node-output" aria-label="Latest node stdout and stderr"></pre>
         </section>
         <section class="panel">
           <h2 style="margin:0 0 8px">Actors (<span data-actor-count></span>)</h2>
@@ -402,12 +408,31 @@ function renderNode(page, node, live, stale) {
     machineSlot.innerHTML = machine;
     lastMachineHtml = machine;
   }
+  renderNodeOutput(node);
   renderRoster(node);
   if (selectedActor) {
     if (!detailTimer) startDetailPolling();
   } else {
     stopDetailPolling();
   }
+}
+
+function renderNodeOutput(node) {
+  const tail = document.getElementById('node-output');
+  const meta = document.getElementById('output-meta');
+  if (!tail || !meta) return;
+  const output = node.output || {};
+  const lines = output.lines || [];
+  const wasAtBottom = tail.dataset.initialized !== 'true'
+    || tail.scrollHeight - tail.clientHeight - tail.scrollTop < 8;
+  tail.textContent = lines.length
+    ? lines.map(line => `[${line.source || '?'} · ${line.phase || '?'}] ${line.text || ''}`).join('\n')
+    : 'No output observed yet.';
+  tail.dataset.initialized = 'true';
+  if (wasAtBottom) tail.scrollTop = tail.scrollHeight;
+  const phase = output.phase || 'waiting';
+  const age = output.last_output_ms_ago == null ? 'no output yet' : `last output ${ago(output.last_output_ms_ago)} ago`;
+  meta.textContent = `${phase} · ${age}`;
 }
 
 function percentOf(used, total) {
@@ -614,7 +639,7 @@ function renderRoster(node) {
       <td data-rate></td>
       <td data-processed></td>
       <td>${a.worker_id == null ? '—' : fmt(a.worker_id)}</td>
-      <td><span class="muted" data-last-message></span></td>
+      <td><span class="muted" data-last-message></span><br><span class="muted" data-last-active></span></td>
     </tr>`).join('')}</tbody>
   </table>`;
   }
@@ -638,6 +663,9 @@ function updateRosterTexts(wrap, actors) {
     last.title = messageType;
     const parts = String(messageType).split('::');
     last.textContent = messageType ? parts[parts.length - 1] || messageType : '—';
+    row.querySelector('[data-last-active]').textContent = actor.last_active_ms_ago == null
+      ? 'never active'
+      : `${ago(actor.last_active_ms_ago)} ago`;
   }
 
 }
@@ -707,6 +735,7 @@ function renderDossier(d) {
       <span class="k">throughput</span><span>${fmtRate(d.msg_per_sec)} msg/s</span>
       <span class="k">processed</span><span>${fmt(d.messages_processed)}</span>
       <span class="k">last message</span><span class="mono" title="${esc(d.last_msg_type || '')}">${esc(d.last_msg_type || '—')}</span>
+      <span class="k">last active</span><span>${d.last_active_ms_ago == null ? 'never' : `${ago(d.last_active_ms_ago)} ago`}</span>
     </div>
     <h2>Throughput</h2>
     <canvas id="dossier-spark" width="380" height="64"></canvas>

@@ -349,6 +349,7 @@ impl ActorInterface for NodeRelayActor {
 
     fn handle(&mut self, _ctx: &Ctx, output: ProcessOutput) {
         match output {
+            ProcessOutput::Stdout(_) | ProcessOutput::Stderr(_) => {}
             ProcessOutput::Started { pid } => self.manager.set_pid(self.attempt, pid),
             ProcessOutput::Exited { status } => self.manager.set_exited(self.attempt, status),
             ProcessOutput::SpawnFailed { error } => {

@@ -249,15 +249,21 @@ mod snapshot_and_swim_telemetry {
         });
 
         let events = telemetry.drain_probe_events();
-        assert_eq!(events.len(), 4);
-        assert_eq!(events[0].event, "sent");
-        assert_eq!(events[1].event, "acked");
-        assert!(events[1].rtt_ms.is_some());
-        assert_eq!(events[2].event, "sent");
-        assert_eq!(events[3].event, "timed_out");
-        assert_eq!(events[3].budget_ms, Some(15_000));
-        assert_eq!(events[3].rtt_ms, None);
-        assert_eq!(events[3].consecutive_timeouts, 1);
+        assert_eq!(events.len(), 1, "only timeout remains immediate");
+        assert_eq!(events[0].event, "timed_out");
+        assert_eq!(events[0].budget_ms, Some(15_000));
+        assert_eq!(events[0].rtt_ms, None);
+        assert_eq!(events[0].consecutive_timeouts, 1);
         assert!(telemetry.drain_probe_events().is_empty());
+
+        std::thread::sleep(Duration::from_millis(1_010));
+        let summary = telemetry
+            .drain_probe_summary()
+            .expect("one-second routine probe aggregate");
+        assert_eq!(summary.sent, 2);
+        assert_eq!(summary.acked, 1);
+        assert_eq!(summary.direct_sent, 2);
+        assert_eq!(summary.rtt_samples, 1);
+        assert!(summary.rtt_ms_p50.is_some());
     }
 }

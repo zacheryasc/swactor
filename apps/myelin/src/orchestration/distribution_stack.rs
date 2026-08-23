@@ -29,9 +29,10 @@ use distribution::registry_actor::{RegistryActor, RegistryIn, RegistryView};
 use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::probe::SwimConfig;
-use distribution::swim::telemetry::{ObservedProbeEvent, ObservedTransition, SwimTelemetry};
-use distribution::telemetry::MembershipTransition;
-use distribution::telemetry::SwimProbeEvent;
+use distribution::swim::telemetry::{
+    ObservedProbeEvent, ObservedProbeSummary, ObservedTransition, SwimTelemetry,
+};
+use distribution::telemetry::{MembershipTransition, SwimProbeEvent, SwimProbeSummary};
 use distribution::transport_bridge::{
     Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
@@ -314,6 +315,10 @@ impl DistributionRuntimeStack {
         self.swim_telemetry.drain_probe_events()
     }
 
+    pub(crate) fn drain_swim_probe_summary(&self) -> Option<ObservedProbeSummary> {
+        self.swim_telemetry.drain_probe_summary()
+    }
+
     pub(crate) fn swim_recent_probe_targets(&self) -> Vec<String> {
         self.swim_telemetry
             .recent_targets()
@@ -351,6 +356,28 @@ impl DistributionRuntimeStack {
             dead_reprobe_interval_ms: duration_ms_u64(config.dead_reprobe_interval),
             probe_mode: format!("{:?}", config.probe_mode),
             lifeguard_enabled: config.lifeguard.is_some(),
+        }
+    }
+
+    pub(crate) fn swim_probe_summary_record(
+        &self,
+        summary: ObservedProbeSummary,
+        local_phase: &str,
+    ) -> SwimProbeSummary {
+        SwimProbeSummary {
+            event: "summary".to_owned(),
+            interval_ms: summary.interval_ms,
+            sent: summary.sent,
+            acked: summary.acked,
+            direct_sent: summary.direct_sent,
+            indirect_sent: summary.indirect_sent,
+            rtt_samples: summary.rtt_samples,
+            rtt_ms_min: summary.rtt_ms_min,
+            rtt_ms_p50: summary.rtt_ms_p50,
+            rtt_ms_p95: summary.rtt_ms_p95,
+            rtt_ms_max: summary.rtt_ms_max,
+            local_phase: local_phase.to_owned(),
+            probe_interval_ms: duration_ms_u64(self.swim_config.probe_interval),
         }
     }
     pub(crate) fn membership_transition(

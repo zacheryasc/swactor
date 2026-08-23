@@ -71,8 +71,9 @@ ProcessOutputConfig::observability(&self) -> ProcessLifecycleObservability
 
 `disabled` sends only upstream `ProcessOutput`.
 
-`telemetry_mirror` sends upstream `ProcessOutput` and also mirrors each
-lifecycle/control output to one telemetry channel.
+`telemetry_mirror` sends every `ProcessOutput` upstream, mirrors lifecycle
+records to `proc.<label>.lifecycle`, and mirrors raw child bytes to
+`proc.<label>.stdout` and `proc.<label>.stderr`.
 
 ### 1.3 ProcessLifecycleObservability
 
@@ -81,8 +82,8 @@ ProcessLifecycleObservability::Disabled
 ProcessLifecycleObservability::TelemetryMirror
 ```
 
-This setting controls lifecycle/control mirroring only. It does not enable child
-stdin/stdout/stderr handling.
+This setting controls telemetry mirroring. Child stdout/stderr are always
+delivered upstream; the mirror additionally publishes those bytes.
 
 ### 1.4 ProcessCommand
 
@@ -98,6 +99,8 @@ present, is the grace duration before kill escalation.
 ### 1.5 ProcessOutput
 
 ```text
+ProcessOutput::Stdout(Vec<u8>)
+ProcessOutput::Stderr(Vec<u8>)
 ProcessOutput::Started { pid: u32 }
 ProcessOutput::SpawnFailed { error: String }
 ProcessOutput::Exited { status: ExitStatus }
@@ -187,17 +190,18 @@ cmd.args(&spec.args)
 cmd.env(key, value) for each spec.env entry
 cmd.current_dir(dir) when spec.working_dir is Some(dir)
 cmd.stdin(Stdio::null())
-cmd.stdout(Stdio::null())
-cmd.stderr(Stdio::null())
+cmd.stdout(Stdio::piped())
+cmd.stderr(Stdio::piped())
 cmd.spawn()
 ```
 
 The crate does not invoke a shell unless the caller explicitly sets `command` to
 a shell executable and supplies shell arguments.
 
-Child stdin/stdout/stderr are connected to null handles. The managed-process
-protocol does not expose stdin writes, stdout/stderr output events, PTY resize,
-or arbitrary signal commands.
+Child stdin is connected to a null handle. Stdout and stderr are piped to
+bounded-read threads and delivered as `ProcessOutput::Stdout` /
+`ProcessOutput::Stderr` before the terminal output. The protocol does not expose
+stdin writes, PTY resize, or arbitrary signal commands.
 
 If `cmd.spawn()` fails, the actor emits exactly one terminal
 `ProcessOutput::SpawnFailed { error }` and does not emit `Started`, `Exited`, or
@@ -209,13 +213,14 @@ If `cmd.spawn()` fails, the actor emits exactly one terminal
 
 The actor sends each public `ProcessOutput` to the configured upstream actor.
 
-When `ProcessOutputConfig::telemetry_mirror` is used, the actor also mirrors
-each output to the configured telemetry producer. Telemetry submit failure is
-ignored and does not suppress upstream output or emit `ProcessOutput::Error`.
+When `ProcessOutputConfig::telemetry_mirror` is used, lifecycle outputs are
+encoded as JSON on `proc.<label>.lifecycle`; stdout/stderr retain their real byte
+content on text-stream channels. Telemetry submit failure is ignored and does
+not suppress upstream output or emit `ProcessOutput::Error`.
 
 Public lifecycle/control output order follows observed lifecycle:
 
-- successful spawn emits `Started` before any terminal `Exited`;
+- successful spawn emits `Started`, then any stdout/stderr chunks, before terminal `Exited`;
 - spawn failure emits `SpawnFailed` without `Started` or `Exited`;
 - supervisor failure emits `Error`;
 - after a terminal output, later public stop attempts emit no additional

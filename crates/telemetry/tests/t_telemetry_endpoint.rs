@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use swactor::actor::ActorAddress;
-use swactor::stats::ActorSnapshot;
+use swactor::stats::{ActorSnapshot, StatsSnapshotKind};
 use telemetry::frame::{FrameDelivery, TelemetryEvent};
 use telemetry::{
     ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, Lifetime, NodeId, Position,
@@ -299,6 +299,7 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
     let snapshots = [ActorSnapshot {
         address: actor,
         mailbox_depth: 3,
+        mailbox_max_depth: 4,
         last_msg_type: Some("Ping"),
         actor_type: Some("TestActor"),
         message_type: Some("Ping"),
@@ -307,14 +308,23 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
         message_type_counts: vec![("Ping", 5)],
     }];
 
-    hook.on_tick(2, &snapshots);
+    hook.on_snapshot(2, &snapshots, StatsSnapshotKind::CENSUS);
     endpoint.tick();
 
-    let event = sub.recv_timeout(Duration::from_millis(50)).unwrap();
-    let delivery = frame_event(&event);
+    let events = sub.drain_available();
+    assert_eq!(events.len(), 2, "started vital plus recovery census");
+    let delivery = events
+        .iter()
+        .map(frame_event)
+        .find(|delivery| {
+            serde_json::from_slice::<Value>(&delivery.payload)
+                .is_ok_and(|json| json["kind"] == "census")
+        })
+        .expect("census frame");
     assert_eq!(delivery.channel.channel, runtime);
     let json: Value = serde_json::from_slice(&delivery.payload).unwrap();
     assert_eq!(json["worker_id"], 2);
+    assert_eq!(json["generation"], 7);
     assert_eq!(json["actors"][0]["address"], actor.to_full_hex());
     assert_eq!(json["actors"][0]["mailbox_depth"], 3);
     assert_eq!(json["actors"][0]["last_msg_type"], "Ping");

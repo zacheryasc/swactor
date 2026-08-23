@@ -48,6 +48,8 @@ tr[data-active="true"]{background:var(--selected);box-shadow:inset 2px 0 0 var(-
 .tag.binary{color:var(--magenta);border-color:var(--magenta)}
 .json{color:var(--ok)}.text{color:var(--amber)}.binary{color:var(--magenta)}
 .ok{color:var(--ok)}.warn{color:var(--amber)}.bad{color:var(--bad)}
+.connection-state{display:grid;justify-items:end;gap:4px;max-width:min(420px,45vw)}
+.status-detail{font:11px/1.3 var(--mono);text-align:right;overflow-wrap:anywhere}
 .kv{display:grid;grid-template-columns:115px 1fr;gap:8px;border-bottom:1px solid var(--divider);padding:7px 0;font-size:12px;font-family:var(--mono)}
 pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);background:var(--inset);border:1px solid var(--border);border-radius:var(--r);padding:12px;max-height:560px;overflow:auto;font-size:12px}
 .empty{border:1px dashed var(--border);border-radius:var(--r);padding:22px;color:var(--muted);font-family:var(--mono);font-size:12px}
@@ -71,13 +73,15 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     <h1>Telemetry live explorer</h1>
     <div class="muted">Auto-connected. Retained channel history is restored from /api/view/telemetry/live, then live frames continue from /events.</div>
   </div>
-  <span class="pill warn" id="status" role="status" aria-live="polite">starting</span>
+  <div class="connection-state">
+    <span class="pill warn" id="status" role="status" aria-live="polite">starting</span>
+    <span class="status-detail muted" id="statusDetail"></span>
+  </div>
 </header>
 <section class="top">
   <button data-level="streams" aria-pressed="true">Streams</button>
   <button data-level="channels" aria-pressed="false">Channels</button>
   <button data-level="frames" aria-pressed="false">Frames</button>
-  <button id="clearScope" aria-label="Reset scope to all streams">all streams</button>
   <input id="filter" aria-label="Filter visible rows" placeholder="filter visible rows" spellcheck="false">
   <select id="kind"><option value="">all payloads</option><option value="json">json</option><option value="text">text</option><option value="binary">binary</option></select>
   <label class="muted" for="limit">keep/channel</label>
@@ -136,6 +140,7 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     selectedFrame: '',
     connected: false,
     error: '',
+    notice: '',
     messageVersion: 0,
     totalFrames: 0,
     jsonFrames: 0,
@@ -338,9 +343,12 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
   }
 
   function updateMetrics() {
-    const status = state.error ? 'error' : state.connected ? 'live' : 'connecting';
+    const status = state.error ? 'reconnecting' : state.notice ? 'resyncing' : state.connected ? 'live' : 'connecting';
+    const detail = state.error || state.notice;
     nodes.status.textContent = status;
-    nodes.status.className = `pill ${status === 'live' ? 'ok' : status === 'error' ? 'bad' : 'warn'}`;
+    nodes.status.className = `pill ${status === 'live' ? 'ok' : 'warn'}`;
+    nodes.statusDetail.textContent = detail;
+    nodes.status.title = detail;
     setSeg('metricFramesSeg', state.totalFrames);
     setSeg('metricStreamsSeg', state.streams.size);
     setSeg('metricChannelsSeg', state.channels.size);
@@ -511,21 +519,20 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
 
   async function reconcileSnapshot({ notice = '', minimumNoticeMs = 0 } = {}) {
     if (notice) {
-      state.error = notice;
+      state.notice = notice;
       state.messageVersion++;
       updateMetrics();
-      renderDetail();
     }
     const messageVersion = state.messageVersion;
     const startedAt = performance.now();
     try {
       const response = await fetch('/api/view/telemetry/live', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`/api/view/telemetry/live HTTP ${response.status}`);
+      if (!response.ok) throw new Error(`history restore failed: HTTP ${response.status}`);
       const snapshot = await response.json();
       if (!snapshot || !Array.isArray(snapshot.frames)) {
-        throw new Error('/api/view/telemetry/live returned an invalid snapshot');
+        throw new Error('history restore returned invalid data');
       }
-      for (const event of snapshot.frames) addFrame(event);
+      for (const frame of snapshot.frames) addFrame(frame);
       flushNow();
 
       const remainingNoticeMs = minimumNoticeMs - (performance.now() - startedAt);
@@ -534,13 +541,15 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       }
       if (state.messageVersion === messageVersion) {
         state.error = '';
+        state.notice = '';
         state.messageVersion++;
         updateMetrics();
         renderDetail();
       }
     } catch (error) {
       if (state.messageVersion === messageVersion) {
-        state.error = error.message;
+        state.error = error.message || 'history restore failed';
+        state.notice = '';
         state.messageVersion++;
         updateMetrics();
         renderDetail();
@@ -557,6 +566,7 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       if (state.source !== source) return;
       state.connected = true;
       state.error = '';
+      state.notice = '';
       state.messageVersion++;
       updateMetrics();
       reconcileSnapshot();
@@ -578,10 +588,8 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     source.onerror = () => {
       if (state.source !== source) return;
       state.connected = false;
-      if (!state.totalFrames) {
-        state.error = 'waiting for /events';
-        state.messageVersion++;
-      }
+      state.notice = 'Telemetry stream disconnected; retrying automatically.';
+      state.messageVersion++;
       updateMetrics();
     };
   }
@@ -621,12 +629,12 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     if (row) selectFrame(row.dataset.frame);
   });
 
-  nodes.clearScope.addEventListener('click', () => selectStream(''));
   nodes.filter.addEventListener('input', applyFilter);
   nodes.kind.addEventListener('change', renderSelectedFrames);
   nodes.limit.addEventListener('change', trimAllChannels);
   nodes.reconnect.addEventListener('click', () => {
     state.error = '';
+    state.notice = '';
     state.messageVersion++;
     connectEvents();
     updateMetrics();

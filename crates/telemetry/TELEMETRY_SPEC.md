@@ -408,14 +408,32 @@ trait ProcessOutputObserver {
 }
 
 trait StatsHook {
-    fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]);
+    fn on_snapshot(
+        &self,
+        worker_id: usize,
+        snapshots: &[ActorSnapshot],
+        kind: StatsSnapshotKind,
+    );
 }
 ```
 
 Process output uses a caller-provided closure from `(label, is_stderr)` to an
-already registered `ChannelId`. Runtime stats default to `runtime.actors` as a
-JSON record channel. Other subsystems follow the same rule: register or reuse a
-channel id, encode their own payload, submit bytes.
+already registered `ChannelId`. Runtime actor telemetry defaults to
+`runtime.actors`. Its JSON records use `swactor.actor-telemetry.v1` and carry
+the stream lifetime as `generation` plus a monotonic `sequence`:
+
+- `census` is a complete per-worker actor list, emitted initially and every
+  15 seconds for reconciliation;
+- `vital` immediately reports actor start/stop, poison/recovery, and mailbox
+  pressure transitions;
+- `activity` contains only changed actors, processed-message deltas, current
+  and interval-maximum mailbox depth, and the last message type, at no more
+  than four records per second per worker.
+
+The hook receives a complete in-memory worker snapshot only when one of those
+lanes is due; actors never receive reporting messages. Other subsystems follow
+the same rule: register or reuse a channel id, encode their own payload, and
+submit bytes.
 
 ### 4.4 The mux: single position authority
 
@@ -633,8 +651,8 @@ not be contradicted:
 |----------------|-----------------|
 | `telemetry.health` | telemetry self-health counters |
 | `host.cpu`, `host.gpu`, `host.net` | host hardware samples |
-| `runtime.actors` | runtime actor stats hook output |
-| `proc.<label>.stdout`, `proc.<label>.stderr` | managed process output |
+| `runtime.actors` | sequenced actor census, vital events, and sampled activity |
+| `proc.<label>.lifecycle`, `.stdout`, `.stderr` | managed process lifecycle and real output |
 | `mvp.lifecycle` | MVP lifecycle facts |
 | `mvp.provisioning.events` | MVP provisioning lifecycle facts |
 | `mvp.provisioning.logs.node.<id>.<stream>` | MVP provisioning stdout/stderr/provider lines |

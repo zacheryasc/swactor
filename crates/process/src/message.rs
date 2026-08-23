@@ -11,6 +11,8 @@ pub enum ProcessCommand {
 /// Public managed-process outputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
     Started { pid: u32 },
     SpawnFailed { error: String },
     Exited { status: ExitStatus },

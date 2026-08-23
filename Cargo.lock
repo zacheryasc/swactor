@@ -4368,6 +4368,7 @@ dependencies = [
  "swactor-process",
  "swactor-transport",
  "tar",
+ "telemetry",
  "tempfile",
  "tokio",
 ]

@@ -32,6 +32,7 @@ const HISTORY_CAP: usize = 512;
 const HISTORY_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const PER_ACTOR_HISTORY_CAP: usize = 120;
 const GROWTH_WINDOW: usize = 12;
+const ACTIVITY_RATE_WINDOW: Duration = Duration::from_secs(3);
 /// Sampled message-receipt ring bound (view side).
 pub(crate) const RECEIPT_CAP: usize = 16;
 /// Minimum spacing between receipts; bounds ring churn for noisy actors.
@@ -54,6 +55,9 @@ pub(crate) struct RuntimeState {
     pub(crate) actors: BTreeMap<String, ActorState>,
     pub(crate) history: VecDeque<HistorySample>,
     actor_snapshot_generation: u64,
+    telemetry_generation: Option<u64>,
+    telemetry_sequence: Option<u64>,
+    telemetry_discontinuities: u64,
 }
 
 impl RuntimeState {
@@ -65,6 +69,9 @@ impl RuntimeState {
             actors: BTreeMap::new(),
             history: VecDeque::with_capacity(HISTORY_CAP),
             actor_snapshot_generation: 0,
+            telemetry_generation: None,
+            telemetry_sequence: None,
+            telemetry_discontinuities: 0,
         }
     }
 
@@ -74,11 +81,83 @@ impl RuntimeState {
             return;
         };
         match channel {
-            RUNTIME_ACTORS => self.apply_actors(&value, now),
+            RUNTIME_ACTORS if self.accept_protocol_frame(&value) => {
+                match value.get("kind").and_then(Value::as_str) {
+                    Some("census") => self.apply_actors(&value, now),
+                    Some("activity") => self.apply_activity(&value, now),
+                    Some("vital") => self.apply_vital(&value, now),
+                    _ => self.apply_actors(&value, now),
+                }
+            }
             RUNTIME_STATS => self.apply_stats(&value, now),
             _ => {}
         }
         self.push_history(now);
+    }
+
+    fn accept_protocol_frame(&mut self, value: &Value) -> bool {
+        let Some(generation) = value.get("generation").and_then(Value::as_u64) else {
+            return true;
+        };
+        match self.telemetry_generation {
+            Some(current) if generation < current => return false,
+            Some(current) if generation > current => {
+                self.actors.clear();
+                self.telemetry_sequence = None;
+            }
+            _ => {}
+        }
+        self.telemetry_generation = Some(generation);
+
+        let Some(sequence) = value.get("sequence").and_then(Value::as_u64) else {
+            return true;
+        };
+        if let Some(previous) = self.telemetry_sequence {
+            if sequence <= previous {
+                return false;
+            }
+            if sequence != previous.wrapping_add(1) {
+                self.telemetry_discontinuities = self.telemetry_discontinuities.saturating_add(1);
+            }
+        }
+        self.telemetry_sequence = Some(sequence);
+        true
+    }
+
+    fn apply_vital(&mut self, value: &Value, now: Instant) {
+        let Some(actor) = value.get("actor") else {
+            return;
+        };
+        let address = string_field(actor, &["address", "addr", "actor_addr"]);
+        if value.get("event").and_then(Value::as_str) == Some("stopped") {
+            if let Some(address) = address {
+                self.actors.remove(&address);
+            }
+            return;
+        }
+        let worker = u32_field(value, &["worker_id", "worker"]);
+        let _ = self.apply_actor(actor, now, worker);
+    }
+
+    fn apply_activity(&mut self, value: &Value, now: Instant) {
+        let worker = u32_field(value, &["worker_id", "worker"]);
+        let interval = value
+            .get("interval_ms")
+            .and_then(Value::as_u64)
+            .map(|ms| Duration::from_millis(ms).as_secs_f64())
+            .unwrap_or(0.0);
+        let Some(actors) = value.get("actors").and_then(Value::as_array) else {
+            return;
+        };
+        for record in actors {
+            let Some(address) = string_field(record, &["address", "addr", "actor_addr"]) else {
+                continue;
+            };
+            self.actors
+                .entry(address.clone())
+                .or_insert_with(|| ActorState::new(address))
+                .apply_activity(record, now, worker, interval);
+        }
     }
 
     fn apply_actors(&mut self, value: &Value, now: Instant) {
@@ -186,6 +265,12 @@ impl RuntimeState {
         }
         totals
     }
+
+    pub(crate) fn totals_at(&self, now: Instant) -> Totals {
+        let mut totals = self.totals();
+        totals.msg_per_sec = self.actors.values().map(|actor| actor.rate_at(now)).sum();
+        totals
+    }
 }
 
 #[derive(Clone)]
@@ -207,7 +292,16 @@ pub(crate) struct ActorState {
     /// Messages folded away by the receipt sampling interval.
     pub(crate) sampled_out: u64,
     pub(crate) last_update: Option<Instant>,
+    pub(crate) last_active: Option<Instant>,
+    activity_rates: VecDeque<ActivityRateSample>,
     snapshot_generation: u64,
+}
+
+#[derive(Clone)]
+struct ActivityRateSample {
+    at: Instant,
+    interval: f64,
+    delta: u64,
 }
 
 impl ActorState {
@@ -229,6 +323,8 @@ impl ActorState {
             receipts: VecDeque::with_capacity(RECEIPT_CAP),
             sampled_out: 0,
             last_update: None,
+            last_active: None,
+            activity_rates: VecDeque::new(),
             snapshot_generation: 0,
         }
     }
@@ -282,7 +378,79 @@ impl ActorState {
             self.messages_processed.saturating_sub(processed_before),
         );
         self.push_history(now);
+        if self.messages_processed > processed_before {
+            self.last_active = Some(now);
+        }
         self.recompute_growth();
+    }
+
+    fn apply_activity(
+        &mut self,
+        value: &Value,
+        now: Instant,
+        default_worker: Option<u32>,
+        interval: f64,
+    ) {
+        if let Some(worker_id) = default_worker {
+            self.worker_id = Some(worker_id);
+        }
+        let delta = u64_field(value, &["messages_processed_delta"]).unwrap_or(0);
+        self.messages_processed = self.messages_processed.saturating_add(delta);
+        if delta > 0 {
+            self.last_active = Some(now);
+        }
+        if interval > 0.0 {
+            self.activity_rates.push_back(ActivityRateSample {
+                at: now,
+                interval,
+                delta,
+            });
+            while self
+                .activity_rates
+                .front()
+                .is_some_and(|sample| now.duration_since(sample.at) > ACTIVITY_RATE_WINDOW)
+            {
+                self.activity_rates.pop_front();
+            }
+        }
+        self.msg_per_sec = self.rate_at(now);
+        assign_u32(&mut self.mailbox_depth, value, &["mailbox_depth", "queued"]);
+        if let Some(last) = string_field(
+            value,
+            &["last_msg_type", "last_message", "last_message_type"],
+        )
+        .filter(|last| !last.is_empty())
+        {
+            self.last_msg_type = Some(last);
+        }
+        if let Some(poisoned) = value.get("poisoned").and_then(Value::as_bool) {
+            self.poisoned = poisoned;
+        }
+        self.last_update = Some(now);
+        self.fold_receipt(now, delta);
+        self.push_history(now);
+        self.recompute_growth();
+    }
+
+    pub(crate) fn rate_at(&self, now: Instant) -> f64 {
+        if self.activity_rates.is_empty() {
+            return self.msg_per_sec;
+        }
+        let mut messages = 0_u64;
+        let mut seconds = 0.0;
+        for sample in self
+            .activity_rates
+            .iter()
+            .filter(|sample| now.duration_since(sample.at) <= ACTIVITY_RATE_WINDOW)
+        {
+            messages = messages.saturating_add(sample.delta);
+            seconds += sample.interval;
+        }
+        if seconds > 0.0 {
+            messages as f64 / seconds
+        } else {
+            0.0
+        }
     }
 
     /// Fold a `messages_processed` jump into the sampled receipt ring. The
@@ -464,6 +632,10 @@ mod tests {
 
     use super::*;
 
+    fn apply_protocol(runtime: &mut RuntimeState, value: Value, at: Instant) {
+        runtime.update(RUNTIME_ACTORS, value.to_string().as_bytes(), at);
+    }
+
     #[test]
     fn per_worker_snapshots_remove_stopped_actors_without_touching_other_workers() {
         let now = Instant::now();
@@ -517,5 +689,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["other-worker"]
         );
+    }
+
+    #[test]
+    fn folds_census_activity_and_vital_records_in_sequence() {
+        let now = Instant::now();
+        let mut runtime = RuntimeState::new(now);
+        apply_protocol(
+            &mut runtime,
+            json!({
+                "kind": "census",
+                "generation": 7,
+                "sequence": 1,
+                "worker_id": 0,
+                "actors": [{
+                    "address": "actor-a",
+                    "actor_type": "ActorA",
+                    "message_type": "Ping",
+                    "messages_processed": 10,
+                    "mailbox_depth": 1,
+                    "poisoned": false
+                }]
+            }),
+            now,
+        );
+        apply_protocol(
+            &mut runtime,
+            json!({
+                "kind": "activity",
+                "generation": 7,
+                "sequence": 2,
+                "worker_id": 0,
+                "interval_ms": 500,
+                "actors": [{
+                    "address": "actor-a",
+                    "messages_processed_delta": 4,
+                    "mailbox_depth": 2,
+                    "mailbox_max_depth": 5,
+                    "last_msg_type": "Ping"
+                }]
+            }),
+            now + Duration::from_millis(500),
+        );
+        let actor = runtime.actors.get("actor-a").unwrap();
+        assert_eq!(actor.messages_processed, 14);
+        assert_eq!(actor.mailbox_depth, 2);
+        assert_eq!(actor.msg_per_sec, 8.0);
+        assert_eq!(actor.rate_at(now + Duration::from_secs(4)), 0.0);
+        assert_eq!(actor.last_active, Some(now + Duration::from_millis(500)));
+
+        apply_protocol(
+            &mut runtime,
+            json!({
+                "kind": "vital",
+                "generation": 7,
+                "sequence": 3,
+                "worker_id": 0,
+                "event": "stopped",
+                "actor": {"address": "actor-a"}
+            }),
+            now + Duration::from_millis(600),
+        );
+        assert!(runtime.actors.is_empty());
+
+        apply_protocol(
+            &mut runtime,
+            json!({
+                "kind": "activity",
+                "generation": 7,
+                "sequence": 2,
+                "worker_id": 0,
+                "interval_ms": 250,
+                "actors": [{"address": "actor-a", "messages_processed_delta": 99}]
+            }),
+            now + Duration::from_millis(700),
+        );
+        assert!(runtime.actors.is_empty(), "stale sequence is ignored");
     }
 }

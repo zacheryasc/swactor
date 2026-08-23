@@ -291,12 +291,8 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_telemetry() {
             .any(|name| name == "proc.trainer_0_foo.lifecycle"),
         "catalog should contain lifecycle channel, got {names:?}"
     );
-    assert!(
-        names
-            .iter()
-            .all(|name| !name.contains("stdout") && !name.contains("stderr")),
-        "process core should not register stdout/stderr channels: {names:?}"
-    );
+    assert!(names.iter().any(|name| name == "proc.trainer_0_foo.stdout"));
+    assert!(names.iter().any(|name| name == "proc.trainer_0_foo.stderr"));
 
     let payloads: Vec<Value> = telemetry_events
         .iter()
@@ -322,13 +318,15 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_telemetry() {
         }),
         "lifecycle mirror should include exited JSON, got {payloads:?}"
     );
-    assert!(
-        payloads.iter().all(|payload| {
-            payload.get("event") != Some(&Value::String("stdout".to_owned()))
-                && payload.get("event") != Some(&Value::String("stderr".to_owned()))
-        }),
-        "lifecycle mirror should not include child output events: {payloads:?}"
-    );
+    let text_payloads = telemetry_events
+        .iter()
+        .filter_map(|event| match event {
+            TelemetryEvent::Frame(delivery) => String::from_utf8(delivery.payload.clone()).ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(text_payloads.iter().any(|payload| payload == "stdout\n"));
+    assert!(text_payloads.iter().any(|payload| payload == "stderr\n"));
 }
 
 #[test]
@@ -948,7 +946,7 @@ fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
 }
 
 #[test]
-fn stdout_and_stderr_writes_do_not_affect_lifecycle() {
+fn stdout_and_stderr_are_delivered_without_affecting_lifecycle() {
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
@@ -983,11 +981,26 @@ fn stdout_and_stderr_writes_do_not_affect_lifecycle() {
         has_exited(outputs, ExitStatus::Code(0))
     });
 
-    assert_eq!(
-        outputs.len(),
-        2,
-        "process core should emit only lifecycle outputs: {outputs:?}"
-    );
+    let stdout = outputs
+        .iter()
+        .filter_map(|output| match output {
+            ProcessOutput::Stdout(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let stderr = outputs
+        .iter()
+        .filter_map(|output| match output {
+            ProcessOutput::Stderr(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(String::from_utf8(stdout).unwrap().lines().count(), 1_000);
+    assert_eq!(String::from_utf8(stderr).unwrap().lines().count(), 1_000);
     assert!(started_index(&outputs) < exited_index(&outputs));
     assert!(
         has_exited(&outputs, ExitStatus::Code(0)),

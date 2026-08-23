@@ -5,6 +5,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use crate::Error;
 use crate::actor::{
@@ -17,10 +18,12 @@ use crate::admin::{
 };
 use crate::channel::Receiver;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
-use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
+use crate::stats::{ActorSnapshot, StatsHook, StatsSnapshotKind, TickTiming, WorkerStats};
 
 use crate::extension::WorkerExtension;
 use crate::runtime::RuntimeShared;
+const ACTOR_ACTIVITY_INTERVAL: Duration = Duration::from_millis(250);
+const ACTOR_CENSUS_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Whether an actor should be skipped during `tick_all`.
 pub(crate) fn should_skip_actor(poisoned: bool, stopping: bool, suspended: bool) -> bool {
@@ -78,6 +81,10 @@ pub struct Worker {
     pub(crate) stats: Arc<WorkerStats>,
     /// Reusable scratch buffer for building per-actor snapshots.
     snapshot_buf: Vec<ActorSnapshot>,
+    /// Last activity snapshot handed to the observer.
+    last_activity_snapshot: Option<Instant>,
+    /// Last periodic reconciliation census handed to the observer.
+    last_census_snapshot: Option<Instant>,
     /// Per-worker extension (e.g., timer wheel). Created by RuntimeExtension factory.
     pub(crate) worker_ext: Option<Box<dyn WorkerExtension>>,
     /// True if the previous tick did work — ensures one full tick follows a productive
@@ -108,6 +115,8 @@ impl Worker {
             admin_rx,
             stats,
             snapshot_buf: Vec::new(),
+            last_activity_snapshot: None,
+            last_census_snapshot: None,
             worker_ext: None,
             has_backlog: false,
             deferred_transfers: VecDeque::new(),
@@ -135,9 +144,21 @@ impl Worker {
     pub fn try_tick(&mut self) -> bool {
         let wid = self.id;
 
-        // Fast idle path: skip the entire tick when nothing could have changed.
-        // Cost: ~3 atomic loads, zero syscalls, zero actor iteration.
+        // Fast idle path: only the infrequent reconciliation census can be due.
+        // Between censuses this adds no actor iteration or allocation.
         if !self.has_work() {
+            Self::publish_actor_stats(
+                self.id,
+                self.shared.stats_hook.get().map(Arc::as_ref),
+                &mut self.pool,
+                &mut self.snapshot_buf,
+                (
+                    &mut self.last_activity_snapshot,
+                    &mut self.last_census_snapshot,
+                ),
+                Instant::now(),
+                false,
+            );
             return false;
         }
 
@@ -152,7 +173,6 @@ impl Worker {
             config: &shared.config,
             extension: shared.extension.get().map(|a| a.as_ref()),
             process_output_observer: shared.process_output_observer.get(),
-            stats_hook: shared.stats_hook.get().map(|a| a.as_ref()),
             worker_stats: &self.stats,
             num_workers: shared.worker_stats.len(),
             worker_id: wid,
@@ -277,7 +297,8 @@ impl Worker {
 
         let t5 = Instant::now();
 
-        // 8. Publish stats (skip entirely when idle to avoid allocation + mutex)
+        // 8. Publish cheap aggregate stats. Per-actor telemetry is emitted once
+        // cleanup has made the worker transition complete.
         if did_work {
             self.stats
                 .num_actors
@@ -288,11 +309,6 @@ impl Worker {
             self.stats
                 .messages_processed
                 .fetch_add(processed as u64, Ordering::Relaxed);
-
-            if let Some(hook) = tc.stats_hook {
-                self.pool.mailbox_depths_into(&mut self.snapshot_buf);
-                hook.on_tick(wid.index(), &self.snapshot_buf);
-            }
         }
 
         let t6 = Instant::now();
@@ -323,10 +339,23 @@ impl Worker {
             );
         }
 
-        // 9. Clean up poisoned and stopping actors. Cleanup changes the pool after
-        // phase 8 published its snapshot, so republish cardinality and mailbox
-        // state when actors were removed rather than leaving observability stale
-        // until unrelated work reaches this worker.
+        // 9. Clean up poisoned and stopping actors before publishing per-actor
+        if self.pool.has_vital_dirty() {
+            Self::publish_actor_stats(
+                self.id,
+                shared.stats_hook.get().map(Arc::as_ref),
+                &mut self.pool,
+                &mut self.snapshot_buf,
+                (
+                    &mut self.last_activity_snapshot,
+                    &mut self.last_census_snapshot,
+                ),
+                t6,
+                did_work,
+            );
+        }
+
+        // state, so observers see one complete transition.
         let cleaned_dead = Self::cleanup_dead_actors(
             &mut self.pool,
             &mut self.worker_ext,
@@ -341,14 +370,62 @@ impl Worker {
             self.stats
                 .total_mailbox_depth
                 .store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
-            if let Some(hook) = tc.stats_hook {
-                self.pool.mailbox_depths_into(&mut self.snapshot_buf);
-                hook.on_tick(wid.index(), &self.snapshot_buf);
-            }
         }
+
+        Self::publish_actor_stats(
+            self.id,
+            shared.stats_hook.get().map(Arc::as_ref),
+            &mut self.pool,
+            &mut self.snapshot_buf,
+            (
+                &mut self.last_activity_snapshot,
+                &mut self.last_census_snapshot,
+            ),
+            t6,
+            did_work,
+        );
 
         self.has_backlog = did_work;
         did_work
+    }
+
+    fn publish_actor_stats(
+        worker_id: WorkerId,
+        hook: Option<&dyn StatsHook>,
+        pool: &mut ActorPool,
+        snapshot_buf: &mut Vec<ActorSnapshot>,
+        deadlines: (&mut Option<Instant>, &mut Option<Instant>),
+        now: Instant,
+        activity_possible: bool,
+    ) {
+        let (last_activity_snapshot, last_census_snapshot) = deadlines;
+        let Some(hook) = hook else {
+            return;
+        };
+        let census = last_census_snapshot
+            .is_none_or(|last| now.duration_since(last) >= ACTOR_CENSUS_INTERVAL);
+        let activity = activity_possible
+            && last_activity_snapshot
+                .is_none_or(|last| now.duration_since(last) >= ACTOR_ACTIVITY_INTERVAL);
+        let vital = pool.take_vital_dirty();
+        if !census && !activity && !vital {
+            return;
+        }
+
+        pool.actor_snapshots_into(snapshot_buf, activity);
+        let kind = match (activity, census) {
+            (true, true) => StatsSnapshotKind::ACTIVITY_AND_CENSUS,
+            (true, false) => StatsSnapshotKind::ACTIVITY,
+            (false, true) => StatsSnapshotKind::CENSUS,
+            (false, false) => StatsSnapshotKind::VITAL,
+        };
+        hook.on_snapshot(worker_id.index(), snapshot_buf, kind);
+        if activity {
+            *last_activity_snapshot = Some(now);
+        }
+        if census {
+            *last_census_snapshot = Some(now);
+        }
     }
 
     fn drain_spawns(
@@ -738,6 +815,8 @@ struct ActorSlot {
     suspended: bool,
     last_msg_type: Option<&'static str>,
     messages_processed: u64,
+    /// Highest mailbox depth observed since the previous activity snapshot.
+    mailbox_max_depth: usize,
     /// Per-message-type counters (bounded to 32 entries).
     msg_type_counts: HashMap<&'static str, u64>,
     /// Address of the actor that spawned this one, or `None` for externally-spawned actors.
@@ -751,12 +830,15 @@ struct ActorSlot {
 /// Per-worker actor storage. Owns per-actor mailboxes.
 pub(crate) struct ActorPool {
     actors: AddrMap<ActorSlot>,
+    /// Population or poison state changed since the previous observer call.
+    vital_dirty: bool,
 }
 
 impl ActorPool {
     pub fn new() -> Self {
         Self {
             actors: HashMap::with_hasher(AddrBuildHasher),
+            vital_dirty: false,
         }
     }
 
@@ -772,12 +854,14 @@ impl ActorPool {
                 suspended: false,
                 last_msg_type: None,
                 messages_processed: 0,
+                mailbox_max_depth: 0,
                 msg_type_counts: HashMap::new(),
                 parent_addr: req.parent,
                 env: req.env,
                 exit_value: None,
             },
         );
+        self.vital_dirty = true;
     }
 
     /// Deliver a type-erased message to the actor at `addr`.
@@ -806,6 +890,7 @@ impl ActorPool {
                 }
             }
             slot.mailbox.push_back(msg);
+            slot.mailbox_max_depth = slot.mailbox_max_depth.max(slot.mailbox.len());
             true
         } else {
             false
@@ -953,6 +1038,7 @@ impl ActorPool {
                     #[cfg(feature = "tracing")]
                     tracing::error!(actor_addr = %addr, "actor.on_start_panicked");
                     slot.poisoned = true;
+                    self.vital_dirty = true;
                     slot.mailbox.clear();
                     continue;
                 }
@@ -1035,6 +1121,7 @@ impl ActorPool {
                         #[cfg(feature = "tracing")]
                         tracing::error!(actor_addr = %addr, "actor.panicked");
                         slot.poisoned = true;
+                        self.vital_dirty = true;
                         slot.mailbox.clear();
                         break;
                     }
@@ -1124,6 +1211,7 @@ impl ActorPool {
         let mut dead = Vec::with_capacity(dead_addrs.len());
         for addr in dead_addrs {
             if let Some(mut slot) = self.actors.remove(&addr) {
+                self.vital_dirty = true;
                 let reason = determine_stop_reason(slot.poisoned, slot.exit_value.is_some());
                 // Call on_stop for gracefully stopping actors only
                 debug_assert!(
@@ -1154,25 +1242,39 @@ impl ActorPool {
         dead
     }
 
-    /// Fill `out` with per-actor snapshots, reusing the existing allocation.
-    pub fn mailbox_depths_into(&self, out: &mut Vec<ActorSnapshot>) {
+    /// Fill `out` with complete per-actor state, reusing its top-level
+    /// allocation. Activity snapshots begin a new mailbox-maximum window.
+    pub fn actor_snapshots_into(&mut self, out: &mut Vec<ActorSnapshot>, reset_mailbox_max: bool) {
         out.clear();
-        out.extend(self.actors.iter().map(|(&addr, slot)| {
+        out.extend(self.actors.iter_mut().map(|(&addr, slot)| {
             let mut type_counts: Vec<(&'static str, u64)> =
                 slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
             type_counts.sort_by_key(|&(_, count)| Reverse(count));
             let metadata = slot.actor.metadata();
-            ActorSnapshot {
+            let snapshot = ActorSnapshot {
                 address: addr,
                 mailbox_depth: slot.mailbox.len(),
+                mailbox_max_depth: slot.mailbox_max_depth.max(slot.mailbox.len()),
                 last_msg_type: slot.last_msg_type,
                 actor_type: Some(metadata.actor_type_name),
                 message_type: Some(metadata.message_type_name),
                 messages_processed: slot.messages_processed,
                 poisoned: slot.poisoned,
                 message_type_counts: type_counts,
+            };
+            if reset_mailbox_max {
+                slot.mailbox_max_depth = slot.mailbox.len();
             }
+            snapshot
         }));
+    }
+
+    fn has_vital_dirty(&self) -> bool {
+        self.vital_dirty
+    }
+
+    fn take_vital_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.vital_dirty)
     }
 }
 

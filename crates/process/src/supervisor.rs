@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::mem;
 use std::os::fd::RawFd;
 use std::process::{Child, Command, Stdio};
@@ -21,6 +21,7 @@ pub(crate) enum ThreadEvent {
     Started { pid: u32 },
     SpawnFailed { error: String },
     Exited { status: ExitStatus },
+    Output { stderr: bool, bytes: Vec<u8> },
     Error { error: String },
     ThreadFinished,
 }
@@ -308,6 +309,7 @@ fn supervisor_thread_main(
     let pid: Option<u32>;
     let mut kill_deadline: Option<Instant> = None;
     let mut kill_sent = false;
+    let mut output_threads = Vec::new();
     debug_assert!(matches!(state, SupervisorState::Spawning));
 
     let mut cmd = Command::new(&spec.command);
@@ -319,12 +321,18 @@ fn supervisor_thread_main(
         cmd.current_dir(dir);
     }
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     match cmd.spawn() {
-        Ok(spawned_child) => {
+        Ok(mut spawned_child) => {
             let child_pid = spawned_child.id();
+            if let Some(stdout) = spawned_child.stdout.take() {
+                output_threads.push(spawn_output_reader(stdout, events.clone(), false));
+            }
+            if let Some(stderr) = spawned_child.stderr.take() {
+                output_threads.push(spawn_output_reader(stderr, events.clone(), true));
+            }
             pid = Some(child_pid);
             child = Some(spawned_child);
             events.push(ThreadEvent::Started { pid: child_pid });
@@ -339,11 +347,11 @@ fn supervisor_thread_main(
             ) {
                 CommandOutcome::Continue => {}
                 CommandOutcome::Exited(status) => {
-                    finish_with_exit(&events, &mut state, &mut child, status);
+                    finish_with_exit(&events, &mut state, &mut child, &mut output_threads, status);
                     return;
                 }
                 CommandOutcome::Error(error) => {
-                    finish_with_error(&events, &mut state, &mut child, error);
+                    finish_with_error(&events, &mut state, &mut child, &mut output_threads, error);
                     return;
                 }
             }
@@ -367,6 +375,7 @@ fn supervisor_thread_main(
                         &events,
                         &mut state,
                         &mut child,
+                        &mut output_threads,
                         format!("process supervisor command wake failed: {err}"),
                     );
                     return;
@@ -381,11 +390,23 @@ fn supervisor_thread_main(
                 ) {
                     CommandOutcome::Continue => {}
                     CommandOutcome::Exited(status) => {
-                        finish_with_exit(&events, &mut state, &mut child, status);
+                        finish_with_exit(
+                            &events,
+                            &mut state,
+                            &mut child,
+                            &mut output_threads,
+                            status,
+                        );
                         return;
                     }
                     CommandOutcome::Error(error) => {
-                        finish_with_error(&events, &mut state, &mut child, error);
+                        finish_with_error(
+                            &events,
+                            &mut state,
+                            &mut child,
+                            &mut output_threads,
+                            error,
+                        );
                         return;
                     }
                 }
@@ -396,6 +417,7 @@ fn supervisor_thread_main(
                     &events,
                     &mut state,
                     &mut child,
+                    &mut output_threads,
                     format!("process supervisor command wake failed: {err}"),
                 );
                 return;
@@ -404,12 +426,12 @@ fn supervisor_thread_main(
 
         match try_wait_pid(child_pid) {
             Ok(Some(status)) => {
-                finish_with_exit(&events, &mut state, &mut child, status);
+                finish_with_exit(&events, &mut state, &mut child, &mut output_threads, status);
                 return;
             }
             Ok(None) => {}
             Err(error) => {
-                finish_with_error(&events, &mut state, &mut child, error);
+                finish_with_error(&events, &mut state, &mut child, &mut output_threads, error);
                 return;
             }
         }
@@ -422,11 +444,11 @@ fn supervisor_thread_main(
                     continue;
                 }
                 CommandOutcome::Exited(status) => {
-                    finish_with_exit(&events, &mut state, &mut child, status);
+                    finish_with_exit(&events, &mut state, &mut child, &mut output_threads, status);
                     return;
                 }
                 CommandOutcome::Error(error) => {
-                    finish_with_error(&events, &mut state, &mut child, error);
+                    finish_with_error(&events, &mut state, &mut child, &mut output_threads, error);
                     return;
                 }
             }
@@ -539,15 +561,44 @@ fn send_kill_or_observe_exit(pid: u32) -> CommandOutcome {
     }
 }
 
+fn spawn_output_reader(
+    mut reader: impl Read + Send + 'static,
+    events: ThreadEventSink,
+    stderr: bool,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = vec![0_u8; 4_096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => events.push(ThreadEvent::Output {
+                    stderr,
+                    bytes: buffer[..read].to_vec(),
+                }),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn join_output_readers(readers: &mut Vec<JoinHandle<()>>) {
+    for reader in readers.drain(..) {
+        let _ = reader.join();
+    }
+}
+
 fn finish_with_exit(
     events: &ThreadEventSink,
     state: &mut SupervisorState,
     child: &mut Option<Child>,
+    output_threads: &mut Vec<JoinHandle<()>>,
     status: ExitStatus,
 ) {
     *state = SupervisorState::Done;
     debug_assert!(matches!(*state, SupervisorState::Done));
     let _ = child.take();
+    join_output_readers(output_threads);
     events.push(ThreadEvent::Exited { status });
     events.push(ThreadEvent::ThreadFinished);
 }
@@ -556,11 +607,17 @@ fn finish_with_error(
     events: &ThreadEventSink,
     state: &mut SupervisorState,
     child: &mut Option<Child>,
+    output_threads: &mut Vec<JoinHandle<()>>,
     error: String,
 ) {
     *state = SupervisorState::Done;
     debug_assert!(matches!(*state, SupervisorState::Done));
+    if let Some(child) = child.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let _ = child.take();
+    join_output_readers(output_threads);
     events.push(ThreadEvent::Error { error });
     events.push(ThreadEvent::ThreadFinished);
 }
@@ -877,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_uses_null_stdio_and_reports_only_lifecycle() {
+    fn supervisor_captures_stdout_and_stderr_before_lifecycle_completion() {
         let (sink, receiver) = thread_event_channel(|| {});
         let mut handle = ProcessSupervisorThread::start(
             shell_spec("echo stdout; echo stderr >&2; exit 0"),
@@ -888,13 +945,22 @@ mod tests {
         let events = collect_until_finished(&receiver, Duration::from_secs(2));
         join_finished(&mut handle);
 
-        assert_eq!(events.len(), 3);
         assert!(matches!(
             events.first(),
             Some(ThreadEvent::Started { pid }) if *pid > 0
         ));
+        let exit = events
+            .iter()
+            .position(|event| matches!(event, ThreadEvent::Exited { .. }))
+            .expect("exited event");
+        assert!(events[..exit]
+            .iter()
+            .any(|event| matches!(event, ThreadEvent::Output { stderr: false, bytes } if bytes == b"stdout\n")));
+        assert!(events[..exit]
+            .iter()
+            .any(|event| matches!(event, ThreadEvent::Output { stderr: true, bytes } if bytes == b"stderr\n")));
         assert_eq!(
-            events.get(1),
+            events.get(exit),
             Some(&ThreadEvent::Exited {
                 status: ExitStatus::Code(0)
             })

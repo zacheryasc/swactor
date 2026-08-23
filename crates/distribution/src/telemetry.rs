@@ -86,6 +86,26 @@ pub struct SwimProbeEvent {
     pub lifeguard_enabled: bool,
 }
 
+/// One-second aggregate of routine SWIM sent/acked traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwimProbeSummary {
+    pub event: String,
+    pub interval_ms: u64,
+    pub sent: u64,
+    pub acked: u64,
+    pub direct_sent: u64,
+    pub indirect_sent: u64,
+    pub rtt_samples: u64,
+    pub rtt_ms_min: Option<u32>,
+    pub rtt_ms_p50: Option<u32>,
+    pub rtt_ms_p95: Option<u32>,
+    pub rtt_ms_max: Option<u32>,
+    #[serde(default)]
+    pub local_phase: String,
+    #[serde(default)]
+    pub probe_interval_ms: u64,
+}
+
 /// Consolidated distribution-subsystem state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributionState {
@@ -140,6 +160,9 @@ impl Record for MembershipTransition {
     const CHANNEL: &'static str = MEMBERSHIP;
 }
 impl Record for SwimProbeEvent {
+    const CHANNEL: &'static str = SWIM_PROBES;
+}
+impl Record for SwimProbeSummary {
     const CHANNEL: &'static str = SWIM_PROBES;
 }
 impl Record for DistributionState {

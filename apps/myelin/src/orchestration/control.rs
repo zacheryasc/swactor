@@ -429,6 +429,7 @@ pub(crate) fn plugin(
     let routes = Router::new()
         .route(FLEET_CONTROL_SCRIPT_URL, get(fleet_control_script))
         .route("/api/control/status", get(status))
+        .route("/api/control/fleet", get(fleet_status))
         .route("/api/control/actors", get(actor_stats))
         .route("/api/control/provision", post(provision))
         .route("/api/control/kill", post(kill))
@@ -643,6 +644,37 @@ async fn status(State(state): State<ControlHttpState>) -> Response {
         ManualControlMsg::Query { reply_to }
     })
     .await
+}
+
+async fn fleet_status(State(state): State<ControlHttpState>) -> Response {
+    let response_rx = match begin_request_reply(&state, CONTROL_REPLY_TIMEOUT, |reply_to| {
+        ManualControlMsg::QueryFleet { reply_to }
+    }) {
+        Ok(response_rx) => response_rx,
+        Err(response) => return *response,
+    };
+    match response_rx.await {
+        Ok(ManualControlReply::FleetStatus(model)) => {
+            Json(ManualControlReply::FleetStatus(model)).into_response()
+        }
+        Ok(ManualControlReply::Rejected(error)) => {
+            (StatusCode::CONFLICT, Json(ErrorResponse { error })).into_response()
+        }
+        Ok(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "manual control returned an unexpected Fleet status reply".to_owned(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("control reply observer stopped: {error}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn actor_stats(State(state): State<ControlHttpState>) -> impl IntoResponse {

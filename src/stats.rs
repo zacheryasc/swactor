@@ -105,10 +105,40 @@ pub struct WorkerInfo {
     pub stops: u64,
 }
 
-/// Per-actor snapshot transferred from worker to runtime (not serialized).
+/// Why a worker is publishing a complete in-memory snapshot to its observer.
+///
+/// The reason lets observers emit sparse activity without losing immediate
+/// lifecycle changes or periodic recovery censuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshotKind {
+    pub activity: bool,
+    pub census: bool,
+}
+
+impl StatsSnapshotKind {
+    pub const VITAL: Self = Self {
+        activity: false,
+        census: false,
+    };
+    pub const ACTIVITY: Self = Self {
+        activity: true,
+        census: false,
+    };
+    pub const CENSUS: Self = Self {
+        activity: false,
+        census: true,
+    };
+    pub const ACTIVITY_AND_CENSUS: Self = Self {
+        activity: true,
+        census: true,
+    };
+}
+
+/// Snapshot of one actor transferred from worker to observer (not serialized).
 pub struct ActorSnapshot {
     pub address: ActorAddress,
     pub mailbox_depth: usize,
+    pub mailbox_max_depth: usize,
     pub last_msg_type: Option<&'static str>,
     pub actor_type: Option<&'static str>,
     pub message_type: Option<&'static str>,
@@ -118,16 +148,16 @@ pub struct ActorSnapshot {
     pub message_type_counts: Vec<(&'static str, u64)>,
 }
 
-/// Observer hook called by workers after productive ticks.
+/// Observer hook called with rate-limited, worker-owned actor snapshots.
 ///
-/// Implement this to collect per-actor snapshot data outside the runtime.
-/// The runtime itself stores nothing — snapshots are ephemeral and passed by reference.
+/// The runtime stores no observer state. Snapshots are ephemeral and borrowed;
+/// observers copy only what they retain.
 pub trait StatsHook: Send + Sync {
-    /// Called once per worker after a productive tick.
+    /// Called for immediate vital changes, activity sampling, periodic census,
+    /// or a combined activity/census deadline.
     ///
     /// `worker_id` is the index of the worker (0..num_workers).
-    /// `snapshots` borrows the worker's scratch buffer — copy what you need.
-    fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]);
+    fn on_snapshot(&self, worker_id: usize, snapshots: &[ActorSnapshot], kind: StatsSnapshotKind);
 }
 
 /// Per-actor runtime stats.

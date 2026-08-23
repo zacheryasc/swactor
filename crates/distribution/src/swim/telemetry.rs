@@ -62,6 +62,21 @@ pub struct ObservedProbeEvent {
     pub consecutive_timeouts: u32,
 }
 
+/// One-second aggregate of routine successful probe traffic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedProbeSummary {
+    pub interval_ms: u64,
+    pub sent: u64,
+    pub acked: u64,
+    pub direct_sent: u64,
+    pub indirect_sent: u64,
+    pub rtt_samples: u64,
+    pub rtt_ms_min: Option<u32>,
+    pub rtt_ms_p50: Option<u32>,
+    pub rtt_ms_p95: Option<u32>,
+    pub rtt_ms_max: Option<u32>,
+}
+
 /// Current probe state for one peer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeerProbeState {
@@ -85,6 +100,12 @@ struct Inner {
     probe_events: VecDeque<ObservedProbeEvent>,
     /// Transitions awaiting drain by the node's telemetry tick.
     transitions: VecDeque<ObservedTransition>,
+    summary_started: Option<Instant>,
+    summary_sent: u64,
+    summary_acked: u64,
+    summary_direct_sent: u64,
+    summary_indirect_sent: u64,
+    summary_rtts: Vec<u32>,
 }
 
 /// The installed SWIM observer plus the readouts the node consumes each tick.
@@ -147,6 +168,50 @@ impl SwimTelemetry {
             .collect()
     }
 
+    /// Drain one aggregate after at least one second. Routine sent/acked
+    /// observations never enter the immediate-event queue.
+    pub fn drain_probe_summary(&self) -> Option<ObservedProbeSummary> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("swim telemetry poisoned");
+        let started = inner.summary_started.get_or_insert(now);
+        let elapsed = now.duration_since(*started);
+        if elapsed < Duration::from_secs(1) {
+            return None;
+        }
+        inner.summary_started = Some(now);
+        if inner.summary_sent == 0 && inner.summary_acked == 0 {
+            return None;
+        }
+
+        inner.summary_rtts.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            if inner.summary_rtts.is_empty() {
+                None
+            } else {
+                let last = inner.summary_rtts.len() - 1;
+                Some(inner.summary_rtts[last * numerator / denominator])
+            }
+        };
+        let summary = ObservedProbeSummary {
+            interval_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+            sent: inner.summary_sent,
+            acked: inner.summary_acked,
+            direct_sent: inner.summary_direct_sent,
+            indirect_sent: inner.summary_indirect_sent,
+            rtt_samples: inner.summary_rtts.len() as u64,
+            rtt_ms_min: inner.summary_rtts.first().copied(),
+            rtt_ms_p50: percentile(1, 2),
+            rtt_ms_p95: percentile(95, 100),
+            rtt_ms_max: inner.summary_rtts.last().copied(),
+        };
+        inner.summary_sent = 0;
+        inner.summary_acked = 0;
+        inner.summary_direct_sent = 0;
+        inner.summary_indirect_sent = 0;
+        inner.summary_rtts.clear();
+        Some(summary)
+    }
+
     /// Snapshot the probe state for one peer without draining events.
     pub fn peer_probe_state(&self, peer: NodeId) -> PeerProbeState {
         let inner = self.inner.lock().expect("swim telemetry poisoned");
@@ -184,27 +249,23 @@ impl SwimTelemetry {
                     inner.targets.pop_front();
                 }
                 inner.targets.push_back(target);
-                let state = Self::peer_probe_state_locked(&inner, target);
-                Self::push_probe_event(
-                    &mut inner,
-                    ObservedProbeEvent {
-                        event: "sent",
-                        target,
-                        sequence,
-                        kind,
-                        rtt_ms: None,
-                        budget_ms: None,
-                        last_ack_age: state.last_ack_age,
-                        consecutive_timeouts: state.consecutive_timeouts,
-                    },
-                );
+                inner.summary_started.get_or_insert_with(Instant::now);
+                inner.summary_sent = inner.summary_sent.saturating_add(1);
+                match kind {
+                    "direct" => {
+                        inner.summary_direct_sent = inner.summary_direct_sent.saturating_add(1);
+                    }
+                    "indirect" => {
+                        inner.summary_indirect_sent = inner.summary_indirect_sent.saturating_add(1);
+                    }
+                    _ => {}
+                }
             }
             SwimObservation::ProbeAcked {
                 target,
                 sequence,
-                kind,
+                kind: _,
             } => {
-                let state = Self::peer_probe_state_locked(&inner, target);
                 let rtt_ms = inner
                     .in_flight
                     .remove(&(target, sequence))
@@ -217,19 +278,10 @@ impl SwimTelemetry {
                 }
                 inner.last_ack.insert(target, Instant::now());
                 inner.consecutive_timeouts.remove(&target);
-                Self::push_probe_event(
-                    &mut inner,
-                    ObservedProbeEvent {
-                        event: "acked",
-                        target,
-                        sequence,
-                        kind,
-                        rtt_ms,
-                        budget_ms: None,
-                        last_ack_age: state.last_ack_age,
-                        consecutive_timeouts: state.consecutive_timeouts,
-                    },
-                );
+                inner.summary_acked = inner.summary_acked.saturating_add(1);
+                if let Some(rtt) = rtt_ms {
+                    inner.summary_rtts.push(rtt);
+                }
             }
             SwimObservation::ProbeTimedOut {
                 target,

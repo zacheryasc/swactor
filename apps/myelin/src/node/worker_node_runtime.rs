@@ -58,7 +58,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime};
-use swactor::stats::{ActorSnapshot, StatsHook};
+use swactor::stats::{ActorSnapshot, StatsHook, StatsSnapshotKind};
 use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor_job_runner::{NodeJobActor, register_job_codecs};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -209,7 +209,7 @@ struct InspectableStatsHook {
 }
 
 impl StatsHook for InspectableStatsHook {
-    fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]) {
+    fn on_snapshot(&self, worker_id: usize, snapshots: &[ActorSnapshot], kind: StatsSnapshotKind) {
         self.inspector.latest.lock().insert(
             worker_id,
             snapshots
@@ -222,7 +222,7 @@ impl StatsHook for InspectableStatsHook {
                 })
                 .collect(),
         );
-        self.inner.on_tick(worker_id, snapshots);
+        self.inner.on_snapshot(worker_id, snapshots, kind);
     }
 }
 
@@ -599,6 +599,13 @@ impl SamplerHealthContext {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SamplerHealthState {
+    Waiting,
+    Ready,
+    Failed,
+}
+
 fn sampler_health_payload(
     context: SamplerHealthContext,
     sampler: &str,
@@ -681,18 +688,33 @@ fn submit_sampler_sample_health(
     producer: &TelemetryProducer,
     health_channel: ChannelId,
     context: SamplerHealthContext,
-    sampler: &str,
-    sample_channel: &str,
+    identity: (&str, &str),
     seq: u64,
     error: Option<&str>,
+    state: &Mutex<SamplerHealthState>,
 ) {
-    let (status, detail) = match error {
-        Some(error) => (
+    let (sampler, sample_channel) = identity;
+    let mut state = state.lock();
+    let (status, detail, next) = match (*state, error) {
+        (SamplerHealthState::Waiting, None) => (
+            "ready",
+            json!({"state":"sample_observed","sample_seq":seq}),
+            SamplerHealthState::Ready,
+        ),
+        (SamplerHealthState::Failed, None) => (
+            "recovered",
+            json!({"state":"sample_observed","sample_seq":seq}),
+            SamplerHealthState::Ready,
+        ),
+        (SamplerHealthState::Waiting | SamplerHealthState::Ready, Some(error)) => (
             "failed",
             json!({"state":"error","sample_seq":seq,"error":error}),
+            SamplerHealthState::Failed,
         ),
-        None => ("ready", json!({"state":"sample_observed","sample_seq":seq})),
+        (SamplerHealthState::Ready, None) | (SamplerHealthState::Failed, Some(_)) => return,
     };
+    *state = next;
+    drop(state);
     submit_sampler_health(
         producer,
         health_channel,
@@ -738,6 +760,7 @@ fn spawn_blocking_sampler_task<State, Sample>(
         error_of,
     } = config;
     let started_producer = producer.clone();
+    let health_state = Arc::new(Mutex::new(SamplerHealthState::Waiting));
     telemetry::hardware::spawn_blocking_sampler(
         engine,
         interval,
@@ -758,10 +781,10 @@ fn spawn_blocking_sampler_task<State, Sample>(
                 &producer,
                 health_channel,
                 health_context,
-                sampler,
-                sample_channel,
+                (sampler, sample_channel),
                 seq,
                 error_of(&sample),
+                &health_state,
             );
             producer.submit_record(channel, &sample);
         },
@@ -2001,6 +2024,7 @@ fn run() -> Result<(), String> {
             .spawn(
                 NodeJobActor::unbound(workdir, stack.runtime.create_sender())
                     .with_actor_timers(engine.handle())
+                    .with_process_telemetry(telemetry.producer.clone())
                     .with_route_registrar(job_route_registrar)
                     .with_data_plane(Arc::new(data_plane.clone())),
             )
@@ -2765,6 +2789,12 @@ fn emit_swim_telemetry(
     }
     for event in stack.drain_swim_probe_events() {
         let record = stack.swim_probe_event_record(event, local_phase);
+        telemetry
+            .producer
+            .submit_record(telemetry.channels.swim_probes, &record);
+    }
+    if let Some(summary) = stack.drain_swim_probe_summary() {
+        let record = stack.swim_probe_summary_record(summary, local_phase);
         telemetry
             .producer
             .submit_record(telemetry.channels.swim_probes, &record);
@@ -5378,6 +5408,104 @@ mod control_flow_properties {
 
     const DRIVE_PER_ACTION: usize = 16;
     const FINAL_DRIVE_BUDGET: usize = 256;
+    #[test]
+    fn sampler_health_emits_only_state_transitions() {
+        let endpoint = TelemetryEndpoint::with_descriptor(
+            StreamDescriptor {
+                stream: StreamId::new(NodeId::new("sampler-health-test"), Lifetime(1)),
+                label: None,
+                origin: StreamOrigin::RemoteNode,
+            },
+            16,
+            16,
+        );
+        let producer = endpoint.producer();
+        let health_channel = producer.register_channel(
+            NODE_SAMPLER_CHANNEL,
+            ChannelContent::JsonRecord {
+                schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
+            },
+        );
+        let subscription = endpoint.subscribe_all("sampler-health-transitions");
+        let context = SamplerHealthContext {
+            run_id: 1,
+            node_id: 2,
+            stage_index: 0,
+        };
+        let state = Mutex::new(SamplerHealthState::Waiting);
+
+        submit_sampler_started(
+            &producer,
+            health_channel,
+            context,
+            "cpu",
+            "host.cpu",
+            Duration::from_secs(1),
+        );
+        submit_sampler_sample_health(
+            &producer,
+            health_channel,
+            context,
+            ("cpu", "host.cpu"),
+            0,
+            None,
+            &state,
+        );
+        submit_sampler_sample_health(
+            &producer,
+            health_channel,
+            context,
+            ("cpu", "host.cpu"),
+            1,
+            None,
+            &state,
+        );
+        submit_sampler_sample_health(
+            &producer,
+            health_channel,
+            context,
+            ("cpu", "host.cpu"),
+            2,
+            Some("unavailable"),
+            &state,
+        );
+        submit_sampler_sample_health(
+            &producer,
+            health_channel,
+            context,
+            ("cpu", "host.cpu"),
+            3,
+            Some("still unavailable"),
+            &state,
+        );
+        submit_sampler_sample_health(
+            &producer,
+            health_channel,
+            context,
+            ("cpu", "host.cpu"),
+            4,
+            None,
+            &state,
+        );
+        endpoint.tick();
+
+        let statuses = subscription
+            .drain_available()
+            .into_iter()
+            .filter_map(|event| match event {
+                TelemetryEvent::Frame(delivery) if delivery.channel.channel == health_channel => {
+                    serde_json::from_slice::<Value>(&delivery.payload)
+                        .ok()
+                        .and_then(|value| value["status"].as_str().map(str::to_owned))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            ["started", "waiting", "ready", "failed", "recovered"]
+        );
+    }
 
     #[test]
     fn hardware_sampler_runs_as_engine_task_not_actor() {

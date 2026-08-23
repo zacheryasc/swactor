@@ -14,6 +14,7 @@ swactor = { path = "../..", features = ["serde"] }
 swactor-transport = { path = "../transport" }
 swactor-process = { path = "../process" }
 swactor-engine = { path = "../engine" }
+telemetry = { path = "../telemetry" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"

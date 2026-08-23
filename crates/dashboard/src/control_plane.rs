@@ -13,7 +13,7 @@
 //! [`STALE_POOL_CAP`]. A newer `life` generation for the same node evicts
 //! older generations immediately — restarts stop accumulating.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -37,6 +37,9 @@ const STALE_POOL_CAP: usize = 50;
 /// Stream origin of the process hosting this dashboard. Its card can never
 /// go meaningfully stale: if that publisher were silent, no page would render.
 const ORIGIN_ORCHESTRATOR: &str = "orchestrator";
+const OUTPUT_TAIL_CAP: usize = 50;
+const PROVISIONING_EVENTS: &str = "myelin.provisioning.events";
+const PROVISIONING_LOG_PREFIX: &str = "myelin.provisioning.logs.node.";
 
 /// Fused control-plane view serving `/` and `/view/fleet`.
 #[derive(Default)]
@@ -54,6 +57,7 @@ struct FusedNode {
     last_seen: Instant,
     hardware: NodeHardwareState,
     actors: RuntimeState,
+    output: NodeOutputState,
     origin: Option<String>,
     label: Option<String>,
 }
@@ -61,6 +65,76 @@ struct FusedNode {
 impl FusedNode {
     fn is_orchestrator(&self) -> bool {
         self.origin.as_deref() == Some(ORIGIN_ORCHESTRATOR)
+    }
+}
+
+#[derive(Default)]
+struct NodeOutputState {
+    lines: VecDeque<NodeOutputLine>,
+    phase: Option<String>,
+    partials: BTreeMap<(String, String), String>,
+    last_output: Option<Instant>,
+}
+
+#[derive(Clone, Serialize)]
+struct NodeOutputLine {
+    source: String,
+    phase: String,
+    text: String,
+}
+
+impl NodeOutputState {
+    fn set_phase(&mut self, phase: impl Into<String>) {
+        self.phase = Some(phase.into());
+    }
+
+    fn push_line(&mut self, source: &str, phase: &str, text: impl Into<String>, now: Instant) {
+        if self.lines.len() == OUTPUT_TAIL_CAP {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(NodeOutputLine {
+            source: source.to_owned(),
+            phase: phase.to_owned(),
+            text: text.into(),
+        });
+        self.phase = Some(phase.to_owned());
+        self.last_output = Some(now);
+    }
+
+    fn push_chunk(&mut self, source: &str, phase: &str, payload: &[u8], now: Instant) {
+        let key = (source.to_owned(), phase.to_owned());
+        let mut buffered = self.partials.remove(&key).unwrap_or_default();
+        buffered.push_str(&String::from_utf8_lossy(payload));
+        while let Some(newline) = buffered.find('\n') {
+            let mut line = buffered.drain(..=newline).collect::<String>();
+            line.truncate(line.trim_end_matches(['\r', '\n']).len());
+            self.push_line(source, phase, line, now);
+        }
+        if !buffered.is_empty() {
+            self.partials.insert(key, buffered);
+        }
+        if !payload.is_empty() {
+            self.phase = Some(phase.to_owned());
+            self.last_output = Some(now);
+        }
+    }
+
+    fn snapshot_lines(&self) -> Vec<NodeOutputLine> {
+        let mut lines = self.lines.iter().cloned().collect::<Vec<_>>();
+        lines.extend(
+            self.partials
+                .iter()
+                .filter(|(_, text)| !text.is_empty())
+                .map(|((source, phase), text)| NodeOutputLine {
+                    source: source.clone(),
+                    phase: phase.clone(),
+                    text: text.clone(),
+                }),
+        );
+        if lines.len() > OUTPUT_TAIL_CAP {
+            lines.drain(..lines.len() - OUTPUT_TAIL_CAP);
+        }
+        lines
     }
 }
 
@@ -86,25 +160,35 @@ impl DashboardView for ControlPlaneView {
     fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
         let now = Instant::now();
         let mut state = self.state.write();
-        let key = stream_key(&event.stream);
-        let node = state.streams.entry(key).or_insert_with(|| FusedNode {
-            stream: event.stream.clone(),
-            last_seen: now,
-            hardware: NodeHardwareState::new(now),
-            actors: RuntimeState::new(now),
-            origin: event.stream.origin.clone(),
-            label: event.stream.label.clone(),
-        });
-        node.last_seen = now;
-        // Later events may carry descriptor metadata the first lacked.
-        if let Some(origin) = &event.stream.origin {
-            node.origin = Some(origin.clone());
+
+        if let Some(routed) = provisioning_output(event) {
+            {
+                let pending = ensure_node(&mut state.streams, &routed.stream, now);
+                pending.last_seen = now;
+                pending.output.set_phase(&routed.phase);
+                if let (Some(source), Some(text)) = (routed.source, routed.text) {
+                    pending.output.push_line(&source, &routed.phase, text, now);
+                }
+            }
+            prune(&mut state.streams, &routed.stream, now);
         }
-        if let Some(label) = &event.stream.label {
-            node.label = Some(label.clone());
+
+        {
+            let node = ensure_node(&mut state.streams, &event.stream, now);
+            node.last_seen = now;
+            // Later events may carry descriptor metadata the first lacked.
+            if let Some(origin) = &event.stream.origin {
+                node.origin = Some(origin.clone());
+            }
+            if let Some(label) = &event.stream.label {
+                node.label = Some(label.clone());
+            }
+            node.hardware.update(&event.channel, &event.payload, now);
+            node.actors.update(&event.channel, &event.payload, now);
+            if let Some((source, phase)) = process_output_channel(&event.channel) {
+                node.output.push_chunk(source, &phase, &event.payload, now);
+            }
         }
-        node.hardware.update(&event.channel, &event.payload, now);
-        node.actors.update(&event.channel, &event.payload, now);
         prune(&mut state.streams, &event.stream, now);
     }
 
@@ -185,6 +269,96 @@ impl DashboardView for ControlPlaneView {
     }
 }
 
+struct RoutedProvisionOutput {
+    stream: StreamEvent,
+    phase: String,
+    source: Option<String>,
+    text: Option<String>,
+}
+
+fn ensure_node<'a>(
+    streams: &'a mut BTreeMap<String, FusedNode>,
+    stream: &StreamEvent,
+    now: Instant,
+) -> &'a mut FusedNode {
+    streams
+        .entry(stream_key(stream))
+        .or_insert_with(|| FusedNode {
+            stream: stream.clone(),
+            last_seen: now,
+            hardware: NodeHardwareState::new(now),
+            actors: RuntimeState::new(now),
+            output: NodeOutputState::default(),
+            origin: stream.origin.clone(),
+            label: stream.label.clone(),
+        })
+}
+
+fn provisioning_output(event: &FrameEvent) -> Option<RoutedProvisionOutput> {
+    let value = serde_json::from_slice::<Value>(&event.payload).ok()?;
+    let (run_id, node_id, phase, source, text) = if event.channel == PROVISIONING_EVENTS {
+        let event = value.get("event")?;
+        let kind = event.get("kind").and_then(Value::as_str)?;
+        let phase = match kind {
+            "ProvisionStart" => "provisioning",
+            "NodeLive" => "joining",
+            "ProvisionFailed" => "failed",
+            "NodeStopped" => "stopped",
+            _ => "provisioning",
+        };
+        (
+            event.get("run_id").and_then(Value::as_u64)?,
+            event.get("node_id").and_then(Value::as_u64)?,
+            phase.to_owned(),
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|_| "provider".to_owned()),
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+    } else if event.channel.starts_with(PROVISIONING_LOG_PREFIX) {
+        let line = value.get("line")?;
+        let source = line
+            .get("stream")
+            .and_then(Value::as_str)
+            .unwrap_or("Provider")
+            .to_ascii_lowercase();
+        (
+            line.get("run_id").and_then(Value::as_u64)?,
+            line.get("node_id").and_then(Value::as_u64)?,
+            "provisioning".to_owned(),
+            Some(source),
+            line.get("line").and_then(Value::as_str).map(str::to_owned),
+        )
+    } else {
+        return None;
+    };
+    Some(RoutedProvisionOutput {
+        stream: StreamEvent {
+            node: node_id.to_string(),
+            life: run_id,
+            origin: Some("bootstrap".to_owned()),
+            label: Some("pending node".to_owned()),
+        },
+        phase,
+        source,
+        text,
+    })
+}
+
+fn process_output_channel(channel: &str) -> Option<(&'static str, String)> {
+    let label = channel.strip_prefix("proc.")?;
+    if let Some(phase) = label.strip_suffix(".stdout") {
+        return Some(("stdout", phase.to_owned()));
+    }
+    label
+        .strip_suffix(".stderr")
+        .map(|phase| ("stderr", phase.to_owned()))
+}
+
 /// Evict superseded life generations and enforce the stale-pool cap.
 fn prune(streams: &mut BTreeMap<String, FusedNode>, fresh: &StreamEvent, now: Instant) {
     // A newer life generation for the same node replaces older ones: the old
@@ -241,6 +415,7 @@ struct NodeCard {
     storage: Option<telemetry::hardware::storage::HostStorageSample>,
     process: Option<crate::hardware_view::ProcessSnapshot>,
     history: Vec<HardwareHistorySnapshot>,
+    output: NodeOutputSnapshot,
     actor_summary: ActorSummarySnapshot,
     /// Aggregate-only roster rows; heavy per-actor detail lives behind the
     /// detail endpoint so snapshot payload stays independent of ring sizes.
@@ -269,6 +444,13 @@ struct ActorSummarySnapshot {
 }
 
 #[derive(Serialize)]
+struct NodeOutputSnapshot {
+    phase: Option<String>,
+    last_output_ms_ago: Option<u64>,
+    lines: Vec<NodeOutputLine>,
+}
+
+#[derive(Serialize)]
 struct RosterRow {
     address: String,
     name: Option<String>,
@@ -281,6 +463,7 @@ struct RosterRow {
     worker_id: Option<u32>,
     poisoned: bool,
     last_msg_type: Option<String>,
+    last_active_ms_ago: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -300,6 +483,7 @@ struct ActorDetail {
     last_msg_type: Option<String>,
     message_type_counts: Vec<MessageTypeCountSnapshot>,
     history: Vec<ActorHistoryPoint>,
+    last_active_ms_ago: Option<u64>,
     receipts: Vec<ReceiptSnapshot>,
     sampled_out: u64,
 }
@@ -330,10 +514,15 @@ fn stream_key(stream: &StreamEvent) -> String {
 
 fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
     let summary = node.hardware.summary();
-    let totals = node.actors.totals();
+    let totals = node.actors.totals_at(now);
     // Address-keyed map order is the stable default. Volatile telemetry must
     // not move a row out from under the pointer; the page offers explicit sorts.
-    let roster: Vec<RosterRow> = node.actors.actors.values().map(roster_row).collect();
+    let roster: Vec<RosterRow> = node
+        .actors
+        .actors
+        .values()
+        .map(|actor| roster_row(actor, now))
+        .collect();
     NodeCard {
         stream: StreamKeySnapshot {
             key: stream_key(&node.stream),
@@ -372,6 +561,14 @@ fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
                 io_pressure_some_avg10: sample.io_pressure_some_avg10,
             })
             .collect(),
+        output: NodeOutputSnapshot {
+            phase: node.output.phase.clone(),
+            last_output_ms_ago: node
+                .output
+                .last_output
+                .map(|last| duration_ms(now.duration_since(last))),
+            lines: node.output.snapshot_lines(),
+        },
         actor_summary: ActorSummarySnapshot {
             actors: totals.actors,
             msg_per_sec: totals.msg_per_sec,
@@ -384,7 +581,7 @@ fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
     }
 }
 
-fn roster_row(actor: &ActorState) -> RosterRow {
+fn roster_row(actor: &ActorState, now: Instant) -> RosterRow {
     RosterRow {
         address: actor.address.clone(),
         name: actor.name.clone(),
@@ -397,9 +594,12 @@ fn roster_row(actor: &ActorState) -> RosterRow {
         },
         mailbox_depth: actor.mailbox_depth,
         messages_processed: actor.messages_processed,
-        msg_per_sec: actor.msg_per_sec,
+        msg_per_sec: actor.rate_at(now),
         worker_id: actor.worker_id,
         poisoned: actor.poisoned,
+        last_active_ms_ago: actor
+            .last_active
+            .map(|last| duration_ms(now.duration_since(last))),
         last_msg_type: actor.last_msg_type.clone(),
     }
 }
@@ -434,8 +634,11 @@ fn actor_detail(
         mailbox_depth: actor.mailbox_depth,
         mailbox_growth: actor.mailbox_growth,
         messages_processed: actor.messages_processed,
-        msg_per_sec: actor.msg_per_sec,
+        msg_per_sec: actor.rate_at(now),
         last_msg_type: actor.last_msg_type.clone(),
+        last_active_ms_ago: actor
+            .last_active
+            .map(|last| duration_ms(now.duration_since(last))),
         message_type_counts: actor
             .message_type_counts
             .iter()
@@ -557,6 +760,73 @@ mod tests {
         let card = &snapshot["live"][0]["stream"];
         assert_eq!(card["origin"], json!("orchestrator"));
         assert_eq!(card["label"], json!("provisioning supervisor"));
+    }
+
+    #[test]
+    fn provisioning_tail_merges_into_joined_node_card() {
+        let view = ControlPlaneView::default();
+        let orchestrator = StreamId::new(NodeId::new("orchestrator"), Lifetime(42));
+        ingest_json(
+            &view,
+            &orchestrator,
+            0,
+            PROVISIONING_EVENTS,
+            serde_json::to_vec(&json!({
+                "event": {
+                    "run_id": 42,
+                    "node_id": 7,
+                    "kind": "ProvisionStart",
+                    "message": "leasing GPU"
+                }
+            }))
+            .unwrap(),
+        );
+        let pending = view.snapshot_json();
+        let pending_card = pending["live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["stream"]["node"] == "7")
+            .expect("pending card");
+        assert_eq!(pending_card["stream"]["origin"], "bootstrap");
+        assert_eq!(pending_card["output"]["phase"], "provisioning");
+
+        ingest_json(
+            &view,
+            &orchestrator,
+            1,
+            "myelin.provisioning.logs.node.7.stdout",
+            serde_json::to_vec(&json!({
+                "line": {
+                    "run_id": 42,
+                    "node_id": 7,
+                    "stream": "Stdout",
+                    "line": "runtime starting"
+                }
+            }))
+            .unwrap(),
+        );
+        let remote = StreamId::new(NodeId::new("7"), Lifetime(42));
+        ingest_json(
+            &view,
+            &remote,
+            2,
+            "proc.job-runner-run.stdout",
+            b"job output\n".to_vec(),
+        );
+
+        let joined = view.snapshot_json();
+        let cards = joined["live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|card| card["stream"]["node"] == "7")
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1, "join keeps one visual identity");
+        assert_eq!(cards[0]["output"]["phase"], "job-runner-run");
+        assert_eq!(cards[0]["output"]["lines"].as_array().unwrap().len(), 3);
+        assert_eq!(cards[0]["output"]["lines"][2]["source"], "stdout");
+        assert_eq!(cards[0]["output"]["lines"][2]["text"], "job output");
     }
 
     fn actors_payload(worker: u32, actors: serde_json::Value) -> Vec<u8> {

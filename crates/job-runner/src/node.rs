@@ -81,6 +81,7 @@ pub struct NodeJobActor {
     output_sink: Option<SharedJobEdgeSink>,
     data_plane: Option<Arc<dyn JobDataPlanePort>>,
     route_registrar: Option<Arc<dyn JobRouteRegistrar>>,
+    process_telemetry: Option<telemetry::TelemetryProducer>,
     data_plane_env: BTreeMap<String, String>,
     data_plane_error: Option<String>,
     data_plane_pending: bool,
@@ -117,6 +118,7 @@ impl NodeJobActor {
             output_sink: None,
             data_plane: None,
             route_registrar: None,
+            process_telemetry: None,
             data_plane_env: BTreeMap::new(),
             data_plane_error: None,
             data_plane_pending: false,
@@ -140,6 +142,11 @@ impl NodeJobActor {
 
     pub fn with_route_registrar(mut self, registrar: Arc<dyn JobRouteRegistrar>) -> Self {
         self.route_registrar = Some(registrar);
+        self
+    }
+
+    pub fn with_process_telemetry(mut self, producer: telemetry::TelemetryProducer) -> Self {
+        self.process_telemetry = Some(producer);
         self
     }
 
@@ -246,12 +253,11 @@ impl NodeJobActor {
             working_dir: Some(self.workdir.clone()),
             label: Some(format!("job-runner-{:?}", phase).to_lowercase()),
         };
-        if let Err(e) = spawn_local_process(
-            ctx,
-            &self.sender,
-            spec,
-            ProcessOutputConfig::disabled(relay),
-        ) {
+        let output = self.process_telemetry.clone().map_or_else(
+            || ProcessOutputConfig::disabled(relay),
+            |producer| ProcessOutputConfig::telemetry_mirror(relay, producer),
+        );
+        if let Err(e) = spawn_local_process(ctx, &self.sender, spec, output) {
             self.emit(
                 ctx,
                 NodeJobEvent::NodeFault {

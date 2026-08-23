@@ -167,6 +167,16 @@ impl ProcessActor {
                     self.state = ProcessActorState::Done(ProcessDoneState::Exited(status));
                 }
             }
+            ThreadEvent::Output { stderr, bytes } => {
+                self.emit_process_output(
+                    ctx,
+                    if stderr {
+                        ProcessOutput::Stderr(bytes)
+                    } else {
+                        ProcessOutput::Stdout(bytes)
+                    },
+                );
+            }
             ThreadEvent::Error { error } => {
                 if !matches!(self.state, ProcessActorState::Done(_)) {
                     self.emit_process_output(

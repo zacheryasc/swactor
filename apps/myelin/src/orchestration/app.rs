@@ -2354,6 +2354,7 @@ fn serve_cluster_flush_reply(reply: ManualControlReply) -> Option<ServeClusterMs
         ManualControlReply::Accepted(_)
         | ManualControlReply::Provider(_)
         | ManualControlReply::Status(_)
+        | ManualControlReply::FleetStatus(_)
         | ManualControlReply::Offers(_)
         | ManualControlReply::Rejoined(_) => None,
     }
@@ -2786,6 +2787,10 @@ fn emit_swim_probe_events(
 ) {
     for event in stack.drain_swim_probe_events() {
         let record = stack.swim_probe_event_record(event, local_phase);
+        orch_telemetry.emit_record(dashboard, &record);
+    }
+    if let Some(summary) = stack.drain_swim_probe_summary() {
+        let record = stack.swim_probe_summary_record(summary, local_phase);
         orch_telemetry.emit_record(dashboard, &record);
     }
 }

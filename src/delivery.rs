@@ -2,7 +2,7 @@ use crate::Error;
 use crate::actor::{ActorAddress, Message, SpawnRequest};
 use crate::channel::{AsyncSender, Sender};
 use crate::config::RuntimeConfig;
-use crate::stats::{StatsHook, WorkerStats};
+use crate::stats::WorkerStats;
 use parking_lot::RwLock;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -209,7 +209,6 @@ pub(crate) struct TickContext<'a> {
     pub(crate) extension: Option<&'a dyn crate::extension::RuntimeExtension>,
     pub(crate) process_output_observer:
         Option<&'a Arc<dyn crate::process_observer::ProcessOutputObserver>>,
-    pub(crate) stats_hook: Option<&'a dyn StatsHook>,
     pub(crate) worker_stats: &'a WorkerStats,
     pub(crate) num_workers: usize,
     pub(crate) worker_id: WorkerId,
