@@ -115,6 +115,13 @@ fn namespace_mutations_are_linearizable_and_durable() {
             .await
             .expect("register first source");
         assert_eq!(registered.revision, 1);
+        let node = directory
+            .client
+            .lookup(logical.clone())
+            .await
+            .expect("lookup first blob node");
+        assert_eq!(node.kind, EntryKind::Blob);
+        assert_eq!(node.revision, registered.revision);
 
         let selected_first = directory
             .client
@@ -186,6 +193,12 @@ fn stream_rendezvous_is_symmetric_and_incarnations_are_isolated() {
             OperationId::from_u128(10),
         ));
         assert!(future::poll_once(source_open.as_mut()).await.is_none());
+        let node = directory
+            .client
+            .lookup(logical.clone())
+            .await
+            .expect("lookup ensured stream node");
+        assert_eq!(node.kind, EntryKind::Stream);
 
         let sink_match = directory
             .client
@@ -592,7 +605,7 @@ struct ModelBinding {
 #[derive(Clone, Debug)]
 enum TypedModelEntry {
     Blob(ModelBinding),
-    Stream(data_plane::namespace::StreamMatch),
+    Stream(Option<data_plane::namespace::StreamMatch>),
 }
 
 proptest! {
@@ -714,15 +727,16 @@ proptest! {
                     next_operation += 1;
                     let source_match = future::block_on(source_open).expect("source match");
                     prop_assert_eq!(&source_match, &sink_match);
-                    model.insert(logical, TypedModelEntry::Stream(sink_match));
+                    model.insert(logical, TypedModelEntry::Stream(Some(sink_match)));
                 }
                 2 => {
-                    if let Some(TypedModelEntry::Stream(binding)) = model.get(&logical) {
+                    if let Some(TypedModelEntry::Stream(binding)) = model.get_mut(&logical)
+                        && let Some(binding) = binding.take()
+                    {
                         future::block_on(directory.client.close_stream(
                             logical.clone(),
                             binding.incarnation,
                         )).expect("close current stream");
-                        model.remove(&logical);
                     }
                 }
                 _ => {

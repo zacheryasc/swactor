@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import json
 import os
 import struct
@@ -150,7 +151,8 @@ def test_run_attaches_before_main_and_maps_blob_buffer_directly(monkeypatch, hos
                 _PY_RELEASE_BUFFER(ctypes.byref(exported))
 
         public = {name for name in dir(ctx.data) if not name.startswith("_")}
-        assert {"read_blob", "write_blob", "read_stream", "write_stream"} <= public
+        assert {"open", "read_blob", "write_blob", "read_stream", "write_stream"} <= public
+        assert isinstance(swactor.O_RDONLY, int)
         assert not public & {
             "actor",
             "actor_id",
@@ -201,6 +203,54 @@ def test_write_blob_seals_cleanly_and_exception_aborts(monkeypatch, host):
 
     swactor.run(main)
 
+def test_raw_descriptor_blob_io_mapping_and_errno(monkeypatch, host):
+    install_host_env(monkeypatch, host)
+
+    async def main(ctx):
+        logical = "/runs/self/results/raw-python"
+        writer = await ctx.data.open(
+            logical,
+            swactor.O_WRONLY | swactor.O_CREAT | swactor.O_TRUNC,
+            length=8,
+        )
+        assert isinstance(writer, swactor.Descriptor)
+        assert writer.kind == "blob"
+        assert await writer.write(b"abc") == 3
+        assert await writer.writefrom(b"defgh") == 5
+        await writer.close()
+        with pytest.raises(OSError) as closed:
+            await writer.close()
+        assert closed.value.errno == errno.EBADF
+
+        reader = await ctx.data.open(logical, swactor.O_RDONLY)
+        destination = bytearray(b"\xa5" * 10)
+        assert await reader.readinto(memoryview(destination)[1:7]) == 6
+        assert destination == b"\xa5abcdef\xa5\xa5\xa5"
+        assert await reader.read(8) == b"gh"
+        assert await reader.read(8) == b""
+        with pytest.raises(OSError) as wrong_access:
+            await reader.write(b"x")
+        assert wrong_access.value.errno == errno.EBADF
+
+        mapping = await reader.map(length=8)
+        assert isinstance(mapping, swactor.DescriptorMapping)
+        exported = memoryview(mapping)
+        assert exported.readonly
+        await reader.close()
+        assert bytes(exported) == b"abcdefgh"
+        with pytest.raises(BufferError, match="active buffer exports"):
+            mapping.close()
+        exported.release()
+        mapping.close()
+
+        with pytest.raises(FileNotFoundError):
+            await ctx.data.open("/models/raw-missing", swactor.O_RDONLY)
+        with pytest.raises(OSError) as unsupported:
+            await ctx.data.open(logical, swactor.O_RDONLY | swactor.O_NONBLOCK)
+        assert unsupported.value.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}
+
+    swactor.run(main)
+
 
 def test_missing_path_and_authorization_are_typed(monkeypatch, host):
     install_host_env(monkeypatch, host)
@@ -217,14 +267,16 @@ def test_missing_path_and_authorization_are_typed(monkeypatch, host):
 def test_native_stream_round_trip_has_ordered_eof(monkeypatch, host):
     install_host_env(monkeypatch, host)
     received = []
+    raw_received = []
 
     async def main(ctx):
         async def receive():
             reader = await ctx.data.read_stream(
                 "/runs/self/results/predictions"
             )
-            while (chunk := await reader.read()) is not None:
-                received.append(chunk)
+            buffer = bytearray(3)
+            while (count := await reader.readinto(buffer)) != 0:
+                received.append(bytes(buffer[:count]))
 
         receiver = asyncio.create_task(receive())
         async with ctx.data.write_stream(
@@ -234,8 +286,20 @@ def test_native_stream_round_trip_has_ordered_eof(monkeypatch, host):
             await stream.write(b"result")
         await receiver
 
+        raw_reader, raw_writer = await asyncio.gather(
+            ctx.data.open("/runs/self/results/predictions", swactor.O_RDONLY),
+            ctx.data.open("/runs/self/results/predictions", swactor.O_WRONLY),
+        )
+        assert await raw_writer.write(b"raw-stream") == len(b"raw-stream")
+        await raw_writer.close()
+        buffer = bytearray(4)
+        while (count := await raw_reader.readinto(buffer)) != 0:
+            raw_received.append(bytes(buffer[:count]))
+        await raw_reader.close()
+
     swactor.run(main)
     assert b"".join(received) == b"native-result"
+    assert b"".join(raw_received) == b"raw-stream"
     assert "SWACTOR_DATA_PLANE_OUTPUT" not in host.env()
 
 

@@ -557,3 +557,73 @@ fn writable_record_is_invisible_until_commit() {
         .collect();
     assert_eq!(observed, (0..17).collect::<Vec<_>>());
 }
+
+#[test]
+fn partial_record_cursor_keeps_capacity_pinned_until_full_release() {
+    let (arena, handle) = installed(32, 1);
+    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+    producer
+        .send_record(RecordKind::Data, b"abcdefgh")
+        .expect("record");
+
+    let cursor = consumer
+        .record_cursor()
+        .expect("cursor")
+        .expect("record visible");
+    let mut first = [0xa5; 5];
+    assert_eq!(
+        consumer
+            .copy_record_range(cursor, 0, &mut first[..3])
+            .expect("partial prefix"),
+        3
+    );
+    assert_eq!(&first, b"abc\xa5\xa5");
+    assert!(matches!(
+        producer.reserve(20),
+        Err(FlowError::InsufficientSpace { .. })
+    ));
+
+    let mut rest = [0_u8; 8];
+    assert_eq!(
+        consumer
+            .copy_record_range(cursor, 3, &mut rest)
+            .expect("partial suffix"),
+        5
+    );
+    assert_eq!(&rest[..5], b"defgh");
+    consumer
+        .release_record_cursor(cursor)
+        .expect("release complete record");
+    assert!(producer.reserve(20).is_ok());
+}
+
+#[test]
+fn partial_record_cursor_hides_payload_wraparound() {
+    let (arena, handle) = installed(32, 1);
+    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+    producer
+        .send_record(RecordKind::Data, &[1; 18])
+        .expect("advance cursor");
+    consumer.recv_record().expect("consume advance");
+    producer
+        .send_record(RecordKind::Data, b"0123456789abcde")
+        .expect("wrapped record");
+
+    let cursor = consumer
+        .record_cursor()
+        .expect("cursor")
+        .expect("wrapped record visible");
+    let mut observed = [0_u8; 15];
+    assert_eq!(
+        consumer
+            .copy_record_range(cursor, 0, &mut observed)
+            .expect("copy wrapped payload"),
+        observed.len()
+    );
+    assert_eq!(&observed, b"0123456789abcde");
+    consumer
+        .release_record_cursor(cursor)
+        .expect("release wrapped record");
+}

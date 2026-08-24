@@ -108,6 +108,8 @@ pub struct NamespaceSnapshot {
     pub authority_epoch: u64,
     pub next_revision: u64,
     pub bindings: BTreeMap<DataPath, PersistedBinding>,
+    #[serde(default)]
+    pub stream_nodes: BTreeMap<DataPath, u64>,
     pub operations: BTreeMap<OperationId, PersistedOperation>,
     #[serde(default)]
     pub retirements: Vec<ActorAddress>,
@@ -121,6 +123,7 @@ impl Default for NamespaceSnapshot {
             next_revision: 1,
             bindings: BTreeMap::new(),
             operations: BTreeMap::new(),
+            stream_nodes: BTreeMap::new(),
             retirements: Vec::new(),
         }
     }
@@ -143,6 +146,10 @@ impl NamespaceSnapshot {
             .bindings
             .values()
             .any(|binding| binding.revision == 0 || binding.revision >= self.next_revision)
+            || self
+                .stream_nodes
+                .values()
+                .any(|revision| *revision == 0 || *revision >= self.next_revision)
         {
             return Err(NamespaceStoreError::Corrupt(
                 "binding revision is outside the committed revision range".to_owned(),

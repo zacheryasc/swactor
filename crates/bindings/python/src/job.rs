@@ -9,11 +9,13 @@ use std::time::Duration;
 use data_plane::blob::{Blob, BlobView, ContentDigest, WritableArenaView};
 use data_plane::bootstrap as dp_bootstrap;
 use data_plane::data_plane::{
-    BlobWriter, DataPlane, DataPlaneBootstrap, StreamReader, StreamWriter, parse_actor_address,
+    BlobWriter, DataPlane, DataPlaneBootstrap, Descriptor, DescriptorMapping, MapRequest,
+    MapTarget, Protection, Sharing, StreamReader, StreamWriter, parse_actor_address,
 };
 use data_plane::path::DataPath;
 use data_plane::protocol::{
-    BlobFailure, DataPlaneError, JobCapability, register_data_plane_codecs,
+    AccessMode, BlobAllocation, BlobFailure, DataPlaneError, DescriptorKind, Errno, JobCapability,
+    OpenOptions, register_data_plane_codecs,
 };
 use distribution::node::DistributedNodeConfig;
 use distribution::transport_bridge::{
@@ -23,7 +25,8 @@ use futures_lite::future;
 use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 use parking_lot::Mutex as ParkingMutex;
-use pyo3::exceptions::{PyBufferError, PyPermissionError, PyRuntimeError};
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyBufferError, PyOSError, PyPermissionError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyModule};
@@ -35,6 +38,44 @@ use swactor_transport::{CodecRegistry, CodecRemoteSink, TransportRouter};
 
 const ROUTE_POLL: Duration = Duration::from_millis(5);
 const ROUTE_DEADLINE: Duration = Duration::from_secs(5);
+
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+const O_ACCMODE: i32 = 3;
+const O_CREAT: i32 = 0o100;
+const O_EXCL: i32 = 0o200;
+const O_TRUNC: i32 = 0o1000;
+const O_NONBLOCK: i32 = 0o4000;
+const KNOWN_OPEN_FLAGS: i32 = O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_NONBLOCK;
+
+fn python_open_options(flags: i32, length: Option<u64>) -> PyResult<OpenOptions> {
+    if flags & !KNOWN_OPEN_FLAGS != 0 {
+        return Err(PyValueError::new_err(format!(
+            "unsupported descriptor open flags: {:#x}",
+            flags & !KNOWN_OPEN_FLAGS
+        )));
+    }
+    let access = match flags & O_ACCMODE {
+        O_RDONLY => AccessMode::ReadOnly,
+        O_WRONLY => AccessMode::WriteOnly,
+        O_RDWR => AccessMode::ReadWrite,
+        _ => return Err(PyValueError::new_err("invalid descriptor access mode")),
+    };
+    let options = OpenOptions {
+        access,
+        create: flags & O_CREAT != 0,
+        exclusive: flags & O_EXCL != 0,
+        truncate: flags & O_TRUNC != 0,
+        nonblocking: flags & O_NONBLOCK != 0,
+        allocation: length.map(|length| BlobAllocation {
+            length,
+            digest: None,
+        }),
+    };
+    options.validate().map_err(raw_data_plane_error)?;
+    Ok(options)
+}
 
 pyo3::create_exception!(swactor, SwactorError, pyo3::exceptions::PyException);
 pyo3::create_exception!(swactor, BootstrapError, SwactorError);
@@ -50,8 +91,8 @@ fn bootstrap_error(message: impl Into<String>) -> PyErr {
 fn data_plane_error(error: DataPlaneError) -> PyErr {
     match error {
         DataPlaneError::InvalidPath(reason) => PyErr::new::<DataPathError, _>(reason),
-        DataPlaneError::Unauthorized { path, operation } => {
-            PyPermissionError::new_err(format!("{operation:?} is not authorized for {path}"))
+        DataPlaneError::Unauthorized { path, access } => {
+            PyPermissionError::new_err(format!("{access:?} is not authorized for {path}"))
         }
         DataPlaneError::PathNotFound(path) => {
             PyErr::new::<DataPathError, _>(format!("data path not found: {path}"))
@@ -67,6 +108,29 @@ fn data_plane_error(error: DataPlaneError) -> PyErr {
         }
         other => PyErr::new::<SessionError, _>(other.to_string()),
     }
+}
+
+fn raw_data_plane_error(error: DataPlaneError) -> PyErr {
+    let code = match error.errno() {
+        Errno::Eacces => libc::EACCES,
+        Errno::Eagain => libc::EAGAIN,
+        Errno::Ebadf => libc::EBADF,
+        Errno::Ebusy => libc::EBUSY,
+        Errno::Ecanceled => libc::ECANCELED,
+        Errno::Econnreset => libc::ECONNRESET,
+        Errno::Eexist => libc::EEXIST,
+        Errno::Einval => libc::EINVAL,
+        Errno::Eio => libc::EIO,
+        Errno::Enodev => libc::ENODEV,
+        Errno::Enoent => libc::ENOENT,
+        Errno::Enomem => libc::ENOMEM,
+        Errno::Enospc => libc::ENOSPC,
+        Errno::Enotsup => libc::ENOTSUP,
+        Errno::Enxio => libc::ENXIO,
+        Errno::Epipe => libc::EPIPE,
+        Errno::Estale => libc::ESTALE,
+    };
+    PyOSError::new_err((code, error.to_string()))
 }
 
 fn bootstrap_env(name: &str) -> PyResult<String> {
@@ -239,6 +303,39 @@ pub struct PyDataPlane {
 
 #[pymethods]
 impl PyDataPlane {
+    #[pyo3(signature = (path, flags, *, length = None))]
+    fn open<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        flags: i32,
+        length: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = DataPath::parse(path).map_err(|error| {
+            raw_data_plane_error(DataPlaneError::InvalidPath(error.to_string()))
+        })?;
+        let options = python_open_options(flags, length)?;
+        let data_plane = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let descriptor = data_plane
+                .open(&path, options)
+                .await
+                .map_err(raw_data_plane_error)?;
+            let kind = descriptor.kind();
+            let capabilities = descriptor.capabilities().bits();
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    PyDescriptor {
+                        descriptor: Arc::new(tokio::sync::Mutex::new(descriptor)),
+                        kind,
+                        capabilities,
+                    },
+                )
+            })
+        })
+    }
+
     fn read_blob<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let data_plane = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -291,6 +388,258 @@ impl PyDataPlane {
             stream: Arc::new(tokio::sync::Mutex::new(None)),
             entered: Arc::new(AtomicBool::new(false)),
         })
+    }
+}
+
+fn byte_buffer(object: &Bound<'_, PyAny>, writable: bool) -> PyResult<PyBuffer<u8>> {
+    let buffer = PyBuffer::<u8>::get(object)?;
+    if writable && buffer.readonly() {
+        return Err(PyBufferError::new_err("buffer is read-only"));
+    }
+    if !buffer.is_c_contiguous() {
+        return Err(PyBufferError::new_err("buffer is not C-contiguous"));
+    }
+    Ok(buffer)
+}
+
+unsafe fn mutable_buffer_bytes<'a>(buffer: &'a PyBuffer<u8>) -> &'a mut [u8] {
+    // SAFETY: `byte_buffer` checked writability and contiguity, and the
+    // retained `PyBuffer` keeps the exporter and pointer valid.
+    unsafe { std::slice::from_raw_parts_mut(buffer.buf_ptr().cast(), buffer.len_bytes()) }
+}
+
+unsafe fn buffer_bytes<'a>(buffer: &'a PyBuffer<u8>) -> &'a [u8] {
+    // SAFETY: `byte_buffer` checked contiguity and retains the exporter.
+    unsafe { std::slice::from_raw_parts(buffer.buf_ptr().cast_const().cast(), buffer.len_bytes()) }
+}
+
+#[pyclass(name = "Descriptor")]
+pub struct PyDescriptor {
+    descriptor: Arc<tokio::sync::Mutex<Descriptor>>,
+    kind: DescriptorKind,
+    capabilities: u16,
+}
+
+#[pymethods]
+impl PyDescriptor {
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.kind {
+            DescriptorKind::Blob => "blob",
+            DescriptorKind::Stream => "stream",
+        }
+    }
+
+    #[getter]
+    fn capabilities(&self) -> u16 {
+        self.capabilities
+    }
+
+    fn read<'py>(&self, py: Python<'py>, size: usize) -> PyResult<Bound<'py, PyAny>> {
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut bytes = vec![0_u8; size];
+            let count = descriptor
+                .lock()
+                .await
+                .read(&mut bytes)
+                .await
+                .map_err(raw_data_plane_error)?;
+            bytes.truncate(count);
+            Python::with_gil(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    fn readinto<'py>(
+        &self,
+        py: Python<'py>,
+        buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let buffer = byte_buffer(buffer, true)?;
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // SAFETY: the owned `PyBuffer` remains alive through completion or
+            // cancellation and no pointer is retained by the Rust primitive.
+            let bytes = unsafe { mutable_buffer_bytes(&buffer) };
+            descriptor
+                .lock()
+                .await
+                .read(bytes)
+                .await
+                .map_err(raw_data_plane_error)
+        })
+    }
+
+    fn write<'py>(&self, py: Python<'py>, bytes: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            descriptor
+                .lock()
+                .await
+                .write(&bytes)
+                .await
+                .map_err(raw_data_plane_error)
+        })
+    }
+
+    fn writefrom<'py>(
+        &self,
+        py: Python<'py>,
+        buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let buffer = byte_buffer(buffer, false)?;
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // SAFETY: the owned `PyBuffer` retains a contiguous exporter until
+            // the descriptor primitive completes or is cancelled.
+            let bytes = unsafe { buffer_bytes(&buffer) };
+            descriptor
+                .lock()
+                .await
+                .write(bytes)
+                .await
+                .map_err(raw_data_plane_error)
+        })
+    }
+
+    #[pyo3(signature = (*, offset = 0, length, writable = false))]
+    fn map<'py>(
+        &self,
+        py: Python<'py>,
+        offset: u64,
+        length: u64,
+        writable: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mapping = descriptor
+                .lock()
+                .await
+                .map(MapRequest {
+                    protection: if writable {
+                        Protection::ReadWrite
+                    } else {
+                        Protection::Read
+                    },
+                    sharing: Sharing::Shared,
+                    target: MapTarget::Host,
+                    offset,
+                    length,
+                })
+                .map_err(raw_data_plane_error)?;
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    PyDescriptorMapping {
+                        inner: Some(mapping),
+                        exports: 0,
+                    },
+                )
+            })
+        })
+    }
+
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            descriptor
+                .lock()
+                .await
+                .close()
+                .await
+                .map_err(raw_data_plane_error)
+        })
+    }
+
+    fn abort<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let descriptor = self.descriptor.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            descriptor
+                .lock()
+                .await
+                .abort()
+                .await
+                .map_err(raw_data_plane_error)
+        })
+    }
+}
+
+#[pyclass(name = "DescriptorMapping")]
+pub struct PyDescriptorMapping {
+    inner: Option<DescriptorMapping>,
+    exports: usize,
+}
+
+#[pymethods]
+impl PyDescriptorMapping {
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if slf.inner.is_none() {
+            return Err(PyBufferError::new_err("descriptor mapping is closed"));
+        }
+        Ok(slf)
+    }
+
+    fn __exit__(
+        &mut self,
+        _exception_type: &Bound<'_, PyAny>,
+        _exception: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false)
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        if self.exports != 0 {
+            return Err(PyBufferError::new_err(
+                "cannot close a descriptor mapping with active buffer exports",
+            ));
+        }
+        self.inner.take();
+        Ok(())
+    }
+
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        let (pointer, length, readonly) = {
+            let mut borrowed = slf.borrow_mut();
+            let inner = borrowed
+                .inner
+                .as_mut()
+                .ok_or_else(|| PyBufferError::new_err("descriptor mapping is closed"))?;
+            match inner {
+                DescriptorMapping::ReadOnly(mapping) => {
+                    (mapping.as_ptr().cast_mut(), mapping.len(), true)
+                }
+                DescriptorMapping::WritableReadOnly(mapping) => {
+                    (mapping.as_ptr(), mapping.len(), true)
+                }
+                DescriptorMapping::Writable(mapping) => (mapping.as_ptr(), mapping.len(), false),
+            }
+        };
+        // SAFETY: the mapping owns the stable arena lease and the Python
+        // buffer retains `slf` until release.
+        unsafe {
+            fill_buffer(
+                view,
+                flags,
+                pointer,
+                length,
+                readonly,
+                slf.clone().into_any(),
+            )
+        }?;
+        slf.borrow_mut().exports += 1;
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&mut self, view: *mut ffi::Py_buffer) {
+        self.exports = self.exports.saturating_sub(1);
+        // SAFETY: `fill_buffer` allocated the format string for this export.
+        unsafe { release_buffer_format(view) };
     }
 }
 
@@ -649,6 +998,26 @@ impl PyStreamReader {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let bytes = reader.lock().await.read().await.map_err(data_plane_error)?;
             Python::with_gil(|py| Ok(bytes.map(|bytes| PyBytes::new(py, &bytes).unbind())))
+        })
+    }
+
+    fn readinto<'py>(
+        &self,
+        py: Python<'py>,
+        buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let buffer = byte_buffer(buffer, true)?;
+        let reader = self.reader.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // SAFETY: the owned `PyBuffer` retains the writable exporter for
+            // the complete async operation and cancellation path.
+            let bytes = unsafe { mutable_buffer_bytes(&buffer) };
+            reader
+                .lock()
+                .await
+                .read_into(bytes)
+                .await
+                .map_err(data_plane_error)
         })
     }
 }
@@ -1208,7 +1577,16 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("BlobError", module.py().get_type::<BlobError>())?;
     module.add("SessionError", module.py().get_type::<SessionError>())?;
     module.add("StreamError", module.py().get_type::<StreamError>())?;
+    module.add("O_RDONLY", O_RDONLY)?;
+    module.add("O_WRONLY", O_WRONLY)?;
+    module.add("O_RDWR", O_RDWR)?;
+    module.add("O_CREAT", O_CREAT)?;
+    module.add("O_EXCL", O_EXCL)?;
+    module.add("O_TRUNC", O_TRUNC)?;
+    module.add("O_NONBLOCK", O_NONBLOCK)?;
     module.add_class::<PyDataPlane>()?;
+    module.add_class::<PyDescriptor>()?;
+    module.add_class::<PyDescriptorMapping>()?;
     module.add_class::<PyBlob>()?;
     module.add_class::<PyBlobView>()?;
     module.add_class::<PyStreamWriter>()?;

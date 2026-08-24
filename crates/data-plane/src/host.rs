@@ -23,14 +23,14 @@ use crate::bootstrap::JobHandoff;
 use crate::byte_ring::{self, ByteRingSpec, RingHandle, Role};
 use crate::mapped_arena::MappedArena;
 use crate::namespace::{
-    BlobBinding as NamespaceBlobBinding, DataDirectoryOut, NamespaceClient, NamespaceClientIn,
-    NamespaceError, NamespaceRequest, OperationId, SourceRecovery, StreamIncarnation, StreamMatch,
-    StreamRole,
+    BlobBinding as NamespaceBlobBinding, DataDirectoryOut, EntryKind, NamespaceClient,
+    NamespaceClientIn, NamespaceError, NamespaceNode, NamespaceRequest, OperationId,
+    SourceRecovery, StreamIncarnation, StreamMatch, StreamRole,
 };
 use crate::path::{DataPath, JobContext};
 use crate::protocol::{
-    AttachmentFailure, ChildSessionIn, DataOperation, DataPlaneError, HostSessionIn, HostStreamIn,
-    JobCapability,
+    AccessMode, AttachmentFailure, ChildSessionIn, DataPlaneError, HostSessionIn, HostStreamIn,
+    JobCapability, OpenOptions, OpenPolicy,
 };
 use crate::source::{BlobSourceIn, BlobSourcePublisher, BlobSourceRetirement, FileBlobSourceActor};
 use crate::stream_transport::{
@@ -41,6 +41,12 @@ use crate::stream_transport::{
 const BLOB_ALIGNMENT: u64 = 64;
 const FIRST_BLOB_REQUEST_ID: u64 = 2;
 const STREAM_RING_CAPACITY: u64 = 256 * 1024;
+
+fn namespace_operation_id(address: ActorAddress) -> OperationId {
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&address.0[..16]);
+    OperationId::from_u128(u128::from_be_bytes(bytes))
+}
 
 pub trait HostRouteRegistrar: Send + Sync + 'static {
     fn register_child(
@@ -73,6 +79,13 @@ pub enum HostSessionState {
     Closed,
 }
 
+#[derive(Clone)]
+struct PendingOpen {
+    child_session: ActorAddress,
+    path: DataPath,
+    options: OpenOptions,
+}
+
 pub struct HostDataPlaneSessionActor {
     arena: Option<ArenaManager>,
     arena_generation: u64,
@@ -91,6 +104,8 @@ pub struct HostDataPlaneSessionActor {
     allocator: Option<ActorAddress>,
     active_bindings: HashSet<ActorAddress>,
     stream_bindings: HashMap<ActorAddress, ActorAddress>,
+    pending_opens: HashMap<ActorAddress, PendingOpen>,
+    open_lookups: HashMap<ActorAddress, ActorAddress>,
     state: HostSessionState,
 }
 
@@ -138,6 +153,8 @@ impl HostDataPlaneSessionActor {
             allocator: None,
             active_bindings: HashSet::new(),
             stream_bindings: HashMap::new(),
+            pending_opens: HashMap::new(),
+            open_lookups: HashMap::new(),
             state: HostSessionState::AwaitingAttachment,
         })
     }
@@ -163,7 +180,7 @@ impl HostDataPlaneSessionActor {
         &self,
         child_session: ActorAddress,
         logical: &DataPath,
-        operation: DataOperation,
+        access: AccessMode,
     ) -> Result<DataPath, DataPlaneError> {
         if self.state != HostSessionState::Running || self.child_session != Some(child_session) {
             return Err(DataPlaneError::SessionNotRunning);
@@ -172,27 +189,207 @@ impl HostDataPlaneSessionActor {
             .job_context
             .resolve(logical)
             .map_err(|error| DataPlaneError::InvalidPath(error.to_string()))?;
-        let authorized = match operation {
-            DataOperation::ReadBlob | DataOperation::ReadStream => {
-                self.job_context.can_read(&resolved)
-            }
-            DataOperation::WriteBlob | DataOperation::WriteStream => {
-                self.job_context.can_write(&resolved)
-            }
-        };
+        let authorized = (!access.can_read() || self.job_context.can_read(&resolved))
+            && (!access.can_write() || self.job_context.can_write(&resolved));
         if !authorized {
             return Err(DataPlaneError::Unauthorized {
                 path: resolved,
-                operation,
+                access,
             });
         }
         Ok(resolved)
+    }
+
+    fn spawn_blob_read(
+        &mut self,
+        ctx: &Ctx<'_>,
+        child_session: ActorAddress,
+        operation: ActorAddress,
+        path: DataPath,
+        expected_revision: Option<u64>,
+    ) {
+        let (Some(namespace), Some(receiver)) = (&self.namespace, &self.transfer_receiver) else {
+            self.send_open_failure(
+                ctx,
+                child_session,
+                operation,
+                DataPlaneError::SessionFailed("data namespace service is unavailable".to_owned()),
+            );
+            return;
+        };
+        let binding = HostBlobBindingActor::namespace_read(
+            HostBindingAddresses {
+                host_session: ctx.self_addr(),
+                allocator: self.allocator.expect("allocator started"),
+                child_session,
+                operation,
+            },
+            path,
+            expected_revision,
+            namespace.clone(),
+            Arc::clone(receiver),
+        );
+        match ctx.spawn(binding) {
+            Ok(binding) => {
+                self.active_bindings.insert(binding);
+            }
+            Err(error) => self.send_open_failure(
+                ctx,
+                child_session,
+                operation,
+                DataPlaneError::SessionFailed(error.to_string()),
+            ),
+        }
+    }
+
+    fn spawn_blob_write(
+        &mut self,
+        ctx: &Ctx<'_>,
+        child_session: ActorAddress,
+        operation: ActorAddress,
+        path: DataPath,
+        length: u64,
+        digest: Option<ContentDigest>,
+        reservation: Option<OperationId>,
+    ) {
+        let binding = HostBlobBindingActor::write(
+            HostBindingAddresses {
+                host_session: ctx.self_addr(),
+                allocator: self.allocator.expect("allocator started"),
+                child_session,
+                operation,
+            },
+            path.clone(),
+            length,
+            digest,
+            reservation,
+            self.namespace.clone(),
+            self.source_publisher.clone(),
+        );
+        match ctx.spawn(binding) {
+            Ok(binding) => {
+                self.active_bindings.insert(binding);
+            }
+            Err(error) => {
+                if let (Some(namespace), Some(reservation)) = (&self.namespace, reservation) {
+                    let _ = ctx.send(
+                        namespace.proxy(),
+                        NamespaceClientIn::CancelBlobReservation {
+                            path,
+                            operation_id: reservation,
+                            reply_to: ctx.self_addr(),
+                        },
+                    );
+                }
+                self.send_open_failure(
+                    ctx,
+                    child_session,
+                    operation,
+                    DataPlaneError::SessionFailed(error.to_string()),
+                );
+            }
+        }
+    }
+
+    fn spawn_stream(
+        &mut self,
+        ctx: &Ctx<'_>,
+        child_session: ActorAddress,
+        operation: ActorAddress,
+        path: DataPath,
+        role: StreamRole,
+        replace: bool,
+        ensure: bool,
+        expected_revision: Option<u64>,
+    ) {
+        let (Some(namespace), Some(arena), Some(transport)) = (
+            self.namespace.clone(),
+            self.stream_arena.clone(),
+            self.stream_transport.clone(),
+        ) else {
+            self.send_open_failure(
+                ctx,
+                child_session,
+                operation,
+                DataPlaneError::SessionFailed(
+                    "stream namespace or transport service is unavailable".to_owned(),
+                ),
+            );
+            return;
+        };
+        let local_descriptor = match transport.descriptor() {
+            Ok(descriptor) => descriptor,
+            Err(reason) => {
+                self.send_open_failure(
+                    ctx,
+                    child_session,
+                    operation,
+                    DataPlaneError::StreamFault(reason),
+                );
+                return;
+            }
+        };
+        let binding = HostStreamBindingActor {
+            runtime: self.runtime.clone(),
+            host_session: ctx.self_addr(),
+            allocator: self.allocator.expect("allocator started"),
+            child_session,
+            operation,
+            path,
+            replace,
+            ensure,
+            expected_revision,
+            role,
+            namespace,
+            arena,
+            transport,
+            local_descriptor,
+            ring: None,
+            matched: None,
+            peer_descriptor: None,
+            transport_installed: false,
+            transport_ready: false,
+            transport_quiesced: false,
+            opened: false,
+            terminal: None,
+            data_waiters: Vec::new(),
+            capacity_waiters: Vec::new(),
+            close_waiters: Vec::new(),
+            release_started: false,
+            namespace_open: None,
+            peer_ack_pending: false,
+        };
+        match ctx.spawn(binding) {
+            Ok(binding) => {
+                if let Some(publisher) = &self.source_publisher
+                    && let Err(error) = publisher.publish_source(binding)
+                {
+                    let _ = ctx.stop_actor(binding);
+                    self.send_open_failure(
+                        ctx,
+                        child_session,
+                        operation,
+                        DataPlaneError::SessionFailed(format!("publish stream endpoint: {error}")),
+                    );
+                    return;
+                }
+                self.stream_bindings.insert(operation, binding);
+            }
+            Err(error) => self.send_open_failure(
+                ctx,
+                child_session,
+                operation,
+                DataPlaneError::SessionFailed(error.to_string()),
+            ),
+        }
     }
 
     fn maybe_finish_close(&mut self) {
         if self.state == HostSessionState::Closing
             && self.active_bindings.is_empty()
             && self.stream_bindings.is_empty()
+            && self.pending_opens.is_empty()
+            && self.open_lookups.is_empty()
         {
             self.state = HostSessionState::Closed;
         }
@@ -272,21 +469,69 @@ impl ActorInterface for HostDataPlaneSessionActor {
                     );
                 }
             }
-            HostSessionIn::OpenReadBlob {
+            HostSessionIn::Open {
                 path,
+                options,
+                policy,
                 child_session,
                 operation,
             } => {
-                let resolved =
-                    match self.validate_open(child_session, &path, DataOperation::ReadBlob) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            self.send_open_failure(ctx, child_session, operation, error);
+                if let Err(error) = options.validate() {
+                    self.send_open_failure(ctx, child_session, operation, error);
+                    return;
+                }
+                let resolved = match self.validate_open(child_session, &path, options.access) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.send_open_failure(ctx, child_session, operation, error);
+                        return;
+                    }
+                };
+                if let OpenPolicy::EnsureStream { replace } = policy {
+                    if options.create
+                        || options.exclusive
+                        || options.truncate
+                        || options.allocation.is_some()
+                    {
+                        self.send_open_failure(
+                            ctx,
+                            child_session,
+                            operation,
+                            DataPlaneError::InvalidArgument(
+                                "stream ensure policy does not accept blob creation flags"
+                                    .to_owned(),
+                            ),
+                        );
+                        return;
+                    }
+                    let role = match options.access {
+                        AccessMode::ReadOnly => StreamRole::Sink,
+                        AccessMode::WriteOnly => StreamRole::Source,
+                        AccessMode::ReadWrite => {
+                            self.send_open_failure(
+                                ctx,
+                                child_session,
+                                operation,
+                                DataPlaneError::Unsupported(
+                                    "read-write stream descriptors are not supported".to_owned(),
+                                ),
+                            );
                             return;
                         }
                     };
-                let (Some(namespace), Some(receiver)) = (&self.namespace, &self.transfer_receiver)
-                else {
+                    self.spawn_stream(
+                        ctx,
+                        child_session,
+                        operation,
+                        resolved,
+                        role,
+                        replace,
+                        true,
+                        None,
+                    );
+                    return;
+                }
+                let Some(namespace) = &self.namespace else {
                     self.send_open_failure(
                         ctx,
                         child_session,
@@ -297,180 +542,279 @@ impl ActorInterface for HostDataPlaneSessionActor {
                     );
                     return;
                 };
-                let binding = HostBlobBindingActor::namespace_read(
-                    HostBindingAddresses {
-                        host_session: ctx.self_addr(),
-                        allocator: self.allocator.expect("allocator started"),
+                self.pending_opens.insert(
+                    operation,
+                    PendingOpen {
                         child_session,
-                        operation,
+                        path: resolved.clone(),
+                        options,
                     },
-                    resolved,
-                    namespace.clone(),
-                    Arc::clone(receiver),
                 );
-                match ctx.spawn(binding) {
-                    Ok(binding) => {
-                        self.active_bindings.insert(binding);
+                match ctx.spawn(NamespaceOpenLookupActor {
+                    namespace_proxy: namespace.proxy(),
+                    host_session: ctx.self_addr(),
+                    operation,
+                    path: resolved,
+                    completed: false,
+                }) {
+                    Ok(lookup) => {
+                        self.open_lookups.insert(operation, lookup);
                     }
-                    Err(error) => self.send_open_failure(
-                        ctx,
-                        child_session,
-                        operation,
-                        DataPlaneError::SessionFailed(error.to_string()),
-                    ),
-                }
-            }
-            HostSessionIn::CancelReadBlob { operation } => {
-                for binding in self.active_bindings.iter().copied() {
-                    let _ = ctx.send(binding, HostBindingIn::CancelRead { operation });
-                }
-            }
-            HostSessionIn::OpenWriteBlob {
-                path,
-                length,
-                child_session,
-                operation,
-            } => {
-                let resolved =
-                    match self.validate_open(child_session, &path, DataOperation::WriteBlob) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            self.send_open_failure(ctx, child_session, operation, error);
-                            return;
-                        }
-                    };
-                let binding = HostBlobBindingActor::write(
-                    HostBindingAddresses {
-                        host_session: ctx.self_addr(),
-                        allocator: self.allocator.expect("allocator started"),
-                        child_session,
-                        operation,
-                    },
-                    resolved,
-                    length,
-                    self.namespace.clone(),
-                    self.source_publisher.clone(),
-                );
-                match ctx.spawn(binding) {
-                    Ok(binding) => {
-                        self.active_bindings.insert(binding);
-                    }
-                    Err(error) => self.send_open_failure(
-                        ctx,
-                        child_session,
-                        operation,
-                        DataPlaneError::SessionFailed(error.to_string()),
-                    ),
-                }
-            }
-            ref message @ (HostSessionIn::OpenReadStream {
-                ref path,
-                child_session,
-                operation,
-                replace,
-            }
-            | HostSessionIn::OpenWriteStream {
-                ref path,
-                child_session,
-                operation,
-                replace,
-            }) => {
-                let role = match message {
-                    HostSessionIn::OpenReadStream { .. } => StreamRole::Sink,
-                    HostSessionIn::OpenWriteStream { .. } => StreamRole::Source,
-                    _ => unreachable!(),
-                };
-                let data_operation = match role {
-                    StreamRole::Source => DataOperation::WriteStream,
-                    StreamRole::Sink => DataOperation::ReadStream,
-                };
-                let resolved = match self.validate_open(child_session, path, data_operation) {
-                    Ok(path) => path,
                     Err(error) => {
-                        self.send_open_failure(ctx, child_session, operation, error);
-                        return;
-                    }
-                };
-                let (Some(namespace), Some(arena), Some(transport)) = (
-                    self.namespace.clone(),
-                    self.stream_arena.clone(),
-                    self.stream_transport.clone(),
-                ) else {
-                    self.send_open_failure(
-                        ctx,
-                        child_session,
-                        operation,
-                        DataPlaneError::SessionFailed(
-                            "stream namespace or transport service is unavailable".to_owned(),
-                        ),
-                    );
-                    return;
-                };
-                let local_descriptor = match transport.descriptor() {
-                    Ok(descriptor) => descriptor,
-                    Err(reason) => {
+                        self.pending_opens.remove(&operation);
                         self.send_open_failure(
                             ctx,
                             child_session,
                             operation,
-                            DataPlaneError::StreamFault(reason),
+                            DataPlaneError::SessionFailed(error.to_string()),
                         );
-                        return;
                     }
+                }
+            }
+            HostSessionIn::OpenResolved { operation, result } => {
+                self.open_lookups.remove(&operation);
+                let Some(pending) = self.pending_opens.remove(&operation) else {
+                    return;
                 };
-                let binding = HostStreamBindingActor {
-                    runtime: self.runtime.clone(),
-                    host_session: ctx.self_addr(),
-                    allocator: self.allocator.expect("allocator started"),
+                let PendingOpen {
                     child_session,
-                    operation,
-                    path: resolved,
-                    replace,
-                    role,
-                    namespace,
-                    arena,
-                    transport,
-                    local_descriptor,
-                    ring: None,
-                    matched: None,
-                    peer_descriptor: None,
-                    transport_installed: false,
-                    transport_ready: false,
-                    transport_quiesced: false,
-                    opened: false,
-                    terminal: None,
-                    data_waiters: Vec::new(),
-                    capacity_waiters: Vec::new(),
-                    close_waiters: Vec::new(),
-                    release_started: false,
-                };
-                match ctx.spawn(binding) {
-                    Ok(binding) => {
-                        if let Some(publisher) = &self.source_publisher
-                            && let Err(error) = publisher.publish_source(binding)
-                        {
-                            let _ = ctx.stop_actor(binding);
+                    path,
+                    options,
+                } = pending;
+                match result {
+                    Err(NamespaceError::PathNotFound(_)) if options.create => {
+                        let Some(allocation) = options.allocation.clone() else {
                             self.send_open_failure(
                                 ctx,
                                 child_session,
                                 operation,
-                                DataPlaneError::SessionFailed(format!(
-                                    "publish stream endpoint: {error}"
-                                )),
+                                DataPlaneError::Unsupported(
+                                    "fixed-length blob creation requires allocation metadata"
+                                        .to_owned(),
+                                ),
+                            );
+                            return;
+                        };
+                        if options.exclusive {
+                            let reservation = namespace_operation_id(operation);
+                            let namespace = self
+                                .namespace
+                                .as_ref()
+                                .expect("lookup requires namespace service");
+                            self.pending_opens.insert(
+                                operation,
+                                PendingOpen {
+                                    child_session,
+                                    path: path.clone(),
+                                    options,
+                                },
+                            );
+                            match ctx.spawn(NamespaceBlobReserveActor {
+                                namespace_proxy: namespace.proxy(),
+                                host_session: ctx.self_addr(),
+                                operation,
+                                path,
+                                reservation,
+                                completed: false,
+                            }) {
+                                Ok(resolver) => {
+                                    self.open_lookups.insert(operation, resolver);
+                                }
+                                Err(error) => {
+                                    self.pending_opens.remove(&operation);
+                                    self.send_open_failure(
+                                        ctx,
+                                        child_session,
+                                        operation,
+                                        DataPlaneError::SessionFailed(error.to_string()),
+                                    );
+                                }
+                            }
+                        } else {
+                            self.spawn_blob_write(
+                                ctx,
+                                child_session,
+                                operation,
+                                path,
+                                allocation.length,
+                                allocation.digest,
+                                None,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.send_open_failure(
+                            ctx,
+                            child_session,
+                            operation,
+                            namespace_error(error),
+                        );
+                    }
+                    Ok(NamespaceNode {
+                        kind: EntryKind::Blob,
+                        revision,
+                    }) => {
+                        if options.create && options.exclusive {
+                            self.send_open_failure(
+                                ctx,
+                                child_session,
+                                operation,
+                                DataPlaneError::PathExists(path),
+                            );
+                        } else if options.access == AccessMode::ReadOnly
+                            && !options.create
+                            && !options.truncate
+                            && options.allocation.is_none()
+                        {
+                            self.spawn_blob_read(
+                                ctx,
+                                child_session,
+                                operation,
+                                path,
+                                Some(revision),
+                            );
+                        } else if options.access.can_write() && options.truncate {
+                            let Some(allocation) = options.allocation else {
+                                self.send_open_failure(
+                                    ctx,
+                                    child_session,
+                                    operation,
+                                    DataPlaneError::Unsupported(
+                                        "fixed-length blob replacement requires allocation metadata"
+                                            .to_owned(),
+                                    ),
+                                );
+                                return;
+                            };
+                            self.spawn_blob_write(
+                                ctx,
+                                child_session,
+                                operation,
+                                path,
+                                allocation.length,
+                                allocation.digest,
+                                None,
+                            );
+                        } else {
+                            self.send_open_failure(
+                                ctx,
+                                child_session,
+                                operation,
+                                DataPlaneError::Unsupported(
+                                    "non-truncating writable blob opens are not supported"
+                                        .to_owned(),
+                                ),
+                            );
+                        }
+                    }
+                    Ok(NamespaceNode {
+                        kind: EntryKind::Stream,
+                        revision,
+                    }) => {
+                        if options.create
+                            || options.exclusive
+                            || options.truncate
+                            || options.allocation.is_some()
+                        {
+                            self.send_open_failure(
+                                ctx,
+                                child_session,
+                                operation,
+                                DataPlaneError::WrongEntryType {
+                                    path,
+                                    expected: EntryKind::Blob,
+                                    found: EntryKind::Stream,
+                                },
                             );
                             return;
                         }
-                        self.stream_bindings.insert(operation, binding);
+                        let role = match options.access {
+                            AccessMode::ReadOnly => StreamRole::Sink,
+                            AccessMode::WriteOnly => StreamRole::Source,
+                            AccessMode::ReadWrite => {
+                                self.send_open_failure(
+                                    ctx,
+                                    child_session,
+                                    operation,
+                                    DataPlaneError::Unsupported(
+                                        "read-write stream descriptors are not supported"
+                                            .to_owned(),
+                                    ),
+                                );
+                                return;
+                            }
+                        };
+                        self.spawn_stream(
+                            ctx,
+                            child_session,
+                            operation,
+                            path,
+                            role,
+                            false,
+                            false,
+                            Some(revision),
+                        );
+                    }
+                }
+            }
+            HostSessionIn::BlobReserved {
+                operation,
+                path: reserved_path,
+                reservation,
+                result,
+            } => {
+                self.open_lookups.remove(&operation);
+                let Some(PendingOpen {
+                    child_session,
+                    path,
+                    options,
+                }) = self.pending_opens.remove(&operation)
+                else {
+                    if result.is_ok()
+                        && let Some(namespace) = &self.namespace
+                    {
+                        let _ = ctx.send(
+                            namespace.proxy(),
+                            NamespaceClientIn::CancelBlobReservation {
+                                path: reserved_path,
+                                operation_id: reservation,
+                                reply_to: ctx.self_addr(),
+                            },
+                        );
+                    }
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        let allocation = options
+                            .allocation
+                            .expect("exclusive fixed blob reservation has allocation");
+                        self.spawn_blob_write(
+                            ctx,
+                            child_session,
+                            operation,
+                            path,
+                            allocation.length,
+                            allocation.digest,
+                            Some(reservation),
+                        );
                     }
                     Err(error) => self.send_open_failure(
                         ctx,
                         child_session,
                         operation,
-                        DataPlaneError::SessionFailed(error.to_string()),
+                        namespace_error(error),
                     ),
                 }
             }
-            HostSessionIn::CancelStream { operation } => {
+            HostSessionIn::CancelOpen { operation } => {
+                self.pending_opens.remove(&operation);
+                if let Some(lookup) = self.open_lookups.remove(&operation) {
+                    let _ = ctx.stop_actor(lookup);
+                }
+                for binding in self.active_bindings.iter().copied() {
+                    let _ = ctx.send(binding, HostBindingIn::CancelOpen { operation });
+                }
                 if let Some(binding) = self.stream_bindings.get(&operation).copied() {
                     let _ = ctx.send(
                         binding,
@@ -582,6 +926,18 @@ impl ActorInterface for HostDataPlaneSessionActor {
                     return;
                 }
                 self.state = HostSessionState::Closing;
+                for lookup in self.open_lookups.drain().map(|(_, lookup)| lookup) {
+                    let _ = ctx.stop_actor(lookup);
+                }
+                for (operation, pending) in self.pending_opens.drain() {
+                    let _ = ctx.send(
+                        pending.child_session,
+                        ChildSessionIn::OperationFailed {
+                            operation,
+                            error: DataPlaneError::SessionNotRunning,
+                        },
+                    );
+                }
                 for binding in self.active_bindings.iter().copied() {
                     let _ = ctx.send(binding, HostBindingIn::SessionClosed);
                 }
@@ -1202,6 +1558,152 @@ impl ActorInterface for DestinationBlobTransferActor {
     }
 }
 
+struct NamespaceOpenLookupActor {
+    namespace_proxy: ActorAddress,
+    host_session: ActorAddress,
+    operation: ActorAddress,
+    path: DataPath,
+    completed: bool,
+}
+
+impl ActorInterface for NamespaceOpenLookupActor {
+    type Incoming = DataDirectoryOut;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        if ctx
+            .send(
+                self.namespace_proxy,
+                NamespaceClientIn::Request {
+                    request: NamespaceRequest::Lookup {
+                        path: self.path.clone(),
+                    },
+                    reply_to: ctx.self_addr(),
+                },
+            )
+            .is_err()
+        {
+            self.completed = true;
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::OpenResolved {
+                    operation: self.operation,
+                    result: Err(NamespaceError::DirectoryUnavailable(
+                        "namespace client is unavailable".to_owned(),
+                    )),
+                },
+            );
+            ctx.stop_self();
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        let result = match message {
+            DataDirectoryOut::LookedUp { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected lookup reply, received {other:?}"
+            ))),
+        };
+        self.completed = true;
+        let _ = ctx.send(
+            self.host_session,
+            HostSessionIn::OpenResolved {
+                operation: self.operation,
+                result,
+            },
+        );
+        ctx.stop_self();
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if !self.completed {
+            let _ = ctx.send(
+                self.namespace_proxy,
+                NamespaceClientIn::Cancel {
+                    reply_to: ctx.self_addr(),
+                },
+            );
+        }
+    }
+}
+
+struct NamespaceBlobReserveActor {
+    namespace_proxy: ActorAddress,
+    host_session: ActorAddress,
+    operation: ActorAddress,
+    path: DataPath,
+    reservation: OperationId,
+    completed: bool,
+}
+
+impl ActorInterface for NamespaceBlobReserveActor {
+    type Incoming = DataDirectoryOut;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        if ctx
+            .send(
+                self.namespace_proxy,
+                NamespaceClientIn::Request {
+                    request: NamespaceRequest::ReserveBlob {
+                        path: self.path.clone(),
+                        operation_id: self.reservation,
+                    },
+                    reply_to: ctx.self_addr(),
+                },
+            )
+            .is_err()
+        {
+            self.completed = true;
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::BlobReserved {
+                    operation: self.operation,
+                    path: self.path.clone(),
+                    reservation: self.reservation,
+                    result: Err(NamespaceError::DirectoryUnavailable(
+                        "namespace client is unavailable".to_owned(),
+                    )),
+                },
+            );
+            ctx.stop_self();
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        let result = match message {
+            DataDirectoryOut::BlobReserved { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected blob reservation reply, received {other:?}"
+            ))),
+        };
+        self.completed = true;
+        let _ = ctx.send(
+            self.host_session,
+            HostSessionIn::BlobReserved {
+                operation: self.operation,
+                path: self.path.clone(),
+                reservation: self.reservation,
+                result,
+            },
+        );
+        ctx.stop_self();
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if !self.completed {
+            let _ = ctx.send(
+                self.namespace_proxy,
+                NamespaceClientIn::CancelBlobReservation {
+                    path: self.path.clone(),
+                    operation_id: self.reservation,
+                    reply_to: ctx.self_addr(),
+                },
+            );
+        }
+    }
+}
+
 struct NamespaceResolveActor {
     namespace_proxy: ActorAddress,
     path: DataPath,
@@ -1259,6 +1761,7 @@ struct NamespacePublishActor {
     source: ActorAddress,
     length: u64,
     operation_id: OperationId,
+    reservation: Option<OperationId>,
     operation: ActorAddress,
     binding: ActorAddress,
 }
@@ -1278,6 +1781,7 @@ impl ActorInterface for NamespacePublishActor {
                         length: self.length,
                         recovery: SourceRecovery::Actor { actor: self.source },
                         operation_id: self.operation_id,
+                        reservation: self.reservation,
                     },
                     reply_to: ctx.self_addr(),
                 },
@@ -1304,6 +1808,64 @@ impl ActorInterface for NamespacePublishActor {
             };
             let _ = ctx.send(self.binding, response);
         }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        let _ = ctx.send(
+            self.namespace_proxy,
+            NamespaceClientIn::Cancel {
+                reply_to: ctx.self_addr(),
+            },
+        );
+    }
+}
+
+struct NamespaceBlobReservationReleaseActor {
+    namespace_proxy: ActorAddress,
+    binding: ActorAddress,
+    path: DataPath,
+    reservation: OperationId,
+}
+
+impl ActorInterface for NamespaceBlobReservationReleaseActor {
+    type Incoming = DataDirectoryOut;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        if ctx
+            .send(
+                self.namespace_proxy,
+                NamespaceClientIn::Request {
+                    request: NamespaceRequest::ReleaseBlobReservation {
+                        path: self.path.clone(),
+                        operation_id: self.reservation,
+                    },
+                    reply_to: ctx.self_addr(),
+                },
+            )
+            .is_err()
+        {
+            let _ = ctx.send(
+                self.binding,
+                HostBindingIn::ReservationReleased(Err(DataPlaneError::SessionFailed(
+                    "namespace client is unavailable".to_owned(),
+                ))),
+            );
+            ctx.stop_self();
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        let result = match message {
+            DataDirectoryOut::BlobReservationReleased { result, .. } => {
+                result.map_err(namespace_error)
+            }
+            other => Err(DataPlaneError::SessionFailed(format!(
+                "expected blob reservation release, received {other:?}"
+            ))),
+        };
+        let _ = ctx.send(self.binding, HostBindingIn::ReservationReleased(result));
+        ctx.stop_self();
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
@@ -1370,6 +1932,8 @@ struct NamespaceStreamOpenActor {
     path: DataPath,
     role: StreamRole,
     replace: bool,
+    ensure: bool,
+    expected_revision: Option<u64>,
     descriptor: Vec<u8>,
     operation_id: OperationId,
     completed: bool,
@@ -1389,6 +1953,8 @@ impl ActorInterface for NamespaceStreamOpenActor {
                     endpoint: self.parent,
                     descriptor: self.descriptor.clone(),
                     replace: self.replace,
+                    ensure: self.ensure,
+                    expected_revision: self.expected_revision,
                     operation_id: self.operation_id,
                 },
                 reply_to: ctx.self_addr(),
@@ -1469,6 +2035,8 @@ struct HostStreamBindingActor {
     operation: ActorAddress,
     path: DataPath,
     replace: bool,
+    ensure: bool,
+    expected_revision: Option<u64>,
     role: StreamRole,
     namespace: NamespaceClient,
     arena: Arc<MappedArena>,
@@ -1486,6 +2054,8 @@ struct HostStreamBindingActor {
     capacity_waiters: Vec<ActorAddress>,
     close_waiters: Vec<ActorAddress>,
     release_started: bool,
+    namespace_open: Option<ActorAddress>,
+    peer_ack_pending: bool,
 }
 
 impl HostStreamBindingActor {
@@ -1611,6 +2181,12 @@ impl HostStreamBindingActor {
         if self.terminal.is_some() {
             return;
         }
+        if let Some(namespace_open) = self.namespace_open.take() {
+            let _ = ctx.stop_actor(namespace_open);
+        }
+        if let Some(ring) = self.ring {
+            let _ = byte_ring::mark_peer_terminated_mapped(&self.arena, ring);
+        }
         self.terminal = Some(error.clone());
         Self::wake_waiters(
             ctx,
@@ -1635,13 +2211,16 @@ impl HostStreamBindingActor {
                 } else {
                     DataPlaneError::PeerLost
                 };
-                let _ = ctx.send(
-                    peer,
-                    HostStreamIn::PeerTerminated {
-                        incarnation: matched.incarnation,
-                        error: peer_error,
-                    },
-                );
+                self.peer_ack_pending = ctx
+                    .send(
+                        peer,
+                        HostStreamIn::PeerTerminated {
+                            incarnation: matched.incarnation,
+                            error: peer_error,
+                            reply_to: Some(ctx.self_addr()),
+                        },
+                    )
+                    .is_ok();
             }
             let _ = ctx.spawn(NamespaceStreamCloseActor {
                 proxy: self.namespace.proxy(),
@@ -1653,6 +2232,9 @@ impl HostStreamBindingActor {
                 if !self.transport_quiesced {
                     return;
                 }
+            }
+            if self.peer_ack_pending {
+                return;
             }
         }
         self.release_ring(ctx);
@@ -1708,44 +2290,56 @@ impl ActorInterface for HostStreamBindingActor {
                 capacity: STREAM_RING_CAPACITY,
             },
         );
-        let _ = ctx.spawn(NamespaceStreamOpenActor {
+        match ctx.spawn(NamespaceStreamOpenActor {
             proxy: self.namespace.proxy(),
             parent: ctx.self_addr(),
             path: self.path.clone(),
             role: self.role,
             descriptor: self.local_descriptor.0.clone(),
             replace: self.replace,
+            ensure: self.ensure,
+            expected_revision: self.expected_revision,
             operation_id: Self::operation_id(ctx.self_addr()),
             completed: false,
-        });
+        }) {
+            Ok(namespace_open) => {
+                self.namespace_open = Some(namespace_open);
+            }
+            Err(error) => {
+                self.fail_open(ctx, DataPlaneError::SessionFailed(error.to_string()));
+            }
+        }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: HostStreamIn) {
         match message {
-            HostStreamIn::NamespaceMatched(result) => match result {
-                Ok(matched) => {
-                    let expected = match self.role {
-                        StreamRole::Source => matched.source,
-                        StreamRole::Sink => matched.sink,
-                    };
-                    if expected != ctx.self_addr() {
-                        self.fail_open(
-                            ctx,
-                            DataPlaneError::StreamFault(
-                                "namespace matched the wrong stream endpoint".to_owned(),
-                            ),
-                        );
-                        return;
+            HostStreamIn::NamespaceMatched(result) => {
+                self.namespace_open = None;
+                match result {
+                    Ok(matched) => {
+                        let expected = match self.role {
+                            StreamRole::Source => matched.source,
+                            StreamRole::Sink => matched.sink,
+                        };
+                        if expected != ctx.self_addr() {
+                            self.fail_open(
+                                ctx,
+                                DataPlaneError::StreamFault(
+                                    "namespace matched the wrong stream endpoint".to_owned(),
+                                ),
+                            );
+                            return;
+                        }
+                        if self.role == StreamRole::Source && !matched.sink_descriptor.is_empty() {
+                            self.peer_descriptor =
+                                Some(StreamPeerDescriptor(matched.sink_descriptor.clone()));
+                        }
+                        self.matched = Some(matched);
+                        self.try_install_transport(ctx);
                     }
-                    if self.role == StreamRole::Source && !matched.sink_descriptor.is_empty() {
-                        self.peer_descriptor =
-                            Some(StreamPeerDescriptor(matched.sink_descriptor.clone()));
-                    }
-                    self.matched = Some(matched);
-                    self.try_install_transport(ctx);
+                    Err(error) => self.fail_open(ctx, namespace_error(error)),
                 }
-                Err(error) => self.fail_open(ctx, namespace_error(error)),
-            },
+            }
             HostStreamIn::Allocated(result) => match result {
                 Ok(ring) => {
                     self.ring = Some(ring);
@@ -1784,7 +2378,7 @@ impl ActorInterface for HostStreamBindingActor {
             }
             HostStreamIn::Transport(StreamTransportEvent::Quiesced) => {
                 self.transport_quiesced = true;
-                if self.terminal.is_some() {
+                if self.terminal.is_some() && !self.peer_ack_pending {
                     self.release_ring(ctx);
                 }
             }
@@ -1851,7 +2445,11 @@ impl ActorInterface for HostStreamBindingActor {
                 };
                 self.fail_open(ctx, error);
             }
-            HostStreamIn::PeerTerminated { incarnation, error } => {
+            HostStreamIn::PeerTerminated {
+                incarnation,
+                error,
+                reply_to,
+            } => {
                 if self
                     .matched
                     .as_ref()
@@ -1867,6 +2465,24 @@ impl ActorInterface for HostStreamBindingActor {
                         );
                     }
                     self.begin_terminal(ctx, error, false);
+                    if let Some(reply_to) = reply_to {
+                        let _ =
+                            ctx.send(reply_to, HostStreamIn::PeerTerminationAck { incarnation });
+                    }
+                }
+            }
+            HostStreamIn::PeerTerminationAck { incarnation } => {
+                if self
+                    .matched
+                    .as_ref()
+                    .is_some_and(|matched| matched.incarnation == incarnation)
+                {
+                    self.peer_ack_pending = false;
+                    if self.terminal.is_some()
+                        && (!self.transport_installed || self.transport_quiesced)
+                    {
+                        self.release_ring(ctx);
+                    }
                 }
             }
             HostStreamIn::ReleaseComplete(result) => {
@@ -1895,6 +2511,7 @@ impl ActorInterface for HostStreamBindingActor {
 
 fn namespace_error(error: NamespaceError) -> DataPlaneError {
     match error {
+        NamespaceError::PathExists(path) => DataPlaneError::PathExists(path),
         NamespaceError::PathNotFound(path) => DataPlaneError::PathNotFound(path),
         NamespaceError::WrongEntryType {
             path,
@@ -1945,10 +2562,12 @@ enum HostBindingState {
 enum BindingMode {
     NamespaceRead {
         namespace: NamespaceClient,
+        expected_revision: Option<u64>,
         receiver: Arc<dyn BlobTransferReceiver>,
     },
     Write {
         length: u64,
+        digest: Option<ContentDigest>,
         namespace: Option<NamespaceClient>,
         source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
     },
@@ -1972,7 +2591,7 @@ enum HostBindingIn {
     },
     TransferFailed(DataPlaneError),
     Allocated(Result<(BlobLease, BlobMetadata), DataPlaneError>),
-    CancelRead {
+    CancelOpen {
         operation: ActorAddress,
     },
     Release {
@@ -1995,6 +2614,7 @@ enum HostBindingIn {
         operation: ActorAddress,
     },
     PublicationRejected(DataPlaneError),
+    ReservationReleased(Result<(), DataPlaneError>),
     ReleasePublished,
     SessionClosed,
     Released(Result<(), DataPlaneError>),
@@ -2020,12 +2640,15 @@ struct HostBlobBindingActor {
     release_outcome: Option<ReleaseOutcome>,
     auxiliary: Option<ActorAddress>,
     published_source: Option<ActorAddress>,
+    cancelled: bool,
+    reservation: Option<OperationId>,
 }
 
 impl HostBlobBindingActor {
     fn namespace_read(
         addresses: HostBindingAddresses,
         path: DataPath,
+        expected_revision: Option<u64>,
         namespace: NamespaceClient,
         receiver: Arc<dyn BlobTransferReceiver>,
     ) -> Self {
@@ -2043,6 +2666,7 @@ impl HostBlobBindingActor {
             path,
             mode: BindingMode::NamespaceRead {
                 namespace,
+                expected_revision,
                 receiver,
             },
             state: HostBindingState::Resolving,
@@ -2051,6 +2675,8 @@ impl HostBlobBindingActor {
             release_outcome: None,
             auxiliary: None,
             published_source: None,
+            reservation: None,
+            cancelled: false,
         }
     }
 
@@ -2058,6 +2684,8 @@ impl HostBlobBindingActor {
         addresses: HostBindingAddresses,
         path: DataPath,
         length: u64,
+        digest: Option<ContentDigest>,
+        reservation: Option<OperationId>,
         namespace: Option<NamespaceClient>,
         source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
     ) -> Self {
@@ -2075,6 +2703,7 @@ impl HostBlobBindingActor {
             path,
             mode: BindingMode::Write {
                 length,
+                digest,
                 namespace,
                 source_publisher,
             },
@@ -2084,6 +2713,45 @@ impl HostBlobBindingActor {
             release_outcome: None,
             auxiliary: None,
             published_source: None,
+            cancelled: false,
+            reservation,
+        }
+    }
+
+    fn begin_reservation_release(&mut self, ctx: &Ctx<'_>, outcome: ReleaseOutcome) -> bool {
+        let Some(reservation) = self.reservation.take() else {
+            return false;
+        };
+        let BindingMode::Write {
+            namespace: Some(namespace),
+            ..
+        } = &self.mode
+        else {
+            return false;
+        };
+        match ctx.spawn(NamespaceBlobReservationReleaseActor {
+            namespace_proxy: namespace.proxy(),
+            binding: ctx.self_addr(),
+            path: self.path.clone(),
+            reservation,
+        }) {
+            Ok(releaser) => {
+                self.auxiliary = Some(releaser);
+                self.release_outcome = Some(outcome);
+                self.state = HostBindingState::Releasing;
+                true
+            }
+            Err(_) => {
+                let _ = ctx.send(
+                    namespace.proxy(),
+                    NamespaceClientIn::CancelBlobReservation {
+                        path: self.path.clone(),
+                        operation_id: reservation,
+                        reply_to: ctx.self_addr(),
+                    },
+                );
+                false
+            }
         }
     }
 
@@ -2138,6 +2806,9 @@ impl HostBlobBindingActor {
     }
 
     fn finish_without_lease(&mut self, ctx: &Ctx<'_>, outcome: ReleaseOutcome) {
+        if self.begin_reservation_release(ctx, outcome.clone()) {
+            return;
+        }
         self.state = HostBindingState::Released;
         let read_released = matches!(outcome, ReleaseOutcome::ReadReleased);
         if let Some(auxiliary) = self.auxiliary.take() {
@@ -2210,18 +2881,15 @@ impl ActorInterface for HostBlobBindingActor {
         }
 
         self.state = HostBindingState::Filling;
-        let length = match &self.mode {
-            BindingMode::Write { length, .. } => *length,
+        let (length, digest) = match &self.mode {
+            BindingMode::Write { length, digest, .. } => (*length, digest.clone()),
             BindingMode::NamespaceRead { .. } => unreachable!("handled above"),
         };
         let _ = ctx.send(
             self.allocator,
             ArenaAllocatorIn::Allocate {
                 binding: ctx.self_addr(),
-                kind: AllocationKind::Write {
-                    length,
-                    digest: None,
-                },
+                kind: AllocationKind::Write { length, digest },
             },
         );
     }
@@ -2233,13 +2901,18 @@ impl ActorInterface for HostBlobBindingActor {
                     && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
             {
                 self.auxiliary = None;
-                let (receiver, failure_proxy) = match &self.mode {
+                let (receiver, failure_proxy, expected_revision) = match &self.mode {
                     BindingMode::NamespaceRead {
                         namespace,
                         receiver,
-                    } => (Arc::clone(receiver), namespace.proxy()),
+                        expected_revision,
+                    } => (Arc::clone(receiver), namespace.proxy(), *expected_revision),
                     _ => unreachable!("namespace resolve on non-namespace binding"),
                 };
+                if expected_revision.is_some_and(|revision| revision != binding.revision) {
+                    self.fail(ctx, DataPlaneError::PathReplaced(self.path.clone()));
+                    return;
+                }
                 let mut id_bytes = [0_u8; 8];
                 id_bytes.copy_from_slice(&ctx.self_addr().0[..8]);
                 let transfer_id = BlobTransferId(u64::from_le_bytes(id_bytes).max(1));
@@ -2273,33 +2946,35 @@ impl ActorInterface for HostBlobBindingActor {
                 self.lease = Some(lease);
                 self.metadata = Some(metadata.clone());
                 self.state = HostBindingState::Granted;
-                let _ = ctx.send(
-                    self.child_session,
-                    ChildSessionIn::BlobOpened {
-                        operation: self.operation,
-                        host_binding: ctx.self_addr(),
-                        lease,
-                        metadata,
-                    },
-                );
+                if self.cancelled {
+                    self.begin_release(ctx, ReleaseOutcome::Faulted);
+                } else {
+                    let _ = ctx.send(
+                        self.child_session,
+                        ChildSessionIn::BlobOpened {
+                            operation: self.operation,
+                            host_binding: ctx.self_addr(),
+                            lease,
+                            metadata,
+                        },
+                    );
+                }
             }
-            HostBindingIn::CancelRead { operation }
-                if operation == self.operation
-                    && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
-            {
+            HostBindingIn::CancelOpen { operation } if operation == self.operation => {
+                self.cancelled = true;
                 match self.state {
                     HostBindingState::Resolving => {
                         self.finish_without_lease(ctx, ReleaseOutcome::Faulted);
                     }
                     HostBindingState::Filling => {
-                        if let Some(transfer) = self.auxiliary {
+                        if matches!(self.mode, BindingMode::NamespaceRead { .. })
+                            && let Some(transfer) = self.auxiliary
+                        {
                             let _ = ctx.send(transfer, BlobTransferEvent::Cancel);
-                        } else {
-                            self.finish_without_lease(ctx, ReleaseOutcome::Faulted);
                         }
                     }
                     HostBindingState::Granted => {
-                        self.begin_release(ctx, ReleaseOutcome::ReadReleased);
+                        self.begin_release(ctx, ReleaseOutcome::Faulted);
                     }
                     _ => {}
                 }
@@ -2319,18 +2994,22 @@ impl ActorInterface for HostBlobBindingActor {
                 self.lease = Some(lease);
                 self.metadata = Some(metadata.clone());
                 self.state = HostBindingState::Granted;
-                let response = match self.mode {
-                    BindingMode::Write { .. } => ChildSessionIn::WriteBlobOpened {
-                        operation: self.operation,
-                        host_binding: ctx.self_addr(),
-                        lease,
-                        metadata,
-                    },
-                    BindingMode::NamespaceRead { .. } => {
-                        unreachable!("namespace read uses TransferReady")
-                    }
-                };
-                let _ = ctx.send(self.child_session, response);
+                if self.cancelled {
+                    self.begin_release(ctx, ReleaseOutcome::Faulted);
+                } else {
+                    let response = match self.mode {
+                        BindingMode::Write { .. } => ChildSessionIn::WriteBlobOpened {
+                            operation: self.operation,
+                            host_binding: ctx.self_addr(),
+                            lease,
+                            metadata,
+                        },
+                        BindingMode::NamespaceRead { .. } => {
+                            unreachable!("namespace read uses TransferReady")
+                        }
+                    };
+                    let _ = ctx.send(self.child_session, response);
+                }
             }
             HostBindingIn::Allocated(Err(error)) if self.state == HostBindingState::Filling => {
                 self.fail(ctx, error);
@@ -2434,6 +3113,7 @@ impl ActorInterface for HostBlobBindingActor {
                     path: self.path.clone(),
                     source,
                     length: self.metadata.as_ref().expect("write metadata").length,
+                    reservation: self.reservation,
                     operation_id,
                     operation: self.operation,
                     binding: ctx.self_addr(),
@@ -2493,6 +3173,7 @@ impl ActorInterface for HostBlobBindingActor {
                 if self.state == HostBindingState::Publishing && operation == self.operation =>
             {
                 self.auxiliary = None;
+                self.reservation = None;
                 self.state = HostBindingState::Published;
                 if let Some(outcome) = self.release_outcome.take() {
                     self.begin_unpublish(ctx, outcome);
@@ -2557,6 +3238,24 @@ impl ActorInterface for HostBlobBindingActor {
                 self.begin_release(ctx, ReleaseOutcome::SessionClosed);
             }
             HostBindingIn::Released(result) if self.state == HostBindingState::Releasing => {
+                if let Err(error) = result {
+                    let _ = ctx.send(
+                        self.host_session,
+                        HostSessionIn::BindingFaulted {
+                            binding: ctx.self_addr(),
+                            operation: self.operation,
+                            error,
+                        },
+                    );
+                }
+                let outcome = self
+                    .release_outcome
+                    .take()
+                    .unwrap_or(ReleaseOutcome::Faulted);
+                self.finish_without_lease(ctx, outcome);
+            }
+            HostBindingIn::ReservationReleased(result) => {
+                self.auxiliary = None;
                 if let Err(error) = result {
                     let _ = ctx.send(
                         self.host_session,

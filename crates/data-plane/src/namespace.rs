@@ -40,6 +40,12 @@ pub enum EntryKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceNode {
+    pub kind: EntryKind,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamRole {
     Source,
     Sink,
@@ -64,6 +70,7 @@ pub struct StreamMatch {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NamespaceError {
     PathNotFound(DataPath),
+    PathExists(DataPath),
     WrongEntryType {
         path: DataPath,
         expected: EntryKind,
@@ -89,6 +96,7 @@ impl fmt::Display for NamespaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PathNotFound(path) => write!(f, "data path not found: {path}"),
+            Self::PathExists(path) => write!(f, "data path already exists: {path}"),
             Self::WrongEntryType {
                 path,
                 expected,
@@ -140,11 +148,29 @@ pub enum DataDirectoryIn {
         length: u64,
         recovery: SourceRecovery,
         operation_id: OperationId,
+        reservation: Option<OperationId>,
         reply_to: ActorAddress,
     },
     Resolve {
         request_id: DirectoryRequestId,
         path: DataPath,
+        reply_to: ActorAddress,
+    },
+    Lookup {
+        request_id: DirectoryRequestId,
+        path: DataPath,
+        reply_to: ActorAddress,
+    },
+    ReserveBlob {
+        request_id: DirectoryRequestId,
+        path: DataPath,
+        operation_id: OperationId,
+        reply_to: ActorAddress,
+    },
+    ReleaseBlobReservation {
+        request_id: DirectoryRequestId,
+        path: DataPath,
+        operation_id: OperationId,
         reply_to: ActorAddress,
     },
     Unregister {
@@ -160,6 +186,8 @@ pub enum DataDirectoryIn {
         descriptor: Vec<u8>,
         endpoint: ActorAddress,
         replace: bool,
+        ensure: bool,
+        expected_revision: Option<u64>,
         operation_id: OperationId,
         reply_to: ActorAddress,
     },
@@ -193,6 +221,21 @@ pub enum DataDirectoryOut {
         authority_epoch: u64,
         result: Result<BlobBinding, NamespaceError>,
     },
+    LookedUp {
+        request_id: DirectoryRequestId,
+        authority_epoch: u64,
+        result: Result<NamespaceNode, NamespaceError>,
+    },
+    BlobReserved {
+        request_id: DirectoryRequestId,
+        authority_epoch: u64,
+        result: Result<(), NamespaceError>,
+    },
+    BlobReservationReleased {
+        request_id: DirectoryRequestId,
+        authority_epoch: u64,
+        result: Result<(), NamespaceError>,
+    },
     Unregistered {
         request_id: DirectoryRequestId,
         authority_epoch: u64,
@@ -214,6 +257,9 @@ impl DataDirectoryOut {
         match self {
             Self::Registered { request_id, .. }
             | Self::Resolved { request_id, .. }
+            | Self::LookedUp { request_id, .. }
+            | Self::BlobReserved { request_id, .. }
+            | Self::BlobReservationReleased { request_id, .. }
             | Self::Unregistered { request_id, .. }
             | Self::StreamOpened { request_id, .. }
             | Self::StreamClosed { request_id, .. } => *request_id,
@@ -229,9 +275,21 @@ pub enum NamespaceRequest {
         length: u64,
         recovery: SourceRecovery,
         operation_id: OperationId,
+        reservation: Option<OperationId>,
     },
     Resolve {
         path: DataPath,
+    },
+    Lookup {
+        path: DataPath,
+    },
+    ReserveBlob {
+        path: DataPath,
+        operation_id: OperationId,
+    },
+    ReleaseBlobReservation {
+        path: DataPath,
+        operation_id: OperationId,
     },
     Unregister {
         path: DataPath,
@@ -243,6 +301,8 @@ pub enum NamespaceRequest {
         endpoint: ActorAddress,
         descriptor: Vec<u8>,
         replace: bool,
+        ensure: bool,
+        expected_revision: Option<u64>,
         operation_id: OperationId,
     },
     CloseStream {
@@ -257,6 +317,11 @@ pub enum NamespaceClientIn {
         reply_to: ActorAddress,
     },
     Cancel {
+        reply_to: ActorAddress,
+    },
+    CancelBlobReservation {
+        path: DataPath,
+        operation_id: OperationId,
         reply_to: ActorAddress,
     },
     DirectoryReply(DataDirectoryOut),
@@ -288,6 +353,7 @@ struct PendingStream {
     descriptor: Vec<u8>,
     reply_to: ActorAddress,
     revision: u64,
+    opened_from_revision: Option<u64>,
 }
 
 struct StreamOpenRequest {
@@ -296,6 +362,8 @@ struct StreamOpenRequest {
     role: StreamRole,
     endpoint: ActorAddress,
     replace: bool,
+    ensure: bool,
+    expected_revision: Option<u64>,
     descriptor: Vec<u8>,
     operation_id: OperationId,
     reply_to: ActorAddress,
@@ -316,6 +384,7 @@ pub struct DataDirectoryActor {
     store: NamespaceStore,
     sources: BTreeMap<DataPath, RuntimeSource>,
     streams: BTreeMap<DataPath, RuntimeStream>,
+    blob_reservations: BTreeMap<DataPath, OperationId>,
     authority_epoch: u64,
 }
 
@@ -339,6 +408,7 @@ impl DataDirectoryActor {
             store,
             sources,
             streams: BTreeMap::new(),
+            blob_reservations: BTreeMap::new(),
             authority_epoch,
         })
     }
@@ -375,6 +445,9 @@ impl DataDirectoryActor {
         operation_id: OperationId,
         retired: Option<ActorAddress>,
     ) -> Result<MutationReceipt, NamespaceError> {
+        if self.blob_reservations.contains_key(&path) {
+            return Err(NamespaceError::PathExists(path));
+        }
         let request = MutationRequest::BindStream { path: path.clone() };
         if let Some(replayed) = self.replay(operation_id, &request) {
             return replayed;
@@ -388,6 +461,7 @@ impl DataDirectoryActor {
         let mut next = self.store.snapshot().clone();
         next.next_revision = next_revision;
         next.bindings.remove(&path);
+        next.stream_nodes.insert(path.clone(), revision);
         if let Some(retired) = retired
             && !next.retirements.contains(&retired)
         {
@@ -440,10 +514,42 @@ impl DataDirectoryActor {
             role,
             endpoint,
             replace,
+            ensure,
+            expected_revision,
             descriptor,
             operation_id,
             reply_to,
         } = request;
+        if !ensure {
+            let snapshot = self.store.snapshot();
+            let Some(current_revision) = snapshot.stream_nodes.get(&path).copied() else {
+                let error = if snapshot.bindings.contains_key(&path) {
+                    NamespaceError::WrongEntryType {
+                        path,
+                        expected: EntryKind::Stream,
+                        found: EntryKind::Blob,
+                    }
+                } else {
+                    NamespaceError::PathNotFound(path)
+                };
+                self.send_stream_result(ctx, request_id, reply_to, Err(error));
+                return;
+            };
+            let pending_from_expected = matches!(
+                self.streams.get(&path),
+                Some(RuntimeStream::Pending(pending))
+                    if pending.opened_from_revision == expected_revision
+            );
+            if expected_revision != Some(current_revision) && !pending_from_expected {
+                self.send_stream_result(
+                    ctx,
+                    request_id,
+                    reply_to,
+                    Err(NamespaceError::PathReplaced(path)),
+                );
+                return;
+            }
+        }
         if let Some(RuntimeStream::Pending(pending)) = self.streams.get_mut(&path)
             && pending.operation_id == operation_id
         {
@@ -583,6 +689,7 @@ impl DataDirectoryActor {
                         request_id,
                         reply_to,
                         revision: receipt.revision,
+                        opened_from_revision: (!ensure).then_some(expected_revision).flatten(),
                     }),
                 );
             }
@@ -620,6 +727,41 @@ impl DataDirectoryActor {
         }
     }
 
+    fn reserve_blob(
+        &mut self,
+        path: DataPath,
+        operation_id: OperationId,
+    ) -> Result<(), NamespaceError> {
+        if self.store.snapshot().bindings.contains_key(&path)
+            || self.store.snapshot().stream_nodes.contains_key(&path)
+        {
+            return Err(NamespaceError::PathExists(path));
+        }
+        match self.blob_reservations.get(&path) {
+            Some(existing) if *existing == operation_id => Ok(()),
+            Some(_) => Err(NamespaceError::PathExists(path)),
+            None => {
+                self.blob_reservations.insert(path, operation_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn release_blob_reservation(
+        &mut self,
+        path: &DataPath,
+        operation_id: OperationId,
+    ) -> Result<(), NamespaceError> {
+        match self.blob_reservations.get(path) {
+            Some(existing) if *existing == operation_id => {
+                self.blob_reservations.remove(path);
+                Ok(())
+            }
+            Some(_) => Err(NamespaceError::OperationConflict(operation_id)),
+            None => Ok(()),
+        }
+    }
+
     fn register(
         &mut self,
         path: DataPath,
@@ -627,6 +769,7 @@ impl DataDirectoryActor {
         length: u64,
         recovery: SourceRecovery,
         operation_id: OperationId,
+        reservation: Option<OperationId>,
         retired: Option<ActorAddress>,
     ) -> Result<MutationReceipt, NamespaceError> {
         let request = MutationRequest::Register {
@@ -637,6 +780,12 @@ impl DataDirectoryActor {
         if let Some(replayed) = self.replay(operation_id, &request) {
             return replayed;
         }
+        match self.blob_reservations.get(&path) {
+            Some(existing) if Some(*existing) == reservation => {}
+            Some(_) => return Err(NamespaceError::PathExists(path)),
+            None if reservation.is_some() => return Err(NamespaceError::PathReplaced(path)),
+            None => {}
+        }
         let revision = self.store.snapshot().next_revision;
         let next_revision = revision
             .checked_add(1)
@@ -645,6 +794,7 @@ impl DataDirectoryActor {
         let receipt = MutationReceipt { revision };
         let mut next = self.store.snapshot().clone();
         next.next_revision = next_revision;
+        next.stream_nodes.remove(&path);
         next.bindings.insert(
             path.clone(),
             PersistedBinding {
@@ -666,12 +816,15 @@ impl DataDirectoryActor {
             },
         );
         self.store.commit(next)?;
+        if reservation.is_some() {
+            self.blob_reservations.remove(&path);
+        }
         self.sources.insert(path, RuntimeSource::Available(source));
         Ok(receipt)
     }
 
     fn resolve(&self, path: &DataPath) -> Result<BlobBinding, NamespaceError> {
-        if self.streams.contains_key(path) {
+        if self.store.snapshot().stream_nodes.contains_key(path) {
             return Err(NamespaceError::WrongEntryType {
                 path: path.clone(),
                 expected: EntryKind::Blob,
@@ -699,17 +852,43 @@ impl DataDirectoryActor {
         }
     }
 
+    fn lookup(&self, path: &DataPath) -> Result<NamespaceNode, NamespaceError> {
+        if self.blob_reservations.contains_key(path) {
+            return Err(NamespaceError::PathExists(path.clone()));
+        }
+        let snapshot = self.store.snapshot();
+        match (snapshot.bindings.get(path), snapshot.stream_nodes.get(path)) {
+            (Some(binding), None) => Ok(NamespaceNode {
+                kind: EntryKind::Blob,
+                revision: binding.revision,
+            }),
+            (None, Some(revision)) => Ok(NamespaceNode {
+                kind: EntryKind::Stream,
+                revision: *revision,
+            }),
+            (None, None) => Err(NamespaceError::PathNotFound(path.clone())),
+            (Some(_), Some(_)) => Err(NamespaceError::Storage(format!(
+                "data path {path} is bound as both blob and stream"
+            ))),
+        }
+    }
+
     fn unregister(
         &mut self,
         path: DataPath,
         operation_id: OperationId,
         retired: Option<ActorAddress>,
     ) -> Result<MutationReceipt, NamespaceError> {
+        if self.blob_reservations.contains_key(&path) {
+            return Err(NamespaceError::PathExists(path));
+        }
         let request = MutationRequest::Unregister { path: path.clone() };
         if let Some(replayed) = self.replay(operation_id, &request) {
             return replayed;
         }
-        if !self.store.snapshot().bindings.contains_key(&path) {
+        if !self.store.snapshot().bindings.contains_key(&path)
+            && !self.store.snapshot().stream_nodes.contains_key(&path)
+        {
             let mut next = self.store.snapshot().clone();
             next.operations.insert(
                 operation_id,
@@ -732,6 +911,7 @@ impl DataDirectoryActor {
         let mut next = self.store.snapshot().clone();
         next.next_revision = next_revision;
         next.bindings.remove(&path);
+        next.stream_nodes.remove(&path);
         if let Some(retired) = retired
             && !next.retirements.contains(&retired)
         {
@@ -769,6 +949,7 @@ impl ActorInterface for DataDirectoryActor {
                 length,
                 recovery,
                 operation_id,
+                reservation,
                 reply_to,
             } => {
                 let logical = path.clone();
@@ -780,7 +961,15 @@ impl ActorInterface for DataDirectoryActor {
                         RuntimeSource::Available(actor) if *actor != source => Some(*actor),
                         RuntimeSource::Available(_) | RuntimeSource::Unavailable(_) => None,
                     });
-                let result = self.register(path, source, length, recovery, operation_id, retired);
+                let result = self.register(
+                    path,
+                    source,
+                    length,
+                    recovery,
+                    operation_id,
+                    reservation,
+                    retired,
+                );
                 if result.is_ok()
                     && let Some(retired) = retired
                 {
@@ -807,6 +996,53 @@ impl ActorInterface for DataDirectoryActor {
                 let _ = ctx.send(
                     reply_to,
                     NamespaceClientIn::DirectoryReply(DataDirectoryOut::Resolved {
+                        request_id,
+                        authority_epoch: self.authority_epoch,
+                        result,
+                    }),
+                );
+            }
+            DataDirectoryIn::Lookup {
+                request_id,
+                path,
+                reply_to,
+            } => {
+                let result = self.lookup(&path);
+                let _ = ctx.send(
+                    reply_to,
+                    NamespaceClientIn::DirectoryReply(DataDirectoryOut::LookedUp {
+                        request_id,
+                        authority_epoch: self.authority_epoch,
+                        result,
+                    }),
+                );
+            }
+            DataDirectoryIn::ReserveBlob {
+                request_id,
+                path,
+                operation_id,
+                reply_to,
+            } => {
+                let result = self.reserve_blob(path, operation_id);
+                let _ = ctx.send(
+                    reply_to,
+                    NamespaceClientIn::DirectoryReply(DataDirectoryOut::BlobReserved {
+                        request_id,
+                        authority_epoch: self.authority_epoch,
+                        result,
+                    }),
+                );
+            }
+            DataDirectoryIn::ReleaseBlobReservation {
+                request_id,
+                path,
+                operation_id,
+                reply_to,
+            } => {
+                let result = self.release_blob_reservation(&path, operation_id);
+                let _ = ctx.send(
+                    reply_to,
+                    NamespaceClientIn::DirectoryReply(DataDirectoryOut::BlobReservationReleased {
                         request_id,
                         authority_epoch: self.authority_epoch,
                         result,
@@ -864,6 +1100,8 @@ impl ActorInterface for DataDirectoryActor {
                 endpoint,
                 descriptor,
                 replace,
+                ensure,
+                expected_revision,
                 operation_id,
                 reply_to,
             } => self.open_stream(
@@ -874,6 +1112,8 @@ impl ActorInterface for DataDirectoryActor {
                     role,
                     endpoint,
                     replace,
+                    ensure,
+                    expected_revision,
                     descriptor,
                     operation_id,
                     reply_to,
@@ -948,6 +1188,7 @@ impl NamespaceClientActor {
                 length,
                 recovery,
                 operation_id,
+                reservation,
             } => DataDirectoryIn::Register {
                 request_id,
                 path: path.clone(),
@@ -955,6 +1196,7 @@ impl NamespaceClientActor {
                 length: *length,
                 recovery: recovery.clone(),
                 operation_id: *operation_id,
+                reservation: *reservation,
                 reply_to: ctx.self_addr(),
             },
             NamespaceRequest::Resolve { path } => DataDirectoryIn::Resolve {
@@ -962,6 +1204,25 @@ impl NamespaceClientActor {
                 path: path.clone(),
                 reply_to: ctx.self_addr(),
             },
+            NamespaceRequest::Lookup { path } => DataDirectoryIn::Lookup {
+                request_id,
+                path: path.clone(),
+                reply_to: ctx.self_addr(),
+            },
+            NamespaceRequest::ReserveBlob { path, operation_id } => DataDirectoryIn::ReserveBlob {
+                request_id,
+                path: path.clone(),
+                operation_id: *operation_id,
+                reply_to: ctx.self_addr(),
+            },
+            NamespaceRequest::ReleaseBlobReservation { path, operation_id } => {
+                DataDirectoryIn::ReleaseBlobReservation {
+                    request_id,
+                    path: path.clone(),
+                    operation_id: *operation_id,
+                    reply_to: ctx.self_addr(),
+                }
+            }
             NamespaceRequest::Unregister { path, operation_id } => DataDirectoryIn::Unregister {
                 request_id,
                 path: path.clone(),
@@ -974,6 +1235,8 @@ impl NamespaceClientActor {
                 endpoint,
                 descriptor,
                 replace,
+                ensure,
+                expected_revision,
                 operation_id,
             } => DataDirectoryIn::OpenStream {
                 request_id,
@@ -982,6 +1245,8 @@ impl NamespaceClientActor {
                 endpoint: *endpoint,
                 descriptor: descriptor.clone(),
                 replace: *replace,
+                ensure: *ensure,
+                expected_revision: *expected_revision,
                 operation_id: *operation_id,
                 reply_to: ctx.self_addr(),
             },
@@ -1057,6 +1322,25 @@ impl ActorInterface for NamespaceClientActor {
                 }
                 self.pending
                     .retain(|_, pending| pending.reply_to != reply_to);
+            }
+            NamespaceClientIn::CancelBlobReservation {
+                path,
+                operation_id,
+                reply_to,
+            } => {
+                self.pending
+                    .retain(|_, pending| pending.reply_to != reply_to);
+                if let Some(directory) = self.discovery.current_directory() {
+                    let _ = ctx.send(
+                        directory,
+                        DataDirectoryIn::ReleaseBlobReservation {
+                            request_id: DirectoryRequestId(0),
+                            path,
+                            operation_id,
+                            reply_to: ctx.self_addr(),
+                        },
+                    );
+                }
             }
             NamespaceClientIn::DirectoryReply(reply) => {
                 if let Some(pending) = self.pending.remove(&reply.request_id()) {
@@ -1155,6 +1439,7 @@ impl NamespaceClient {
                 length,
                 recovery,
                 operation_id,
+                reservation: None,
             })
             .await?
         {
@@ -1170,6 +1455,15 @@ impl NamespaceClient {
             DataDirectoryOut::Resolved { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected resolve reply, received {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn lookup(&self, path: DataPath) -> Result<NamespaceNode, NamespaceError> {
+        match self.request(NamespaceRequest::Lookup { path }).await? {
+            DataDirectoryOut::LookedUp { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected lookup reply, received {other:?}"
             ))),
         }
     }
@@ -1204,6 +1498,8 @@ impl NamespaceClient {
                 role,
                 endpoint,
                 replace,
+                ensure: true,
+                expected_revision: None,
                 descriptor: Vec::new(),
                 operation_id,
             })
@@ -1335,6 +1631,7 @@ impl DirectoryClient {
                     length,
                     recovery,
                     operation_id,
+                    reservation: None,
                     reply_to: *inbox.addr(),
                 },
             )
@@ -1366,6 +1663,29 @@ impl DirectoryClient {
             DataDirectoryOut::Resolved { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected resolve reply, received {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn lookup(&self, path: DataPath) -> Result<NamespaceNode, NamespaceError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<NamespaceClientIn>()
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        self.runtime
+            .send_to(
+                self.directory,
+                DataDirectoryIn::Lookup {
+                    request_id: self.request_id(),
+                    path,
+                    reply_to: *inbox.addr(),
+                },
+            )
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        match self.receive(&inbox).await? {
+            DataDirectoryOut::LookedUp { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected lookup reply, received {other:?}"
             ))),
         }
     }
@@ -1426,6 +1746,8 @@ impl DirectoryClient {
                     role,
                     endpoint,
                     replace,
+                    ensure: true,
+                    expected_revision: None,
                     operation_id,
                     descriptor: Vec::new(),
                     reply_to: *inbox.addr(),

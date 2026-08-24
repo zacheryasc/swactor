@@ -1,357 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-use data_plane::arena::{ArenaConfig, ArenaManager, NodeId};
-use data_plane::blob::{
-    BLOB_HEADER_LEN, Blob, BlobError, BlobLease, BlobMetadata, BlobSharedState, LeaseReleaser,
-};
-use data_plane::bootstrap::{self, BootstrapSpec};
-use data_plane::data_plane::DataPlaneBootstrap;
-use data_plane::host::{HostDataPlaneConfig, HostDataPlaneSessionActor};
-use data_plane::path::{DataPath, JobContext};
-use data_plane::protocol::{DataPlaneError, JobCapability};
-use futures_lite::future::{self, FutureExt};
-use swactor::Error;
-use swactor::actor::ActorAddress;
-use swactor::config::RuntimeConfig;
-use swactor::runtime::{RemoteSink, Runtime, RuntimeParts};
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
-
-const CAPABILITY: JobCapability = JobCapability::new([9; 32]);
-const ARENA_GENERATION: u64 = 17;
-const SESSION_GENERATION: u64 = 29;
-const WEIGHTS: &[u8] = b"0123456789abcdefghijklmn";
-static STREAM_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-struct DirectRuntimeSink {
-    destination: Runtime,
-}
-
-impl RemoteSink for DirectRuntimeSink {
-    fn send(
-        &self,
-        address: ActorAddress,
-        message: Box<dyn std::any::Any + Send>,
-    ) -> Result<(), Error> {
-        self.destination.deliver_raw(address, message)
-    }
-}
-
-struct BlackHoleSink;
-
-impl RemoteSink for BlackHoleSink {
-    fn send(
-        &self,
-        _address: ActorAddress,
-        _message: Box<dyn std::any::Any + Send>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-struct Harness {
-    _host_engine: Engine,
-    _child_engine: Engine,
-    _temp: TempState,
-    bootstrap: DataPlaneBootstrap,
-}
-
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
-
-struct TempState {
-    root: std::path::PathBuf,
-}
-
-impl TempState {
-    fn new() -> Self {
-        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "swactor-actor-blob-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        Self { root }
-    }
-}
-
-impl Drop for TempState {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-fn path(value: &str) -> DataPath {
-    DataPath::parse(value).expect("test path")
-}
-
-fn runtime_parts() -> (RuntimeParts, Runtime) {
-    let parts = RuntimeParts::new(RuntimeConfig {
-        worker_count: 1,
-        ..RuntimeConfig::default()
-    });
-    let runtime = parts.runtime().clone();
-    (parts, runtime)
-}
-
-struct LoopbackSender {
-    runtime: Runtime,
-}
-
-impl data_plane::blob_transfer::BlobTransferSender for LoopbackSender {
-    fn start_file(
-        &self,
-        request: data_plane::blob_transfer::FileTransferRequest,
-    ) -> Result<(), String> {
-        use std::os::unix::fs::FileExt;
-        let mut bytes = vec![0_u8; request.length as usize];
-        request
-            .file
-            .read_exact_at(&mut bytes, request.offset)
-            .map_err(|error| error.to_string())?;
-        self.runtime
-            .send_to(
-                request.offer.destination,
-                data_plane::blob_transfer::BlobTransferEvent::Chunk {
-                    transfer_id: request.offer.transfer_id,
-                    bytes,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        self.runtime
-            .send_to(
-                request.offer.destination,
-                data_plane::blob_transfer::BlobTransferEvent::Finished {
-                    transfer_id: request.offer.transfer_id,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        request.completion.complete(Ok(()));
-        Ok(())
-    }
-}
-
-struct DirectReceiver;
-
-impl data_plane::blob_transfer::BlobTransferReceiver for DirectReceiver {
-    fn open(
-        &self,
-        destination: ActorAddress,
-        transfer_id: data_plane::blob_transfer::BlobTransferId,
-    ) -> Result<data_plane::blob_transfer::BlobTransferOffer, String> {
-        Ok(data_plane::blob_transfer::BlobTransferOffer {
-            transfer_id,
-            destination,
-            failure_proxy: None,
-            transport: Vec::new(),
-        })
-    }
-
-    fn cancel(&self, _offer: &data_plane::blob_transfer::BlobTransferOffer) {}
-}
-
-struct StaticDiscovery(ActorAddress);
-
-impl data_plane::namespace::NamespaceDiscovery for StaticDiscovery {
-    fn current_directory(&self) -> Option<ActorAddress> {
-        Some(self.0)
-    }
-}
-
-struct NoopSourceRegistrar;
-
-impl data_plane::source::BlobSourcePublisher for NoopSourceRegistrar {
-    fn publish_source(&self, _source: ActorAddress) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-struct RejectingStreamTransport;
-
-impl data_plane::stream_transport::StreamTransport for RejectingStreamTransport {
-    fn descriptor(&self) -> Result<data_plane::stream_transport::StreamPeerDescriptor, String> {
-        Ok(data_plane::stream_transport::StreamPeerDescriptor(vec![1]))
-    }
-
-    fn install_source(
-        &self,
-        _request: data_plane::stream_transport::StreamSourceRequest,
-    ) -> Result<(), String> {
-        Err("injected source transport failure".to_owned())
-    }
-
-    fn install_sink(
-        &self,
-        _request: data_plane::stream_transport::StreamSinkRequest,
-    ) -> Result<(), String> {
-        Err("injected sink transport failure".to_owned())
-    }
-
-    fn source_progress(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
-
-    fn sink_progress(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
-
-    fn terminate(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
-}
-
-struct CollectBytes(Arc<parking_lot::Mutex<Vec<u8>>>);
-
-impl data_plane::data_plane::StreamConsumer for CollectBytes {
-    fn consume(&self, bytes: &[u8]) -> Result<(), String> {
-        self.0.lock().extend_from_slice(bytes);
-        Ok(())
-    }
-}
-
-fn harness(arena_bytes: u64) -> Harness {
-    harness_with_transport(
-        arena_bytes,
-        Arc::new(data_plane::stream_transport::LocalStreamTransport::new()),
-    )
-}
-
-fn harness_with_transport(
-    arena_bytes: u64,
-    stream_transport: Arc<dyn data_plane::stream_transport::StreamTransport>,
-) -> Harness {
-    let temp = TempState::new();
-    let mut arena = ArenaManager::boot(ArenaConfig {
-        node_id: NodeId(1),
-        reservation_ceiling: arena_bytes,
-        base_alignment: 64,
-    })
-    .expect("host arena");
-    let handoff = bootstrap::write_bootstrap(
-        &mut arena,
-        BootstrapSpec {
-            arena_generation: ARENA_GENERATION,
-            alignment: 64,
-        },
-    )
-    .expect("bootstrap");
-
-    let (host_parts, host_runtime) = runtime_parts();
-    let (child_parts, child_runtime) = runtime_parts();
-    host_runtime.set_remote_sink(Arc::new(DirectRuntimeSink {
-        destination: child_runtime.clone(),
-    }));
-    child_runtime.set_remote_sink(Arc::new(DirectRuntimeSink {
-        destination: host_runtime.clone(),
-    }));
-    let host_engine = Engine::new(
-        host_parts,
-        TokioBackend::new(TokioConfig {
-            worker_threads: 1,
-            ..TokioConfig::default()
-        })
-        .expect("host backend"),
-    )
-    .expect("host engine");
-    let child_engine = Engine::new(
-        child_parts,
-        TokioBackend::new(TokioConfig {
-            worker_threads: 1,
-            ..TokioConfig::default()
-        })
-        .expect("child backend"),
-    )
-    .expect("child engine");
-
-    let sender: Arc<dyn data_plane::blob_transfer::BlobTransferSender> = Arc::new(LoopbackSender {
-        runtime: host_runtime.clone(),
-    });
-    let directory_actor = data_plane::namespace::DataDirectoryActor::recover(
-        temp.root.join("namespace.json"),
-        |_record, _length| {
-            Err(data_plane::namespace::NamespaceError::SourceRecovery(
-                "unexpected recovery".to_owned(),
-            ))
-        },
-    )
-    .unwrap();
-    let directory = host_runtime.spawn(directory_actor).unwrap();
-    let directory_client =
-        data_plane::namespace::DirectoryClient::new(host_runtime.clone(), directory);
-    for (logical, name, bytes) in [
-        ("/models/tiny-linear/weights", "weights.bin", WEIGHTS),
-        ("/models/second", "second.bin", b"second-blob".as_slice()),
-    ] {
-        let file_path = temp.root.join(name);
-        std::fs::write(&file_path, bytes).unwrap();
-        let source = data_plane::source::FileBlobSourceActor::open(
-            host_runtime.clone(),
-            Arc::clone(&sender),
-            &file_path,
-        )
-        .unwrap();
-        let length = source.length();
-        let recovery = source.recovery();
-        let source = host_runtime.spawn(source).unwrap();
-        future::block_on(directory_client.register(
-            path(logical),
-            source,
-            length,
-            recovery,
-            data_plane::namespace::OperationId::from_u128(u128::from(length) + 1),
-        ))
-        .unwrap();
-    }
-    let proxy = host_runtime
-        .spawn(data_plane::namespace::NamespaceClientActor::new(
-            host_engine.handle(),
-            host_runtime.create_sender(),
-            Arc::new(StaticDiscovery(directory)),
-            Duration::from_millis(5),
-        ))
-        .unwrap();
-    let namespace = data_plane::namespace::NamespaceClient::new(host_runtime.clone(), proxy);
-    let host_session = host_runtime
-        .spawn(
-            HostDataPlaneSessionActor::new(HostDataPlaneConfig {
-                runtime: host_runtime.clone(),
-                arena,
-                arena_generation: ARENA_GENERATION,
-                session_generation: SESSION_GENERATION,
-                capability: CAPABILITY,
-                job_context: JobContext {
-                    run_id: "run-7".to_owned(),
-                    read_prefixes: vec![path("/models"), path("/runs/run-7/results")],
-                    write_prefixes: vec![path("/runs/run-7/results")],
-                },
-                namespace: Some(namespace),
-                transfer_receiver: Some(Arc::new(DirectReceiver)),
-                source_sender: Some(sender),
-                source_publisher: Some(Arc::new(NoopSourceRegistrar)),
-                route_registrar: None,
-                stream_transport: Some(stream_transport),
-            })
-            .expect("host session config"),
-        )
-        .expect("spawn host session");
-    let bootstrap = future::block_on(DataPlaneBootstrap::attach(
-        handoff.arena_fd,
-        child_runtime,
-        host_session,
-        CAPABILITY,
-    ))
-    .expect("routed attachment");
-
-    Harness {
-        _host_engine: host_engine,
-        _child_engine: child_engine,
-        _temp: temp,
-        bootstrap,
-    }
-}
-
-#[derive(Default)]
-struct NoopReleaser;
-
-impl LeaseReleaser for NoopReleaser {
-    fn release(&self, _lease: BlobLease) {}
-}
+include!("data_plane_test_support.inc");
 
 #[test]
 fn attachment_without_a_host_reply_fails_on_actor_deadline() {
@@ -873,4 +522,191 @@ fn actor_stream_consumer_registers_before_writer_and_collects_to_eof() {
 
     completion.wait().expect("collector completes");
     assert_eq!(&*observed.lock(), b"actor-consumer");
+}
+
+#[test]
+fn raw_blob_descriptor_enforces_offsets_rights_and_terminal_state() {
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/raw-blob");
+
+    future::block_on(async {
+        let mut writer = data_plane
+            .open(&logical, OpenOptions::staged_blob(8))
+            .await
+            .expect("open staged descriptor");
+        assert_eq!(writer.kind(), DescriptorKind::Blob);
+        assert!(
+            writer
+                .capabilities()
+                .contains(DescriptorCapabilities::WRITE)
+        );
+        assert_eq!(writer.write(b"abc").await.expect("first write"), 3);
+        assert_eq!(writer.write(b"defgh").await.expect("second write"), 5);
+        assert_eq!(writer.last_route(), Some(TransferRoute::Staged));
+        assert_eq!(
+            writer
+                .write(b"!")
+                .await
+                .expect_err("growth rejected")
+                .errno(),
+            Errno::Enotsup
+        );
+        writer.close().await.expect("publish");
+        assert_eq!(
+            writer.close().await.expect_err("double close").errno(),
+            Errno::Ebadf
+        );
+
+        let mut reader = data_plane
+            .open(&logical, OpenOptions::read_only())
+            .await
+            .expect("open published descriptor");
+        assert_eq!(reader.kind(), DescriptorKind::Blob);
+        let mut first = [0xa5; 5];
+        reader
+            .read_exact(&mut first[..3])
+            .await
+            .expect("exact prefix read");
+        assert_eq!(&first, b"abc\xa5\xa5");
+        let mut rest = [0_u8; 8];
+        assert_eq!(reader.read(&mut rest).await.expect("remaining read"), 5);
+        assert_eq!(reader.read(&mut rest).await.expect("eof"), 0);
+        assert_eq!(
+            reader.write(b"x").await.expect_err("wrong access").errno(),
+            Errno::Ebadf
+        );
+        assert_eq!(reader.read(&mut []).await.expect("zero length"), 0);
+        reader.close().await.expect("close reader");
+
+        let mut source = data_plane
+            .open(&logical, OpenOptions::read_only())
+            .await
+            .expect("open arena-region source");
+        let target_path = path("/runs/self/results/raw-region-target");
+        let mut target = data_plane
+            .open(&target_path, OpenOptions::staged_blob(8))
+            .await
+            .expect("open arena-region target");
+        let mut target_mapping = target
+            .map(MapRequest {
+                protection: Protection::ReadWrite,
+                sharing: Sharing::Shared,
+                target: MapTarget::Host,
+                offset: 0,
+                length: 8,
+            })
+            .expect("map arena target");
+        assert_eq!(target_mapping.route(), TransferRoute::Direct);
+        let count = source
+            .read_into(RegionSlice::arena(
+                target_mapping.as_mut().expect("writable arena region"),
+            ))
+            .await
+            .expect("read into arena region");
+        assert_eq!(count, 8);
+        assert_eq!(target_mapping.as_ref(), b"abcdefgh");
+        drop(target_mapping);
+        target.abort().await.expect("abort arena target");
+        source.close().await.expect("close arena source");
+        assert_eq!(
+            reader
+                .read(&mut rest)
+                .await
+                .expect_err("read after close")
+                .errno(),
+            Errno::Ebadf
+        );
+    });
+}
+
+#[test]
+fn raw_stream_descriptor_hides_record_boundaries_and_preserves_eof() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/raw-stream");
+
+    future::block_on(async {
+        let typed_reader = data_plane.read_stream(&logical);
+        let typed_writer = data_plane.write_stream(&logical);
+        let (typed_reader, typed_writer) = future::zip(typed_reader, typed_writer).await;
+        let mut typed_reader = typed_reader.expect("seed stream reader");
+        let mut typed_writer = typed_writer.expect("seed stream writer");
+        typed_writer.close().await.expect("seed close");
+        assert_eq!(typed_reader.read().await.expect("seed eof"), None);
+
+        let raw_reader = data_plane.open(&logical, OpenOptions::read_only());
+        let raw_writer = data_plane.open(
+            &logical,
+            OpenOptions {
+                access: AccessMode::WriteOnly,
+                ..OpenOptions::default()
+            },
+        );
+        let (raw_reader, raw_writer) = future::zip(raw_reader, raw_writer).await;
+        let mut reader = raw_reader.expect("raw stream reader");
+        let mut writer = raw_writer.expect("raw stream writer");
+        assert_eq!(reader.kind(), DescriptorKind::Stream);
+        writer
+            .write_all(b"abcdefgh")
+            .await
+            .expect("stream write all");
+        writer.close().await.expect("writer close");
+
+        let mut chunk = [0_u8; 3];
+        assert_eq!(reader.read(&mut chunk).await.expect("chunk one"), 3);
+        assert_eq!(&chunk, b"abc");
+        assert_eq!(reader.read(&mut chunk).await.expect("chunk two"), 3);
+        assert_eq!(&chunk, b"def");
+        assert_eq!(reader.read(&mut chunk).await.expect("chunk three"), 2);
+        assert_eq!(&chunk[..2], b"gh");
+        assert_eq!(reader.read(&mut chunk).await.expect("stream eof"), 0);
+        assert_eq!(reader.read(&mut chunk).await.expect("sticky eof"), 0);
+        reader.close().await.expect("reader close");
+    });
+}
+
+#[test]
+fn raw_blob_mapping_is_bounded_and_can_outlive_descriptor_close() {
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/raw-mapped-blob");
+
+    future::block_on(async {
+        let mut writer = data_plane
+            .open(&logical, OpenOptions::staged_blob(6))
+            .await
+            .expect("open mapped writer");
+        let mut mapping = writer
+            .map(MapRequest {
+                protection: Protection::ReadWrite,
+                sharing: Sharing::Shared,
+                target: MapTarget::Host,
+                offset: 1,
+                length: 4,
+            })
+            .expect("bounded writable mapping");
+        assert_eq!(mapping.route(), TransferRoute::Direct);
+        mapping
+            .as_mut()
+            .expect("writable mapping")
+            .copy_from_slice(b"data");
+        writer.close().await.expect("deferred close intent");
+        assert_eq!(mapping.as_ref(), b"data");
+        drop(mapping);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let blob = loop {
+            match data_plane.read_blob(&logical).await {
+                Ok(blob) => break blob,
+                Err(DataPlaneError::PathNotFound(_)) if std::time::Instant::now() < deadline => {
+                    future::yield_now().await;
+                }
+                Err(error) => panic!("deferred publication failed: {error}"),
+            }
+        };
+        let view = blob.map().expect("published mapping");
+        assert_eq!(&view[..], b"\0data\0");
+    });
 }

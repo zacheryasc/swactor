@@ -1,9 +1,10 @@
 //! Child-side data-plane session, per-operation actors, and native API.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
@@ -11,12 +12,19 @@ use swactor::runtime::{ExternalSender, Runtime};
 use swactor_engine::{ActorCompletion, EngineHandle};
 
 use crate::blob::{
-    Blob, BlobLease, BlobMetadata, LeaseReleaser, WritableArenaView, WritableBlobLease,
+    Blob, BlobLease, BlobMetadata, BlobView, LeaseReleaser, WritableArenaView, WritableBlobLease,
+    WritableViewObserver,
 };
-use crate::byte_ring::{Endpoint, FlowError, RecordKind, RingHandle, Role, attach_mapped};
+use crate::byte_ring::{
+    Endpoint, FlowError, RecordCursor, RecordKind, RingHandle, Role, attach_mapped,
+};
 use crate::mapped_arena::MappedArena;
 use crate::path::DataPath;
-use crate::protocol::{ChildSessionIn, DataPlaneError, HostSessionIn, HostStreamIn, JobCapability};
+pub use crate::protocol::{
+    AccessMode, BlobAllocation, DataPlaneError, DescriptorCapabilities, DescriptorKind, Errno,
+    OpenOptions,
+};
+use crate::protocol::{ChildSessionIn, HostSessionIn, HostStreamIn, JobCapability, OpenPolicy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSessionState {
@@ -132,14 +140,13 @@ impl DataPlaneBootstrap {
             .spawn(ChildDataPlaneSessionActor {
                 runtime: runtime.clone(),
                 host_session,
-                arena: arena.clone(),
                 arena_generation: resolved.arena_generation,
                 job_capability,
                 child_node,
                 session_generation: None,
                 attach_reply: Some(attach_reply),
                 operations: HashSet::new(),
-                read_operations: HashMap::new(),
+                open_operations: HashMap::new(),
                 state: ChildSessionState::Attaching,
                 stream_operations: HashMap::new(),
                 pending_blob_releases: 0,
@@ -162,19 +169,19 @@ impl DataPlaneBootstrap {
     }
 }
 
-struct ReadCancellation {
+struct DescriptorOpenCancellation {
     runtime: Runtime,
     child_session: ActorAddress,
     reply_to: ActorAddress,
     armed: bool,
 }
 
-impl Drop for ReadCancellation {
+impl Drop for DescriptorOpenCancellation {
     fn drop(&mut self) {
         if self.armed {
             let _ = self.runtime.send_to(
                 self.child_session,
-                ChildSessionIn::CancelRead {
+                ChildSessionIn::CancelOpen {
                     reply_to: self.reply_to,
                 },
             );
@@ -182,22 +189,77 @@ impl Drop for ReadCancellation {
     }
 }
 
-struct StreamOpenCancellation {
-    runtime: Runtime,
-    child_session: ActorAddress,
-    reply_to: ActorAddress,
-    armed: bool,
+#[derive(Clone)]
+enum DescriptorOpenGrant {
+    ReadBlob {
+        host_binding: ActorAddress,
+        lease: BlobLease,
+        metadata: BlobMetadata,
+        cancellation: Arc<DescriptorGrantCancellation>,
+    },
+    WriteBlob {
+        operation: ActorAddress,
+        lease: BlobLease,
+        metadata: BlobMetadata,
+        access: AccessMode,
+        cancellation: Arc<DescriptorGrantCancellation>,
+    },
+    Stream {
+        operation: ActorAddress,
+        host_binding: ActorAddress,
+        ring: RingHandle,
+        role: Role,
+        cancellation: Arc<DescriptorGrantCancellation>,
+    },
 }
 
-impl Drop for StreamOpenCancellation {
+#[derive(Clone, Copy)]
+enum DescriptorGrantCancellationAction {
+    HostOpen {
+        host_session: ActorAddress,
+        operation: ActorAddress,
+    },
+    WriteBlob {
+        operation: ActorAddress,
+        lease: BlobLease,
+    },
+}
+
+struct DescriptorGrantCancellation {
+    runtime: Runtime,
+    action: DescriptorGrantCancellationAction,
+    armed: AtomicBool,
+}
+
+impl DescriptorGrantCancellation {
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for DescriptorGrantCancellation {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.runtime.send_to(
-                self.child_session,
-                ChildSessionIn::CancelStream {
-                    reply_to: self.reply_to,
-                },
-            );
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        match self.action {
+            DescriptorGrantCancellationAction::HostOpen {
+                host_session,
+                operation,
+            } => {
+                let _ = self
+                    .runtime
+                    .send_to(host_session, HostSessionIn::CancelOpen { operation });
+            }
+            DescriptorGrantCancellationAction::WriteBlob { operation, lease } => {
+                let _ = self.runtime.send_to(
+                    operation,
+                    ChildOperationIn::AbortRequested {
+                        reply_to: None,
+                        lease,
+                    },
+                );
+            }
         }
     }
 }
@@ -209,6 +271,513 @@ pub struct DataPlane {
     arena: Arc<MappedArena>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protection {
+    Read,
+    ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sharing {
+    Shared,
+    Private,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapTarget {
+    Host,
+    Device(DeviceId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapRequest {
+    pub protection: Protection,
+    pub sharing: Sharing,
+    pub target: MapTarget,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionKind {
+    Host,
+    Arena,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferRoute {
+    Direct,
+    Staged,
+}
+
+pub struct DeviceRegion {
+    identity: [u8; 32],
+    generation: u64,
+    length: u64,
+    readable: bool,
+    writable: bool,
+    direct_required: bool,
+}
+
+impl DeviceRegion {
+    pub const fn identity(&self) -> &[u8; 32] {
+        &self.identity
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub const fn is_readable(&self) -> bool {
+        self.readable
+    }
+
+    pub const fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    pub const fn requires_direct_route(&self) -> bool {
+        self.direct_required
+    }
+}
+
+pub struct DeviceRegionSlice<'a> {
+    region: &'a DeviceRegion,
+    offset: u64,
+    length: u64,
+}
+
+pub enum RegionSlice<'a> {
+    Host(&'a mut [u8]),
+    Arena(&'a mut [u8]),
+    Device(DeviceRegionSlice<'a>),
+}
+
+impl<'a> RegionSlice<'a> {
+    pub fn host(bytes: &'a mut [u8]) -> Self {
+        Self::Host(bytes)
+    }
+
+    pub fn arena(bytes: &'a mut [u8]) -> Self {
+        Self::Arena(bytes)
+    }
+
+    pub fn device(
+        region: &'a DeviceRegion,
+        offset: u64,
+        length: u64,
+    ) -> Result<Self, DataPlaneError> {
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > region.length)
+        {
+            return Err(DataPlaneError::InvalidArgument(
+                "device region slice is out of bounds".to_owned(),
+            ));
+        }
+        Ok(Self::Device(DeviceRegionSlice {
+            region,
+            offset,
+            length,
+        }))
+    }
+
+    pub const fn kind(&self) -> RegionKind {
+        match self {
+            Self::Host(_) => RegionKind::Host,
+            Self::Arena(_) => RegionKind::Arena,
+            Self::Device(_) => RegionKind::Device,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Host(bytes) | Self::Arena(bytes) => bytes.len(),
+            Self::Device(slice) => usize::try_from(slice.length).unwrap_or(usize::MAX),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn as_ref(&self) -> Result<&[u8], DataPlaneError> {
+        match self {
+            Self::Host(bytes) | Self::Arena(bytes) => Ok(bytes),
+            Self::Device(slice) if !slice.region.readable => Err(DataPlaneError::BadDescriptor),
+            Self::Device(slice) => {
+                let _ = slice.offset;
+                Err(DataPlaneError::Unsupported(
+                    "no registered device read route is installed".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn as_mut(&mut self) -> Result<&mut [u8], DataPlaneError> {
+        match self {
+            Self::Host(bytes) | Self::Arena(bytes) => Ok(bytes),
+            Self::Device(slice) if !slice.region.writable => Err(DataPlaneError::BadDescriptor),
+            Self::Device(slice) => {
+                let _ = slice.offset;
+                Err(DataPlaneError::Unsupported(
+                    "no registered device write route is installed".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+pub enum DescriptorMapping {
+    ReadOnly(BlobView),
+    WritableReadOnly(WritableArenaView),
+    Writable(WritableArenaView),
+}
+
+impl DescriptorMapping {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::ReadOnly(view) => view.len(),
+            Self::WritableReadOnly(view) | Self::Writable(view) => view.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::ReadOnly(view) => view.as_ref(),
+            Self::WritableReadOnly(view) | Self::Writable(view) => view.as_ref(),
+        }
+    }
+
+    pub fn as_mut(&mut self) -> Result<&mut [u8], DataPlaneError> {
+        match self {
+            Self::ReadOnly(_) | Self::WritableReadOnly(_) => Err(DataPlaneError::BadDescriptor),
+            Self::Writable(view) => Ok(view.as_mut()),
+        }
+    }
+
+    pub const fn route(&self) -> TransferRoute {
+        TransferRoute::Direct
+    }
+}
+
+impl fmt::Debug for DescriptorMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DescriptorMapping")
+            .field("len", &self.len())
+            .field("route", &self.route())
+            .field("writable", &matches!(self, Self::Writable(_)))
+            .finish()
+    }
+}
+
+enum DescriptorBackend {
+    ReadBlob { blob: Blob, offset: u64 },
+    WriteBlob { writer: BlobWriter, offset: u64 },
+    ReadStream(StreamReader),
+    WriteStream(StreamWriter),
+}
+
+pub struct Descriptor {
+    kind: DescriptorKind,
+    capabilities: DescriptorCapabilities,
+    access: AccessMode,
+    backend: Option<DescriptorBackend>,
+    last_route: Option<TransferRoute>,
+}
+
+impl Descriptor {
+    fn read_blob(blob: Blob) -> Self {
+        Self {
+            kind: DescriptorKind::Blob,
+            capabilities: DescriptorCapabilities::READ
+                .union(DescriptorCapabilities::MAP_HOST)
+                .union(DescriptorCapabilities::SEEK),
+            access: AccessMode::ReadOnly,
+            backend: Some(DescriptorBackend::ReadBlob { blob, offset: 0 }),
+            last_route: None,
+        }
+    }
+
+    fn write_blob(writer: BlobWriter, access: AccessMode) -> Self {
+        let mut capabilities = DescriptorCapabilities::WRITE
+            .union(DescriptorCapabilities::MAP_HOST)
+            .union(DescriptorCapabilities::SEEK);
+        if access.can_read() {
+            capabilities = capabilities.union(DescriptorCapabilities::READ);
+        }
+        Self {
+            kind: DescriptorKind::Blob,
+            capabilities,
+            access,
+            backend: Some(DescriptorBackend::WriteBlob { writer, offset: 0 }),
+            last_route: None,
+        }
+    }
+
+    fn read_stream(reader: StreamReader) -> Self {
+        Self {
+            kind: DescriptorKind::Stream,
+            capabilities: DescriptorCapabilities::READ,
+            access: AccessMode::ReadOnly,
+            backend: Some(DescriptorBackend::ReadStream(reader)),
+            last_route: None,
+        }
+    }
+
+    fn write_stream(writer: StreamWriter) -> Self {
+        Self {
+            kind: DescriptorKind::Stream,
+            capabilities: DescriptorCapabilities::WRITE,
+            access: AccessMode::WriteOnly,
+            backend: Some(DescriptorBackend::WriteStream(writer)),
+            last_route: None,
+        }
+    }
+
+    pub const fn kind(&self) -> DescriptorKind {
+        self.kind
+    }
+
+    pub const fn capabilities(&self) -> DescriptorCapabilities {
+        self.capabilities
+    }
+
+    pub const fn access(&self) -> AccessMode {
+        self.access
+    }
+
+    pub const fn last_route(&self) -> Option<TransferRoute> {
+        self.last_route
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.backend.is_none()
+    }
+
+    pub async fn read(&mut self, destination: &mut [u8]) -> Result<usize, DataPlaneError> {
+        if !self.access.can_read() {
+            return Err(DataPlaneError::BadDescriptor);
+        }
+        let backend = self.backend.as_mut().ok_or(DataPlaneError::BadDescriptor)?;
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        let result = match backend {
+            DescriptorBackend::ReadBlob { blob, offset } => {
+                let count = blob.copy_at(*offset, destination)?;
+                *offset += count as u64;
+                Ok(count)
+            }
+            DescriptorBackend::WriteBlob { writer, offset } => {
+                let count = writer.copy_at(*offset, destination)?;
+                *offset += count as u64;
+                Ok(count)
+            }
+            DescriptorBackend::ReadStream(reader) => reader.read_into(destination).await,
+            DescriptorBackend::WriteStream(_) => Err(DataPlaneError::BadDescriptor),
+        };
+        if result.is_ok() {
+            self.last_route = Some(TransferRoute::Staged);
+        }
+        result
+    }
+
+    pub async fn write(&mut self, source: &[u8]) -> Result<usize, DataPlaneError> {
+        if !self.access.can_write() {
+            return Err(DataPlaneError::BadDescriptor);
+        }
+        let backend = self.backend.as_mut().ok_or(DataPlaneError::BadDescriptor)?;
+        if source.is_empty() {
+            return Ok(0);
+        }
+        let result = match backend {
+            DescriptorBackend::WriteBlob { writer, offset } => {
+                let count = writer.copy_from(*offset, source)?;
+                *offset += count as u64;
+                Ok(count)
+            }
+            DescriptorBackend::WriteStream(writer) => writer.write_partial(source).await,
+            DescriptorBackend::ReadBlob { .. } | DescriptorBackend::ReadStream(_) => {
+                Err(DataPlaneError::BadDescriptor)
+            }
+        };
+        if result.is_ok() {
+            self.last_route = Some(TransferRoute::Staged);
+        }
+        result
+    }
+
+    pub async fn read_into(
+        &mut self,
+        mut destination: RegionSlice<'_>,
+    ) -> Result<usize, DataPlaneError> {
+        let destination = destination.as_mut()?;
+        self.read(destination).await
+    }
+
+    pub async fn write_from(&mut self, source: RegionSlice<'_>) -> Result<usize, DataPlaneError> {
+        let source = source.as_ref()?;
+        self.write(source).await
+    }
+
+    pub async fn read_exact(&mut self, destination: &mut [u8]) -> Result<(), DataPlaneError> {
+        let mut completed = 0;
+        while completed < destination.len() {
+            let count = self.read(&mut destination[completed..]).await?;
+            if count == 0 {
+                return Err(DataPlaneError::InvalidArgument(
+                    "unexpected EOF during read_exact".to_owned(),
+                ));
+            }
+            completed += count;
+        }
+        Ok(())
+    }
+
+    pub async fn write_all(&mut self, source: &[u8]) -> Result<(), DataPlaneError> {
+        let mut completed = 0;
+        while completed < source.len() {
+            let count = self.write(&source[completed..]).await?;
+            if count == 0 {
+                return Err(DataPlaneError::SessionFailed(
+                    "zero-byte write made no progress".to_owned(),
+                ));
+            }
+            completed += count;
+        }
+        Ok(())
+    }
+
+    pub fn map(&self, request: MapRequest) -> Result<DescriptorMapping, DataPlaneError> {
+        let backend = self.backend.as_ref().ok_or(DataPlaneError::BadDescriptor)?;
+        if request.target != MapTarget::Host || request.sharing != Sharing::Shared {
+            return Err(DataPlaneError::Unsupported(
+                "requested mapping target or sharing mode is not supported".to_owned(),
+            ));
+        }
+        match backend {
+            DescriptorBackend::ReadBlob { blob, .. } => {
+                if request.protection != Protection::Read {
+                    return Err(DataPlaneError::BadDescriptor);
+                }
+                Ok(DescriptorMapping::ReadOnly(
+                    blob.map_range(request.offset, request.length)?,
+                ))
+            }
+            DescriptorBackend::WriteBlob { writer, .. } => match request.protection {
+                Protection::Read if self.access.can_read() => {
+                    Ok(DescriptorMapping::WritableReadOnly(
+                        writer.map_range(request.offset, request.length)?,
+                    ))
+                }
+                Protection::Read => Err(DataPlaneError::BadDescriptor),
+                Protection::ReadWrite if self.access.can_write() => Ok(
+                    DescriptorMapping::Writable(writer.map_range(request.offset, request.length)?),
+                ),
+                Protection::ReadWrite => Err(DataPlaneError::BadDescriptor),
+            },
+            DescriptorBackend::ReadStream(_) | DescriptorBackend::WriteStream(_) => {
+                Err(DataPlaneError::MappingUnsupported)
+            }
+        }
+    }
+
+    pub async fn close(&mut self) -> Result<(), DataPlaneError> {
+        let backend = self.backend.take().ok_or(DataPlaneError::BadDescriptor)?;
+        match backend {
+            DescriptorBackend::ReadBlob { .. } => Ok(()),
+            DescriptorBackend::WriteBlob { mut writer, .. } => {
+                if writer.defer_seal_if_mapped() {
+                    Ok(())
+                } else {
+                    writer.seal().await
+                }
+            }
+            DescriptorBackend::ReadStream(mut reader) => reader.close_descriptor().await,
+            DescriptorBackend::WriteStream(mut writer) => writer.close().await,
+        }
+    }
+
+    pub async fn abort(&mut self) -> Result<(), DataPlaneError> {
+        let backend = self.backend.take().ok_or(DataPlaneError::BadDescriptor)?;
+        match backend {
+            DescriptorBackend::ReadBlob { .. } => Ok(()),
+            DescriptorBackend::WriteBlob { mut writer, .. } => {
+                if writer.defer_abort_if_mapped() {
+                    Ok(())
+                } else {
+                    writer.abort().await
+                }
+            }
+            DescriptorBackend::ReadStream(mut reader) => reader.abort_descriptor().await,
+            DescriptorBackend::WriteStream(mut writer) => writer.abort_descriptor().await,
+        }
+    }
+
+    fn into_blob(mut self) -> Result<Blob, DataPlaneError> {
+        match self.backend.take() {
+            Some(DescriptorBackend::ReadBlob { blob, .. }) => Ok(blob),
+            _ => Err(DataPlaneError::BadDescriptor),
+        }
+    }
+
+    fn into_blob_writer(mut self) -> Result<BlobWriter, DataPlaneError> {
+        match self.backend.take() {
+            Some(DescriptorBackend::WriteBlob { writer, .. }) => Ok(writer),
+            _ => Err(DataPlaneError::BadDescriptor),
+        }
+    }
+
+    fn into_stream_reader(mut self) -> Result<StreamReader, DataPlaneError> {
+        match self.backend.take() {
+            Some(DescriptorBackend::ReadStream(reader)) => Ok(reader),
+            _ => Err(DataPlaneError::BadDescriptor),
+        }
+    }
+
+    fn into_stream_writer(mut self) -> Result<StreamWriter, DataPlaneError> {
+        match self.backend.take() {
+            Some(DescriptorBackend::WriteStream(writer)) => Ok(writer),
+            _ => Err(DataPlaneError::BadDescriptor),
+        }
+    }
+}
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        let Some(backend) = self.backend.take() else {
+            return;
+        };
+        drop(backend);
+    }
+}
+
+impl fmt::Debug for Descriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Descriptor")
+            .field("kind", &self.kind)
+            .field("capabilities", &self.capabilities)
+            .field("access", &self.access)
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
 impl DataPlane {
     pub fn child_session(&self) -> ActorAddress {
         self.child_session
@@ -218,22 +787,112 @@ impl DataPlane {
         &self.arena
     }
 
-    pub async fn read_blob(&self, path: &DataPath) -> Result<Blob, DataPlaneError> {
+    fn descriptor_from_grant(
+        &self,
+        grant: DescriptorOpenGrant,
+    ) -> Result<Descriptor, DataPlaneError> {
+        match grant {
+            DescriptorOpenGrant::ReadBlob {
+                host_binding,
+                lease,
+                metadata,
+                cancellation,
+            } => {
+                let releaser: Arc<dyn LeaseReleaser> = Arc::new(RuntimeLeaseReleaser {
+                    runtime: self.runtime.clone(),
+                    child_session: self.child_session,
+                    host_binding,
+                });
+                let blob = Blob::from_sealed_lease(self.arena.clone(), lease, metadata, releaser)?;
+                cancellation.disarm();
+                Ok(Descriptor::read_blob(blob))
+            }
+            DescriptorOpenGrant::WriteBlob {
+                operation,
+                lease,
+                metadata,
+                access,
+                cancellation,
+            } => {
+                let writable = WritableBlobLease::from_grant(self.arena.clone(), lease, metadata)?;
+                let lifecycle = Arc::new(WritableDescriptorLifecycle {
+                    runtime: self.runtime.clone(),
+                    operation,
+                    writable: Arc::downgrade(&writable),
+                    terminal: AtomicU8::new(0),
+                    completed: AtomicBool::new(false),
+                });
+                let observer: Arc<dyn WritableViewObserver> = lifecycle.clone();
+                writable.set_view_observer(observer);
+                let writer = BlobWriter {
+                    runtime: self.runtime.clone(),
+                    operation,
+                    writable,
+                    lifecycle,
+                    finalized: false,
+                };
+                cancellation.disarm();
+                Ok(Descriptor::write_blob(writer, access))
+            }
+            DescriptorOpenGrant::Stream {
+                operation,
+                host_binding,
+                ring,
+                role,
+                cancellation,
+            } => {
+                let endpoint = attach_mapped(&self.arena, ring, role).map_err(|error| {
+                    DataPlaneError::StreamFault(format!("attach descriptor stream: {error:?}"))
+                })?;
+                let descriptor = match role {
+                    Role::Consumer => Descriptor::read_stream(StreamReader {
+                        runtime: self.runtime.clone(),
+                        child_session: self.child_session,
+                        operation,
+                        host_binding,
+                        endpoint,
+                        terminal: None,
+                        pending_record: None,
+                    }),
+                    Role::Producer => Descriptor::write_stream(StreamWriter {
+                        runtime: self.runtime.clone(),
+                        child_session: self.child_session,
+                        operation,
+                        host_binding,
+                        endpoint,
+                        closed: false,
+                    }),
+                };
+                cancellation.disarm();
+                Ok(descriptor)
+            }
+        }
+    }
+
+    async fn open_inner(
+        &self,
+        path: &DataPath,
+        options: OpenOptions,
+        policy: OpenPolicy,
+    ) -> Result<Descriptor, DataPlaneError> {
+        options.validate()?;
         let inbox = self
             .runtime
-            .new_inbox::<Result<Blob, DataPlaneError>>()
+            .new_inbox::<Result<DescriptorOpenGrant, DataPlaneError>>()
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
         let reply_to = *inbox.addr();
         self.runtime
             .send_to(
                 self.child_session,
-                ChildSessionIn::ReadBlob {
+                ChildSessionIn::Open {
                     path: path.clone(),
+                    options,
+                    policy,
                     reply_to,
                 },
             )
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        let mut cancellation = ReadCancellation {
+        let mut cancellation = DescriptorOpenCancellation {
             runtime: self.runtime.clone(),
             child_session: self.child_session,
             reply_to,
@@ -241,7 +900,29 @@ impl DataPlane {
         };
         let result = inbox.recv().await;
         cancellation.armed = false;
-        result
+        self.descriptor_from_grant(result?)
+    }
+
+    pub async fn open(
+        &self,
+        path: &DataPath,
+        options: OpenOptions,
+    ) -> Result<Descriptor, DataPlaneError> {
+        self.open_inner(path, options, OpenPolicy::Ordinary).await
+    }
+
+    pub async fn open_path(
+        &self,
+        path: &str,
+        options: OpenOptions,
+    ) -> Result<Descriptor, DataPlaneError> {
+        let path = DataPath::parse(path)
+            .map_err(|error| DataPlaneError::InvalidPath(error.to_string()))?;
+        self.open(&path, options).await
+    }
+
+    pub async fn read_blob(&self, path: &DataPath) -> Result<Blob, DataPlaneError> {
+        self.open(path, OpenOptions::read_only()).await?.into_blob()
     }
 
     pub async fn read_blob_path(&self, path: &str) -> Result<Blob, DataPlaneError> {
@@ -255,27 +936,9 @@ impl DataPlane {
         path: &DataPath,
         length: u64,
     ) -> Result<BlobWriter, DataPlaneError> {
-        let ask = self
-            .runtime
-            .ask::<ChildSessionIn, Result<WriteBlobGrant, DataPlaneError>>(
-                self.child_session,
-                |reply_to| ChildSessionIn::OpenWriteBlob {
-                    path: path.clone(),
-                    length,
-                    reply_to,
-                },
-            )
-            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        let grant = ask.await?;
-        let writable =
-            WritableBlobLease::from_grant(self.arena.clone(), grant.lease, grant.metadata.clone())?;
-        grant.cancellation.disarm();
-        Ok(BlobWriter {
-            runtime: self.runtime.clone(),
-            operation: grant.operation,
-            writable,
-            finalized: false,
-        })
+        self.open(path, OpenOptions::staged_blob(length))
+            .await?
+            .into_blob_writer()
     }
 
     pub async fn write_blob_path(
@@ -288,94 +951,46 @@ impl DataPlane {
         self.write_blob(&path, length).await
     }
 
-    async fn open_stream(
-        &self,
-        path: &DataPath,
-        role: Role,
-        replace: bool,
-    ) -> Result<StreamOpenGrant, DataPlaneError> {
-        let inbox = self
-            .runtime
-            .new_inbox::<ChildStreamIn>()
-            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        let reply_to = *inbox.addr();
-        let message = match role {
-            Role::Consumer => ChildSessionIn::OpenReadStream {
-                path: path.clone(),
-                reply_to,
-                replace,
-            },
-            Role::Producer => ChildSessionIn::OpenWriteStream {
-                path: path.clone(),
-                reply_to,
-                replace,
-            },
-        };
-        self.runtime
-            .send_to(self.child_session, message)
-            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        let mut cancellation = StreamOpenCancellation {
-            runtime: self.runtime.clone(),
-            child_session: self.child_session,
-            reply_to,
-            armed: true,
-        };
-        let result = match inbox.recv().await {
-            ChildStreamIn::Opened(result) => result,
-            ChildStreamIn::Wake(_) => Err(DataPlaneError::StreamFault(
-                "received stream wake before open completed".to_owned(),
-            )),
-        };
-        cancellation.armed = false;
-        result
-    }
-
     pub async fn read_stream(&self, path: &DataPath) -> Result<StreamReader, DataPlaneError> {
-        let grant = self.open_stream(path, Role::Consumer, false).await?;
-        let endpoint = attach_mapped(&self.arena, grant.ring, Role::Consumer).map_err(|error| {
-            DataPlaneError::StreamFault(format!("attach stream reader: {error:?}"))
-        })?;
-        Ok(StreamReader {
-            runtime: self.runtime.clone(),
-            child_session: self.child_session,
-            operation: grant.operation,
-            host_binding: grant.host_binding,
-            endpoint,
-            terminal: None,
-        })
+        self.open_inner(
+            path,
+            OpenOptions {
+                access: AccessMode::ReadOnly,
+                ..OpenOptions::default()
+            },
+            OpenPolicy::EnsureStream { replace: false },
+        )
+        .await?
+        .into_stream_reader()
     }
 
     pub async fn write_stream(&self, path: &DataPath) -> Result<StreamWriter, DataPlaneError> {
-        let grant = self.open_stream(path, Role::Producer, false).await?;
-        let endpoint = attach_mapped(&self.arena, grant.ring, Role::Producer).map_err(|error| {
-            DataPlaneError::StreamFault(format!("attach stream writer: {error:?}"))
-        })?;
-        Ok(StreamWriter {
-            runtime: self.runtime.clone(),
-            child_session: self.child_session,
-            operation: grant.operation,
-            host_binding: grant.host_binding,
-            endpoint,
-            closed: false,
-        })
+        self.open_inner(
+            path,
+            OpenOptions {
+                access: AccessMode::WriteOnly,
+                ..OpenOptions::default()
+            },
+            OpenPolicy::EnsureStream { replace: false },
+        )
+        .await?
+        .into_stream_writer()
     }
 
     pub async fn write_stream_replacing(
         &self,
         path: &DataPath,
     ) -> Result<StreamWriter, DataPlaneError> {
-        let grant = self.open_stream(path, Role::Producer, true).await?;
-        let endpoint = attach_mapped(&self.arena, grant.ring, Role::Producer).map_err(|error| {
-            DataPlaneError::StreamFault(format!("attach stream writer: {error:?}"))
-        })?;
-        Ok(StreamWriter {
-            runtime: self.runtime.clone(),
-            child_session: self.child_session,
-            operation: grant.operation,
-            host_binding: grant.host_binding,
-            endpoint,
-            closed: false,
-        })
+        self.open_inner(
+            path,
+            OpenOptions {
+                access: AccessMode::WriteOnly,
+                ..OpenOptions::default()
+            },
+            OpenPolicy::EnsureStream { replace: true },
+        )
+        .await?
+        .into_stream_writer()
     }
 
     pub fn close(&self) -> Result<(), DataPlaneError> {
@@ -413,10 +1028,91 @@ impl DataPlane {
         Ok(completion)
     }
 }
+struct WritableDescriptorLifecycle {
+    runtime: Runtime,
+    operation: ActorAddress,
+    writable: Weak<WritableBlobLease>,
+    terminal: AtomicU8,
+    completed: AtomicBool,
+}
+
+impl WritableDescriptorLifecycle {
+    const CLOSE: u8 = 1;
+    const ABORT: u8 = 2;
+
+    fn request(&self, terminal: u8) {
+        let _ = self
+            .terminal
+            .compare_exchange(0, terminal, Ordering::AcqRel, Ordering::Acquire);
+        if self
+            .writable
+            .upgrade()
+            .is_some_and(|writable| !writable.has_active_view())
+        {
+            self.finalize();
+        }
+    }
+
+    fn finalize(&self) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(writable) = self.writable.upgrade() else {
+            return;
+        };
+        let lease = writable.lease();
+        match self.terminal.load(Ordering::Acquire) {
+            Self::CLOSE => match writable.seal() {
+                Ok(metadata) => {
+                    let _ = self.runtime.send_to(
+                        self.operation,
+                        ChildOperationIn::SealRequested {
+                            reply_to: None,
+                            lease,
+                            metadata,
+                        },
+                    );
+                }
+                Err(_) => {
+                    let _ = self.runtime.send_to(
+                        self.operation,
+                        ChildOperationIn::AbortRequested {
+                            reply_to: None,
+                            lease,
+                        },
+                    );
+                }
+            },
+            Self::ABORT => {
+                let _ = writable.abort();
+                let _ = self.runtime.send_to(
+                    self.operation,
+                    ChildOperationIn::AbortRequested {
+                        reply_to: None,
+                        lease,
+                    },
+                );
+            }
+            _ => {
+                self.completed.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+impl WritableViewObserver for WritableDescriptorLifecycle {
+    fn view_released(&self) {
+        if self.terminal.load(Ordering::Acquire) != 0 {
+            self.finalize();
+        }
+    }
+}
+
 pub struct BlobWriter {
     runtime: Runtime,
     operation: ActorAddress,
     writable: Arc<WritableBlobLease>,
+    lifecycle: Arc<WritableDescriptorLifecycle>,
     finalized: bool,
 }
 
@@ -429,6 +1125,28 @@ impl BlobWriter {
         self.writable.map().map_err(Into::into)
     }
 
+    fn copy_at(&self, offset: u64, destination: &mut [u8]) -> Result<usize, DataPlaneError> {
+        self.writable
+            .copy_at(offset, destination)
+            .map_err(Into::into)
+    }
+
+    fn copy_from(&self, offset: u64, source: &[u8]) -> Result<usize, DataPlaneError> {
+        let end = offset.checked_add(source.len() as u64).ok_or_else(|| {
+            DataPlaneError::Unsupported("blob growth is not supported".to_owned())
+        })?;
+        if end > self.length() {
+            return Err(DataPlaneError::Unsupported(
+                "blob growth is not supported".to_owned(),
+            ));
+        }
+        self.writable.copy_from(offset, source).map_err(Into::into)
+    }
+
+    fn map_range(&self, offset: u64, length: u64) -> Result<WritableArenaView, DataPlaneError> {
+        self.writable.map_range(offset, length).map_err(Into::into)
+    }
+
     pub async fn seal(&mut self) -> Result<(), DataPlaneError> {
         let metadata = self.writable.seal()?;
         let lease = self.writable.lease();
@@ -436,7 +1154,7 @@ impl BlobWriter {
             .runtime
             .ask::<ChildOperationIn, Result<(), DataPlaneError>>(self.operation, |reply_to| {
                 ChildOperationIn::SealRequested {
-                    reply_to,
+                    reply_to: Some(reply_to),
                     lease,
                     metadata,
                 }
@@ -463,6 +1181,24 @@ impl BlobWriter {
             })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
         ask.await
+    }
+
+    fn defer_seal_if_mapped(&mut self) -> bool {
+        if !self.writable.has_active_view() {
+            return false;
+        }
+        self.finalized = true;
+        self.lifecycle.request(WritableDescriptorLifecycle::CLOSE);
+        true
+    }
+
+    fn defer_abort_if_mapped(&mut self) -> bool {
+        if !self.writable.has_active_view() {
+            return false;
+        }
+        self.finalized = true;
+        self.lifecycle.request(WritableDescriptorLifecycle::ABORT);
+        true
     }
 }
 
@@ -631,22 +1367,78 @@ impl StreamWriter {
         }
     }
 
-    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), DataPlaneError> {
+    pub async fn write_partial(&mut self, bytes: &[u8]) -> Result<usize, DataPlaneError> {
         if self.closed {
             return Err(DataPlaneError::StreamClosed);
         }
         if bytes.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        let max_payload = usize::try_from(self.endpoint.capacity().saturating_sub(5))
-            .map_err(|_| DataPlaneError::StreamFault("stream capacity exceeds usize".to_owned()))?;
-        if max_payload == 0 {
-            return Err(DataPlaneError::StreamFault(
-                "stream ring cannot hold a framed byte".to_owned(),
-            ));
+        loop {
+            if self.endpoint.peer_terminated().map_err(|error| {
+                DataPlaneError::StreamFault(format!(
+                    "observe stream peer terminal state: {error:?}"
+                ))
+            })? {
+                return Err(DataPlaneError::BrokenPipe);
+            }
+            let available = self.endpoint.writable_payload_capacity().map_err(|error| {
+                DataPlaneError::StreamFault(format!("observe writable stream capacity: {error:?}"))
+            })?;
+            if available != 0 {
+                let count = bytes
+                    .len()
+                    .min(usize::try_from(available).unwrap_or(usize::MAX));
+                let mut record = self
+                    .endpoint
+                    .reserve_record(RecordKind::Data, count as u64)
+                    .map_err(|error| {
+                        DataPlaneError::StreamFault(format!(
+                            "reserve partial stream record: {error:?}"
+                        ))
+                    })?;
+                let (first, second) = record.spans_mut();
+                first.copy_from_slice(&bytes[..first.len()]);
+                second.copy_from_slice(&bytes[first.len()..count]);
+                record.commit().map_err(|error| {
+                    DataPlaneError::StreamFault(format!("commit partial stream record: {error:?}"))
+                })?;
+                self.send_control(HostStreamIn::DataAvailable)?;
+                return Ok(count);
+            }
+
+            let inbox = self
+                .runtime
+                .new_inbox::<ChildStreamIn>()
+                .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+            self.send_control(HostStreamIn::WaitCapacity {
+                reply_to: *inbox.addr(),
+            })?;
+            if self.endpoint.writable_payload_capacity().map_err(|error| {
+                DataPlaneError::StreamFault(format!("recheck writable stream capacity: {error:?}"))
+            })? != 0
+            {
+                continue;
+            }
+            match inbox.recv().await {
+                ChildStreamIn::Wake(Ok(())) => {}
+                ChildStreamIn::Wake(Err(
+                    DataPlaneError::StreamClosed | DataPlaneError::PeerLost,
+                )) => return Err(DataPlaneError::BrokenPipe),
+                ChildStreamIn::Wake(Err(error)) => return Err(error),
+                ChildStreamIn::Opened(_) => {
+                    return Err(DataPlaneError::StreamFault(
+                        "received stream-open result while waiting for capacity".to_owned(),
+                    ));
+                }
+            }
         }
-        for chunk in bytes.chunks(max_payload) {
-            self.send_one(RecordKind::Data, chunk).await?;
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), DataPlaneError> {
+        let mut completed = 0;
+        while completed < bytes.len() {
+            completed += self.write_partial(&bytes[completed..]).await?;
         }
         Ok(())
     }
@@ -676,6 +1468,34 @@ impl StreamWriter {
             clean: false,
             reply_to: None,
         })
+    }
+
+    async fn abort_descriptor(&mut self) -> Result<(), DataPlaneError> {
+        if self.closed {
+            return Ok(());
+        }
+        let inbox = self
+            .runtime
+            .new_inbox::<ChildStreamIn>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        self.closed = true;
+        self.send_control(HostStreamIn::Close {
+            clean: false,
+            reply_to: Some(*inbox.addr()),
+        })?;
+        let result = match inbox.recv().await {
+            ChildStreamIn::Wake(result) => result,
+            ChildStreamIn::Opened(_) => Err(DataPlaneError::StreamFault(
+                "received stream-open result while aborting writer".to_owned(),
+            )),
+        };
+        let _ = self.runtime.send_to(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: self.operation,
+            },
+        );
+        result
     }
 }
 
@@ -709,6 +1529,7 @@ pub struct StreamReader {
     host_binding: ActorAddress,
     endpoint: Endpoint,
     terminal: Option<StreamReadTerminal>,
+    pending_record: Option<(RecordCursor, u64)>,
 }
 
 impl StreamReader {
@@ -744,73 +1565,100 @@ impl StreamReader {
         }
     }
 
-    async fn finish_read(
-        &mut self,
-        result: Option<Vec<u8>>,
-    ) -> Result<Option<Vec<u8>>, DataPlaneError> {
-        if result.is_none() {
-            self.close_clean().await?;
-            let _ = self.runtime.send_to(
-                self.child_session,
-                ChildSessionIn::OperationDone {
-                    operation: self.operation,
-                },
-            );
-        }
-        Ok(result)
-    }
-
-    fn terminal_result(&self) -> Option<Result<Option<Vec<u8>>, DataPlaneError>> {
+    fn terminal_read_count(&self) -> Option<Result<usize, DataPlaneError>> {
         self.terminal.as_ref().map(|terminal| match terminal {
-            StreamReadTerminal::Eof => Ok(None),
+            StreamReadTerminal::Eof => Ok(0),
             StreamReadTerminal::Error(error) => Err(error.clone()),
         })
     }
 
-    fn try_read(&mut self) -> Result<Option<Option<Vec<u8>>>, DataPlaneError> {
-        let Some(view) = self
-            .endpoint
-            .peek_record()
-            .map_err(|error| DataPlaneError::StreamFault(format!("read stream ring: {error:?}")))?
-        else {
-            return Ok(None);
-        };
-        let kind = view.kind();
-        let (first, second) = view.spans();
-        let mut bytes = Vec::with_capacity(first.len() + second.len());
-        bytes.extend_from_slice(first);
-        bytes.extend_from_slice(second);
-        view.release().map_err(|error| {
-            DataPlaneError::StreamFault(format!("consume stream ring: {error:?}"))
-        })?;
-        self.send_control(HostStreamIn::CapacityAvailable)?;
-        match kind {
-            RecordKind::Data => Ok(Some(Some(bytes))),
-            RecordKind::Eof => {
-                self.terminal = Some(StreamReadTerminal::Eof);
-                Ok(Some(None))
-            }
-            RecordKind::Fault => {
-                let error =
-                    DataPlaneError::StreamFault(String::from_utf8_lossy(&bytes).into_owned());
-                self.terminal = Some(StreamReadTerminal::Error(error.clone()));
-                let _ = self.send_control(HostStreamIn::Close {
-                    clean: false,
-                    reply_to: None,
-                });
-                Err(error)
-            }
-        }
+    fn release_record(&mut self, cursor: RecordCursor) -> Result<(), DataPlaneError> {
+        self.endpoint
+            .release_record_cursor(cursor)
+            .map_err(|error| {
+                DataPlaneError::StreamFault(format!("consume stream ring: {error:?}"))
+            })?;
+        self.send_control(HostStreamIn::CapacityAvailable)
     }
 
-    pub async fn read(&mut self) -> Result<Option<Vec<u8>>, DataPlaneError> {
-        if let Some(result) = self.terminal_result() {
+    pub async fn read_into(&mut self, destination: &mut [u8]) -> Result<usize, DataPlaneError> {
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        if let Some(result) = self.terminal_read_count() {
             return result;
         }
         loop {
-            if let Some(result) = self.try_read()? {
-                return self.finish_read(result).await;
+            if self.pending_record.is_none() {
+                if let Some(cursor) = self.endpoint.record_cursor().map_err(|error| {
+                    DataPlaneError::StreamFault(format!("read stream ring: {error:?}"))
+                })? {
+                    match cursor.kind() {
+                        RecordKind::Data if cursor.is_empty() => {
+                            self.release_record(cursor)?;
+                            continue;
+                        }
+                        RecordKind::Data => {
+                            self.pending_record = Some((cursor, 0));
+                        }
+                        RecordKind::Eof => {
+                            self.release_record(cursor)?;
+                            self.terminal = Some(StreamReadTerminal::Eof);
+                            let close_result = self.close_clean().await;
+                            let _ = self.runtime.send_to(
+                                self.child_session,
+                                ChildSessionIn::OperationDone {
+                                    operation: self.operation,
+                                },
+                            );
+                            close_result?;
+                            return Ok(0);
+                        }
+                        RecordKind::Fault => {
+                            let mut bytes = vec![0_u8; cursor.len()];
+                            let count = self
+                                .endpoint
+                                .copy_record_range(cursor, 0, &mut bytes)
+                                .map_err(|error| {
+                                    DataPlaneError::StreamFault(format!(
+                                        "read stream fault record: {error:?}"
+                                    ))
+                                })?;
+                            bytes.truncate(count);
+                            self.release_record(cursor)?;
+                            let error = DataPlaneError::StreamFault(
+                                String::from_utf8_lossy(&bytes).into_owned(),
+                            );
+                            self.terminal = Some(StreamReadTerminal::Error(error.clone()));
+                            let _ = self.send_control(HostStreamIn::Close {
+                                clean: false,
+                                reply_to: None,
+                            });
+                            return Err(error);
+                        }
+                    }
+                }
             }
+
+            if let Some((cursor, offset)) = self.pending_record {
+                let count = self
+                    .endpoint
+                    .copy_record_range(cursor, offset, destination)
+                    .map_err(|error| {
+                        DataPlaneError::StreamFault(format!(
+                            "copy partial stream record: {error:?}"
+                        ))
+                    })?;
+                let next_offset = offset + count as u64;
+                if next_offset == cursor.len() as u64 {
+                    self.pending_record = None;
+                    self.release_record(cursor)?;
+                } else {
+                    self.pending_record = Some((cursor, next_offset));
+                }
+                return Ok(count);
+            }
+
             let inbox = self
                 .runtime
                 .new_inbox::<ChildStreamIn>()
@@ -818,8 +1666,15 @@ impl StreamReader {
             self.send_control(HostStreamIn::WaitData {
                 reply_to: *inbox.addr(),
             })?;
-            if let Some(result) = self.try_read()? {
-                return self.finish_read(result).await;
+            if self
+                .endpoint
+                .record_cursor()
+                .map_err(|error| {
+                    DataPlaneError::StreamFault(format!("recheck stream ring: {error:?}"))
+                })?
+                .is_some()
+            {
+                continue;
             }
             match inbox.recv().await {
                 ChildStreamIn::Wake(Ok(())) => {}
@@ -834,6 +1689,68 @@ impl StreamReader {
                 }
             }
         }
+    }
+
+    pub async fn read(&mut self) -> Result<Option<Vec<u8>>, DataPlaneError> {
+        if matches!(self.terminal, Some(StreamReadTerminal::Eof)) {
+            return Ok(None);
+        }
+        let capacity = usize::try_from(self.capacity())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut bytes = vec![0_u8; capacity];
+        let count = self.read_into(&mut bytes).await?;
+        if count == 0 {
+            Ok(None)
+        } else {
+            bytes.truncate(count);
+            Ok(Some(bytes))
+        }
+    }
+
+    async fn close_descriptor(&mut self) -> Result<(), DataPlaneError> {
+        if self.terminal.is_some() {
+            return Ok(());
+        }
+        let result = self.close_clean().await;
+        self.terminal = Some(StreamReadTerminal::Eof);
+        let _ = self.runtime.send_to(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: self.operation,
+            },
+        );
+        result
+    }
+
+    async fn abort_descriptor(&mut self) -> Result<(), DataPlaneError> {
+        if self.terminal.is_some() {
+            return Ok(());
+        }
+        let inbox = self
+            .runtime
+            .new_inbox::<ChildStreamIn>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        self.terminal = Some(StreamReadTerminal::Error(
+            DataPlaneError::OperationCancelled,
+        ));
+        self.send_control(HostStreamIn::Close {
+            clean: false,
+            reply_to: Some(*inbox.addr()),
+        })?;
+        let result = match inbox.recv().await {
+            ChildStreamIn::Wake(result) => result,
+            ChildStreamIn::Opened(_) => Err(DataPlaneError::StreamFault(
+                "received stream-open result while aborting reader".to_owned(),
+            )),
+        };
+        let _ = self.runtime.send_to(
+            self.child_session,
+            ChildSessionIn::OperationDone {
+                operation: self.operation,
+            },
+        );
+        result
     }
 }
 
@@ -1089,14 +2006,13 @@ impl ActorInterface for StreamConsumerActor {
 pub struct ChildDataPlaneSessionActor {
     runtime: Runtime,
     host_session: ActorAddress,
-    arena: Arc<MappedArena>,
     arena_generation: u64,
     job_capability: JobCapability,
     child_node: Option<[u8; 32]>,
     session_generation: Option<u64>,
     attach_reply: Option<ActorAddress>,
     operations: HashSet<ActorAddress>,
-    read_operations: HashMap<ActorAddress, ActorAddress>,
+    open_operations: HashMap<ActorAddress, ActorAddress>,
     state: ChildSessionState,
     stream_operations: HashMap<ActorAddress, ActorAddress>,
     pending_blob_releases: usize,
@@ -1106,10 +2022,6 @@ pub struct ChildDataPlaneSessionActor {
 impl ChildDataPlaneSessionActor {
     pub fn state(&self) -> ChildSessionState {
         self.state
-    }
-
-    fn fail_local_open(&self, ctx: &Ctx<'_>, reply_to: ActorAddress, error: DataPlaneError) {
-        let _ = ctx.send(reply_to, Err::<Blob, _>(error));
     }
 
     fn start_stream_open(
@@ -1211,87 +2123,60 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 }
                 ctx.stop_self();
             }
-            ChildSessionIn::ReadBlob { path, reply_to } => {
-                if self.pending_blob_releases != 0 {
-                    self.deferred_blob_opens
-                        .push_back(ChildSessionIn::ReadBlob { path, reply_to });
-                    return;
-                }
-                if self.state != ChildSessionState::Running {
-                    self.fail_local_open(ctx, reply_to, DataPlaneError::SessionNotRunning);
-                    return;
-                }
-                let operation = ReadBlobOperationActor {
-                    runtime: self.runtime.clone(),
-                    arena: self.arena.clone(),
-                    host_session: self.host_session,
-                    child_session: ctx.self_addr(),
-                    path,
-                    reply_to,
-                    replied: false,
-                };
-                match ctx.spawn(operation) {
-                    Ok(operation) => {
-                        self.operations.insert(operation);
-                        self.read_operations.insert(reply_to, operation);
-                    }
-                    Err(error) => self.fail_local_open(
-                        ctx,
-                        reply_to,
-                        DataPlaneError::SessionFailed(error.to_string()),
-                    ),
-                }
-            }
-            ChildSessionIn::CancelRead { reply_to } => {
-                if let Some(operation) = self.read_operations.remove(&reply_to) {
-                    self.operations.remove(&operation);
-                    let _ = ctx.stop_actor(operation);
-                }
-            }
-            ChildSessionIn::OpenWriteBlob {
+            ChildSessionIn::Open {
                 path,
-                length,
+                options,
+                policy,
                 reply_to,
             } => {
                 if self.pending_blob_releases != 0 {
-                    self.deferred_blob_opens
-                        .push_back(ChildSessionIn::OpenWriteBlob {
-                            path,
-                            length,
-                            reply_to,
-                        });
+                    self.deferred_blob_opens.push_back(ChildSessionIn::Open {
+                        path,
+                        options,
+                        policy,
+                        reply_to,
+                    });
                     return;
                 }
                 if self.state != ChildSessionState::Running {
                     let _ = ctx.send(
                         reply_to,
-                        Err::<WriteBlobGrant, _>(DataPlaneError::SessionNotRunning),
+                        Err::<DescriptorOpenGrant, _>(DataPlaneError::SessionNotRunning),
                     );
                     return;
                 }
-                let operation = WriteBlobOperationActor {
+                let actor = DescriptorOpenOperationActor {
                     runtime: self.runtime.clone(),
                     host_session: self.host_session,
                     child_session: ctx.self_addr(),
                     path,
-                    length,
+                    options,
+                    policy,
                     open_reply: Some(reply_to),
                     finish_reply: None,
                     grant: None,
                     state: WriteOperationState::Opening,
+                    replied: false,
                 };
-                match ctx.spawn(operation) {
+                match ctx.spawn(actor) {
                     Ok(operation) => {
                         self.operations.insert(operation);
+                        self.open_operations.insert(reply_to, operation);
                     }
                     Err(error) => {
                         let _ = ctx.send(
                             reply_to,
-                            Err::<WriteBlobGrant, _>(DataPlaneError::SessionFailed(
+                            Err::<DescriptorOpenGrant, _>(DataPlaneError::SessionFailed(
                                 error.to_string(),
                             )),
                         );
                     }
+                }
+            }
+            ChildSessionIn::CancelOpen { reply_to } => {
+                if let Some(operation) = self.open_operations.remove(&reply_to) {
+                    self.operations.remove(&operation);
+                    let _ = ctx.stop_actor(operation);
                 }
             }
             ChildSessionIn::OpenReadStream {
@@ -1301,17 +2186,9 @@ impl ActorInterface for ChildDataPlaneSessionActor {
             } => {
                 self.start_stream_open(ctx, path, reply_to, Role::Consumer, replace);
             }
-            ChildSessionIn::OpenWriteStream {
-                path,
-                reply_to,
-                replace,
-            } => {
-                self.start_stream_open(ctx, path, reply_to, Role::Producer, replace);
-            }
             ChildSessionIn::CancelStream { reply_to } => {
                 if let Some(operation) = self.stream_operations.remove(&reply_to) {
                     self.operations.remove(&operation);
-                    let _ = ctx.send(self.host_session, HostSessionIn::CancelStream { operation });
                     let _ = ctx.stop_actor(operation);
                 }
             }
@@ -1418,8 +2295,8 @@ impl ActorInterface for ChildDataPlaneSessionActor {
             }
             ChildSessionIn::OperationDone { operation } => {
                 self.operations.remove(&operation);
-                self.read_operations
-                    .retain(|_, read_operation| *read_operation != operation);
+                self.open_operations
+                    .retain(|_, open_operation| *open_operation != operation);
                 self.stream_operations
                     .retain(|_, stream_operation| *stream_operation != operation);
             }
@@ -1434,7 +2311,7 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 for operation in self.operations.iter().copied() {
                     let _ = ctx.stop_actor(operation);
                 }
-                self.read_operations.clear();
+                self.open_operations.clear();
                 self.stream_operations.clear();
                 let _ = ctx.send(self.host_session, HostSessionIn::Close);
                 self.state = ChildSessionState::Closed;
@@ -1463,7 +2340,7 @@ enum ChildOperationIn {
     },
     Failed(DataPlaneError),
     SealRequested {
-        reply_to: ActorAddress,
+        reply_to: Option<ActorAddress>,
         lease: BlobLease,
         metadata: BlobMetadata,
     },
@@ -1504,19 +2381,21 @@ impl ActorInterface for StreamOpenOperationActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
-        let message = match self.role {
-            Role::Consumer => HostSessionIn::OpenReadStream {
-                path: self.path.clone(),
-                child_session: self.child_session,
-                operation: ctx.self_addr(),
+        let access = match self.role {
+            Role::Consumer => AccessMode::ReadOnly,
+            Role::Producer => AccessMode::WriteOnly,
+        };
+        let message = HostSessionIn::Open {
+            path: self.path.clone(),
+            options: OpenOptions {
+                access,
+                ..OpenOptions::default()
+            },
+            policy: OpenPolicy::EnsureStream {
                 replace: self.replace,
             },
-            Role::Producer => HostSessionIn::OpenWriteStream {
-                path: self.path.clone(),
-                child_session: self.child_session,
-                operation: ctx.self_addr(),
-                replace: self.replace,
-            },
+            child_session: self.child_session,
+            operation: ctx.self_addr(),
         };
         if let Err(error) = ctx.send(self.host_session, message) {
             self.finish(ctx, Err(DataPlaneError::SessionFailed(error.to_string())));
@@ -1556,7 +2435,7 @@ impl ActorInterface for StreamOpenOperationActor {
             );
             let _ = ctx.send(
                 self.host_session,
-                HostSessionIn::CancelStream {
+                HostSessionIn::CancelOpen {
                     operation: ctx.self_addr(),
                 },
             );
@@ -1583,31 +2462,75 @@ impl LeaseReleaser for RuntimeLeaseReleaser {
     }
 }
 
-struct ReadBlobOperationActor {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteOperationState {
+    Opening,
+    Filling,
+    Sealing,
+    Aborting,
+    Finished,
+}
+
+struct DescriptorOpenOperationActor {
     runtime: Runtime,
-    arena: Arc<MappedArena>,
     host_session: ActorAddress,
     child_session: ActorAddress,
     path: DataPath,
-    reply_to: ActorAddress,
+    options: OpenOptions,
+    policy: OpenPolicy,
+    open_reply: Option<ActorAddress>,
+    finish_reply: Option<ActorAddress>,
+    grant: Option<(ActorAddress, BlobLease, BlobMetadata)>,
+    state: WriteOperationState,
     replied: bool,
 }
 
-impl ReadBlobOperationActor {
-    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<Blob, DataPlaneError>) {
-        self.replied = true;
-        let _ = ctx.send(self.reply_to, result);
+impl DescriptorOpenOperationActor {
+    fn operation_done(&self, ctx: &Ctx<'_>) {
         let _ = ctx.send(
             self.child_session,
             ChildSessionIn::OperationDone {
                 operation: ctx.self_addr(),
             },
         );
+    }
+
+    fn finish_open(
+        &mut self,
+        ctx: &Ctx<'_>,
+        result: Result<DescriptorOpenGrant, DataPlaneError>,
+        keep_alive: bool,
+    ) {
+        self.replied = true;
+        if let Some(reply_to) = self.open_reply.take() {
+            let _ = ctx.send(reply_to, result);
+        }
+        if !keep_alive {
+            self.state = WriteOperationState::Finished;
+            self.operation_done(ctx);
+            ctx.stop_self();
+        }
+    }
+
+    fn finish_write(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        self.state = WriteOperationState::Finished;
+        if let Some(reply_to) = self.finish_reply.take() {
+            let _ = ctx.send(reply_to, result);
+        }
+        self.operation_done(ctx);
         ctx.stop_self();
+    }
+
+    fn fail(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
+        if self.open_reply.is_some() {
+            self.finish_open(ctx, Err(error), false);
+        } else {
+            self.finish_write(ctx, Err(error));
+        }
     }
 }
 
-impl ActorInterface for ReadBlobOperationActor {
+impl ActorInterface for DescriptorOpenOperationActor {
     type Incoming = ChildOperationIn;
     type Response = ();
 
@@ -1615,19 +2538,19 @@ impl ActorInterface for ReadBlobOperationActor {
         if ctx
             .send(
                 self.host_session,
-                HostSessionIn::OpenReadBlob {
+                HostSessionIn::Open {
                     path: self.path.clone(),
+                    options: self.options.clone(),
+                    policy: self.policy,
                     child_session: self.child_session,
                     operation: ctx.self_addr(),
                 },
             )
             .is_err()
         {
-            self.finish(
+            self.fail(
                 ctx,
-                Err(DataPlaneError::SessionFailed(
-                    "send read-blob open to host session".to_owned(),
-                )),
+                DataPlaneError::SessionFailed("send descriptor open to host session".to_owned()),
             );
         }
     }
@@ -1638,151 +2561,26 @@ impl ActorInterface for ReadBlobOperationActor {
                 host_binding,
                 lease,
                 metadata,
-            } => {
-                let releaser: Arc<dyn LeaseReleaser> = Arc::new(RuntimeLeaseReleaser {
+            } if self.state == WriteOperationState::Opening => {
+                let cancellation = Arc::new(DescriptorGrantCancellation {
                     runtime: self.runtime.clone(),
-                    child_session: self.child_session,
-                    host_binding,
+                    action: DescriptorGrantCancellationAction::HostOpen {
+                        host_session: self.host_session,
+                        operation: ctx.self_addr(),
+                    },
+                    armed: AtomicBool::new(true),
                 });
-                let result = Blob::from_sealed_lease(self.arena.clone(), lease, metadata, releaser)
-                    .map_err(Into::into);
-                self.finish(ctx, result);
+                self.finish_open(
+                    ctx,
+                    Ok(DescriptorOpenGrant::ReadBlob {
+                        host_binding,
+                        lease,
+                        metadata,
+                        cancellation,
+                    }),
+                    false,
+                );
             }
-            ChildOperationIn::Failed(error) => self.finish(ctx, Err(error)),
-            _ => {}
-        }
-    }
-
-    fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if !self.replied {
-            let _ = ctx.send(
-                self.host_session,
-                HostSessionIn::CancelReadBlob {
-                    operation: ctx.self_addr(),
-                },
-            );
-            let _ = ctx.send(
-                self.reply_to,
-                Err::<Blob, _>(DataPlaneError::OperationCancelled),
-            );
-        }
-    }
-}
-
-#[derive(Clone)]
-struct WriteBlobGrant {
-    operation: ActorAddress,
-    lease: BlobLease,
-    metadata: BlobMetadata,
-    cancellation: Arc<WriteGrantCancellation>,
-}
-
-struct WriteGrantCancellation {
-    runtime: Runtime,
-    operation: ActorAddress,
-    lease: BlobLease,
-    armed: AtomicBool,
-}
-
-impl WriteGrantCancellation {
-    fn disarm(&self) {
-        self.armed.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for WriteGrantCancellation {
-    fn drop(&mut self) {
-        if self.armed.swap(false, Ordering::AcqRel) {
-            let _ = self.runtime.send_to(
-                self.operation,
-                ChildOperationIn::AbortRequested {
-                    reply_to: None,
-                    lease: self.lease,
-                },
-            );
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WriteOperationState {
-    Opening,
-    Filling,
-    Sealing,
-    Aborting,
-    Finished,
-}
-
-struct WriteBlobOperationActor {
-    runtime: Runtime,
-    host_session: ActorAddress,
-    child_session: ActorAddress,
-    path: DataPath,
-    length: u64,
-    open_reply: Option<ActorAddress>,
-    finish_reply: Option<ActorAddress>,
-    grant: Option<(ActorAddress, BlobLease, BlobMetadata)>,
-    state: WriteOperationState,
-}
-
-impl WriteBlobOperationActor {
-    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
-        self.state = WriteOperationState::Finished;
-        if let Some(reply_to) = self.finish_reply.take() {
-            let _ = ctx.send(reply_to, result);
-        }
-        let _ = ctx.send(
-            self.child_session,
-            ChildSessionIn::OperationDone {
-                operation: ctx.self_addr(),
-            },
-        );
-        ctx.stop_self();
-    }
-
-    fn fail(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
-        if let Some(reply_to) = self.open_reply.take() {
-            let _ = ctx.send(reply_to, Err::<WriteBlobGrant, _>(error));
-            self.state = WriteOperationState::Finished;
-            let _ = ctx.send(
-                self.child_session,
-                ChildSessionIn::OperationDone {
-                    operation: ctx.self_addr(),
-                },
-            );
-            ctx.stop_self();
-        } else {
-            self.finish(ctx, Err(error));
-        }
-    }
-}
-
-impl ActorInterface for WriteBlobOperationActor {
-    type Incoming = ChildOperationIn;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx<'_>) {
-        if ctx
-            .send(
-                self.host_session,
-                HostSessionIn::OpenWriteBlob {
-                    path: self.path.clone(),
-                    length: self.length,
-                    child_session: self.child_session,
-                    operation: ctx.self_addr(),
-                },
-            )
-            .is_err()
-        {
-            self.fail(
-                ctx,
-                DataPlaneError::SessionFailed("send write-blob open to host session".to_owned()),
-            );
-        }
-    }
-
-    fn handle(&mut self, ctx: &Ctx<'_>, message: ChildOperationIn) {
-        match message {
             ChildOperationIn::WriteOpened {
                 host_binding,
                 lease,
@@ -1790,45 +2588,72 @@ impl ActorInterface for WriteBlobOperationActor {
             } if self.state == WriteOperationState::Opening => {
                 self.state = WriteOperationState::Filling;
                 self.grant = Some((host_binding, lease, metadata.clone()));
-                if let Some(reply_to) = self.open_reply.take()
-                    && ctx
-                        .send(
-                            reply_to,
-                            Ok::<_, DataPlaneError>(WriteBlobGrant {
-                                operation: ctx.self_addr(),
-                                lease,
-                                metadata,
-                                cancellation: Arc::new(WriteGrantCancellation {
-                                    runtime: self.runtime.clone(),
-                                    operation: ctx.self_addr(),
-                                    lease,
-                                    armed: AtomicBool::new(true),
-                                }),
-                            }),
-                        )
-                        .is_err()
-                {
-                    self.state = WriteOperationState::Aborting;
-                    if ctx
-                        .send(
-                            self.host_session,
-                            HostSessionIn::AbortWriteBlob {
-                                binding: host_binding,
-                                operation: ctx.self_addr(),
-                                lease_id: lease.lease_id,
-                                generation: lease.generation,
-                            },
-                        )
-                        .is_err()
-                    {
+                let cancellation = Arc::new(DescriptorGrantCancellation {
+                    runtime: self.runtime.clone(),
+                    action: DescriptorGrantCancellationAction::WriteBlob {
+                        operation: ctx.self_addr(),
+                        lease,
+                    },
+                    armed: AtomicBool::new(true),
+                });
+                self.finish_open(
+                    ctx,
+                    Ok(DescriptorOpenGrant::WriteBlob {
+                        operation: ctx.self_addr(),
+                        lease,
+                        metadata,
+                        access: self.options.access,
+                        cancellation,
+                    }),
+                    true,
+                );
+            }
+            ChildOperationIn::StreamOpened {
+                host_binding,
+                ring,
+                role,
+            } if self.state == WriteOperationState::Opening => {
+                let expected_role = match self.options.access {
+                    AccessMode::ReadOnly => Role::Consumer,
+                    AccessMode::WriteOnly => Role::Producer,
+                    AccessMode::ReadWrite => {
                         self.fail(
                             ctx,
-                            DataPlaneError::SessionFailed(
-                                "abort cancelled write-blob open".to_owned(),
+                            DataPlaneError::Unsupported(
+                                "read-write stream descriptors are not supported".to_owned(),
                             ),
                         );
+                        return;
                     }
+                };
+                if role != expected_role {
+                    self.fail(
+                        ctx,
+                        DataPlaneError::StreamFault(
+                            "host opened stream with the wrong ring role".to_owned(),
+                        ),
+                    );
+                    return;
                 }
+                let cancellation = Arc::new(DescriptorGrantCancellation {
+                    runtime: self.runtime.clone(),
+                    action: DescriptorGrantCancellationAction::HostOpen {
+                        host_session: self.host_session,
+                        operation: ctx.self_addr(),
+                    },
+                    armed: AtomicBool::new(true),
+                });
+                self.finish_open(
+                    ctx,
+                    Ok(DescriptorOpenGrant::Stream {
+                        operation: ctx.self_addr(),
+                        host_binding,
+                        ring,
+                        role,
+                        cancellation,
+                    }),
+                    false,
+                );
             }
             ChildOperationIn::SealRequested {
                 reply_to,
@@ -1848,7 +2673,7 @@ impl ActorInterface for WriteBlobOperationActor {
                     return;
                 }
                 self.state = WriteOperationState::Sealing;
-                self.finish_reply = Some(reply_to);
+                self.finish_reply = reply_to;
                 if ctx
                     .send(
                         self.host_session,
@@ -1864,7 +2689,7 @@ impl ActorInterface for WriteBlobOperationActor {
                     self.fail(
                         ctx,
                         DataPlaneError::SessionFailed(
-                            "send write-blob seal to host session".to_owned(),
+                            "send descriptor blob seal to host session".to_owned(),
                         ),
                     );
                 }
@@ -1903,16 +2728,16 @@ impl ActorInterface for WriteBlobOperationActor {
                     self.fail(
                         ctx,
                         DataPlaneError::SessionFailed(
-                            "send write-blob abort to host session".to_owned(),
+                            "send descriptor blob abort to host session".to_owned(),
                         ),
                     );
                 }
             }
             ChildOperationIn::WritePublished if self.state == WriteOperationState::Sealing => {
-                self.finish(ctx, Ok(()));
+                self.finish_write(ctx, Ok(()));
             }
             ChildOperationIn::WriteAborted if self.state == WriteOperationState::Aborting => {
-                self.finish(ctx, Ok(()));
+                self.finish_write(ctx, Ok(()));
             }
             ChildOperationIn::Failed(error) => self.fail(ctx, error),
             _ => {}
@@ -1920,11 +2745,19 @@ impl ActorInterface for WriteBlobOperationActor {
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if let Some(reply_to) = self.open_reply.take() {
+        if !self.replied {
             let _ = ctx.send(
-                reply_to,
-                Err::<WriteBlobGrant, _>(DataPlaneError::OperationCancelled),
+                self.host_session,
+                HostSessionIn::CancelOpen {
+                    operation: ctx.self_addr(),
+                },
             );
+            if let Some(reply_to) = self.open_reply.take() {
+                let _ = ctx.send(
+                    reply_to,
+                    Err::<DescriptorOpenGrant, _>(DataPlaneError::OperationCancelled),
+                );
+            }
         }
         if let Some(reply_to) = self.finish_reply.take() {
             let _ = ctx.send(reply_to, Err::<(), _>(DataPlaneError::OperationCancelled));

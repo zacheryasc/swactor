@@ -69,6 +69,7 @@ pub const OFF_CAPACITY: u64 = 8;
 pub const OFF_GENERATION: u64 = 16;
 pub const OFF_COMMIT: u64 = 24;
 pub const OFF_CONSUME: u64 = 32;
+pub const OFF_TERMINAL: u64 = 40;
 
 const ZERO_CHUNK: usize = 4 * 1024;
 
@@ -126,6 +127,30 @@ pub enum RecordKind {
 pub struct RecordMeta {
     pub kind: RecordKind,
     pub len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordCursor {
+    kind: RecordKind,
+    payload_start: u64,
+    payload_len: u64,
+    record_start: u64,
+    record_len: u64,
+    generation: u64,
+}
+
+impl RecordCursor {
+    pub const fn kind(self) -> RecordKind {
+        self.kind
+    }
+
+    pub fn len(self) -> usize {
+        self.payload_len as usize
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.payload_len == 0
+    }
 }
 
 /// Borrowed committed record. Dropping the view releases the complete framed
@@ -557,6 +582,15 @@ pub fn attach_mapped(
     Ok(endpoint)
 }
 
+pub fn mark_peer_terminated_mapped(
+    arena: &crate::mapped_arena::MappedArena,
+    handle: RingHandle,
+) -> Result<(), AttachError> {
+    let endpoint = attach_mapped(arena, handle, Role::Producer)?;
+    endpoint.atomic(OFF_TERMINAL).store(1, Ordering::Release);
+    Ok(())
+}
+
 fn lease_ring(
     arena: &mut ArenaManager,
     request_id: u64,
@@ -572,6 +606,7 @@ fn lease_ring(
         (1, Some(ArenaEvent::RingLeaseRejected { reason, .. })) => {
             Err(InstallError::LeaseRejected(reason))
         }
+
         (1, Some(ArenaEvent::RingLeaseQueued { .. })) => Err(InstallError::LeaseQueued),
         _ => Err(InstallError::UnexpectedLeaseOutcome),
     }
@@ -584,6 +619,13 @@ impl Endpoint {
 
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    pub fn peer_terminated(&self) -> Result<bool, FlowError> {
+        self.validate_fixed().map_err(FlowError::Corrupt)?;
+        self.validate_generation(self.info.generation)
+            .map_err(FlowError::Corrupt)?;
+        Ok(self.atomic(OFF_TERMINAL).load(Ordering::Acquire) != 0)
     }
 
     /// Current published producer and consumer positions. This role-neutral
@@ -764,6 +806,25 @@ impl Endpoint {
         }
     }
 
+    fn copy_into_slice(&self, stream_pos: u64, destination: &mut [u8]) {
+        let capacity = self.info.capacity as usize;
+        let start = (stream_pos % self.info.capacity) as usize;
+        let first = destination.len().min(capacity - start);
+        // SAFETY: the caller validated the source range against committed bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.data_ptr().add(start),
+                destination.as_mut_ptr(),
+                first,
+            );
+            std::ptr::copy_nonoverlapping(
+                self.data_ptr(),
+                destination.as_mut_ptr().add(first),
+                destination.len() - first,
+            );
+        }
+    }
+
     fn copy_out(&self, stream_pos: u64, len: u64) -> Vec<u8> {
         let capacity = self.info.capacity as usize;
         let start = (stream_pos % self.info.capacity) as usize;
@@ -803,6 +864,14 @@ impl Endpoint {
             len,
             generation: self.info.generation,
         })
+    }
+
+    pub fn writable_payload_capacity(&self) -> Result<u64, FlowError> {
+        self.check("writable_payload_capacity", Role::Producer)?;
+        self.validate_generation(self.info.generation)
+            .map_err(FlowError::Corrupt)?;
+        let used = self.commit_cursor() - self.consume_cursor();
+        Ok((self.info.capacity - used).saturating_sub(RECORD_HEADER_LEN))
     }
 
     /// Copy bytes into the reserved (producer-side) span.
@@ -994,6 +1063,97 @@ impl Endpoint {
             generation,
             released: false,
         }))
+    }
+
+    /// Acquire an owned cursor for the next complete record. The cursor does
+    /// not release capacity and remains valid only while that record is first.
+    pub fn record_cursor(&self) -> Result<Option<RecordCursor>, FlowError> {
+        self.check("record_cursor", Role::Consumer)?;
+        self.validate_generation(self.info.generation)
+            .map_err(FlowError::Corrupt)?;
+        let (commit, consume) = (self.commit_cursor(), self.consume_cursor());
+        let readable = commit - consume;
+        if readable < RECORD_HEADER_LEN {
+            return Ok(None);
+        }
+        let mut prefix = [0_u8; RECORD_HEADER_LEN as usize];
+        self.copy_into_slice(consume, &mut prefix);
+        let kind = RecordKind::from_byte(prefix[0])
+            .ok_or(FlowError::BadRecord(RecordError::InvalidKind(prefix[0])))?;
+        let payload_len = u64::from(u32::from_le_bytes(prefix[1..5].try_into().unwrap()));
+        let record_len = RECORD_HEADER_LEN + payload_len;
+        if record_len > self.info.capacity {
+            return Err(FlowError::BadRecord(RecordError::LengthExceedsCapacity {
+                len: payload_len,
+                capacity: self.info.capacity,
+            }));
+        }
+        if readable < record_len {
+            return Ok(None);
+        }
+        Ok(Some(RecordCursor {
+            kind,
+            payload_start: consume + RECORD_HEADER_LEN,
+            payload_len,
+            record_start: consume,
+            record_len,
+            generation: self.info.generation,
+        }))
+    }
+
+    pub fn copy_record_range(
+        &self,
+        cursor: RecordCursor,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<usize, FlowError> {
+        self.check("copy_record_range", Role::Consumer)?;
+        let generation = self.field_u64(OFF_GENERATION);
+        if generation != cursor.generation {
+            return Err(FlowError::StaleReservation {
+                reservation: cursor.generation,
+                ring: generation,
+            });
+        }
+        let consume = self.consume_cursor();
+        if consume != cursor.record_start {
+            return Err(FlowError::PinnedRecordMoved {
+                expected: cursor.record_start,
+                found: consume,
+            });
+        }
+        if offset > cursor.payload_len {
+            return Err(FlowError::BeyondCommitted {
+                requested: offset,
+                readable: cursor.payload_len,
+            });
+        }
+        let count = destination
+            .len()
+            .min(usize::try_from(cursor.payload_len - offset).unwrap_or(usize::MAX));
+        self.copy_into_slice(cursor.payload_start + offset, &mut destination[..count]);
+        Ok(count)
+    }
+
+    pub fn release_record_cursor(&mut self, cursor: RecordCursor) -> Result<(), FlowError> {
+        self.check("release_record_cursor", Role::Consumer)?;
+        let generation = self.field_u64(OFF_GENERATION);
+        if generation != cursor.generation {
+            return Err(FlowError::StaleReservation {
+                reservation: cursor.generation,
+                ring: generation,
+            });
+        }
+        let consume = self.consume_cursor();
+        if consume != cursor.record_start {
+            return Err(FlowError::PinnedRecordMoved {
+                expected: cursor.record_start,
+                found: consume,
+            });
+        }
+        self.atomic(OFF_CONSUME)
+            .store(cursor.record_start + cursor.record_len, Ordering::Release);
+        Ok(())
     }
 
     /// Receive one complete record; `Ok(None)` when nothing (or only a

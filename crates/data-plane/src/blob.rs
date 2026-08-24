@@ -7,6 +7,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use parking_lot::Mutex;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -251,26 +253,59 @@ impl Blob {
         self.guard.lease
     }
 
-    pub fn map(&self) -> Result<BlobView, BlobError> {
+    pub(crate) fn copy_at(&self, offset: u64, destination: &mut [u8]) -> Result<usize, BlobError> {
+        if offset >= self.metadata.length || destination.is_empty() {
+            return Ok(0);
+        }
+        let count = destination
+            .len()
+            .min(usize::try_from(self.metadata.length - offset).unwrap_or(usize::MAX));
+        let view = self.map_range(offset, count as u64)?;
+        destination[..count].copy_from_slice(view.as_ref());
+        Ok(count)
+    }
+
+    pub fn map_range(&self, offset: u64, length: u64) -> Result<BlobView, BlobError> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.metadata.length,
+            })?;
+        if end > self.metadata.length {
+            return Err(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.metadata.length,
+            });
+        }
         validate_mapped_header(
             &self.guard.arena,
             self.guard.lease,
             &self.metadata,
             BlobSharedState::Sealed,
         )?;
-        let payload_offset = self.guard.lease.offset.checked_add(BLOB_HEADER_LEN).ok_or(
-            BlobError::RangeOutOfBounds {
-                offset: self.guard.lease.offset,
-                length: self.guard.lease.length,
+        let payload_offset = self
+            .guard
+            .lease
+            .offset
+            .checked_add(BLOB_HEADER_LEN)
+            .and_then(|start| start.checked_add(offset))
+            .ok_or(BlobError::RangeOutOfBounds {
+                offset,
+                length,
                 arena_size: self.guard.arena.len() as u64,
-            },
-        )?;
-        let range = mapped_range(&self.guard.arena, payload_offset, self.guard.lease.length)?;
+            })?;
+        let range = mapped_range(&self.guard.arena, payload_offset, length)?;
         Ok(BlobView {
             guard: self.guard.clone(),
             payload_offset: range.start,
             length: range.len(),
         })
+    }
+    pub fn map(&self) -> Result<BlobView, BlobError> {
+        self.map_range(0, self.metadata.length)
     }
 }
 
@@ -315,12 +350,17 @@ impl Deref for BlobView {
     }
 }
 
+pub(crate) trait WritableViewObserver: Send + Sync + 'static {
+    fn view_released(&self);
+}
+
 pub(crate) struct WritableBlobLease {
     arena: Arc<MappedArena>,
     lease: BlobLease,
     metadata: BlobMetadata,
     active_view: AtomicBool,
     finished: AtomicBool,
+    view_observer: Mutex<Option<Arc<dyn WritableViewObserver>>>,
 }
 
 impl WritableBlobLease {
@@ -339,6 +379,7 @@ impl WritableBlobLease {
             metadata,
             active_view: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            view_observer: Mutex::new(None),
         }))
     }
 
@@ -350,23 +391,111 @@ impl WritableBlobLease {
         &self.metadata
     }
 
-    pub(crate) fn map(self: &Arc<Self>) -> Result<WritableArenaView, BlobError> {
+    pub(crate) fn set_view_observer(&self, observer: Arc<dyn WritableViewObserver>) {
+        *self.view_observer.lock() = Some(observer);
+    }
+
+    pub(crate) fn has_active_view(&self) -> bool {
+        self.active_view.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn copy_at(&self, offset: u64, destination: &mut [u8]) -> Result<usize, BlobError> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(BlobError::AlreadyFinished);
+        }
+        if self.active_view.load(Ordering::Acquire) {
+            return Err(BlobError::ActiveWritableView);
+        }
+        if offset >= self.metadata.length || destination.is_empty() {
+            return Ok(0);
+        }
+        let count = destination
+            .len()
+            .min(usize::try_from(self.metadata.length - offset).unwrap_or(usize::MAX));
+        let payload_offset = self.lease.offset + BLOB_HEADER_LEN + offset;
+        let range = mapped_range(&self.arena, payload_offset, count as u64)?;
+        // SAFETY: the mapped range was bounds-checked and no mutable view is active.
+        let source = unsafe {
+            std::slice::from_raw_parts(
+                self.arena.ptr_at(range.start).as_ptr().cast_const(),
+                range.len(),
+            )
+        };
+        destination[..count].copy_from_slice(source);
+        Ok(count)
+    }
+
+    pub(crate) fn copy_from(&self, offset: u64, source: &[u8]) -> Result<usize, BlobError> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(BlobError::AlreadyFinished);
+        }
+        if self.active_view.load(Ordering::Acquire) {
+            return Err(BlobError::ActiveWritableView);
+        }
+        let length = source.len() as u64;
+        let end = offset
+            .checked_add(length)
+            .ok_or(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.metadata.length,
+            })?;
+        if end > self.metadata.length {
+            return Err(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.metadata.length,
+            });
+        }
+        if source.is_empty() {
+            return Ok(0);
+        }
+        let payload_offset = self.lease.offset + BLOB_HEADER_LEN + offset;
+        let range = mapped_range(&self.arena, payload_offset, length)?;
+        // SAFETY: the mapped range was bounds-checked and no other mutable view is active.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(self.arena.ptr_at(range.start).as_ptr(), range.len())
+        };
+        destination.copy_from_slice(source);
+        Ok(source.len())
+    }
+
+    pub(crate) fn map_range(
+        self: &Arc<Self>,
+        offset: u64,
+        length: u64,
+    ) -> Result<WritableArenaView, BlobError> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.metadata.length,
+            })?;
+        if end > self.metadata.length {
+            return Err(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.metadata.length,
+            });
+        }
         if self.finished.load(Ordering::Acquire) {
             return Err(BlobError::AlreadyFinished);
         }
         self.active_view
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BlobError::ActiveWritableView)?;
-        let payload_offset =
-            self.lease
-                .offset
-                .checked_add(BLOB_HEADER_LEN)
-                .ok_or(BlobError::RangeOutOfBounds {
-                    offset: self.lease.offset,
-                    length: self.lease.length,
-                    arena_size: self.arena.len() as u64,
-                })?;
-        let range = match mapped_range(&self.arena, payload_offset, self.lease.length) {
+        let payload_offset = self
+            .lease
+            .offset
+            .checked_add(BLOB_HEADER_LEN)
+            .and_then(|start| start.checked_add(offset))
+            .ok_or(BlobError::RangeOutOfBounds {
+                offset,
+                length,
+                arena_size: self.arena.len() as u64,
+            })?;
+        let range = match mapped_range(&self.arena, payload_offset, length) {
             Ok(range) => range,
             Err(error) => {
                 self.active_view.store(false, Ordering::Release);
@@ -378,6 +507,9 @@ impl WritableBlobLease {
             payload_offset: range.start,
             length: range.len(),
         })
+    }
+    pub(crate) fn map(self: &Arc<Self>) -> Result<WritableArenaView, BlobError> {
+        self.map_range(0, self.metadata.length)
     }
 
     pub(crate) fn seal(&self) -> Result<BlobMetadata, BlobError> {
@@ -483,6 +615,10 @@ impl DerefMut for WritableArenaView {
 impl Drop for WritableArenaView {
     fn drop(&mut self) {
         self.owner.active_view.store(false, Ordering::Release);
+        let observer = self.owner.view_observer.lock().clone();
+        if let Some(observer) = observer {
+            observer.view_released();
+        }
     }
 }
 

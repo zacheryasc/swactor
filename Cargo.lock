@@ -947,6 +947,7 @@ dependencies = [
 name = "data-plane"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "futures-lite",
  "libc",
  "parking_lot",

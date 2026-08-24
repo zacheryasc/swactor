@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
-use crate::blob::{BlobError, BlobLease, BlobMetadata};
+use crate::blob::{BlobError, BlobLease, BlobMetadata, ContentDigest};
 use crate::byte_ring::{RingHandle, Role};
 use crate::ids::BlobLeaseId;
-use crate::namespace::{EntryKind, NamespaceError, StreamIncarnation, StreamMatch};
+use crate::namespace::{
+    EntryKind, NamespaceError, NamespaceNode, OperationId, StreamIncarnation, StreamMatch,
+};
 use crate::path::DataPath;
 use crate::stream_transport::{StreamPeerDescriptor, StreamTransportEvent};
 
@@ -45,11 +47,155 @@ impl JobCapability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DataOperation {
-    ReadBlob,
-    WriteBlob,
-    ReadStream,
-    WriteStream,
+pub enum AccessMode {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl AccessMode {
+    pub const fn can_read(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobAllocation {
+    pub length: u64,
+    pub digest: Option<ContentDigest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenOptions {
+    pub access: AccessMode,
+    pub create: bool,
+    pub exclusive: bool,
+    pub truncate: bool,
+    pub nonblocking: bool,
+    pub allocation: Option<BlobAllocation>,
+}
+
+impl OpenOptions {
+    pub const fn read_only() -> Self {
+        Self {
+            access: AccessMode::ReadOnly,
+            create: false,
+            exclusive: false,
+            truncate: false,
+            nonblocking: false,
+            allocation: None,
+        }
+    }
+
+    pub fn staged_blob(length: u64) -> Self {
+        Self {
+            access: AccessMode::WriteOnly,
+            create: true,
+            exclusive: false,
+            truncate: true,
+            nonblocking: false,
+            allocation: Some(BlobAllocation {
+                length,
+                digest: None,
+            }),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), DataPlaneError> {
+        if self.nonblocking {
+            return Err(DataPlaneError::Unsupported(
+                "O_NONBLOCK is not supported".to_owned(),
+            ));
+        }
+        if self.exclusive && !self.create {
+            return Err(DataPlaneError::InvalidArgument(
+                "O_EXCL requires O_CREAT".to_owned(),
+            ));
+        }
+        if (self.create || self.truncate) && !self.access.can_write() {
+            return Err(DataPlaneError::InvalidArgument(
+                "creation and truncation require write access".to_owned(),
+            ));
+        }
+        if self.allocation.is_some() && !(self.access.can_write() && self.truncate) {
+            return Err(DataPlaneError::InvalidArgument(
+                "blob allocation requires a truncating writable open".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self::read_only()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DescriptorKind {
+    Blob,
+    Stream,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescriptorCapabilities(u16);
+
+impl DescriptorCapabilities {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const MAP_HOST: Self = Self(1 << 2);
+    pub const MAP_DEVICE: Self = Self(1 << 3);
+    pub const SEEK: Self = Self(1 << 4);
+    pub const POLL: Self = Self(1 << 5);
+    pub const CONTROL: Self = Self(1 << 6);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn contains(self, capability: Self) -> bool {
+        self.0 & capability.0 == capability.0
+    }
+
+    pub const fn union(self, capability: Self) -> Self {
+        Self(self.0 | capability.0)
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Errno {
+    Eacces,
+    Eagain,
+    Ebadf,
+    Ebusy,
+    Ecanceled,
+    Econnreset,
+    Eexist,
+    Einval,
+    Eio,
+    Enodev,
+    Enoent,
+    Enomem,
+    Enospc,
+    Enotsup,
+    Enxio,
+    Epipe,
+    Estale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenPolicy {
+    Ordinary,
+    EnsureStream { replace: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,19 +244,27 @@ impl From<BlobError> for BlobFailure {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataPlaneError {
     InvalidPath(String),
+    InvalidArgument(String),
     InvalidCapability,
     Attachment(AttachmentFailure),
     SessionNotRunning,
     SessionFailed(String),
     Unauthorized {
         path: DataPath,
-        operation: DataOperation,
+        access: AccessMode,
     },
     PathNotFound(DataPath),
+    PathExists(DataPath),
     SourceFailure(String),
     ArenaExhausted,
     Blob(BlobFailure),
     OperationCancelled,
+    BadDescriptor,
+    Unsupported(String),
+    MappingUnsupported,
+    Busy(String),
+    Stale(String),
+    BrokenPipe,
     WrongEntryType {
         path: DataPath,
         expected: EntryKind,
@@ -126,18 +280,26 @@ impl fmt::Display for DataPlaneError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPath(reason) => write!(f, "invalid data path: {reason}"),
+            Self::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
             Self::InvalidCapability => f.write_str("invalid job capability"),
             Self::Attachment(reason) => write!(f, "data-plane attachment failed: {reason:?}"),
             Self::SessionNotRunning => f.write_str("data-plane session is not running"),
             Self::SessionFailed(reason) => write!(f, "data-plane session failed: {reason}"),
-            Self::Unauthorized { path, operation } => {
-                write!(f, "{operation:?} is not authorized for {path}")
+            Self::Unauthorized { path, access } => {
+                write!(f, "{access:?} access is not authorized for {path}")
             }
             Self::PathNotFound(path) => write!(f, "data path not found: {path}"),
+            Self::PathExists(path) => write!(f, "data path already exists: {path}"),
             Self::SourceFailure(reason) => write!(f, "blob source failed: {reason}"),
             Self::ArenaExhausted => f.write_str("data-plane arena is exhausted"),
             Self::Blob(reason) => write!(f, "blob lease failure: {reason:?}"),
             Self::OperationCancelled => f.write_str("data-plane operation was cancelled"),
+            Self::BadDescriptor => f.write_str("bad descriptor"),
+            Self::Unsupported(reason) => write!(f, "operation is not supported: {reason}"),
+            Self::MappingUnsupported => f.write_str("object does not support mapping"),
+            Self::Busy(reason) => write!(f, "resource is busy: {reason}"),
+            Self::Stale(reason) => write!(f, "stale capability: {reason}"),
+            Self::BrokenPipe => f.write_str("stream peer is closed"),
             Self::WrongEntryType {
                 path,
                 expected,
@@ -150,6 +312,44 @@ impl fmt::Display for DataPlaneError {
             Self::PeerLost => f.write_str("stream peer was lost"),
             Self::StreamFault(reason) => write!(f, "stream fault: {reason}"),
             Self::StreamClosed => f.write_str("stream is closed"),
+        }
+    }
+}
+
+impl DataPlaneError {
+    pub const fn errno(&self) -> Errno {
+        match self {
+            Self::InvalidPath(_) | Self::InvalidArgument(_) | Self::InvalidCapability => {
+                Errno::Einval
+            }
+            Self::Attachment(_)
+            | Self::SessionNotRunning
+            | Self::SessionFailed(_)
+            | Self::SourceFailure(_)
+            | Self::StreamFault(_) => Errno::Eio,
+            Self::Unauthorized { .. } => Errno::Eacces,
+            Self::PathNotFound(_) => Errno::Enoent,
+            Self::PathExists(_) => Errno::Eexist,
+            Self::ArenaExhausted => Errno::Enospc,
+            Self::Blob(BlobFailure::Bounds | BlobFailure::Length { .. }) => Errno::Einval,
+            Self::Blob(BlobFailure::StaleGeneration { .. }) | Self::Stale(_) => Errno::Estale,
+            Self::Blob(BlobFailure::Access) | Self::BadDescriptor | Self::StreamClosed => {
+                Errno::Ebadf
+            }
+            Self::Blob(BlobFailure::ActiveWritableView) | Self::Busy(_) => Errno::Ebusy,
+            Self::Blob(
+                BlobFailure::Digest
+                | BlobFailure::State { .. }
+                | BlobFailure::InvalidLease
+                | BlobFailure::AlreadyFinished,
+            ) => Errno::Eio,
+            Self::OperationCancelled => Errno::Ecanceled,
+            Self::Unsupported(_) => Errno::Enotsup,
+            Self::MappingUnsupported => Errno::Enodev,
+            Self::BrokenPipe => Errno::Epipe,
+            Self::WrongEntryType { .. } => Errno::Enxio,
+            Self::PathReplaced(_) => Errno::Estale,
+            Self::PeerLost => Errno::Econnreset,
         }
     }
 }
@@ -170,33 +370,24 @@ pub enum HostSessionIn {
         job_capability: JobCapability,
         child_node: Option<[u8; 32]>,
     },
-    OpenReadBlob {
+    Open {
         path: DataPath,
+        options: OpenOptions,
+        policy: OpenPolicy,
         child_session: ActorAddress,
         operation: ActorAddress,
     },
-    CancelReadBlob {
+    OpenResolved {
         operation: ActorAddress,
+        result: Result<NamespaceNode, NamespaceError>,
     },
-    OpenWriteBlob {
+    BlobReserved {
+        operation: ActorAddress,
         path: DataPath,
-        length: u64,
-        child_session: ActorAddress,
-        operation: ActorAddress,
+        reservation: OperationId,
+        result: Result<(), NamespaceError>,
     },
-    OpenReadStream {
-        path: DataPath,
-        child_session: ActorAddress,
-        operation: ActorAddress,
-        replace: bool,
-    },
-    OpenWriteStream {
-        path: DataPath,
-        child_session: ActorAddress,
-        operation: ActorAddress,
-        replace: bool,
-    },
-    CancelStream {
+    CancelOpen {
         operation: ActorAddress,
     },
     StreamControl {
@@ -253,24 +444,16 @@ pub enum ChildSessionIn {
         error: DataPlaneError,
     },
     AttachmentDeadline,
-    ReadBlob {
+    Open {
         path: DataPath,
+        options: OpenOptions,
+        policy: OpenPolicy,
         reply_to: ActorAddress,
     },
-    CancelRead {
-        reply_to: ActorAddress,
-    },
-    OpenWriteBlob {
-        path: DataPath,
-        length: u64,
+    CancelOpen {
         reply_to: ActorAddress,
     },
     OpenReadStream {
-        path: DataPath,
-        reply_to: ActorAddress,
-        replace: bool,
-    },
-    OpenWriteStream {
         path: DataPath,
         reply_to: ActorAddress,
         replace: bool,
@@ -356,6 +539,10 @@ pub enum HostStreamIn {
     PeerTerminated {
         incarnation: StreamIncarnation,
         error: DataPlaneError,
+        reply_to: Option<ActorAddress>,
+    },
+    PeerTerminationAck {
+        incarnation: StreamIncarnation,
     },
     ReleaseComplete(Result<(), DataPlaneError>),
 }
