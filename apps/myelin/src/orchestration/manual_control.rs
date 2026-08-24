@@ -1392,7 +1392,9 @@ impl NetworkMessage for ManualControlReply {
 }
 
 pub(crate) fn register_codecs(registry: &mut CodecRegistry) {
-    registry.register::<ManualControlReply, _>(JsonCodec::<ManualControlReply>::default());
+    registry
+        .register::<ManualControlReply, _>(JsonCodec::<ManualControlReply>::default())
+        .expect("unique codec registration");
 }
 
 struct NodeLane {

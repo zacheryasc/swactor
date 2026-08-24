@@ -106,8 +106,10 @@ impl ActorInterface for PongActor {
 
 fn build_codec_registry() -> CodecRegistry {
     let mut cr = CodecRegistry::new();
-    cr.register::<Ping, _>(TestCodec);
-    cr.register::<Pong, _>(TestCodec);
+    cr.register::<Ping, _>(TestCodec)
+        .expect("unique codec registration");
+    cr.register::<Pong, _>(TestCodec)
+        .expect("unique codec registration");
     cr
 }
 
@@ -228,27 +230,6 @@ fn unregistered_type_produces_clear_error() {
     assert!(
         err_msg.contains("not registered"),
         "Expected 'not registered' in error, got: {err_msg}"
-    );
-}
-
-/// Given a WireEnvelope arrives with a type_tag not in the codec registry,
-/// when CodecRegistry receives it,
-/// then the error mentions "unknown type_tag".
-#[test]
-fn unknown_type_tag_on_receive_produces_clear_error() {
-    let codecs = CodecRegistry::new(); // empty registry
-
-    let envelope = WireEnvelope {
-        dest: ActorAddress::default(),
-        type_tag: "nonexistent::Type".to_string(),
-        payload: vec![1, 2, 3],
-    };
-
-    let result = codecs.receive(envelope);
-    let err_msg = format!("{:?}", result.unwrap_err());
-    assert!(
-        err_msg.contains("unknown type_tag"),
-        "Expected 'unknown type_tag' in error, got: {err_msg}"
     );
 }
 

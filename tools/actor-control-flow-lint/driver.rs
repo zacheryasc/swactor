@@ -31,9 +31,9 @@ const EXECUTION_OWNERS: &[&str] = &[
     "telemetry",
 ];
 
-/// This package owns only the compile-contract subprocess harness. It cannot be
-/// used as a workspace dependency.
-const TEST_SUPPORT_OWNERS: &[&str] = &["actor-control-flow-lint-tests"];
+/// Test and benchmark harness packages that must not be workspace dependencies.
+const TEST_SUPPORT_OWNERS: &[&str] =
+    &["actor-control-flow-lint-tests", "swactor-benchmarks"];
 
 /// Policy-bearing crates that must never enter an execution owner's dependency
 /// closure.

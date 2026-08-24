@@ -739,15 +739,20 @@ mod directory_route_path {
             // The shared codec carries the directory's gossip frame *and* the app
             // protocol — the app registers its own type, exactly as a real app would.
             let mut codec = actor_codec_registry();
-            codec.register_encoder::<Hello>(|h: &Hello| {
-                Ok((
-                    Hello::type_tag().to_string(),
-                    serde_json::to_vec(h).map_err(|e| Error::from(format!("encode: {e}")))?,
-                ))
-            });
-            codec.register_decoder::<Hello>(Hello::type_tag(), |b: &[u8]| {
-                serde_json::from_slice::<Hello>(b).map_err(|e| Error::from(format!("decode: {e}")))
-            });
+            codec
+                .register_encoder::<Hello>(|h: &Hello| {
+                    Ok((
+                        Hello::type_tag().to_string(),
+                        serde_json::to_vec(h).map_err(|e| Error::from(format!("encode: {e}")))?,
+                    ))
+                })
+                .expect("unique codec encoder registration");
+            codec
+                .register_decoder::<Hello>(Hello::type_tag(), |b: &[u8]| {
+                    serde_json::from_slice::<Hello>(b)
+                        .map_err(|e| Error::from(format!("decode: {e}")))
+                })
+                .expect("unique codec decoder registration");
             let codec = Arc::new(codec);
 
             let keys: Vec<Keypair> = (0..n).map(|_| Keypair::generate()).collect();

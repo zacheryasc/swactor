@@ -334,14 +334,18 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
             ))
             .map_err(|e| format!("spawn edge ack relay: {e}"))?;
         let mut codec = CodecRegistry::new();
-        codec.register_decoder::<node::NodeAnnounce>(node::ANNOUNCE_TAG, |bytes| {
-            serde_json::from_slice(bytes)
-                .map_err(|e| swactor::Error::from(format!("announce decode: {e}")))
-        });
-        codec.register_decoder::<edge::EdgeAck>(edge::EDGE_ACK_TAG, |bytes| {
-            serde_json::from_slice(bytes)
-                .map_err(|e| swactor::Error::from(format!("edge ack decode: {e}")))
-        });
+        codec
+            .register_decoder::<node::NodeAnnounce>(node::ANNOUNCE_TAG, |bytes| {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| swactor::Error::from(format!("announce decode: {e}")))
+            })
+            .expect("unique codec decoder registration");
+        codec
+            .register_decoder::<edge::EdgeAck>(edge::EDGE_ACK_TAG, |bytes| {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| swactor::Error::from(format!("edge ack decode: {e}")))
+            })
+            .expect("unique codec decoder registration");
         let mut routes = std::collections::HashMap::new();
         routes.insert(node::ANNOUNCE_TAG.to_owned(), announce);
         routes.insert(edge::EDGE_ACK_TAG.to_owned(), ack_relay);

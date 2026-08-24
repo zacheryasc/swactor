@@ -155,8 +155,16 @@ impl NetworkMessage for OutputChunk {
 
 /// Register the job wire messages with a codec registry (JSON).
 pub fn register_job_codecs(registry: &mut CodecRegistry) {
-    registry.register::<NodeJobCommand, JsonCodec<NodeJobCommand>>(JsonCodec::default());
-    registry.register::<NodeJobEvent, JsonCodec<NodeJobEvent>>(JsonCodec::default());
-    registry.register::<OrchestratorJobMsg, JsonCodec<OrchestratorJobMsg>>(JsonCodec::default());
-    registry.register::<OutputChunk, JsonCodec<OutputChunk>>(JsonCodec::default());
+    registry
+        .register::<NodeJobCommand, JsonCodec<NodeJobCommand>>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<NodeJobEvent, JsonCodec<NodeJobEvent>>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<OrchestratorJobMsg, JsonCodec<OrchestratorJobMsg>>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<OutputChunk, JsonCodec<OutputChunk>>(JsonCodec::default())
+        .expect("unique codec registration");
 }

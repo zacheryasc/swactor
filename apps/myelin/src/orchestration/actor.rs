@@ -523,8 +523,12 @@ impl From<&core::LifecycleEvent> for LifecycleEventWire {
 }
 
 pub(crate) fn register_codecs(registry: &mut CodecRegistry) {
-    registry.register::<OrchestratorMsg, _>(JsonCodec::<OrchestratorMsg>::default());
-    registry.register::<OrchestratorReport, _>(JsonCodec::<OrchestratorReport>::default());
+    registry
+        .register::<OrchestratorMsg, _>(JsonCodec::<OrchestratorMsg>::default())
+        .expect("unique codec registration");
+    registry
+        .register::<OrchestratorReport, _>(JsonCodec::<OrchestratorReport>::default())
+        .expect("unique codec registration");
 }
 
 impl From<&core::TokenObjectPayload> for TokenObjectPayloadWire {

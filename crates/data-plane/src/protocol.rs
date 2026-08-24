@@ -367,9 +367,15 @@ impl NetworkMessage for HostStreamIn {
 }
 
 pub fn register_data_plane_codecs(registry: &mut CodecRegistry) {
-    registry.register::<HostSessionIn, _>(JsonCodec::default());
-    registry.register::<ChildSessionIn, _>(JsonCodec::default());
-    registry.register::<HostStreamIn, _>(JsonCodec::default());
+    registry
+        .register::<HostSessionIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<ChildSessionIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<HostStreamIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
     crate::namespace::register_namespace_codecs(registry);
     crate::blob_transfer::register_blob_transfer_codecs(registry);
     crate::source::register_blob_source_codecs(registry);

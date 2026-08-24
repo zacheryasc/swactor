@@ -295,5 +295,7 @@ impl ActorInterface for FileBlobSourceActor {
 }
 
 pub fn register_blob_source_codecs(registry: &mut CodecRegistry) {
-    registry.register::<BlobSourceIn, _>(JsonCodec::default());
+    registry
+        .register::<BlobSourceIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
 }

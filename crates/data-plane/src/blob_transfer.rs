@@ -99,5 +99,7 @@ impl fmt::Display for BlobTransferFailure {
 impl std::error::Error for BlobTransferFailure {}
 
 pub fn register_blob_transfer_codecs(registry: &mut CodecRegistry) {
-    registry.register::<BlobTransferEvent, _>(JsonCodec::default());
+    registry
+        .register::<BlobTransferEvent, _>(JsonCodec::default())
+        .expect("unique codec registration");
 }

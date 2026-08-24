@@ -1,0 +1,23 @@
+[package]
+name = "swactor-benchmarks"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+autobenches = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+swactor = { path = "../.." }
+swactor-transport = { path = "../../crates/transport" }
+telemetry = { path = "../../crates/telemetry" }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "criterion"
+harness = false
+
+[lints]
+workspace = true

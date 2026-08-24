@@ -167,18 +167,27 @@ impl NetworkMessage for DirectoryGossip {
 /// Build a `CodecRegistry` with all distribution protocol messages registered.
 pub fn distribution_codec_registry() -> CodecRegistry {
     let mut cr = CodecRegistry::new();
-    cr.register::<Ping, _>(JsonCodec::<Ping>::default());
-    cr.register::<Ack, _>(JsonCodec::<Ack>::default());
-    cr.register::<PingReq, _>(JsonCodec::<PingReq>::default());
+    cr.register::<Ping, _>(JsonCodec::<Ping>::default())
+        .expect("unique codec registration");
+    cr.register::<Ack, _>(JsonCodec::<Ack>::default())
+        .expect("unique codec registration");
+    cr.register::<PingReq, _>(JsonCodec::<PingReq>::default())
+        .expect("unique codec registration");
     // §6.1 / §14.5: `IndirectAck` is folded into the shared registry so all six
     // SWIM message types decode through one uniform path; concrete drivers no
     // longer need to hand-dispatch it by tag.
-    cr.register::<IndirectAck, _>(JsonCodec::<IndirectAck>::default());
-    cr.register::<JoinRequest, _>(JsonCodec::<JoinRequest>::default());
-    cr.register::<JoinResponse, _>(JsonCodec::<JoinResponse>::default());
-    cr.register::<RegistryGossip, _>(JsonCodec::<RegistryGossip>::default());
-    cr.register::<MetadataGossip, _>(JsonCodec::<MetadataGossip>::default());
-    cr.register::<DirectoryGossip, _>(JsonCodec::<DirectoryGossip>::default());
+    cr.register::<IndirectAck, _>(JsonCodec::<IndirectAck>::default())
+        .expect("unique codec registration");
+    cr.register::<JoinRequest, _>(JsonCodec::<JoinRequest>::default())
+        .expect("unique codec registration");
+    cr.register::<JoinResponse, _>(JsonCodec::<JoinResponse>::default())
+        .expect("unique codec registration");
+    cr.register::<RegistryGossip, _>(JsonCodec::<RegistryGossip>::default())
+        .expect("unique codec registration");
+    cr.register::<MetadataGossip, _>(JsonCodec::<MetadataGossip>::default())
+        .expect("unique codec registration");
+    cr.register::<DirectoryGossip, _>(JsonCodec::<DirectoryGossip>::default())
+        .expect("unique codec registration");
     cr
 }
 
@@ -228,25 +237,32 @@ pub fn actor_codec_registry() -> CodecRegistry {
             }
         };
         Ok((tag.to_string(), bytes))
-    });
+    })
+    .expect("unique codec encoder registration");
 
     // A generic free fn (not a closure — closures are monomorphic and we decode
     // into six different inner types).
     fn d<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Error> {
         serde_json::from_slice(bytes).map_err(|e| Error::from(format!("decode: {e}")))
     }
-    cr.register_decoder::<SwimIn>("swactor_dist::Ping", |b| Ok(SwimIn::Ping(d(b)?)));
-    cr.register_decoder::<SwimIn>("swactor_dist::Ack", |b| Ok(SwimIn::Ack(d(b)?)));
-    cr.register_decoder::<SwimIn>("swactor_dist::PingReq", |b| Ok(SwimIn::PingReq(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::Ping", |b| Ok(SwimIn::Ping(d(b)?)))
+        .expect("unique codec decoder registration");
+    cr.register_decoder::<SwimIn>("swactor_dist::Ack", |b| Ok(SwimIn::Ack(d(b)?)))
+        .expect("unique codec decoder registration");
+    cr.register_decoder::<SwimIn>("swactor_dist::PingReq", |b| Ok(SwimIn::PingReq(d(b)?)))
+        .expect("unique codec decoder registration");
     cr.register_decoder::<SwimIn>("swactor_dist::IndirectAck", |b| {
         Ok(SwimIn::IndirectAck(d(b)?))
-    });
+    })
+    .expect("unique codec decoder registration");
     cr.register_decoder::<SwimIn>("swactor_dist::JoinRequest", |b| {
         Ok(SwimIn::JoinRequest(d(b)?))
-    });
+    })
+    .expect("unique codec decoder registration");
     cr.register_decoder::<SwimIn>("swactor_dist::JoinResponse", |b| {
         Ok(SwimIn::JoinResponse(d(b)?))
-    });
+    })
+    .expect("unique codec decoder registration");
 
     // ── Registry: RegistryIn::Gossip ⇄ RegistryGossip frame ──
     use crate::registry_actor::RegistryIn;
@@ -256,10 +272,12 @@ pub fn actor_codec_registry() -> CodecRegistry {
             serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
         )),
         _ => Err(Error::from("RegistryIn: only Gossip is network-encodable")),
-    });
+    })
+    .expect("unique codec encoder registration");
     cr.register_decoder::<RegistryIn>(RegistryGossip::type_tag(), |b| {
         Ok(RegistryIn::Gossip(d(b)?))
-    });
+    })
+    .expect("unique codec decoder registration");
 
     // ── Metadata: MetadataIn::Gossip ⇄ MetadataGossip frame ──
     use crate::node_metadata_actor::MetadataIn;
@@ -269,10 +287,12 @@ pub fn actor_codec_registry() -> CodecRegistry {
             serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
         )),
         _ => Err(Error::from("MetadataIn: only Gossip is network-encodable")),
-    });
+    })
+    .expect("unique codec encoder registration");
     cr.register_decoder::<MetadataIn>(MetadataGossip::type_tag(), |b| {
         Ok(MetadataIn::Gossip(d(b)?))
-    });
+    })
+    .expect("unique codec decoder registration");
 
     // ── Directory: DirectoryIn::Gossip ⇄ DirectoryGossip frame ──
     use crate::directory_actor::DirectoryIn;
@@ -282,10 +302,12 @@ pub fn actor_codec_registry() -> CodecRegistry {
             serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
         )),
         _ => Err(Error::from("DirectoryIn: only Gossip is network-encodable")),
-    });
+    })
+    .expect("unique codec encoder registration");
     cr.register_decoder::<DirectoryIn>(DirectoryGossip::type_tag(), |b| {
         Ok(DirectoryIn::Gossip(d(b)?))
-    });
+    })
+    .expect("unique codec decoder registration");
 
     cr
 }

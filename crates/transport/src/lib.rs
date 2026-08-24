@@ -12,7 +12,8 @@ pub mod json_codec;
 pub mod transport;
 
 pub use codec::{
-    hex_decode, hex_encode, Codec, CodecRegistry, NetworkMessage, NodeId, WireEnvelope,
+    hex_decode, hex_encode, Codec, CodecRegistrationError, CodecRegistry, NetworkMessage, NodeId,
+    WireEnvelope,
 };
 pub use json_codec::JsonCodec;
 pub use transport::{CodecRemoteSink, InMemoryTransport, Transport, TransportRouter};

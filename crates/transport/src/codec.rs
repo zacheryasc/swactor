@@ -9,6 +9,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::fmt;
 use swactor::actor::{ActorAddress, Message};
 use swactor::Error;
 
@@ -111,6 +112,31 @@ pub struct WireEnvelope {
     pub payload: Vec<u8>,
 }
 
+/// Setup-time conflicts returned by [`CodecRegistry`] registration methods.
+///
+/// Registrations are never replaced implicitly. A failed registration leaves
+/// both registry maps unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodecRegistrationError {
+    EncoderAlreadyRegistered { message_type: &'static str },
+    DecoderAlreadyRegistered { type_tag: String },
+}
+
+impl fmt::Display for CodecRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EncoderAlreadyRegistered { message_type } => {
+                write!(f, "encoder already registered for {message_type}")
+            }
+            Self::DecoderAlreadyRegistered { type_tag } => {
+                write!(f, "decoder already registered for '{type_tag}'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CodecRegistrationError {}
+
 // ─── CodecRegistry ──────────────────────────────────────────────────────────
 
 type EncodeFn = Box<dyn Fn(Box<dyn Any + Send>) -> Result<(String, Vec<u8>), Error> + Send + Sync>;
@@ -145,11 +171,25 @@ impl CodecRegistry {
     /// Register a message type with its codec.
     ///
     /// Both encoding and decoding are handled by the same codec instance, keyed
-    /// symmetrically by `M::type_tag()`.
-    pub fn register<M: NetworkMessage, C: Codec<M>>(&mut self, codec: C) {
-        let codec = Arc::new(codec);
+    /// symmetrically by `M::type_tag()`. If either the Rust type or wire tag is
+    /// already registered, this returns an error without changing either map.
+    pub fn register<M: NetworkMessage, C: Codec<M>>(
+        &mut self,
+        codec: C,
+    ) -> Result<(), CodecRegistrationError> {
+        let message_type = std::any::type_name::<M>();
+        let type_id = TypeId::of::<M>();
+        let type_tag = M::type_tag();
+        if self.encoders.contains_key(&type_id) {
+            return Err(CodecRegistrationError::EncoderAlreadyRegistered { message_type });
+        }
+        if self.decoders.contains_key(type_tag) {
+            return Err(CodecRegistrationError::DecoderAlreadyRegistered {
+                type_tag: type_tag.to_string(),
+            });
+        }
 
-        // Encoder side — closure downcasts Any → M, encodes, returns (tag, bytes)
+        let codec = Arc::new(codec);
         let encode_codec = codec.clone();
         let encode_fn: EncodeFn = Box::new(move |msg: Box<dyn Any + Send>| {
             let typed = msg
@@ -158,14 +198,14 @@ impl CodecRegistry {
             let bytes = encode_codec.encode(&*typed)?;
             Ok((M::type_tag().to_string(), bytes))
         });
-        self.encoders.insert(TypeId::of::<M>(), encode_fn);
-
-        // Decoder side — closure captures Arc<C>
         let decode_fn: DecodeFn = Box::new(move |bytes: &[u8]| {
             let msg: M = codec.decode(bytes)?;
             Ok(Box::new(msg) as Box<dyn Any + Send>)
         });
-        self.decoders.insert(M::type_tag().to_string(), decode_fn);
+
+        self.encoders.insert(type_id, encode_fn);
+        self.decoders.insert(type_tag.to_string(), decode_fn);
+        Ok(())
     }
 
     /// Register a **variant-multiplexing** encoder for one Rust type `M`.
@@ -175,17 +215,26 @@ impl CodecRegistry {
     /// may refuse to encode local-only variants by returning `Err`. `M` is a
     /// plain [`Message`] (e.g. an actor `Incoming` enum), not a
     /// [`NetworkMessage`] — it has no single canonical `type_tag`.
+    ///
+    /// Returns an error without mutation if `M` already has an encoder.
     pub fn register_encoder<M: Message>(
         &mut self,
         e: impl Fn(&M) -> Result<(String, Vec<u8>), Error> + Send + Sync + 'static,
-    ) {
+    ) -> Result<(), CodecRegistrationError> {
+        let type_id = TypeId::of::<M>();
+        if self.encoders.contains_key(&type_id) {
+            return Err(CodecRegistrationError::EncoderAlreadyRegistered {
+                message_type: std::any::type_name::<M>(),
+            });
+        }
         let encode_fn: EncodeFn = Box::new(move |msg: Box<dyn Any + Send>| {
             let typed = msg
                 .downcast::<M>()
                 .map_err(|_| Error::from("Transport: type downcast failed during encode"))?;
             e(&*typed)
         });
-        self.encoders.insert(TypeId::of::<M>(), encode_fn);
+        self.encoders.insert(type_id, encode_fn);
+        Ok(())
     }
 
     /// Register a **fan-in** decoder mapping an arbitrary wire `type_tag` to one
@@ -194,14 +243,22 @@ impl CodecRegistry {
     /// Unlike [`register`](Self::register), the tag is caller-chosen, so several
     /// tags can decode into the same actor enum `M`. `M` is a plain [`Message`]
     /// (e.g. an actor `Incoming` enum), not a [`NetworkMessage`].
+    ///
+    /// Returns an error without mutation if `type_tag` already has a decoder.
     pub fn register_decoder<M: Message>(
         &mut self,
         type_tag: &str,
         d: impl Fn(&[u8]) -> Result<M, Error> + Send + Sync + 'static,
-    ) {
+    ) -> Result<(), CodecRegistrationError> {
+        if self.decoders.contains_key(type_tag) {
+            return Err(CodecRegistrationError::DecoderAlreadyRegistered {
+                type_tag: type_tag.to_string(),
+            });
+        }
         let decode_fn: DecodeFn =
             Box::new(move |bytes: &[u8]| Ok(Box::new(d(bytes)?) as Box<dyn Any + Send>));
         self.decoders.insert(type_tag.to_string(), decode_fn);
+        Ok(())
     }
 
     /// Encode a type-erased message. Returns `(type_tag, payload_bytes)`.

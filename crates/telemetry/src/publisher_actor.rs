@@ -76,5 +76,7 @@ impl ActorInterface for TelemetryPublisherActor {
 
 /// Register JSON encoding for remote telemetry publisher messages.
 pub fn register_telemetry_publisher_codec(registry: &mut CodecRegistry) {
-    registry.register::<TelemetryPublisherMsg, _>(JsonCodec::<TelemetryPublisherMsg>::default());
+    registry
+        .register::<TelemetryPublisherMsg, _>(JsonCodec::<TelemetryPublisherMsg>::default())
+        .expect("unique codec registration");
 }

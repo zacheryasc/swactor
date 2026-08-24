@@ -87,7 +87,8 @@ impl Codec<TelemetryFrame> for TelemetryFrameCodec {
 
 /// Register the [`TelemetryFrame`] codec.
 pub fn register_telemetry_codec(cr: &mut CodecRegistry) {
-    cr.register::<TelemetryFrame, _>(TelemetryFrameCodec);
+    cr.register::<TelemetryFrame, _>(TelemetryFrameCodec)
+        .expect("unique codec registration");
 }
 
 /// JSON event envelope for actor/control paths that can tolerate metadata size.

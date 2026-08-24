@@ -1494,6 +1494,10 @@ impl DirectoryClient {
 }
 
 pub fn register_namespace_codecs(registry: &mut CodecRegistry) {
-    registry.register::<DataDirectoryIn, _>(JsonCodec::default());
-    registry.register::<NamespaceClientIn, _>(JsonCodec::default());
+    registry
+        .register::<DataDirectoryIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<NamespaceClientIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
 }

@@ -809,6 +809,10 @@ impl From<&stage::StageLifecycleEvent> for StageLifecycleWire {
 }
 
 pub(crate) fn register_codecs(registry: &mut CodecRegistry) {
-    registry.register::<NodeAgentMsg, _>(JsonCodec::<NodeAgentMsg>::default());
-    registry.register::<NodeAgentReport, _>(JsonCodec::<NodeAgentReport>::default());
+    registry
+        .register::<NodeAgentMsg, _>(JsonCodec::<NodeAgentMsg>::default())
+        .expect("unique codec registration");
+    registry
+        .register::<NodeAgentReport, _>(JsonCodec::<NodeAgentReport>::default())
+        .expect("unique codec registration");
 }

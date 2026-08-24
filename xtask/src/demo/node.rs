@@ -167,11 +167,13 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         use distribution::transport_bridge::{Outbox, RelayMirror, RouteView};
         use swactor_transport::CodecRegistry;
         let mut codec = CodecRegistry::new();
-        codec.register_decoder::<edge::NodeEdgeMsg>(edge::EDGE_PROVISION_TAG, |bytes| {
-            let provision: edge::EdgeProvision = serde_json::from_slice(bytes)
-                .map_err(|e| swactor::Error::from(format!("edge provision decode: {e}")))?;
-            Ok(edge::NodeEdgeMsg::Provision(provision))
-        });
+        codec
+            .register_decoder::<edge::NodeEdgeMsg>(edge::EDGE_PROVISION_TAG, |bytes| {
+                let provision: edge::EdgeProvision = serde_json::from_slice(bytes)
+                    .map_err(|e| swactor::Error::from(format!("edge provision decode: {e}")))?;
+                Ok(edge::NodeEdgeMsg::Provision(provision))
+            })
+            .expect("unique codec decoder registration");
         let mut routes = std::collections::HashMap::new();
         routes.insert(edge::EDGE_PROVISION_TAG.to_owned(), edge_agent);
         let relay_mirror: RelayMirror =

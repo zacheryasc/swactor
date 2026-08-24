@@ -14,6 +14,7 @@ members = [
     "xtask",
     "tools/vastai",
     "tools/actor-control-flow-lint",
+    "tools/benchmarks",
 ]
 default-members = [
     ".",
@@ -71,7 +72,6 @@ crossbeam-utils = "0.8.21"
 parking_lot = "0.12"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 proptest-state-machine = "0.3"
 loom = "0.7"
