@@ -4349,6 +4349,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "proptest",
  "rand_core 0.6.4",
+ "rustc-hash",
  "serde",
  "serde_json",
  "swactor",

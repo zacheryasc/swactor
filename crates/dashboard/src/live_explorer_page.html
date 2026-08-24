@@ -147,6 +147,8 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     seq: 0,
     paintQueued: false,
     paintHandle: 0,
+    reconciling: false,
+    reconcilePending: false,
   };
 
   const dirty = {
@@ -523,6 +525,11 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       state.messageVersion++;
       updateMetrics();
     }
+    if (state.reconciling) {
+      state.reconcilePending = true;
+      return;
+    }
+    state.reconciling = true;
     const messageVersion = state.messageVersion;
     const startedAt = performance.now();
     try {
@@ -553,6 +560,12 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
         state.messageVersion++;
         updateMetrics();
         renderDetail();
+      }
+    } finally {
+      state.reconciling = false;
+      if (state.reconcilePending) {
+        state.reconcilePending = false;
+        reconcileSnapshot({ notice: 'Catching up after concurrent telemetry updates.' });
       }
     }
   }

@@ -112,7 +112,7 @@ impl TelemetrySubscription {
     }
 
     pub fn drain_available(&self) -> Vec<TelemetryEvent> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.rx.len());
         while let Ok(event) = self.rx.try_recv() {
             out.push(event);
         }
@@ -135,6 +135,31 @@ struct FanoutReport {
     id: SubscriptionId,
     dropped: u64,
     disconnected: bool,
+}
+
+fn publish_to_target(
+    target: FanoutTarget,
+    events: impl IntoIterator<Item = TelemetryEvent>,
+) -> (usize, Option<FanoutReport>) {
+    let mut delivered = 0;
+    let mut dropped = 0;
+    let mut disconnected = false;
+    for event in events {
+        match target.tx.try_send(event) {
+            Ok(()) => delivered += 1,
+            Err(TrySendError::Full(_)) => dropped += 1,
+            Err(TrySendError::Disconnected(_)) => {
+                dropped += 1;
+                disconnected = true;
+            }
+        }
+    }
+    let report = (dropped > 0 || disconnected).then_some(FanoutReport {
+        id: target.id,
+        dropped,
+        disconnected,
+    });
+    (delivered, report)
 }
 
 struct FanoutState {
@@ -236,11 +261,12 @@ impl DeliveryFanout {
         if events.is_empty() {
             return EndpointTick::default();
         }
+        let drained = events.len();
 
         // Snapshot sender handles while holding the subscriber map lock, then
         // deliver outside the lock so large batches or slow subscribers do not
         // block subscribe/snapshot control-plane operations.
-        let (targets, subscribers) = {
+        let (mut targets, subscribers) = {
             let state = self.state.lock().expect("telemetry fanout poisoned");
             let subscribers = state.subscribers.len();
             let targets = state
@@ -256,7 +282,7 @@ impl DeliveryFanout {
 
         if targets.is_empty() {
             return EndpointTick {
-                drained: events.len(),
+                drained,
                 subscribers: 0,
                 ..EndpointTick::default()
             };
@@ -264,26 +290,18 @@ impl DeliveryFanout {
 
         let mut delivered = 0;
         let mut reports = Vec::new();
+        let last_target = targets.pop().expect("nonempty fanout targets");
         for target in targets {
-            let mut dropped = 0;
-            let mut disconnected = false;
-            for event in &events {
-                match target.tx.try_send(event.clone()) {
-                    Ok(()) => delivered += 1,
-                    Err(TrySendError::Full(_)) => dropped += 1,
-                    Err(TrySendError::Disconnected(_)) => {
-                        dropped += 1;
-                        disconnected = true;
-                    }
-                }
+            let (target_delivered, report) = publish_to_target(target, events.iter().cloned());
+            delivered += target_delivered;
+            if let Some(report) = report {
+                reports.push(report);
             }
-            if dropped > 0 || disconnected {
-                reports.push(FanoutReport {
-                    id: target.id,
-                    dropped,
-                    disconnected,
-                });
-            }
+        }
+        let (target_delivered, report) = publish_to_target(last_target, events);
+        delivered += target_delivered;
+        if let Some(report) = report {
+            reports.push(report);
         }
 
         let dropped_for_subscribers = reports.iter().map(|report| report.dropped).sum::<u64>();
@@ -302,7 +320,7 @@ impl DeliveryFanout {
         }
 
         EndpointTick {
-            drained: events.len(),
+            drained,
             delivered,
             dropped_for_subscribers: usize::try_from(dropped_for_subscribers).unwrap_or(usize::MAX),
             subscribers,

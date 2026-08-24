@@ -173,6 +173,7 @@ let rosterSort = { key: 'address', direction: 'asc' };
 let hardwareSource = 'node';
 let lastSnapshot = null;
 let detailTimer = null;
+let refreshInFlight = false;
 // A1: last-rendered HTML per region. A poll that yields identical markup
 // must not swap innerHTML — the swap destroyed hover/selection/presses and
 // restarted animations every second even in a fully converged steady state.
@@ -256,13 +257,18 @@ function pushUrl() {
 }
 
 async function refresh() {
-  let data;
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const response = await fetch('/api/view/fleet');
-    data = await response.json();
-  } catch { return; }
-  lastSnapshot = data;
-  render();
+    const data = await response.json();
+    lastSnapshot = data;
+    render();
+  } catch {
+    // Keep the last good snapshot while the next scheduled refresh retries.
+  } finally {
+    refreshInFlight = false;
+  }
 }
 
 function render() {
@@ -681,15 +687,20 @@ function stopDetailPolling() {
 
 function startDetailPolling() {
   stopDetailPolling();
+  let pollInFlight = false;
   const poll = async () => {
-    if (!selectedStream || !selectedActor) return;
-    let detail;
+    if (!selectedStream || !selectedActor || pollInFlight) return;
+    pollInFlight = true;
     try {
       const response = await fetch(`/api/view/fleet/detail?stream=${encodeURIComponent(selectedStream)}&actor=${encodeURIComponent(selectedActor)}`);
       if (!response.ok) { stopDetailPolling(); return; }
-      detail = await response.json();
-    } catch { return; }
-    renderDossier(detail);
+      const detail = await response.json();
+      renderDossier(detail);
+    } catch {
+      // Keep the current dossier while the next scheduled refresh retries.
+    } finally {
+      pollInFlight = false;
+    }
   };
   poll();
   detailTimer = setInterval(poll, POLL_MS);

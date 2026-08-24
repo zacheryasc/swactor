@@ -5,6 +5,7 @@
 //! per-type encoders/decoders so a type-erased message can be put on the wire
 //! and a [`WireEnvelope`] can be turned back into a concrete message.
 
+use rustc_hash::FxHashMap;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,7 +151,7 @@ type DecodeFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send>, Error> + Send +
 /// [`register_decoder`](Self::register_decoder) (variant-multiplexing encode,
 /// fan-in decode), then shared read-only via `Arc`.
 pub struct CodecRegistry {
-    encoders: HashMap<TypeId, EncodeFn>,
+    encoders: FxHashMap<TypeId, EncodeFn>,
     decoders: HashMap<String, DecodeFn>,
 }
 
@@ -163,7 +164,7 @@ impl Default for CodecRegistry {
 impl CodecRegistry {
     pub fn new() -> Self {
         Self {
-            encoders: HashMap::new(),
+            encoders: FxHashMap::default(),
             decoders: HashMap::new(),
         }
     }

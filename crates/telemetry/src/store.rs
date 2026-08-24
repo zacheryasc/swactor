@@ -143,6 +143,9 @@ impl Store {
 
     /// The stored stream for a node's life, creating an empty one if needed.
     pub fn stream_mut(&mut self, id: &StreamId) -> &mut StoredStream {
+        if self.streams.contains_key(id) {
+            return self.streams.get_mut(id).expect("stream checked as present");
+        }
         self.streams.entry(id.clone()).or_default()
     }
 

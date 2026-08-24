@@ -20,7 +20,7 @@ is hard-capped at 50.
 - `GET /api/frames` — recent raw frame window
 - `GET /api/views` — registered view metadata
 - `GET /view/telemetry/live` — generic live explorer over retained and incoming telemetry frames
-- `GET /api/view/telemetry/live` — 2,000 frames per stream/channel, newest lifetime per node, all live streams plus 50 stale streams
+- `GET /api/view/telemetry/live` — bounded bootstrap snapshot: up to 500 recent frames and 256 KiB of raw payload, distributed across channels; retention remains 500 frames per stream/channel for live inspection
 - `GET /view/fleet` — fused control-plane page (machine + actors per node)
 - `GET /api/view/fleet` — live/stale pools with per-node machine and roster snapshot
 - `GET /api/view/fleet/detail?stream=<node#life>&actor=<addr>` — bounded per-actor dossier detail (diet, history, sampled receipts)
