@@ -26,23 +26,22 @@ const EXECUTION_OWNERS: &[&str] = &[
     "swactor",
     "swactor-engine",
     "swactor-process",
+    "swactor-process-context",
     "swactor-transport",
     "swactor-vastai",
     "telemetry",
 ];
 
 /// Test and benchmark harness packages that must not be workspace dependencies.
-const TEST_SUPPORT_OWNERS: &[&str] =
-    &["actor-control-flow-lint-tests", "swactor-benchmarks"];
+const TEST_SUPPORT_OWNERS: &[&str] = &[
+    "actor-control-flow-lint-tests",
+    "myelin-e2e-fuzz",
+    "swactor-benchmarks",
+];
 
 /// Policy-bearing crates that must never enter an execution owner's dependency
 /// closure.
-const DOMAIN_CONTROL_CRATES: &[&str] = &[
-    "myelin",
-    "provisioning",
-    "swactor-job-runner",
-    "xtask",
-];
+const DOMAIN_CONTROL_CRATES: &[&str] = &["myelin", "provisioning", "xtask"];
 
 #[derive(Clone, Copy)]
 struct Capability {
@@ -54,8 +53,7 @@ struct Capability {
 
 const MOVE_TO_OWNER: &str =
     "move stream mechanics into an approved execution owner or move the decision into an actor";
-const USE_ACTOR_TIMER: &str =
-    "schedule a typed actor message through the engine; the receiving actor owns the deadline decision";
+const USE_ACTOR_TIMER: &str = "schedule a typed actor message through the engine; the receiving actor owns the deadline decision";
 
 /// Stable resolved item paths. These are deliberately compiler identities, not
 /// spellings found in source, so re-exports, renamed imports, and local wrappers
@@ -179,6 +177,8 @@ const CAPABILITIES: &[Capability] = &[
     },
 ];
 
+include!("timing_policy.rs");
+
 struct ActorControlFlowCallbacks {
     package: String,
     test_build: bool,
@@ -186,17 +186,11 @@ struct ActorControlFlowCallbacks {
 }
 
 impl Callbacks for ActorControlFlowCallbacks {
-    fn after_analysis<'tcx>(
-        &mut self,
-        _compiler: &Compiler,
-        tcx: TyCtxt<'tcx>,
-    ) -> Compilation {
-        if TEST_SUPPORT_OWNERS.contains(&self.package.as_str()) {
-            return Compilation::Continue;
-        }
+    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        let role_exempt = TEST_SUPPORT_OWNERS.contains(&self.package.as_str())
+            || EXECUTION_OWNERS.contains(&self.package.as_str());
         if EXECUTION_OWNERS.contains(&self.package.as_str()) {
             check_owner_dependencies(tcx, &self.package);
-            return Compilation::Continue;
         }
 
         for owner in tcx.hir_body_owners() {
@@ -206,8 +200,11 @@ impl Callbacks for ActorControlFlowCallbacks {
                 tcx,
                 typeck,
                 package: &self.package,
+                caller: tcx.def_path_str(owner.to_def_id()),
+                role_exempt,
                 test_build: self.test_build,
                 trace: self.trace,
+                timing_counts: Vec::new(),
             };
             visitor.visit_body(body);
         }
@@ -232,8 +229,11 @@ struct CapabilityVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
     package: &'a str,
+    caller: String,
+    role_exempt: bool,
     test_build: bool,
     trace: bool,
+    timing_counts: Vec<(String, usize)>,
 }
 
 impl<'tcx> Visitor<'tcx> for CapabilityVisitor<'_, 'tcx> {
@@ -256,11 +256,46 @@ impl<'tcx> Visitor<'tcx> for CapabilityVisitor<'_, 'tcx> {
 }
 
 impl CapabilityVisitor<'_, '_> {
-    fn check(&self, def_id: rustc_hir::def_id::DefId, span: Span) {
+    fn check(&mut self, def_id: rustc_hir::def_id::DefId, span: Span) {
         let path = self.tcx.def_path_str(def_id);
         let normalized_path = normalize_def_path(&path);
-        if self.trace && is_candidate_name(self.tcx.item_name(def_id)) {
-            eprintln!("actor-control-flow trace: {path}");
+        let item_name = self.tcx.item_name(def_id);
+        if self.trace && is_candidate_name(item_name) {
+            eprintln!(
+                "actor-control-flow trace: package=`{}` caller=`{}` callee=`{path}`",
+                self.package, self.caller
+            );
+        }
+
+        if GUARDED_TIMING_ITEMS.contains(&item_name.as_str()) {
+            let occurrence = self.next_timing_occurrence(&normalized_path);
+            let allowance = TIMING_ALLOWANCES.iter().find(|allowance| {
+                allowance.package == self.package
+                    && allowance.caller == self.caller
+                    && allowance.callee == normalized_path
+            });
+            match allowance {
+                Some(allowance) if occurrence <= allowance.calls => return,
+                Some(allowance) => {
+                    self.tcx.dcx().span_err(
+                        span,
+                        format!(
+                            "unapproved timing primitive: `{normalized_path}` occurrence {occurrence} exceeds the {} audited call(s) in `{}` (`{}`); remove the timer or update the central timing registry after architectural review",
+                            allowance.calls, self.caller, allowance.purpose
+                        ),
+                    );
+                }
+                None => {
+                    self.tcx.dcx().span_err(
+                        span,
+                        format!(
+                            "unapproved timing primitive: `{normalized_path}` is forbidden in workspace package `{}` at `{}`; use typed engine scheduling or register an exact external-resource boundary",
+                            self.package, self.caller
+                        ),
+                    );
+                }
+            }
+            return;
         }
 
         let Some(capability) = CAPABILITIES
@@ -270,8 +305,7 @@ impl CapabilityVisitor<'_, '_> {
             return;
         };
 
-
-        if self.test_build && capability.test_wait {
+        if self.role_exempt || (self.test_build && capability.test_wait) {
             return;
         }
 
@@ -282,6 +316,19 @@ impl CapabilityVisitor<'_, '_> {
                 capability.label, self.package, capability.resolution
             ),
         );
+    }
+
+    fn next_timing_occurrence(&mut self, callee: &str) -> usize {
+        if let Some((_, count)) = self
+            .timing_counts
+            .iter_mut()
+            .find(|(known, _)| known == callee)
+        {
+            *count += 1;
+            return *count;
+        }
+        self.timing_counts.push((callee.to_owned(), 1));
+        1
     }
 }
 
@@ -314,29 +361,24 @@ fn normalize_def_path(path: &str) -> String {
 }
 
 fn is_candidate_name(name: Symbol) -> bool {
-    matches!(
-        name.as_str(),
-        "block_on"
-            | "blocking_recv"
-            | "has_work"
-            | "interval"
-            | "interval_at"
-            | "new_current_thread"
-            | "new_multi_thread"
-            | "recv"
-            | "recv_deadline"
-            | "recv_timeout"
-            | "sleep"
-            | "sleep_until"
-            | "spawn"
-            | "spawn_blocking"
-            | "spawn_local"
-            | "tick"
-            | "timeout"
-            | "timeout_at"
-            | "timer"
-            | "try_tick"
-    )
+    GUARDED_TIMING_ITEMS.contains(&name.as_str())
+        || matches!(
+            name.as_str(),
+            "block_on"
+                | "blocking_recv"
+                | "has_work"
+                | "interval"
+                | "interval_at"
+                | "new_current_thread"
+                | "new_multi_thread"
+                | "recv"
+                | "spawn"
+                | "spawn_blocking"
+                | "spawn_local"
+                | "tick"
+                | "timer"
+                | "try_tick"
+        )
 }
 
 fn main() -> ExitCode {

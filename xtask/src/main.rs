@@ -13,7 +13,7 @@ const TEST_STEPS: &[TestStep] = &[
         args: &["lint"],
     },
     TestStep {
-        label: "all Rust tests (60s per-test timeout)",
+        label: "all Rust tests (180s per-test timeout)",
         args: &["nextest", "run", "--workspace", "--all-features"],
     },
     TestStep {
@@ -82,6 +82,7 @@ COMMANDS:
                       Run the visual provisioning-reconciler demo.
   check-telemetry-isolation
                       Verify no frame types appear in control-plane modules.
+  lint                Run the Python timeout policy and strict workspace Clippy.
   test                Run strict lint plus every Rust and Python test."
     );
 }
@@ -138,6 +139,31 @@ fn run_tests() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_lint() -> ExitCode {
+    let policy = workspace_root().join("tools/timeout-policy.py");
+    let policy_status = swactor_process::command_status(Command::new("python3").arg(policy));
+    if !policy_status.is_ok_and(|status| status.success()) {
+        return ExitCode::from(1);
+    }
+
+    let mut clippy = cargo_command();
+    clippy.args(["clippy", "--workspace", "--all-targets", "--all-features"]);
+    // Pin pyo3 to the same interpreter the Python test flow uses: a newer
+    // system python exceeds the bundled pyo3's supported maximum and would
+    // fail the workspace build here even though tests build fine.
+    if let Some(tools) = PythonTestTools::discover() {
+        clippy.env("PYO3_PYTHON", tools.python);
+    }
+    match swactor_process::command_status(&mut clippy) {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("Failed to execute cargo clippy: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn nextest_available() -> bool {
     let available = swactor_process::command_status(
         cargo_command()
@@ -185,7 +211,8 @@ impl PythonTestTools {
             build_command
                 .current_dir(&self.directory)
                 .arg("develop")
-                .env("PYO3_PYTHON", &self.python),
+                .arg("--features")
+                .arg("test-host"),
         )
         .is_ok_and(|status| status.success());
         if !built {
@@ -298,6 +325,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        Some("lint") if args.next().is_none() => run_lint(),
         Some("test") if args.next().is_none() => run_tests(),
         Some("demo") => demo::run(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") | None => {

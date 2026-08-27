@@ -24,6 +24,7 @@ def main() -> None:
     rustc_args = sys.argv[2:]
     root = Path(__file__).resolve().parents[2]
     source = Path(__file__).with_name("driver.rs")
+    policy = Path(__file__).with_name("timing_policy.rs")
     target_root = Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
     if not target_root.is_absolute():
         target_root = root / target_root
@@ -50,7 +51,9 @@ def main() -> None:
     except (OSError, subprocess.CalledProcessError) as error:
         fail(f"cannot inspect pinned rustc: {error}")
 
-    digest = hashlib.sha256(source.read_bytes() + version.encode()).hexdigest()[:20]
+    digest = hashlib.sha256(
+        source.read_bytes() + b"\0" + policy.read_bytes() + b"\0" + version.encode()
+    ).hexdigest()[:20]
     driver = cache / f"driver-{digest}"
     lock_path = cache / "build.lock"
 

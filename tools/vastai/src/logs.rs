@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 pub async fn request_logs(
     client: &reqwest::Client,
     base_url: &str,
@@ -24,7 +22,6 @@ pub async fn request_logs(
 }
 
 pub async fn fetch_logs(client: &reqwest::Client, log_url: &str) -> Result<String, String> {
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let resp = client
         .get(log_url)
         .send()

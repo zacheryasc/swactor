@@ -9,6 +9,18 @@ fn repository_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn driver_revision(root: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for path in ["driver.rs", "timing_policy.rs"] {
+        let source = std::fs::read(root.join("tools/actor-control-flow-lint").join(path))
+            .expect("read compiler policy source");
+        for byte in source {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("--cfg=actor_lint_driver_{hash:016x}")
+}
+
 fn cargo_check(fixture: &str, extra_args: &[&str]) -> Output {
     let root = repository_root();
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -28,6 +40,7 @@ fn cargo_check(fixture: &str, extra_args: &[&str]) -> Output {
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_TERM_COLOR", "never")
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env("RUSTFLAGS", driver_revision(&root))
         .env_remove("CARGO_MAKEFLAGS")
         .env_remove("MAKEFLAGS");
     command.output().expect("run fixture cargo check")
@@ -50,7 +63,7 @@ fn compiler_policy_contracts() {
         "blocking task spawning",
         "engine task scheduling",
         "OS thread creation",
-        "thread sleeping",
+        "unapproved timing primitive",
         "direct timer driving",
         "runtime construction or driving",
         "blocking receive used as a controller",
@@ -72,6 +85,30 @@ fn compiler_policy_contracts() {
         dependency_stderr
             .contains("execution owner `swactor-engine` depends on domain-control crate `myelin`"),
         "missing owner dependency diagnostic:\n{dependency_stderr}"
+    );
+
+    let owner_timing = cargo_check("fail-owner-timing", &[]);
+    assert!(
+        !owner_timing.status.success(),
+        "unapproved execution-owner timer compiled"
+    );
+    let owner_timing_stderr = stderr(&owner_timing);
+    assert!(
+        owner_timing_stderr.contains(
+            "unapproved timing primitive: `tokio::time::sleep` is forbidden in workspace package `iroh-driver`"
+        ),
+        "missing resolved owner-timer diagnostic:\n{owner_timing_stderr}"
+    );
+
+    let timing_overage = cargo_check("fail-timing-overage", &[]);
+    assert!(
+        !timing_overage.status.success(),
+        "timing allowance overage compiled"
+    );
+    let timing_overage_stderr = stderr(&timing_overage);
+    assert!(
+        timing_overage_stderr.contains("occurrence 2 exceeds the 1 audited call(s)"),
+        "missing timing-overage diagnostic:\n{timing_overage_stderr}"
     );
 
     for fixture in ["pass-actor-domain", "pass-execution-owner"] {

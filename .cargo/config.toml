@@ -3,4 +3,4 @@ rustc-workspace-wrapper = "tools/actor-control-flow-lint/rustc-wrapper.py"
 
 [alias]
 xtask = "run --package xtask --"
-lint = "clippy --workspace --all-targets --all-features"
+lint = "run --package xtask -- lint"

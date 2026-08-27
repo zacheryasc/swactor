@@ -55,9 +55,6 @@ impl TestHttpServer {
     pub fn start(routes: Vec<TestHttpRoute>) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind test HTTP server: {error}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("configure test HTTP server: {error}"))?;
         let address = listener
             .local_addr()
             .map_err(|error| format!("read test HTTP address: {error}"))?;
@@ -66,14 +63,11 @@ impl TestHttpServer {
         let thread_requests = Arc::clone(&requests);
         let thread_stop = Arc::clone(&stop);
         let join = std::thread::spawn(move || {
-            while !thread_stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => serve(stream, &routes, &thread_requests),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            while let Ok((stream, _)) = listener.accept() {
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
                 }
+                serve(stream, &routes, &thread_requests);
             }
         });
         Ok(Self {
@@ -96,6 +90,7 @@ impl TestHttpServer {
 impl Drop for TestHttpServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
