@@ -1,6 +1,6 @@
 //! Authoritative virtual blob namespace actor and restart-tolerant client proxy.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::{ExternalSender, Runtime};
-use swactor_engine::EngineHandle;
+use swactor_engine::{EngineHandle, EngineInstant};
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
 use crate::blob_transfer::{BlobTransferEvent, BlobTransferId};
@@ -43,6 +43,7 @@ pub enum EntryKind {
 pub struct NamespaceNode {
     pub kind: EntryKind,
     pub revision: u64,
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +87,7 @@ pub enum NamespaceError {
         incarnation: StreamIncarnation,
     },
     OperationConflict(OperationId),
+    StreamActive(DataPath),
     Storage(String),
     SourceRecovery(String),
     DirectoryUnavailable(String),
@@ -121,6 +123,9 @@ impl fmt::Display for NamespaceError {
                 "namespace operation ID {:02x?} was reused for a different request",
                 operation.bytes()
             ),
+            Self::StreamActive(path) => {
+                write!(f, "stream path {path} has active or pending endpoints")
+            }
             Self::Storage(reason) => write!(f, "namespace persistence failed: {reason}"),
             Self::SourceRecovery(reason) => write!(f, "namespace source recovery failed: {reason}"),
             Self::DirectoryUnavailable(reason) => {
@@ -179,6 +184,14 @@ pub enum DataDirectoryIn {
         operation_id: OperationId,
         reply_to: ActorAddress,
     },
+    Rename {
+        request_id: DirectoryRequestId,
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+        operation_id: OperationId,
+        reply_to: ActorAddress,
+    },
     OpenStream {
         request_id: DirectoryRequestId,
         path: DataPath,
@@ -201,6 +214,14 @@ pub enum DataDirectoryIn {
         incarnation: StreamIncarnation,
         reply_to: ActorAddress,
     },
+    SourceRetired {
+        source: ActorAddress,
+    },
+    /// Periodic self-tick that re-drives pending retirements. Retire is a
+    /// lifecycle one-shot over an at-most-once transport; without traffic
+    /// that re-runs [`DataDirectoryActor`]'s retry pass, a single lost frame
+    /// strands the retired source and its published binding forever.
+    RetryRetirements,
 }
 
 impl NetworkMessage for DataDirectoryIn {
@@ -241,6 +262,11 @@ pub enum DataDirectoryOut {
         authority_epoch: u64,
         result: Result<MutationReceipt, NamespaceError>,
     },
+    Renamed {
+        request_id: DirectoryRequestId,
+        authority_epoch: u64,
+        result: Result<MutationReceipt, NamespaceError>,
+    },
     StreamOpened {
         request_id: DirectoryRequestId,
         authority_epoch: u64,
@@ -261,6 +287,7 @@ impl DataDirectoryOut {
             | Self::BlobReserved { request_id, .. }
             | Self::BlobReservationReleased { request_id, .. }
             | Self::Unregistered { request_id, .. }
+            | Self::Renamed { request_id, .. }
             | Self::StreamOpened { request_id, .. }
             | Self::StreamClosed { request_id, .. } => *request_id,
         }
@@ -293,6 +320,12 @@ pub enum NamespaceRequest {
     },
     Unregister {
         path: DataPath,
+        operation_id: OperationId,
+    },
+    Rename {
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
         operation_id: OperationId,
     },
     OpenStream {
@@ -368,6 +401,15 @@ struct StreamOpenRequest {
     operation_id: OperationId,
     reply_to: ActorAddress,
 }
+struct BlobRegistration {
+    path: DataPath,
+    source: ActorAddress,
+    length: u64,
+    recovery: SourceRecovery,
+    operation_id: OperationId,
+    reservation: Option<OperationId>,
+    retired: Option<ActorAddress>,
+}
 
 struct ActiveStream {
     binding: StreamMatch,
@@ -379,18 +421,44 @@ enum RuntimeStream {
     Pending(PendingStream),
     Active(ActiveStream),
 }
-
 pub struct DataDirectoryActor {
     store: NamespaceStore,
     sources: BTreeMap<DataPath, RuntimeSource>,
     streams: BTreeMap<DataPath, RuntimeStream>,
     blob_reservations: BTreeMap<DataPath, OperationId>,
+    pending_retirements: HashSet<ActorAddress>,
     authority_epoch: u64,
+    retire_retry: Option<RetirementRetry>,
+}
+
+/// Engine-hosted periodic tick that re-sends pending `Retire` messages.
+///
+/// Retire frames are fire-and-forget: a write onto a connection that dies
+/// mid-flight is dropped without feedback, and the directory only re-ran its
+/// retry pass when some other message arrived. A directory whose last
+/// operation retired a source would therefore never retry, stranding the
+/// source actor and its published binding. The tick keeps the retry pass
+/// running until each retirement is acknowledged.
+pub struct RetirementRetry {
+    engine: EngineHandle,
+    sender: ExternalSender,
+    period: Duration,
+}
+
+impl RetirementRetry {
+    pub fn new(engine: EngineHandle, sender: ExternalSender, period: Duration) -> Self {
+        Self {
+            engine,
+            sender,
+            period,
+        }
+    }
 }
 
 impl DataDirectoryActor {
     pub fn recover(
         store_path: impl AsRef<Path>,
+        retire_retry: Option<RetirementRetry>,
         mut recover_source: impl FnMut(&SourceRecovery, u64) -> Result<ActorAddress, NamespaceError>,
     ) -> Result<Self, NamespaceError> {
         let mut store = NamespaceStore::open(store_path)?;
@@ -403,16 +471,50 @@ impl DataDirectoryActor {
             };
             sources.insert(path, source);
         }
+        let pending_retirements = store.snapshot().retirements.iter().copied().collect();
         let authority_epoch = store.advance_authority_epoch()?;
         Ok(Self {
             store,
             sources,
             streams: BTreeMap::new(),
             blob_reservations: BTreeMap::new(),
+            pending_retirements,
             authority_epoch,
+            retire_retry,
         })
     }
 
+    fn queue_retirement(&mut self, ctx: &Ctx<'_>, source: ActorAddress) {
+        self.pending_retirements.insert(source);
+        let _ = ctx.send(
+            source,
+            BlobSourceIn::Retire {
+                reply_to: Some(ctx.self_addr()),
+            },
+        );
+    }
+
+    fn retry_retirements(&self, ctx: &Ctx<'_>) {
+        for source in &self.pending_retirements {
+            let _ = ctx.send(
+                *source,
+                BlobSourceIn::Retire {
+                    reply_to: Some(ctx.self_addr()),
+                },
+            );
+        }
+    }
+
+    fn confirm_retirement(&mut self, source: ActorAddress) -> Result<(), NamespaceError> {
+        if !self.pending_retirements.contains(&source) {
+            return Ok(());
+        }
+        let mut next = self.store.snapshot().clone();
+        next.retirements.retain(|retired| *retired != source);
+        self.store.commit(next)?;
+        self.pending_retirements.remove(&source);
+        Ok(())
+    }
     pub fn authority_epoch(&self) -> u64 {
         self.authority_epoch
     }
@@ -435,22 +537,84 @@ impl DataDirectoryActor {
                     PersistedMutationResult::Rejected(MutationRejection::PathNotFound(path)) => {
                         Err(NamespaceError::PathNotFound(path.clone()))
                     }
+                    PersistedMutationResult::Rejected(MutationRejection::PathExists(path)) => {
+                        Err(NamespaceError::PathExists(path.clone()))
+                    }
+                    PersistedMutationResult::Rejected(MutationRejection::StreamActive(path)) => {
+                        Err(NamespaceError::StreamActive(path.clone()))
+                    }
+                    PersistedMutationResult::Rejected(MutationRejection::PathReplaced(path)) => {
+                        Err(NamespaceError::PathReplaced(path.clone()))
+                    }
                 }
             })
     }
 
+    /// Persist a rejected mutation under its operation ID so later retries of
+    /// the same operation replay the rejection instead of re-evaluating
+    /// against state that has since changed. Returns the matching error.
+    fn reject(
+        &mut self,
+        operation_id: OperationId,
+        request: MutationRequest,
+        rejection: MutationRejection,
+    ) -> NamespaceError {
+        let mut next = self.store.snapshot().clone();
+        next.operations.insert(
+            operation_id,
+            PersistedOperation {
+                request,
+                result: PersistedMutationResult::Rejected(rejection.clone()),
+            },
+        );
+        if let Err(error) = self.store.commit(next) {
+            return error.into();
+        }
+        match rejection {
+            MutationRejection::PathNotFound(path) => NamespaceError::PathNotFound(path),
+            MutationRejection::PathExists(path) => NamespaceError::PathExists(path),
+            MutationRejection::StreamActive(path) => NamespaceError::StreamActive(path),
+            MutationRejection::PathReplaced(path) => NamespaceError::PathReplaced(path),
+        }
+    }
+
+    fn record_stream_participant(
+        &mut self,
+        path: &DataPath,
+        operation_id: OperationId,
+        revision: u64,
+    ) -> Result<(), NamespaceError> {
+        let request = MutationRequest::BindStream { path: path.clone() };
+        if let Some(existing) = self.store.snapshot().operations.get(&operation_id) {
+            return if existing.request == request {
+                Ok(())
+            } else {
+                Err(NamespaceError::OperationConflict(operation_id))
+            };
+        }
+        let mut next = self.store.snapshot().clone();
+        next.operations.insert(
+            operation_id,
+            PersistedOperation {
+                request,
+                result: PersistedMutationResult::Committed(MutationReceipt { revision }),
+            },
+        );
+        self.store.commit(next)?;
+        Ok(())
+    }
     fn bind_stream(
         &mut self,
         path: DataPath,
         operation_id: OperationId,
         retired: Option<ActorAddress>,
     ) -> Result<MutationReceipt, NamespaceError> {
-        if self.blob_reservations.contains_key(&path) {
-            return Err(NamespaceError::PathExists(path));
-        }
         let request = MutationRequest::BindStream { path: path.clone() };
         if let Some(replayed) = self.replay(operation_id, &request) {
             return replayed;
+        }
+        if self.blob_reservations.contains_key(&path) {
+            return Err(self.reject(operation_id, request, MutationRejection::PathExists(path)));
         }
         let revision = self.store.snapshot().next_revision;
         let next_revision = revision
@@ -520,6 +684,36 @@ impl DataDirectoryActor {
             operation_id,
             reply_to,
         } = request;
+        if let Some(Ok(receipt)) = self.replay(
+            operation_id,
+            &MutationRequest::BindStream { path: path.clone() },
+        ) {
+            let is_current = matches!(
+                self.streams.get(&path),
+                Some(RuntimeStream::Pending(pending))
+                    if pending.operation_id == operation_id
+            ) || matches!(
+                self.streams.get(&path),
+                Some(RuntimeStream::Active(active))
+                    if active.source_operation == operation_id
+                        || active.sink_operation == operation_id
+            );
+            if !is_current {
+                self.send_stream_result(
+                    ctx,
+                    request_id,
+                    reply_to,
+                    Err(NamespaceError::StaleIncarnation {
+                        path,
+                        incarnation: StreamIncarnation {
+                            authority_epoch: self.authority_epoch,
+                            revision: receipt.revision,
+                        },
+                    }),
+                );
+                return;
+            }
+        }
         if !ensure {
             let snapshot = self.store.snapshot();
             let Some(current_revision) = snapshot.stream_nodes.get(&path).copied() else {
@@ -591,6 +785,14 @@ impl DataDirectoryActor {
                     reply_to,
                     Err(NamespaceError::DuplicateStreamRole { path, role }),
                 );
+                return;
+            }
+            if let Err(error) =
+                self.record_stream_participant(&path, operation_id, pending.revision)
+            {
+                self.streams
+                    .insert(path.clone(), RuntimeStream::Pending(pending));
+                self.send_stream_result(ctx, request_id, reply_to, Err(error));
                 return;
             }
             let (
@@ -677,7 +879,7 @@ impl DataDirectoryActor {
         match self.bind_stream(path.clone(), operation_id, retired) {
             Ok(receipt) => {
                 if let Some(retired) = retired {
-                    let _ = ctx.send(retired, BlobSourceIn::Retire);
+                    self.queue_retirement(ctx, retired);
                 }
                 self.streams.insert(
                     path,
@@ -764,14 +966,17 @@ impl DataDirectoryActor {
 
     fn register(
         &mut self,
-        path: DataPath,
-        source: ActorAddress,
-        length: u64,
-        recovery: SourceRecovery,
-        operation_id: OperationId,
-        reservation: Option<OperationId>,
-        retired: Option<ActorAddress>,
+        registration: BlobRegistration,
     ) -> Result<MutationReceipt, NamespaceError> {
+        let BlobRegistration {
+            path,
+            source,
+            length,
+            recovery,
+            operation_id,
+            reservation,
+            retired,
+        } = registration;
         let request = MutationRequest::Register {
             path: path.clone(),
             length,
@@ -782,8 +987,20 @@ impl DataDirectoryActor {
         }
         match self.blob_reservations.get(&path) {
             Some(existing) if Some(*existing) == reservation => {}
-            Some(_) => return Err(NamespaceError::PathExists(path)),
-            None if reservation.is_some() => return Err(NamespaceError::PathReplaced(path)),
+            Some(_) => {
+                return Err(self.reject(
+                    operation_id,
+                    request,
+                    MutationRejection::PathExists(path),
+                ));
+            }
+            None if reservation.is_some() => {
+                return Err(self.reject(
+                    operation_id,
+                    request,
+                    MutationRejection::PathReplaced(path),
+                ));
+            }
             None => {}
         }
         let revision = self.store.snapshot().next_revision;
@@ -861,10 +1078,12 @@ impl DataDirectoryActor {
             (Some(binding), None) => Ok(NamespaceNode {
                 kind: EntryKind::Blob,
                 revision: binding.revision,
+                active: false,
             }),
             (None, Some(revision)) => Ok(NamespaceNode {
                 kind: EntryKind::Stream,
                 revision: *revision,
+                active: self.streams.contains_key(path),
             }),
             (None, None) => Err(NamespaceError::PathNotFound(path.clone())),
             (Some(_), Some(_)) => Err(NamespaceError::Storage(format!(
@@ -879,28 +1098,17 @@ impl DataDirectoryActor {
         operation_id: OperationId,
         retired: Option<ActorAddress>,
     ) -> Result<MutationReceipt, NamespaceError> {
-        if self.blob_reservations.contains_key(&path) {
-            return Err(NamespaceError::PathExists(path));
-        }
         let request = MutationRequest::Unregister { path: path.clone() };
         if let Some(replayed) = self.replay(operation_id, &request) {
             return replayed;
         }
+        if self.blob_reservations.contains_key(&path) {
+            return Err(self.reject(operation_id, request, MutationRejection::PathExists(path)));
+        }
         if !self.store.snapshot().bindings.contains_key(&path)
             && !self.store.snapshot().stream_nodes.contains_key(&path)
         {
-            let mut next = self.store.snapshot().clone();
-            next.operations.insert(
-                operation_id,
-                PersistedOperation {
-                    request,
-                    result: PersistedMutationResult::Rejected(MutationRejection::PathNotFound(
-                        path.clone(),
-                    )),
-                },
-            );
-            self.store.commit(next)?;
-            return Err(NamespaceError::PathNotFound(path));
+            return Err(self.reject(operation_id, request, MutationRejection::PathNotFound(path)));
         }
         let revision = self.store.snapshot().next_revision;
         let next_revision = revision
@@ -928,6 +1136,117 @@ impl DataDirectoryActor {
         self.sources.remove(&path);
         Ok(receipt)
     }
+
+    fn rename(
+        &mut self,
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+        operation_id: OperationId,
+    ) -> Result<MutationReceipt, NamespaceError> {
+        let request = MutationRequest::Rename {
+            source: source.clone(),
+            destination: destination.clone(),
+            replace,
+        };
+        if let Some(replayed) = self.replay(operation_id, &request) {
+            return replayed;
+        }
+        let snapshot = self.store.snapshot();
+        let source_exists =
+            snapshot.bindings.contains_key(&source) || snapshot.stream_nodes.contains_key(&source);
+        if !source_exists {
+            return Err(self.reject(
+                operation_id,
+                request,
+                MutationRejection::PathNotFound(source),
+            ));
+        }
+        if self.blob_reservations.contains_key(&source)
+            || self.blob_reservations.contains_key(&destination)
+        {
+            let reserved = if self.blob_reservations.contains_key(&source) {
+                source
+            } else {
+                destination
+            };
+            return Err(self.reject(
+                operation_id,
+                request,
+                MutationRejection::PathExists(reserved),
+            ));
+        }
+        let active_path = self
+            .streams
+            .contains_key(&source)
+            .then_some(source.clone())
+            .or_else(|| {
+                self.streams
+                    .contains_key(&destination)
+                    .then_some(destination.clone())
+            });
+        if let Some(path) = active_path {
+            return Err(self.reject(operation_id, request, MutationRejection::StreamActive(path)));
+        }
+
+        let destination_exists = snapshot.bindings.contains_key(&destination)
+            || snapshot.stream_nodes.contains_key(&destination);
+        if source != destination && destination_exists && !replace {
+            return Err(self.reject(
+                operation_id,
+                request,
+                MutationRejection::PathExists(destination),
+            ));
+        }
+
+        let revision = snapshot.next_revision;
+        let next_revision = revision
+            .checked_add(1)
+            .filter(|revision| *revision != 0)
+            .ok_or(NamespaceStoreError::RevisionExhausted)?;
+        let receipt = MutationReceipt { revision };
+        let destination_retired = (source != destination)
+            .then(|| self.sources.get(&destination))
+            .flatten()
+            .and_then(|source| match source {
+                RuntimeSource::Available(actor) => Some(*actor),
+                RuntimeSource::Unavailable(_) => None,
+            });
+        let mut next = snapshot.clone();
+        next.next_revision = next_revision;
+        let source_binding = next.bindings.remove(&source);
+        let source_stream = next.stream_nodes.remove(&source);
+        next.bindings.remove(&destination);
+        next.stream_nodes.remove(&destination);
+        if let Some(mut binding) = source_binding {
+            binding.revision = revision;
+            next.bindings.insert(destination.clone(), binding);
+        } else if source_stream.is_some() {
+            next.stream_nodes.insert(destination.clone(), revision);
+        }
+        if let Some(retired) = destination_retired
+            && !next.retirements.contains(&retired)
+        {
+            next.retirements.push(retired);
+        }
+        next.operations.insert(
+            operation_id,
+            PersistedOperation {
+                request,
+                result: PersistedMutationResult::Committed(receipt),
+            },
+        );
+        self.store.commit(next)?;
+
+        let source_runtime = self.sources.remove(&source);
+        if source != destination {
+            self.sources.remove(&destination);
+        }
+        if let Some(source_runtime) = source_runtime {
+            self.sources.insert(destination, source_runtime);
+        }
+        Ok(receipt)
+    }
 }
 
 impl ActorInterface for DataDirectoryActor {
@@ -935,12 +1254,19 @@ impl ActorInterface for DataDirectoryActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
-        for source in self.store.snapshot().retirements.iter().copied() {
-            let _ = ctx.send(source, BlobSourceIn::Retire);
+        if let Some(retire_retry) = &self.retire_retry {
+            retire_retry.engine.send_every(
+                retire_retry.period,
+                retire_retry.sender.clone(),
+                ctx.self_addr(),
+                DataDirectoryIn::RetryRetirements,
+            );
         }
+        self.retry_retirements(ctx);
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryIn) {
+        self.retry_retirements(ctx);
         match message {
             DataDirectoryIn::Register {
                 request_id,
@@ -961,7 +1287,7 @@ impl ActorInterface for DataDirectoryActor {
                         RuntimeSource::Available(actor) if *actor != source => Some(*actor),
                         RuntimeSource::Available(_) | RuntimeSource::Unavailable(_) => None,
                     });
-                let result = self.register(
+                let result = self.register(BlobRegistration {
                     path,
                     source,
                     length,
@@ -969,11 +1295,11 @@ impl ActorInterface for DataDirectoryActor {
                     operation_id,
                     reservation,
                     retired,
-                );
+                });
                 if result.is_ok()
                     && let Some(retired) = retired
                 {
-                    let _ = ctx.send(retired, BlobSourceIn::Retire);
+                    self.queue_retirement(ctx, retired);
                 }
                 if result.is_ok() {
                     self.displace_stream(ctx, &logical);
@@ -1082,11 +1408,42 @@ impl ActorInterface for DataDirectoryActor {
                 if result.is_ok()
                     && let Some(retired) = retired
                 {
-                    let _ = ctx.send(retired, BlobSourceIn::Retire);
+                    self.queue_retirement(ctx, retired);
                 }
                 let _ = ctx.send(
                     reply_to,
                     NamespaceClientIn::DirectoryReply(DataDirectoryOut::Unregistered {
+                        request_id,
+                        authority_epoch: self.authority_epoch,
+                        result,
+                    }),
+                );
+            }
+            DataDirectoryIn::Rename {
+                request_id,
+                source,
+                destination,
+                replace,
+                operation_id,
+                reply_to,
+            } => {
+                let replayed = self.store.snapshot().operations.contains_key(&operation_id);
+                let retired = (!replayed && source != destination)
+                    .then(|| self.sources.get(&destination))
+                    .flatten()
+                    .and_then(|source| match source {
+                        RuntimeSource::Available(actor) => Some(*actor),
+                        RuntimeSource::Unavailable(_) => None,
+                    });
+                let result = self.rename(source, destination, replace, operation_id);
+                if result.is_ok()
+                    && let Some(retired) = retired
+                {
+                    self.queue_retirement(ctx, retired);
+                }
+                let _ = ctx.send(
+                    reply_to,
+                    NamespaceClientIn::DirectoryReply(DataDirectoryOut::Renamed {
                         request_id,
                         authority_epoch: self.authority_epoch,
                         result,
@@ -1138,6 +1495,12 @@ impl ActorInterface for DataDirectoryActor {
                     }),
                 );
             }
+            DataDirectoryIn::SourceRetired { source } => {
+                let _ = self.confirm_retirement(source);
+            }
+            // The retry pass at the top of `handle` re-drives pending
+            // retirements; the tick exists only to run that pass.
+            DataDirectoryIn::RetryRetirements => {}
         }
     }
 }
@@ -1149,13 +1512,21 @@ pub trait NamespaceDiscovery: Send + Sync + 'static {
 struct PendingRequest {
     request: NamespaceRequest,
     reply_to: ActorAddress,
+    enqueued: EngineInstant,
 }
+
+/// How long a namespace request may stay unanswered while no directory is
+/// discoverable. Authority loss must surface as a bounded typed failure to
+/// callers (e.g. a contextual process blocked on `lookup` after the
+/// orchestrator died), never as a hang.
+const NAMESPACE_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 pub struct NamespaceClientActor {
     engine: EngineHandle,
     sender: ExternalSender,
     discovery: Arc<dyn NamespaceDiscovery>,
     retry_period: Duration,
+    request_deadline: Duration,
     next_request_id: u64,
     pending: HashMap<DirectoryRequestId, PendingRequest>,
 }
@@ -1167,11 +1538,28 @@ impl NamespaceClientActor {
         discovery: Arc<dyn NamespaceDiscovery>,
         retry_period: Duration,
     ) -> Self {
+        Self::new_with_deadline(
+            engine,
+            sender,
+            discovery,
+            retry_period,
+            NAMESPACE_REQUEST_DEADLINE,
+        )
+    }
+
+    pub fn new_with_deadline(
+        engine: EngineHandle,
+        sender: ExternalSender,
+        discovery: Arc<dyn NamespaceDiscovery>,
+        retry_period: Duration,
+        request_deadline: Duration,
+    ) -> Self {
         Self {
             engine,
             sender,
             discovery,
             retry_period,
+            request_deadline,
             next_request_id: 1,
             pending: HashMap::new(),
         }
@@ -1226,6 +1614,19 @@ impl NamespaceClientActor {
             NamespaceRequest::Unregister { path, operation_id } => DataDirectoryIn::Unregister {
                 request_id,
                 path: path.clone(),
+                operation_id: *operation_id,
+                reply_to: ctx.self_addr(),
+            },
+            NamespaceRequest::Rename {
+                source,
+                destination,
+                replace,
+                operation_id,
+            } => DataDirectoryIn::Rename {
+                request_id,
+                source: source.clone(),
+                destination: destination.clone(),
+                replace: *replace,
                 operation_id: *operation_id,
                 reply_to: ctx.self_addr(),
             },
@@ -1297,8 +1698,14 @@ impl ActorInterface for NamespaceClientActor {
                 };
                 self.next_request_id = next;
                 self.dispatch(ctx, request_id, &request);
-                self.pending
-                    .insert(request_id, PendingRequest { request, reply_to });
+                self.pending.insert(
+                    request_id,
+                    PendingRequest {
+                        request,
+                        reply_to,
+                        enqueued: self.engine.now(),
+                    },
+                );
             }
             NamespaceClientIn::Cancel { reply_to } => {
                 let cancelled: Vec<(DataPath, OperationId)> = self
@@ -1361,11 +1768,92 @@ impl ActorInterface for NamespaceClientActor {
                 );
             }
             NamespaceClientIn::Retry => {
+                // A request no directory has answered within the bound fails
+                // with a typed error instead of hanging the caller forever
+                // (e.g. authority loss — the registry may keep serving the
+                // dead directory's address, so age is the only sound bound).
+                let now = self.engine.now();
+                let expired: Vec<DirectoryRequestId> = self
+                    .pending
+                    .iter()
+                    .filter(|(_, pending)| {
+                        now.to_instant()
+                            .duration_since(pending.enqueued.to_instant())
+                            > self.request_deadline
+                    })
+                    .map(|(request_id, _)| *request_id)
+                    .collect();
+                for request_id in expired {
+                    if let Some(pending) = self.pending.remove(&request_id) {
+                        let _ = ctx.send(
+                            pending.reply_to,
+                            expired_reply(request_id, &pending.request),
+                        );
+                    }
+                }
                 for (request_id, pending) in &self.pending {
                     self.dispatch(ctx, *request_id, &pending.request);
                 }
             }
         }
+    }
+}
+
+/// Build the typed failure a caller receives when its namespace request
+fn expired_reply(request_id: DirectoryRequestId, request: &NamespaceRequest) -> DataDirectoryOut {
+    fn failure<T>() -> Result<T, NamespaceError> {
+        Err(NamespaceError::DirectoryUnavailable(
+            "no namespace authority was discoverable within the request deadline".to_owned(),
+        ))
+    }
+    match request {
+        NamespaceRequest::Register { .. } => DataDirectoryOut::Registered {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::Resolve { .. } => DataDirectoryOut::Resolved {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::Lookup { .. } => DataDirectoryOut::LookedUp {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::ReserveBlob { .. } => DataDirectoryOut::BlobReserved {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::ReleaseBlobReservation { .. } => {
+            DataDirectoryOut::BlobReservationReleased {
+                request_id,
+                authority_epoch: 0,
+                result: failure(),
+            }
+        }
+        NamespaceRequest::Unregister { .. } => DataDirectoryOut::Unregistered {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::Rename { .. } => DataDirectoryOut::Renamed {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::OpenStream { .. } => DataDirectoryOut::StreamOpened {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
+        NamespaceRequest::CloseStream { .. } => DataDirectoryOut::StreamClosed {
+            request_id,
+            authority_epoch: 0,
+            result: failure(),
+        },
     }
 }
 
@@ -1480,6 +1968,29 @@ impl NamespaceClient {
             DataDirectoryOut::Unregistered { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected unregister reply, received {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn rename(
+        &self,
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+        operation_id: OperationId,
+    ) -> Result<MutationReceipt, NamespaceError> {
+        match self
+            .request(NamespaceRequest::Rename {
+                source,
+                destination,
+                replace,
+                operation_id,
+            })
+            .await?
+        {
+            DataDirectoryOut::Renamed { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected rename reply, received {other:?}"
             ))),
         }
     }
@@ -1714,6 +2225,94 @@ impl DirectoryClient {
             DataDirectoryOut::Unregistered { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected unregister reply, received {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn rename(
+        &self,
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+        operation_id: OperationId,
+    ) -> Result<MutationReceipt, NamespaceError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<NamespaceClientIn>()
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        self.runtime
+            .send_to(
+                self.directory,
+                DataDirectoryIn::Rename {
+                    request_id: self.request_id(),
+                    source,
+                    destination,
+                    replace,
+                    operation_id,
+                    reply_to: *inbox.addr(),
+                },
+            )
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        match self.receive(&inbox).await? {
+            DataDirectoryOut::Renamed { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected rename reply, received {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn reserve_blob(
+        &self,
+        path: DataPath,
+        operation_id: OperationId,
+    ) -> Result<(), NamespaceError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<NamespaceClientIn>()
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        self.runtime
+            .send_to(
+                self.directory,
+                DataDirectoryIn::ReserveBlob {
+                    request_id: self.request_id(),
+                    path,
+                    operation_id,
+                    reply_to: *inbox.addr(),
+                },
+            )
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        match self.receive(&inbox).await? {
+            DataDirectoryOut::BlobReserved { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected reserve reply, received {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn release_blob_reservation(
+        &self,
+        path: DataPath,
+        operation_id: OperationId,
+    ) -> Result<(), NamespaceError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<NamespaceClientIn>()
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        self.runtime
+            .send_to(
+                self.directory,
+                DataDirectoryIn::ReleaseBlobReservation {
+                    request_id: self.request_id(),
+                    path,
+                    operation_id,
+                    reply_to: *inbox.addr(),
+                },
+            )
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        match self.receive(&inbox).await? {
+            DataDirectoryOut::BlobReservationReleased { result, .. } => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected release reply, received {other:?}"
             ))),
         }
     }

@@ -3,31 +3,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId};
-#[allow(unused_imports)]
-use data_plane::blob::{
-    BLOB_HEADER_LEN, Blob, BlobError, BlobLease, BlobMetadata, BlobSharedState, LeaseReleaser,
-};
 use data_plane::bootstrap::{self, BootstrapSpec};
-#[allow(unused_imports)]
 use data_plane::data_plane::{
-    DataPlaneBootstrap, MapRequest, MapTarget, Protection, RegionSlice, Sharing, TransferRoute,
+    DataPlaneBootstrap, MapRequest, MapTarget, Protection, Sharing, TransferRoute,
 };
 use data_plane::host::{HostDataPlaneConfig, HostDataPlaneSessionActor};
-use data_plane::path::{DataPath, JobContext};
-#[allow(unused_imports)]
-use data_plane::protocol::{
-    AccessMode, DataPlaneError, DescriptorCapabilities, DescriptorKind, Errno, JobCapability,
-    OpenOptions,
-};
-#[allow(unused_imports)]
-use futures_lite::future::{self, FutureExt};
+use data_plane::path::{DataPath, SessionAccess};
+use data_plane::protocol::{AccessMode, DataPlaneError, Errno, OpenOptions, SessionCapability};
+use futures_lite::future;
 use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{RemoteSink, Runtime, RuntimeParts};
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
-const CAPABILITY: JobCapability = JobCapability::new([9; 32]);
+const CAPABILITY: SessionCapability = SessionCapability::new([9; 32]);
 const ARENA_GENERATION: u64 = 17;
 const SESSION_GENERATION: u64 = 29;
 const WEIGHTS: &[u8] = b"0123456789abcdefghijklmn";
@@ -47,23 +37,12 @@ impl RemoteSink for DirectRuntimeSink {
     }
 }
 
-#[allow(dead_code)]
-struct BlackHoleSink;
-
-impl RemoteSink for BlackHoleSink {
-    fn send(
-        &self,
-        _address: ActorAddress,
-        _message: Box<dyn std::any::Any + Send>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-}
 
 struct Harness {
     _host_engine: Engine,
     _child_engine: Engine,
     _temp: TempState,
+    _host_runtime: Runtime,
     bootstrap: DataPlaneBootstrap,
 }
 
@@ -204,15 +183,6 @@ impl data_plane::stream_transport::StreamTransport for RejectingStreamTransport 
     fn terminate(&self, _incarnation: data_plane::namespace::StreamIncarnation) {}
 }
 
-#[allow(dead_code)]
-struct CollectBytes(Arc<parking_lot::Mutex<Vec<u8>>>);
-
-impl data_plane::data_plane::StreamConsumer for CollectBytes {
-    fn consume(&self, bytes: &[u8]) -> Result<(), String> {
-        self.0.lock().extend_from_slice(bytes);
-        Ok(())
-    }
-}
 
 fn harness(arena_bytes: u64) -> Harness {
     harness_with_transport(
@@ -232,7 +202,7 @@ fn harness_with_transport(
         base_alignment: 64,
     })
     .expect("host arena");
-    let handoff = bootstrap::write_bootstrap(
+    let prepared = bootstrap::prepare_arena(
         &mut arena,
         BootstrapSpec {
             arena_generation: ARENA_GENERATION,
@@ -273,6 +243,7 @@ fn harness_with_transport(
     });
     let directory_actor = data_plane::namespace::DataDirectoryActor::recover(
         temp.root.join("namespace.json"),
+        None,
         |_record, _length| {
             Err(data_plane::namespace::NamespaceError::SourceRecovery(
                 "unexpected recovery".to_owned(),
@@ -320,12 +291,13 @@ fn harness_with_transport(
         .spawn(
             HostDataPlaneSessionActor::new(HostDataPlaneConfig {
                 runtime: host_runtime.clone(),
+                engine: host_engine.handle(),
                 arena,
                 arena_generation: ARENA_GENERATION,
                 session_generation: SESSION_GENERATION,
                 capability: CAPABILITY,
-                job_context: JobContext {
-                    run_id: "run-7".to_owned(),
+                session_access: SessionAccess {
+                    execution_id: "run-7".to_owned(),
                     read_prefixes: vec![path("/models"), path("/runs/run-7/results")],
                     write_prefixes: vec![path("/runs/run-7/results")],
                 },
@@ -340,7 +312,7 @@ fn harness_with_transport(
         )
         .expect("spawn host session");
     let bootstrap = future::block_on(DataPlaneBootstrap::attach(
-        handoff.arena_fd,
+        prepared.arena_fd,
         child_runtime,
         host_session,
         CAPABILITY,
@@ -351,14 +323,7 @@ fn harness_with_transport(
         _host_engine: host_engine,
         _child_engine: child_engine,
         _temp: temp,
+        _host_runtime: host_runtime,
         bootstrap,
     }
-}
-
-#[allow(dead_code)]
-#[derive(Default)]
-struct NoopReleaser;
-
-impl LeaseReleaser for NoopReleaser {
-    fn release(&self, _lease: BlobLease) {}
 }

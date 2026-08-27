@@ -2,16 +2,25 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
+use swactor_engine::EngineHandle;
 
 use crate::blob::FileRegistration;
 use crate::blob_transfer::BlobTransferSender;
-use crate::namespace::{DataDirectoryActor, DirectoryClient, NamespaceError, OperationId};
+use crate::namespace::{
+    DataDirectoryActor, DirectoryClient, NamespaceError, OperationId, RetirementRetry,
+};
 use crate::namespace_store::SourceRecovery;
 use crate::path::DataPath;
 use crate::source::{BlobSourceIn, BlobSourcePublisher, FileBlobSourceActor};
+
+/// How often the directory re-sends retirements that no source has
+/// acknowledged yet. Retire frames are at-most-once; this retry bounds how
+/// long a lost frame can strand a published source and its binding.
+const RETIREMENT_RETRY_PERIOD: Duration = Duration::from_millis(250);
 
 pub struct DataNamespaceService {
     directory: ActorAddress,
@@ -21,6 +30,7 @@ pub struct DataNamespaceService {
 impl DataNamespaceService {
     pub fn recover(
         runtime: Runtime,
+        engine: EngineHandle,
         store_path: impl AsRef<Path>,
         source_sender: Arc<dyn BlobTransferSender>,
         source_publisher: Arc<dyn BlobSourcePublisher>,
@@ -28,8 +38,11 @@ impl DataNamespaceService {
         let recovery_runtime = runtime.clone();
         let recovery_sender = Arc::clone(&source_sender);
         let recovery_publisher = Arc::clone(&source_publisher);
+        let retire_retry =
+            RetirementRetry::new(engine, runtime.create_sender(), RETIREMENT_RETRY_PERIOD);
         let directory = DataDirectoryActor::recover(
             store_path,
+            Some(retire_retry),
             move |recovery, expected_length| match recovery {
                 SourceRecovery::File { path } => {
                     let source = FileBlobSourceActor::recover(
@@ -45,7 +58,8 @@ impl DataNamespaceService {
                         ))
                     })?;
                     if let Err(error) = recovery_publisher.publish_source(source) {
-                        let _ = recovery_runtime.send_to(source, BlobSourceIn::Retire);
+                        let _ = recovery_runtime
+                            .send_to(source, BlobSourceIn::Retire { reply_to: None });
                         return Err(NamespaceError::SourceRecovery(error));
                     }
                     Ok(source)
@@ -134,6 +148,18 @@ impl DataPlaneControl {
             .await?;
         Ok(())
     }
+
+    pub async fn rename(
+        &self,
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+    ) -> Result<(), NamespaceError> {
+        self.directory
+            .rename(source, destination, replace, random_operation_id())
+            .await?;
+        Ok(())
+    }
 }
 
 struct PendingSourceRegistration {
@@ -145,7 +171,9 @@ struct PendingSourceRegistration {
 impl Drop for PendingSourceRegistration {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.runtime.send_to(self.source, BlobSourceIn::Retire);
+            let _ = self
+                .runtime
+                .send_to(self.source, BlobSourceIn::Retire { reply_to: None });
         }
     }
 }

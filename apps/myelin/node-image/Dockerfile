@@ -1,5 +1,5 @@
 # Myelin node agent: a thin Rust control-plane layer over the CUDA base.
-# Workload frameworks are supplied by job payload images.
+# Workload frameworks are supplied by workload-specific images.
 # Build from workspace root after compiling the Rust binary:
 #   cargo build --release -p myelin --bin myelin-worker
 #   docker build -f apps/myelin/node-image/Dockerfile.base -t myelin-node-base:cuda12.6 .

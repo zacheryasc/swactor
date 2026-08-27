@@ -1,9 +1,16 @@
+use std::collections::{HashMap, VecDeque};
+
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
+use crate::contextual_process::{
+    ContextualNodeCommand, ContextualProcessEventKindWire, ContextualProcessEventWire,
+    ContextualProcessSpecWire,
+};
+use crate::node_actor::NodeAgentMsg;
 use crate::orchestration::manual_control::{ManualActorControl, ManualControlMsg};
 use crate::run_fsm as core;
 
@@ -33,7 +40,6 @@ pub(crate) enum OrchestratorMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
-        job_actor: Option<ActorAddress>,
         readiness_id: u64,
     },
     ObserveNodeRuntimeReadyAck {
@@ -80,12 +86,74 @@ pub(crate) enum OrchestratorMsg {
         reply_to: ActorAddress,
     },
     Manual(ManualControlMsg),
+    ContextualSpawn {
+        logical_node_id: u64,
+        request_id: String,
+        spec: ContextualProcessSpecWire,
+        reply_to: ActorAddress,
+    },
+    ContextualStop {
+        request_id: String,
+        control_request_id: String,
+        kill_after_ms: Option<u64>,
+        reply_to: ActorAddress,
+    },
+    ContextualQuery {
+        logical_node_id: u64,
+        control_request_id: String,
+        reply_to: ActorAddress,
+    },
+    ContextualEvents {
+        request_id: String,
+        after_sequence: u64,
+        reply_to: ActorAddress,
+    },
+    ContextualEvent(ContextualProcessEventWire),
+    /// An HTTP control observer timed out waiting for its reply; drop the
+    /// pending entry so a hung node cannot accumulate parked control requests.
+    ContextualControlCancel {
+        control_request_id: String,
+    },
 }
 
 impl NetworkMessage for OrchestratorMsg {
     fn type_tag() -> &'static str {
         "myelin::OrchestratorMsg"
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContextualEventRecord {
+    pub sequence: u64,
+    pub observation: ContextualProcessEventWire,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContextualExecutionView {
+    pub request_id: String,
+    pub logical_node_id: u64,
+    pub process: Option<ActorAddress>,
+    pub terminal: bool,
+    pub truncated_before: u64,
+    pub next_sequence: u64,
+    pub events: Vec<ContextualEventRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ContextualControlReply {
+    Event {
+        observation: ContextualProcessEventWire,
+    },
+    Events {
+        execution: ContextualExecutionView,
+    },
+    Rejected {
+        error: String,
+    },
+    /// Locally injected by the HTTP reply observer when its deadline passes;
+    /// never produced by the orchestrator.
+    TimedOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +257,60 @@ impl NetworkMessage for OrchestratorReport {
         "myelin::OrchestratorReport"
     }
 }
+const MAX_CONTEXTUAL_EXECUTIONS: usize = 256;
+const MAX_CONTEXTUAL_EVENTS_PER_EXECUTION: usize = 4096;
+
+struct ContextualExecutionState {
+    logical_node_id: u64,
+    process: Option<ActorAddress>,
+    terminal: bool,
+    next_sequence: u64,
+    events: VecDeque<ContextualEventRecord>,
+    spawn_waiter: Option<ActorAddress>,
+}
+
+impl ContextualExecutionState {
+    fn record(&mut self, observation: ContextualProcessEventWire) {
+        if let ContextualProcessEventKindWire::Spawned { process, .. } = &observation.event {
+            self.process = Some(*process);
+        }
+        self.terminal |= observation.event.is_terminal();
+        self.events.push_back(ContextualEventRecord {
+            sequence: self.next_sequence,
+            observation,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.events.len() > MAX_CONTEXTUAL_EVENTS_PER_EXECUTION {
+            self.events.pop_front();
+        }
+    }
+
+    fn view(&self, request_id: String, after_sequence: u64) -> ContextualExecutionView {
+        ContextualExecutionView {
+            request_id,
+            logical_node_id: self.logical_node_id,
+            process: self.process,
+            terminal: self.terminal,
+            truncated_before: self
+                .events
+                .front()
+                .map_or(self.next_sequence, |event| event.sequence),
+            next_sequence: self.next_sequence,
+            events: self
+                .events
+                .iter()
+                .filter(|event| event.sequence >= after_sequence)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+struct PendingContextualReply {
+    reply_to: ActorAddress,
+    target_request_id: Option<String>,
+    logical_node_id: u64,
+}
 
 pub(crate) struct OrchestratorActor {
     core: core::OrchestratorRun,
@@ -196,6 +318,8 @@ pub(crate) struct OrchestratorActor {
     command_cursor: usize,
     event_cursor: usize,
     manual: Option<ManualActorControl>,
+    contextual_executions: HashMap<String, ContextualExecutionState>,
+    pending_contextual_replies: HashMap<String, PendingContextualReply>,
 }
 
 impl OrchestratorActor {
@@ -206,12 +330,334 @@ impl OrchestratorActor {
             command_cursor: 0,
             event_cursor: 0,
             manual: None,
+            contextual_executions: HashMap::new(),
+            pending_contextual_replies: HashMap::new(),
         }
     }
 
     pub(crate) fn with_manual_control(mut self, manual: ManualActorControl) -> Self {
         self.manual = Some(manual);
         self
+    }
+
+    fn contextual_rejection(
+        &self,
+        ctx: &Ctx<'_>,
+        reply_to: ActorAddress,
+        error: impl Into<String>,
+    ) {
+        let _ = ctx.send(
+            reply_to,
+            ContextualControlReply::Rejected {
+                error: error.into(),
+            },
+        );
+    }
+
+    fn contextual_node_actor(&self, logical_node_id: u64) -> Result<ActorAddress, String> {
+        self.manual
+            .as_ref()
+            .ok_or_else(|| "manual node control is unavailable".to_owned())?
+            .running_node_actor(logical_node_id)
+    }
+
+    fn route_contextual(
+        &self,
+        ctx: &Ctx<'_>,
+        logical_node_id: u64,
+        command: ContextualNodeCommand,
+    ) -> Result<(), String> {
+        let node_actor = self.contextual_node_actor(logical_node_id)?;
+        ctx.send(node_actor, NodeAgentMsg::Contextual(command))
+            .map_err(|error| format!("route contextual command to node {logical_node_id}: {error}"))
+    }
+
+    fn handle_contextual(&mut self, ctx: &Ctx<'_>, msg: &OrchestratorMsg) -> bool {
+        match msg {
+            OrchestratorMsg::ContextualSpawn {
+                logical_node_id,
+                request_id,
+                spec,
+                reply_to,
+            } => {
+                if request_id.trim().is_empty() {
+                    self.contextual_rejection(ctx, *reply_to, "request_id must not be empty");
+                    return true;
+                }
+                if self.contextual_executions.contains_key(request_id) {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        format!("contextual request {request_id:?} already exists"),
+                    );
+                    return true;
+                }
+                if self.contextual_executions.len() >= MAX_CONTEXTUAL_EXECUTIONS {
+                    self.contextual_executions
+                        .retain(|_, execution| !execution.terminal);
+                }
+                if self.contextual_executions.len() >= MAX_CONTEXTUAL_EXECUTIONS {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        "too many live contextual executions",
+                    );
+                    return true;
+                }
+                self.contextual_executions.insert(
+                    request_id.clone(),
+                    ContextualExecutionState {
+                        logical_node_id: *logical_node_id,
+                        process: None,
+                        terminal: false,
+                        next_sequence: 0,
+                        events: VecDeque::new(),
+                        spawn_waiter: Some(*reply_to),
+                    },
+                );
+                if let Err(error) = self.route_contextual(
+                    ctx,
+                    *logical_node_id,
+                    ContextualNodeCommand::Spawn {
+                        request_id: request_id.clone(),
+                        spec: spec.clone(),
+                        reply_to: ctx.self_addr(),
+                    },
+                ) {
+                    self.contextual_executions.remove(request_id);
+                    self.contextual_rejection(ctx, *reply_to, error);
+                }
+                true
+            }
+            OrchestratorMsg::ContextualStop {
+                request_id,
+                control_request_id,
+                kill_after_ms,
+                reply_to,
+            } => {
+                if self
+                    .pending_contextual_replies
+                    .contains_key(control_request_id)
+                {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        format!("contextual control request {control_request_id:?} already exists"),
+                    );
+                    return true;
+                }
+                let Some(execution) = self.contextual_executions.get(request_id) else {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        format!("contextual request {request_id:?} does not exist"),
+                    );
+                    return true;
+                };
+                let Some(process) = execution.process else {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        format!("contextual request {request_id:?} has not spawned"),
+                    );
+                    return true;
+                };
+                let logical_node_id = execution.logical_node_id;
+                self.pending_contextual_replies.insert(
+                    control_request_id.clone(),
+                    PendingContextualReply {
+                        reply_to: *reply_to,
+                        target_request_id: Some(request_id.clone()),
+                        logical_node_id,
+                    },
+                );
+                if let Err(error) = self.route_contextual(
+                    ctx,
+                    logical_node_id,
+                    ContextualNodeCommand::Stop {
+                        request_id: control_request_id.clone(),
+                        process,
+                        kill_after_ms: *kill_after_ms,
+                        reply_to: ctx.self_addr(),
+                    },
+                ) {
+                    self.pending_contextual_replies.remove(control_request_id);
+                    self.contextual_rejection(ctx, *reply_to, error);
+                }
+                true
+            }
+            OrchestratorMsg::ContextualQuery {
+                logical_node_id,
+                control_request_id,
+                reply_to,
+            } => {
+                if self
+                    .pending_contextual_replies
+                    .contains_key(control_request_id)
+                {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        format!("contextual control request {control_request_id:?} already exists"),
+                    );
+                    return true;
+                }
+                self.pending_contextual_replies.insert(
+                    control_request_id.clone(),
+                    PendingContextualReply {
+                        reply_to: *reply_to,
+                        target_request_id: None,
+                        logical_node_id: *logical_node_id,
+                    },
+                );
+                if let Err(error) = self.route_contextual(
+                    ctx,
+                    *logical_node_id,
+                    ContextualNodeCommand::Query {
+                        request_id: control_request_id.clone(),
+                        reply_to: ctx.self_addr(),
+                    },
+                ) {
+                    self.pending_contextual_replies.remove(control_request_id);
+                    self.contextual_rejection(ctx, *reply_to, error);
+                }
+                true
+            }
+            OrchestratorMsg::ContextualEvents {
+                request_id,
+                after_sequence,
+                reply_to,
+            } => {
+                let Some(execution) = self.contextual_executions.get(request_id) else {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        format!("contextual request {request_id:?} does not exist"),
+                    );
+                    return true;
+                };
+                let terminal = execution.terminal;
+                let reply = ContextualControlReply::Events {
+                    execution: execution.view(request_id.clone(), *after_sequence),
+                };
+                let _ = ctx.send(*reply_to, reply);
+                if terminal {
+                    self.contextual_executions.remove(request_id);
+                }
+                true
+            }
+            OrchestratorMsg::ContextualEvent(observation) => {
+                if let Some(pending) = self
+                    .pending_contextual_replies
+                    .remove(&observation.request_id)
+                {
+                    if pending.logical_node_id != observation.logical_node_id {
+                        self.contextual_rejection(
+                            ctx,
+                            pending.reply_to,
+                            format!(
+                                "contextual reply came from node {}, expected {}",
+                                observation.logical_node_id, pending.logical_node_id
+                            ),
+                        );
+                        return true;
+                    }
+                    if let Some(target) = pending.target_request_id
+                        && let Some(execution) = self.contextual_executions.get_mut(&target)
+                    {
+                        execution.record(observation.clone());
+                    }
+                    let _ = ctx.send(
+                        pending.reply_to,
+                        ContextualControlReply::Event {
+                            observation: observation.clone(),
+                        },
+                    );
+                    return true;
+                }
+                let Some(execution) = self.contextual_executions.get_mut(&observation.request_id)
+                else {
+                    return true;
+                };
+                if execution.logical_node_id != observation.logical_node_id {
+                    let expected = execution.logical_node_id;
+                    let waiter = execution.spawn_waiter.take();
+                    execution.terminal = true;
+                    if let Some(waiter) = waiter {
+                        let _ = ctx.send(
+                            waiter,
+                            ContextualControlReply::Rejected {
+                                error: format!(
+                                    "contextual reply came from node {}, expected {}",
+                                    observation.logical_node_id, expected
+                                ),
+                            },
+                        );
+                    }
+                    return true;
+                }
+                let resolves_spawn = matches!(
+                    &observation.event,
+                    ContextualProcessEventKindWire::Spawned { .. }
+                ) || observation.event.is_terminal();
+                execution.record(observation.clone());
+                if resolves_spawn && let Some(waiter) = execution.spawn_waiter.take() {
+                    let _ = ctx.send(
+                        waiter,
+                        ContextualControlReply::Event {
+                            observation: observation.clone(),
+                        },
+                    );
+                }
+                true
+            }
+            OrchestratorMsg::ContextualControlCancel { control_request_id } => {
+                // The HTTP caller already observed a timeout; the pending
+                // entry is stale and must not swallow a later reply.
+                self.pending_contextual_replies.remove(control_request_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn fail_contextual_node(&mut self, ctx: &Ctx<'_>, logical_node_id: u64, reason: &str) {
+        let mut waiters = Vec::new();
+        for (request_id, execution) in &mut self.contextual_executions {
+            if execution.logical_node_id != logical_node_id || execution.terminal {
+                continue;
+            }
+            let observation = ContextualProcessEventWire {
+                request_id: request_id.clone(),
+                logical_node_id,
+                event: ContextualProcessEventKindWire::ProcessError {
+                    error: reason.to_owned(),
+                },
+            };
+            execution.record(observation.clone());
+            if let Some(waiter) = execution.spawn_waiter.take() {
+                waiters.push((waiter, observation));
+            }
+        }
+        for (waiter, observation) in waiters {
+            let _ = ctx.send(waiter, ContextualControlReply::Event { observation });
+        }
+
+        // Stop and query controls parked against the failed node will never
+        // receive a reply; reject them now so HTTP callers fail boundedly and
+        // the pending map cannot grow across node losses.
+        let mut timed_out_callers = Vec::new();
+        self.pending_contextual_replies.retain(|_, pending| {
+            if pending.logical_node_id == logical_node_id {
+                timed_out_callers.push(pending.reply_to);
+                false
+            } else {
+                true
+            }
+        });
+        for reply_to in timed_out_callers {
+            self.contextual_rejection(ctx, reply_to, reason.to_owned());
+        }
     }
 
     fn observe(&mut self, msg: OrchestratorMsg) {
@@ -245,7 +691,13 @@ impl OrchestratorActor {
             | OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. }
             | OrchestratorMsg::ObserveWeightsReady { .. }
             | OrchestratorMsg::Snapshot { .. }
-            | OrchestratorMsg::Manual(_) => {}
+            | OrchestratorMsg::Manual(_)
+            | OrchestratorMsg::ContextualSpawn { .. }
+            | OrchestratorMsg::ContextualStop { .. }
+            | OrchestratorMsg::ContextualQuery { .. }
+            | OrchestratorMsg::ContextualEvents { .. }
+            | OrchestratorMsg::ContextualEvent(_)
+            | OrchestratorMsg::ContextualControlCancel { .. } => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
             }
@@ -332,11 +784,28 @@ impl ActorInterface for OrchestratorActor {
         }
     }
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
+        if self.handle_contextual(ctx, &msg) {
+            return;
+        }
         if let OrchestratorMsg::Manual(manual_msg) = msg.clone() {
+            if let ManualControlMsg::Kill { request, .. } = &manual_msg {
+                self.fail_contextual_node(
+                    ctx,
+                    request.logical_node_id,
+                    "contextual process node termination was requested",
+                );
+            }
             if let Some(manual) = self.manual.as_mut() {
                 manual.handle(ctx, manual_msg);
             }
             return;
+        }
+        if let OrchestratorMsg::ObserveMembershipLost { node_id, .. } = &msg {
+            self.fail_contextual_node(
+                ctx,
+                *node_id,
+                "contextual process node was lost from membership",
+            );
         }
         match msg.clone() {
             OrchestratorMsg::ObserveNodeRuntimeReady {
@@ -345,7 +814,6 @@ impl ActorInterface for OrchestratorActor {
                 stage_index,
                 endpoint,
                 node_actor,
-                job_actor,
                 readiness_id,
             } => {
                 if let Some(manual) = self.manual.as_mut() {
@@ -363,7 +831,6 @@ impl ActorInterface for OrchestratorActor {
                                 .map_or(0, |spec| spec.attempt_id),
                             endpoint: serde_json::to_string(&endpoint).unwrap_or_default(),
                             node_actor,
-                            job_actor,
                             swim_node_id: distribution::types::NodeId(*endpoint.id.as_bytes()),
                             stage_index,
                             readiness_id,

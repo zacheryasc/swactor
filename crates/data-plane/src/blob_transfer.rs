@@ -38,6 +38,7 @@ pub enum BlobTransferEvent {
     Sealed(Result<(), DataPlaneError>),
     Released(Result<(), DataPlaneError>),
     Cancel,
+    RouteRetry,
 }
 
 impl NetworkMessage for BlobTransferEvent {

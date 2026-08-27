@@ -11,7 +11,7 @@ use ::swactor::config::RuntimeConfig;
 use ::swactor::runtime::{Inbox, Runtime, RuntimeParts};
 use swactor_engine::{Engine, SteppingBackend};
 
-mod job;
+mod context;
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
 
@@ -450,7 +450,7 @@ fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
 // ─── Module registration ─────────────────────────────────────────────────────
 
 fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    job::register(m)?;
+    context::register(m)?;
     m.add_class::<PyActorAddress>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyInbox>()?;

@@ -34,13 +34,15 @@ struct IrohBlobOffer {
 pub struct IrohBlobTransferSender {
     connector: EdgeConnector,
     blocking: BlockingWorkSender,
+    runtime: Runtime,
 }
 
 impl IrohBlobTransferSender {
-    pub fn new(connector: EdgeConnector, engine: &EngineHandle) -> Self {
+    pub fn new(connector: EdgeConnector, engine: &EngineHandle, runtime: Runtime) -> Self {
         Self {
             connector,
             blocking: engine.blocking_work_sender(),
+            runtime,
         }
     }
 }
@@ -48,8 +50,13 @@ impl IrohBlobTransferSender {
 impl BlobTransferSender for IrohBlobTransferSender {
     fn start_file(&self, request: FileTransferRequest) -> Result<(), String> {
         let connector = self.connector.clone();
+        let runtime = self.runtime.clone();
         let work = Box::new(move || {
-            let result = send_file(connector, &request);
+            let result = if runtime.is_local_actor(request.offer.destination) {
+                send_file_local(&runtime, &request)
+            } else {
+                send_file(connector, &request)
+            };
             request.completion.complete(result);
         });
         self.blocking
@@ -62,6 +69,36 @@ fn send_file(connector: EdgeConnector, request: &FileTransferRequest) -> Result<
     let wire: IrohBlobOffer = serde_json::from_slice(&request.offer.transport)
         .map_err(|error| format!("decode Iroh blob offer: {error}"))?;
     let sender = connector.connect(wire.endpoint, wire.edge_id, CONNECT_TIMEOUT)?;
+    read_file_chunks(request, |bytes| sender.send(bytes))?;
+    sender.finish(CONNECT_TIMEOUT)
+}
+
+fn send_file_local(runtime: &Runtime, request: &FileTransferRequest) -> Result<(), String> {
+    read_file_chunks(request, |bytes| {
+        runtime
+            .send_to(
+                request.offer.destination,
+                BlobTransferEvent::Chunk {
+                    transfer_id: request.offer.transfer_id,
+                    bytes,
+                },
+            )
+            .map_err(|error| format!("send local blob chunk: {error}"))
+    })?;
+    runtime
+        .send_to(
+            request.offer.destination,
+            BlobTransferEvent::Finished {
+                transfer_id: request.offer.transfer_id,
+            },
+        )
+        .map_err(|error| format!("finish local blob transfer: {error}"))
+}
+
+fn read_file_chunks(
+    request: &FileTransferRequest,
+    mut send: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
     let mut transferred = 0_u64;
     let mut chunk = vec![0_u8; FILE_CHUNK_BYTES];
     while transferred < request.length {
@@ -82,12 +119,11 @@ fn send_file(connector: EdgeConnector, request: &FileTransferRequest) -> Result<
                 request.length
             ));
         }
-        sender.send(chunk[..read].to_vec())?;
+        send(chunk[..read].to_vec())?;
         transferred = transferred
             .checked_add(read as u64)
             .ok_or_else(|| "blob source transfer offset overflow".to_owned())?;
     }
-    drop(sender);
     Ok(())
 }
 
@@ -131,8 +167,7 @@ impl IrohBlobTransferReceiver {
         let mut remaining = Vec::with_capacity(queue.len());
         for event in queue.drain(..) {
             match event {
-                WireEvent::StreamArrived { edge_id, .. }
-                    if self.destinations.lock().contains_key(&edge_id.0) => {}
+                WireEvent::StreamArrived { edge_id, .. } if is_blob_edge(edge_id.0) => {}
                 WireEvent::BytesRead {
                     edge_id,
                     stream_id,
@@ -140,9 +175,19 @@ impl IrohBlobTransferReceiver {
                 } => {
                     let destination = self.destinations.lock().get(&edge_id.0).copied();
                     if let Some((transfer_id, destination)) = destination {
-                        let _ = runtime
-                            .send_to(destination, BlobTransferEvent::Chunk { transfer_id, bytes });
-                    } else {
+                        if runtime
+                            .send_to(destination, BlobTransferEvent::Chunk { transfer_id, bytes })
+                            .is_err()
+                        {
+                            // The destination actor is gone (send_to only
+                            // fails for unknown addresses): the blob can no
+                            // longer land anywhere and notifying anyone is
+                            // impossible. Drop the mapping so later events
+                            // for this edge are discarded instead of being
+                            // resent to the dead actor forever.
+                            self.destinations.lock().remove(&edge_id.0);
+                        }
+                    } else if !is_blob_edge(edge_id.0) {
                         remaining.push(WireEvent::BytesRead {
                             edge_id,
                             stream_id,
@@ -156,7 +201,7 @@ impl IrohBlobTransferReceiver {
                     {
                         let _ = runtime
                             .send_to(destination, BlobTransferEvent::Finished { transfer_id });
-                    } else {
+                    } else if !is_blob_edge(edge_id.0) {
                         remaining.push(WireEvent::StreamEnded { edge_id, stream_id });
                     }
                 }
@@ -175,7 +220,7 @@ impl IrohBlobTransferReceiver {
                                 reason: format!("{reason:?}"),
                             },
                         );
-                    } else {
+                    } else if !is_blob_edge(edge_id.0) {
                         remaining.push(WireEvent::StreamFault {
                             edge_id: Some(edge_id),
                             stream_id,
@@ -188,6 +233,13 @@ impl IrohBlobTransferReceiver {
         }
         queue.extend(remaining);
     }
+}
+
+/// Blob-transfer edges are allocated at and above [`FIRST_BLOB_EDGE_ID`],
+/// disjoint from data-plane edge identifiers, so an event for such an edge
+/// with no registered destination belongs to an already-terminated transfer.
+fn is_blob_edge(edge_id: u64) -> bool {
+    edge_id >= FIRST_BLOB_EDGE_ID
 }
 
 impl BlobTransferReceiver for IrohBlobTransferReceiver {

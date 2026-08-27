@@ -5,6 +5,8 @@ use swactor::runtime::ExternalSender;
 
 use crate::lifecycle::PreparedProcessOutput;
 use crate::message::{ProcessActorCommand, ProcessCommand, ProcessOutput};
+#[cfg(unix)]
+use crate::resources::ProcessSpawnResources;
 use crate::supervisor::{
     ProcessSupervisorThread, ProcessThreadHandle, ThreadEvent, ThreadEventReceiver,
     thread_event_channel,
@@ -39,6 +41,8 @@ impl ProcessDoneState {
 
 pub(crate) struct ProcessActor {
     spec: Option<ProcessSpec>,
+    #[cfg(unix)]
+    resources: Option<ProcessSpawnResources>,
     output: PreparedProcessOutput,
     sender: ExternalSender,
     addr_slot: Arc<OnceLock<ActorAddress>>,
@@ -51,12 +55,15 @@ pub(crate) struct ProcessActor {
 impl ProcessActor {
     pub(crate) fn new(
         spec: ProcessSpec,
+        #[cfg(unix)] resources: ProcessSpawnResources,
         output: PreparedProcessOutput,
         sender: ExternalSender,
         addr_slot: Arc<OnceLock<ActorAddress>>,
     ) -> Self {
         Self {
             spec: Some(spec),
+            #[cfg(unix)]
+            resources: Some(resources),
             output,
             sender,
             addr_slot,
@@ -254,7 +261,17 @@ impl ActorInterface for ProcessActor {
         });
 
         let spec = self.spec.take().expect("process spec already taken");
-        match ProcessSupervisorThread::start(spec, event_sink) {
+        #[cfg(unix)]
+        let resources = self
+            .resources
+            .take()
+            .expect("process resources already taken");
+        match ProcessSupervisorThread::start(
+            spec,
+            #[cfg(unix)]
+            resources,
+            event_sink,
+        ) {
             Ok(supervisor) => {
                 self.supervisor = Some(supervisor);
                 self.supervisor_events = Some(event_receiver);

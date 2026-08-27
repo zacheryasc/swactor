@@ -78,6 +78,11 @@ pub enum MutationRequest {
     Unregister {
         path: DataPath,
     },
+    Rename {
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +93,9 @@ pub struct MutationReceipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationRejection {
     PathNotFound(DataPath),
+    PathExists(DataPath),
+    StreamActive(DataPath),
+    PathReplaced(DataPath),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

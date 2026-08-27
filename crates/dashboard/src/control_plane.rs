@@ -811,8 +811,8 @@ mod tests {
             &view,
             &remote,
             2,
-            "proc.job-runner-run.stdout",
-            b"job output\n".to_vec(),
+            "proc.contextual-python.stdout",
+            b"process output\n".to_vec(),
         );
 
         let joined = view.snapshot_json();
@@ -823,10 +823,10 @@ mod tests {
             .filter(|card| card["stream"]["node"] == "7")
             .collect::<Vec<_>>();
         assert_eq!(cards.len(), 1, "join keeps one visual identity");
-        assert_eq!(cards[0]["output"]["phase"], "job-runner-run");
+        assert_eq!(cards[0]["output"]["phase"], "contextual-python");
         assert_eq!(cards[0]["output"]["lines"].as_array().unwrap().len(), 3);
         assert_eq!(cards[0]["output"]["lines"][2]["source"], "stdout");
-        assert_eq!(cards[0]["output"]["lines"][2]["text"], "job output");
+        assert_eq!(cards[0]["output"]["lines"][2]["text"], "process output");
     }
 
     fn actors_payload(worker: u32, actors: serde_json::Value) -> Vec<u8> {

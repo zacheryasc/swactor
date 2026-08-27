@@ -418,6 +418,13 @@ impl Runtime {
         Ok(addr)
     }
 
+    /// Return whether an actor address is owned by this runtime.
+    ///
+    /// External inboxes are not actors and therefore return `false`.
+    pub fn is_local_actor(&self, address: ActorAddress) -> bool {
+        self.shared.address_map.worker_of(&address).is_some()
+    }
+
     /// Access the installed runtime extension (if any).
     pub fn extension(&self) -> Option<&dyn RuntimeExtension> {
         self.shared.extension.get().map(|a| a.as_ref())

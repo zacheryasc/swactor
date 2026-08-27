@@ -124,8 +124,11 @@ enum CompletionState<T> {
 
 /// One actor-owned terminal observation for a synchronous process entrypoint.
 ///
-/// The waiting thread cannot poll, set a deadline, or advance domain state.
-/// An actor decides when the operation is complete and publishes the value.
+/// The waiting thread cannot poll or advance domain state. An actor decides
+/// when the operation is complete and publishes the value; [`Self::wait`]
+/// blocks until then, while [`Self::wait_deadline`] bounds the wait for
+/// entrypoints whose failure must be observable even if the actor stalls.
+///
 pub struct ActorCompletion<T> {
     inner: Arc<(Mutex<CompletionState<T>>, Condvar)>,
 }
@@ -179,6 +182,32 @@ impl<T> ActorCompletion<T> {
                 }
                 CompletionState::Pending => unreachable!("pending state handled above"),
             }
+        }
+    }
+
+    /// Block until the owning actor completes or `timeout` elapses.
+    ///
+    /// Returns `None` on timeout with the completion still pending, so a
+    /// bootstrap entrypoint can fail boundedly instead of hanging forever.
+    pub fn wait_deadline(&self, timeout: Duration) -> Option<T> {
+        let (state, ready) = &*self.inner;
+        let mut state = state.lock();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !matches!(*state, CompletionState::Pending) {
+                return match std::mem::replace(&mut *state, CompletionState::Consumed) {
+                    CompletionState::Ready(value) => Some(value),
+                    CompletionState::Consumed => {
+                        panic!("ActorCompletion::wait called after value was consumed")
+                    }
+                    CompletionState::Pending => unreachable!("pending state handled above"),
+                };
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            ready.wait_until(&mut state, deadline);
         }
     }
 }

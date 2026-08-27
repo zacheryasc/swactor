@@ -4,12 +4,20 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
+use crate::contextual_process::{
+    ContextualNodeCommand, ContextualProcessControllerIn, ContextualProcessEventKindWire,
+    ContextualProcessEventWire,
+};
 use crate::gguf_shard::StageShardPlan;
 use crate::run_plan;
 use crate::staging as stage;
 
 use crate::orchestration::actor::OrchestratorMsg;
 use swactor_transport::JsonCodec;
+
+/// Error text for contextual commands on a node whose controller is absent
+/// (for example, a non-agent node); the event kind stays command-specific.
+const CONTROL_UNAVAILABLE: &str = "contextual process control is unavailable on this node";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum StageEdgeKindWire {
@@ -137,7 +145,6 @@ pub(crate) enum NodeAgentMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
-        job_actor: Option<ActorAddress>,
         readiness_id: u64,
     },
     RuntimeReadyAck {
@@ -221,6 +228,7 @@ pub(crate) enum NodeAgentMsg {
         tokens: Vec<u32>,
         reply_to: ActorAddress,
     },
+    Contextual(ContextualNodeCommand),
 }
 
 impl NetworkMessage for NodeAgentMsg {
@@ -334,8 +342,10 @@ impl NetworkMessage for NodeAgentReport {
 
 pub(crate) struct NodeAgentActor {
     core: stage::StageController,
+    logical_node_id: u64,
     orchestrator: ActorAddress,
     report_to: Option<ActorAddress>,
+    contextual_controller: Option<ActorAddress>,
     control_generation: u64,
     inbound_edge: Option<StageInboundEdgeWire>,
     outbound_edge: Option<StageOutboundEdgeWire>,
@@ -352,8 +362,10 @@ impl NodeAgentActor {
     ) -> Self {
         Self {
             core: stage::StageController::new(local_node_id),
+            logical_node_id: local_node_id.0,
             orchestrator,
             report_to,
+            contextual_controller: None,
             control_generation: 0,
             inbound_edge: None,
             outbound_edge: None,
@@ -361,6 +373,11 @@ impl NodeAgentActor {
             event_cursor: 0,
             last_worker_crash: None,
         }
+    }
+
+    pub(crate) fn with_contextual_controller(mut self, controller: ActorAddress) -> Self {
+        self.contextual_controller = Some(controller);
+        self
     }
 
     fn forward_prompt_or_snapshot(&mut self, ctx: &Ctx, msg: NodeAgentMsg) -> Option<NodeAgentMsg> {
@@ -432,6 +449,55 @@ impl NodeAgentActor {
                 );
                 None
             }
+            NodeAgentMsg::Contextual(command) => {
+                if let Some(controller) = self.contextual_controller {
+                    let _ = ctx.send(controller, ContextualProcessControllerIn::Command(command));
+                } else {
+                    let (request_id, reply_to, event) = match command {
+                        ContextualNodeCommand::Spawn {
+                            request_id,
+                            reply_to,
+                            ..
+                        } => (
+                            request_id,
+                            reply_to,
+                            ContextualProcessEventKindWire::SpawnRejected {
+                                error: CONTROL_UNAVAILABLE.to_owned(),
+                            },
+                        ),
+                        ContextualNodeCommand::Stop {
+                            request_id,
+                            reply_to,
+                            ..
+                        } => (
+                            request_id,
+                            reply_to,
+                            ContextualProcessEventKindWire::StopRejected {
+                                error: CONTROL_UNAVAILABLE.to_owned(),
+                            },
+                        ),
+                        ContextualNodeCommand::Query {
+                            request_id,
+                            reply_to,
+                        } => (
+                            request_id,
+                            reply_to,
+                            ContextualProcessEventKindWire::ControlUnavailable {
+                                error: CONTROL_UNAVAILABLE.to_owned(),
+                            },
+                        ),
+                    };
+                    let _ = ctx.send(
+                        reply_to,
+                        OrchestratorMsg::ContextualEvent(ContextualProcessEventWire {
+                            request_id,
+                            logical_node_id: self.logical_node_id,
+                            event,
+                        }),
+                    );
+                }
+                None
+            }
             other => Some(other),
         }
     }
@@ -467,7 +533,6 @@ impl NodeAgentActor {
                 stage_index,
                 endpoint,
                 node_actor,
-                job_actor,
                 readiness_id,
             } => {
                 self.core.observe(stage::StageEvent::WorkerReady);
@@ -479,7 +544,6 @@ impl NodeAgentActor {
                         stage_index,
                         endpoint,
                         node_actor,
-                        job_actor,
                         readiness_id,
                     },
                 );
@@ -606,6 +670,7 @@ impl NodeAgentActor {
             | NodeAgentMsg::EncodePrompt { .. }
             | NodeAgentMsg::DecodeTokens { .. }
             | NodeAgentMsg::Snapshot { .. } => unreachable!("prompt messages returned early"),
+            NodeAgentMsg::Contextual(_) => return,
             NodeAgentMsg::RebindOrchestrator { .. } => {
                 unreachable!("rebind messages returned early")
             }

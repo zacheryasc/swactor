@@ -1,51 +1,27 @@
 #![cfg(target_os = "linux")]
 
 include!("data_plane_test_support.inc");
+use data_plane::blob::{
+    BLOB_HEADER_LEN, Blob, BlobError, BlobLease, BlobMetadata, BlobSharedState, LeaseReleaser,
+};
+use data_plane::data_plane::RegionSlice;
+use data_plane::protocol::{DescriptorCapabilities, DescriptorKind};
+use futures_lite::future::FutureExt;
 
-#[test]
-fn attachment_without_a_host_reply_fails_on_actor_deadline() {
-    let mut arena = ArenaManager::boot(ArenaConfig {
-        node_id: NodeId(8),
-        reservation_ceiling: 4096,
-        base_alignment: 64,
-    })
-    .unwrap();
-    let handoff = bootstrap::write_bootstrap(
-        &mut arena,
-        BootstrapSpec {
-            arena_generation: ARENA_GENERATION,
-            alignment: 64,
-        },
-    )
-    .unwrap();
-    let (parts, runtime) = runtime_parts();
-    runtime.set_remote_sink(Arc::new(BlackHoleSink));
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig {
-            worker_threads: 1,
-            ..TokioConfig::default()
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let (mapped, resolved) = DataPlaneBootstrap::map_arena(handoff.arena_fd).unwrap();
-    let result = future::block_on(DataPlaneBootstrap::attach_mapped_with_deadline(
-        mapped,
-        resolved,
-        runtime.clone(),
-        ActorAddress::new_random(),
-        CAPABILITY,
-        None,
-        data_plane::data_plane::AttachDeadline {
-            engine: engine.handle(),
-            timeout: Duration::from_millis(20),
-        },
-    ));
-    assert!(matches!(
-        result,
-        Err(DataPlaneError::SessionFailed(reason)) if reason.contains("deadline")
-    ));
+struct CollectBytes(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl data_plane::data_plane::StreamConsumer for CollectBytes {
+    fn consume(&self, bytes: &[u8]) -> Result<(), String> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct NoopReleaser;
+
+impl LeaseReleaser for NoopReleaser {
+    fn release(&self, _lease: BlobLease) {}
 }
 
 #[test]
@@ -130,6 +106,85 @@ fn routed_read_blob_maps_final_sealed_lease_without_copying() {
     )
     .expect_err("early grant must fail");
     assert!(matches!(error, BlobError::InvalidState { .. }));
+}
+
+#[test]
+fn namespace_operations_resolve_self_and_enforce_both_rename_permissions() {
+    let harness = harness(4096);
+    let data_plane = &harness.bootstrap.data_plane;
+
+    future::block_on(async {
+        let model = data_plane
+            .lookup(&path("/models/tiny-linear/weights"))
+            .await
+            .unwrap();
+        assert_eq!(model.kind, data_plane::namespace::EntryKind::Blob);
+        assert!(matches!(
+            data_plane
+                .unlink(&path("/models/tiny-linear/weights"))
+                .await,
+            Err(DataPlaneError::Unauthorized { path, access: data_plane::protocol::AccessMode::WriteOnly })
+                if path == DataPath::parse("/models/tiny-linear/weights").unwrap()
+        ));
+
+        let mut writer = data_plane
+            .write_blob_path("/runs/self/results/rename-source", 4)
+            .await
+            .unwrap();
+        let mut view = writer.map().unwrap();
+        view.copy_from_slice(b"move");
+        drop(view);
+        writer.seal().await.unwrap();
+
+        assert!(matches!(
+            data_plane
+                .rename(
+                    &path("/runs/self/results/rename-source"),
+                    &path("/models/forbidden"),
+                    false,
+                )
+                .await,
+            Err(DataPlaneError::Unauthorized { path, access: data_plane::protocol::AccessMode::WriteOnly })
+                if path == DataPath::parse("/models/forbidden").unwrap()
+        ));
+        let revision = data_plane
+            .rename(
+                &path("/runs/self/results/rename-source"),
+                &path("/runs/self/results/rename-destination"),
+                false,
+            )
+            .await
+            .unwrap();
+        let renamed = data_plane
+            .lookup(&path("/runs/self/results/rename-destination"))
+            .await
+            .unwrap();
+        assert_eq!(renamed.kind, data_plane::namespace::EntryKind::Blob);
+        assert_eq!(renamed.revision, revision);
+        assert!(matches!(
+            data_plane
+                .lookup(&path("/runs/self/results/rename-source"))
+                .await,
+            Err(DataPlaneError::PathNotFound(_))
+        ));
+        let blob = data_plane
+            .read_blob_path("/runs/self/results/rename-destination")
+            .await
+            .unwrap();
+        assert_eq!(blob.map().unwrap().as_ref(), b"move");
+
+        let unlinked_revision = data_plane
+            .unlink(&path("/runs/self/results/rename-destination"))
+            .await
+            .unwrap();
+        assert!(unlinked_revision > revision);
+        assert!(matches!(
+            data_plane
+                .lookup(&path("/runs/self/results/rename-destination"))
+                .await,
+            Err(DataPlaneError::PathNotFound(_))
+        ));
+    });
 }
 
 #[test]
@@ -282,6 +337,7 @@ fn cancelled_write_open_releases_queued_grant() {
 #[test]
 fn write_blob_seals_once_and_abort_publishes_nothing() {
     let harness = harness(4096);
+    let baseline_actors = harness._host_runtime.stats().actors.len();
     let mut writer = future::block_on(
         harness
             .bootstrap
@@ -299,6 +355,17 @@ fn write_blob_seals_once_and_abort_publishes_nothing() {
     ));
     drop(view);
     future::block_on(writer.seal()).expect("seal and publish");
+    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while harness._host_runtime.stats().actors.len() > baseline_actors + 2
+        && std::time::Instant::now() < cleanup_deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        harness._host_runtime.stats().actors.len(),
+        baseline_actors + 2,
+        "namespace publication helper outlived its completed request"
+    );
 
     let published = future::block_on(
         harness

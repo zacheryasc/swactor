@@ -2,12 +2,11 @@ mod actor;
 mod lifecycle;
 mod message;
 mod operations;
+#[cfg(unix)]
+mod resources;
 mod spawn;
 mod supervisor;
 mod types;
-
-pub mod pipeline;
-pub mod yaml;
 
 pub use lifecycle::{ProcessLifecycleObservability, ProcessOutputConfig};
 pub use message::{ProcessCommand, ProcessOutput};
@@ -29,9 +28,9 @@ pub use operations::{
     spawn_mapped_line_reader, spawn_shared_child_wait, spawn_stdin_command_wait,
     spawn_stop_channel_wait, wait_for_path, wait_shared_child_or_kill,
 };
-pub use pipeline::{
-    JobComplete, JobDefinition, JobFailure, JobId, JobProgress, JobStatus, JobSuccess,
-    LocalPipelineConfig, LocalStartJob, PipelineId, PipelineStatus,
-};
+#[cfg(unix)]
+pub use resources::{ProcessResourceError, ProcessSpawnResources};
+#[cfg(unix)]
+pub use spawn::spawn_local_process_with_resources;
 pub use spawn::{send_process_command, spawn_local_process};
 pub use types::{ExitStatus, ProcessSpec};

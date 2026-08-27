@@ -85,13 +85,6 @@ fn iroh_adapter_satisfies_ordering_and_terminal_contract() {
     };
     let (source_tx, source_rx) = mpsc::channel();
     let (sink_tx, sink_rx) = mpsc::channel();
-    sink_transport
-        .install_sink(StreamSinkRequest {
-            incarnation,
-            endpoint: sink_pump,
-            notifier: Arc::new(ChannelNotifier(sink_tx)),
-        })
-        .expect("install sink");
     source_transport
         .install_source(StreamSourceRequest {
             incarnation,
@@ -99,8 +92,15 @@ fn iroh_adapter_satisfies_ordering_and_terminal_contract() {
             endpoint: source_pump,
             notifier: Arc::new(ChannelNotifier(source_tx)),
         })
-        .expect("install source");
+        .expect("install source before sink");
     recv_until(&source_rx, StreamTransportEvent::Ready);
+    sink_transport
+        .install_sink(StreamSinkRequest {
+            incarnation,
+            endpoint: sink_pump,
+            notifier: Arc::new(ChannelNotifier(sink_tx)),
+        })
+        .expect("install sink");
     recv_until(&sink_rx, StreamTransportEvent::Ready);
 
     writer
@@ -134,4 +134,77 @@ fn iroh_adapter_satisfies_ordering_and_terminal_contract() {
 
     source_transport.terminate(incarnation);
     sink_transport.terminate(incarnation);
+}
+
+#[test]
+fn iroh_adapter_uses_in_process_transport_for_its_own_endpoint() {
+    let node = make_driver();
+    let transport = node.driver.stream_transport();
+    let mut source_arena = arena(3);
+    let source_handle = install(
+        &mut source_arena,
+        ByteRingSpec {
+            capacity: 128,
+            generation: 3,
+            alignment: 64,
+            request_id: 3,
+        },
+    )
+    .expect("source ring");
+    let mut sink_arena = arena(4);
+    let sink_handle = install(
+        &mut sink_arena,
+        ByteRingSpec {
+            capacity: 128,
+            generation: 4,
+            alignment: 64,
+            request_id: 4,
+        },
+    )
+    .expect("sink ring");
+    let mut writer = attach(&source_arena, source_handle, Role::Producer).expect("writer");
+    let source_pump = attach(&source_arena, source_handle, Role::Consumer).expect("source pump");
+    let sink_pump = attach(&sink_arena, sink_handle, Role::Producer).expect("sink pump");
+    let mut reader = attach(&sink_arena, sink_handle, Role::Consumer).expect("reader");
+    let incarnation = StreamIncarnation {
+        authority_epoch: 29,
+        revision: 31,
+    };
+    let (source_tx, source_rx) = mpsc::channel();
+    let (sink_tx, sink_rx) = mpsc::channel();
+
+    transport
+        .install_sink(StreamSinkRequest {
+            incarnation,
+            endpoint: sink_pump,
+            notifier: Arc::new(ChannelNotifier(sink_tx)),
+        })
+        .expect("install sink before local source");
+    transport
+        .install_source(StreamSourceRequest {
+            incarnation,
+            peer: transport.descriptor().expect("self descriptor"),
+            endpoint: source_pump,
+            notifier: Arc::new(ChannelNotifier(source_tx)),
+        })
+        .expect("install local source");
+    recv_until(&source_rx, StreamTransportEvent::Ready);
+    recv_until(&sink_rx, StreamTransportEvent::Ready);
+
+    writer
+        .send_record(RecordKind::Data, b"local")
+        .expect("write data");
+    writer.send_record(RecordKind::Eof, &[]).expect("write eof");
+    transport.source_progress(incarnation);
+    assert_eq!(
+        reader.recv_record().expect("read data"),
+        Some((RecordKind::Data, b"local".to_vec()))
+    );
+    assert_eq!(
+        reader.recv_record().expect("read eof"),
+        Some((RecordKind::Eof, Vec::new()))
+    );
+    recv_until(&source_rx, StreamTransportEvent::Quiesced);
+    recv_until(&sink_rx, StreamTransportEvent::Quiesced);
+    transport.terminate(incarnation);
 }

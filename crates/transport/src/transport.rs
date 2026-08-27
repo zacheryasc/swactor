@@ -2,9 +2,10 @@
 //! transport for tests, and the [`CodecRemoteSink`] adapter that bridges this
 //! crate's codec/router back to core's [`swactor::runtime::RemoteSink`] hook.
 
+use parking_lot::RwLock;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use swactor::actor::ActorAddress;
 use swactor::Error;
@@ -44,12 +45,16 @@ impl TransportRouter {
 
     /// Register a remote address as reachable via the given transport.
     pub fn add_route(&self, addr: ActorAddress, transport: Arc<dyn Transport>) {
-        self.routes.write().unwrap().insert(addr, transport);
+        self.routes.write().insert(addr, transport);
+    }
+    /// Remove one remote address route. Repeated removal is a no-op.
+    pub fn remove_route(&self, addr: &ActorAddress) {
+        self.routes.write().remove(addr);
     }
 
     /// Look up which transport handles a given address.
     pub(crate) fn lookup(&self, addr: &ActorAddress) -> Option<Arc<dyn Transport>> {
-        self.routes.read().unwrap().get(addr).cloned()
+        self.routes.read().get(addr).cloned()
     }
 }
 

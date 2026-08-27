@@ -38,7 +38,6 @@ impl BlobSourcePublisher for LocalActorPublisher {
         self.publish(source)
     }
 }
-
 struct RegistryNamespaceDiscovery {
     view: RegistryView,
 }
@@ -112,6 +111,7 @@ impl DataNamespaceAuthority {
         let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
             driver.edge_connector(),
             &stack.engine,
+            runtime.clone(),
         ));
         let publisher = Arc::new(LocalActorPublisher {
             runtime: runtime.clone(),
@@ -121,6 +121,7 @@ impl DataNamespaceAuthority {
         let source_publisher: Arc<dyn BlobSourcePublisher> = publisher.clone();
         let service = DataNamespaceService::recover(
             runtime.clone(),
+            stack.engine.clone(),
             state_path,
             source_sender,
             source_publisher,

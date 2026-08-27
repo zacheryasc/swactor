@@ -1,14 +1,14 @@
 //! Iroh-specific implementation of the data-plane SPSC stream transport port.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use data_plane::byte_ring::{Endpoint as RingEndpoint, FlowError, RecordKind, RingProbe};
 use data_plane::namespace::StreamIncarnation;
 use data_plane::stream_transport::{
-    StreamPeerDescriptor, StreamSinkRequest, StreamSourceRequest, StreamTransport,
-    StreamTransportEvent, StreamTransportNotifier,
+    LocalStreamTransport, StreamPeerDescriptor, StreamSinkRequest, StreamSourceRequest,
+    StreamTransport, StreamTransportEvent, StreamTransportNotifier,
 };
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint as IrohEndpoint, EndpointAddr};
@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 pub const STREAM_ALPN: &[u8] = b"swactor/data-plane-spsc/1";
 const PREAMBLE_LEN: usize = 16;
 const RECORD_HEADER_LEN: usize = 5;
+const MAX_PENDING_INBOUND: usize = 256;
+const PENDING_INBOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 struct TaskControl {
@@ -72,15 +74,18 @@ struct PendingSink {
 #[derive(Default)]
 struct TransportState {
     pending_sinks: BTreeMap<StreamIncarnation, PendingSink>,
+    pending_inbound: BTreeMap<StreamIncarnation, RecvStream>,
     controls: BTreeMap<StreamIncarnation, Vec<TaskControl>>,
     source_probes: BTreeMap<StreamIncarnation, RingProbe>,
     sink_probes: BTreeMap<StreamIncarnation, RingProbe>,
+    local_incarnations: BTreeSet<StreamIncarnation>,
 }
 
 struct Inner {
     engine: EngineHandle,
     endpoint: IrohEndpoint,
     state: Mutex<TransportState>,
+    local: LocalStreamTransport,
 }
 
 /// Cloneable adapter capability installed into `HostDataPlaneConfig`.
@@ -95,6 +100,7 @@ impl IrohStreamTransport {
             inner: Arc::new(Inner {
                 engine,
                 endpoint,
+                local: LocalStreamTransport::new(),
                 state: Mutex::new(TransportState::default()),
             }),
         }
@@ -109,32 +115,32 @@ impl IrohStreamTransport {
                     continue;
                 }
                 let incarnation = decode_incarnation(preamble);
-                let pending = transport
-                    .inner
-                    .state
-                    .lock()
-                    .pending_sinks
-                    .remove(&incarnation);
-                let Some(pending) = pending else {
-                    continue;
+                let mut recv = Some(recv);
+                let (pending, retained) = {
+                    let mut state = transport.inner.state.lock();
+                    if let Some(pending) = state.pending_sinks.remove(&incarnation) {
+                        (Some(pending), false)
+                    } else if !state.pending_inbound.contains_key(&incarnation)
+                        && state.pending_inbound.len() < MAX_PENDING_INBOUND
+                    {
+                        state
+                            .pending_inbound
+                            .insert(incarnation, recv.take().expect("unclaimed inbound stream"));
+                        (None, true)
+                    } else {
+                        (None, false)
+                    }
                 };
-                let (control, receiver) = TaskControl::pair();
-                transport
-                    .inner
-                    .state
-                    .lock()
-                    .controls
-                    .entry(incarnation)
-                    .or_default()
-                    .push(control.clone());
-                transport.inner.engine.spawn(run_sink(
-                    incarnation,
-                    recv,
-                    pending.endpoint,
-                    pending.notifier,
-                    control,
-                    receiver,
-                ));
+                if retained {
+                    transport.schedule_pending_timeout(incarnation);
+                }
+                if let Some(pending) = pending {
+                    transport.start_sink(
+                        incarnation,
+                        recv.expect("matched inbound stream"),
+                        pending,
+                    );
+                }
             }
         });
     }
@@ -149,12 +155,75 @@ impl IrohStreamTransport {
             .push(control);
     }
 
+    fn start_sink(&self, incarnation: StreamIncarnation, recv: RecvStream, pending: PendingSink) {
+        let (control, receiver) = TaskControl::pair();
+        self.register_control(incarnation, control.clone());
+        self.inner.engine.spawn(run_sink(
+            incarnation,
+            recv,
+            pending.endpoint,
+            pending.notifier,
+            control,
+            receiver,
+        ));
+    }
+
+    fn schedule_pending_timeout(&self, incarnation: StreamIncarnation) {
+        let engine = self.inner.engine.clone();
+        let transport = self.clone();
+        engine.clone().spawn(async move {
+            let mut deadline = engine.interval(PENDING_INBOUND_TIMEOUT);
+            (&mut deadline).await;
+            transport
+                .inner
+                .state
+                .lock()
+                .pending_inbound
+                .remove(&incarnation);
+        });
+    }
+
     fn progress_controls(&self, incarnation: StreamIncarnation) {
         if let Some(controls) = self.inner.state.lock().controls.get(&incarnation) {
             for control in controls {
                 control.progress();
             }
         }
+    }
+    fn install_local_source(&self, mut request: StreamSourceRequest) -> Result<(), String> {
+        let incarnation = request.incarnation;
+        let pending = {
+            let mut state = self.inner.state.lock();
+            state.local_incarnations.insert(incarnation);
+            state.pending_inbound.remove(&incarnation);
+            state.sink_probes.remove(&incarnation);
+            state.pending_sinks.remove(&incarnation)
+        };
+        request.peer = self.inner.local.descriptor()?;
+        if let Err(error) = self.inner.local.install_source(request) {
+            self.inner
+                .state
+                .lock()
+                .local_incarnations
+                .remove(&incarnation);
+            return Err(error);
+        }
+        if let Some(pending) = pending
+            && let Err(error) = self.inner.local.install_sink(StreamSinkRequest {
+                incarnation,
+                endpoint: pending.endpoint,
+                notifier: pending.notifier,
+            })
+        {
+            self.inner.local.terminate(incarnation);
+            self.inner
+                .state
+                .lock()
+                .local_incarnations
+                .remove(&incarnation);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -168,6 +237,9 @@ impl StreamTransport for IrohStreamTransport {
     fn install_source(&self, request: StreamSourceRequest) -> Result<(), String> {
         let peer: EndpointAddr = serde_json::from_slice(&request.peer.0)
             .map_err(|error| format!("decode iroh stream endpoint: {error}"))?;
+        if peer.id == self.inner.endpoint.id() {
+            return self.install_local_source(request);
+        }
         let (control, receiver) = TaskControl::pair();
         self.register_control(request.incarnation, control.clone());
         let endpoint = self.inner.endpoint.clone();
@@ -190,31 +262,84 @@ impl StreamTransport for IrohStreamTransport {
     }
 
     fn install_sink(&self, request: StreamSinkRequest) -> Result<(), String> {
-        let mut state = self.inner.state.lock();
-        if state.pending_sinks.contains_key(&request.incarnation) {
-            return Err("iroh stream sink is already installed".to_owned());
+        let incarnation = request.incarnation;
+        if self
+            .inner
+            .state
+            .lock()
+            .local_incarnations
+            .contains(&incarnation)
+        {
+            return self.inner.local.install_sink(request);
         }
         let probe = request.endpoint.probe();
-        state.sink_probes.insert(request.incarnation, probe);
-        state.pending_sinks.insert(
-            request.incarnation,
-            PendingSink {
-                endpoint: request.endpoint,
-                notifier: request.notifier,
-            },
-        );
+        let mut pending = Some(PendingSink {
+            endpoint: request.endpoint,
+            notifier: request.notifier,
+        });
+        let inbound = {
+            let mut state = self.inner.state.lock();
+            if state.sink_probes.contains_key(&incarnation) {
+                return Err("iroh stream sink is already installed".to_owned());
+            }
+            state.sink_probes.insert(incarnation, probe);
+            if let Some(inbound) = state.pending_inbound.remove(&incarnation) {
+                Some(inbound)
+            } else {
+                state
+                    .pending_sinks
+                    .insert(incarnation, pending.take().expect("pending sink available"));
+                None
+            }
+        };
+        if let Some(inbound) = inbound {
+            self.start_sink(
+                incarnation,
+                inbound,
+                pending.expect("inbound stream retains pending sink"),
+            );
+        }
         Ok(())
     }
 
     fn source_progress(&self, incarnation: StreamIncarnation) {
+        if self
+            .inner
+            .state
+            .lock()
+            .local_incarnations
+            .contains(&incarnation)
+        {
+            self.inner.local.source_progress(incarnation);
+            return;
+        }
         self.progress_controls(incarnation);
     }
 
     fn sink_progress(&self, incarnation: StreamIncarnation) {
+        if self
+            .inner
+            .state
+            .lock()
+            .local_incarnations
+            .contains(&incarnation)
+        {
+            self.inner.local.sink_progress(incarnation);
+            return;
+        }
         self.progress_controls(incarnation);
     }
 
     fn source_has_capacity(&self, incarnation: StreamIncarnation) -> bool {
+        if self
+            .inner
+            .state
+            .lock()
+            .local_incarnations
+            .contains(&incarnation)
+        {
+            return self.inner.local.source_has_capacity(incarnation);
+        }
         self.inner
             .state
             .lock()
@@ -224,6 +349,15 @@ impl StreamTransport for IrohStreamTransport {
     }
 
     fn sink_has_data(&self, incarnation: StreamIncarnation) -> bool {
+        if self
+            .inner
+            .state
+            .lock()
+            .local_incarnations
+            .contains(&incarnation)
+        {
+            return self.inner.local.sink_has_data(incarnation);
+        }
         self.inner
             .state
             .lock()
@@ -233,14 +367,20 @@ impl StreamTransport for IrohStreamTransport {
     }
 
     fn terminate(&self, incarnation: StreamIncarnation) {
-        let (pending, controls) = {
+        let (local, pending, _inbound, controls) = {
             let mut state = self.inner.state.lock();
+            let local = state.local_incarnations.remove(&incarnation);
             let pending = state.pending_sinks.remove(&incarnation);
+            let inbound = state.pending_inbound.remove(&incarnation);
             let controls = state.controls.remove(&incarnation).unwrap_or_default();
             state.source_probes.remove(&incarnation);
             state.sink_probes.remove(&incarnation);
-            (pending, controls)
+            (local, pending, inbound, controls)
         };
+        if local {
+            self.inner.local.terminate(incarnation);
+            return;
+        }
         if let Some(pending) = pending {
             pending.notifier.notify(StreamTransportEvent::Quiesced);
         }
@@ -291,7 +431,7 @@ async fn run_source(
                     .ok_or_else(|| "source record disappeared after inspection".to_owned())?;
                 write_record(&mut send, meta.kind, view.spans())
                     .await
-                    .map_err(|error| format!("write stream record: {error}"))?;
+                    .map_err(|error| format!("write {:?} stream record: {error}", meta.kind))?;
                 view.release()
                     .map_err(|error| format!("release source ring: {error:?}"))?;
                 notifier.notify(StreamTransportEvent::CapacityAvailable);

@@ -2,7 +2,7 @@
  ***STALE! FOR HISTORICAL REFERENCE ONLY*** 
 
 Id: 9
-Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
+Last modified: c705c7428960d287f190cad6bfbf57c193da31df
 Last reviewed:
 > Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
@@ -1460,8 +1460,8 @@ Adapter rules:
 Worker environment:
 
 ```text
-SWACTOR_ARENA_FD      memfd for the shared arena
-SWACTOR_ARENA_BYTES   arena reservation ceiling
+SWACTOR contextual children receive one fixed private bootstrap descriptor.
+Arena and session material arrive through the private bootstrap protocol.
 ```
 
 ---

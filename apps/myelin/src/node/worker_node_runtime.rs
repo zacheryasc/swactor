@@ -22,10 +22,11 @@ use telemetry::{
 };
 
 use crate::codecs::register_myelin_actor_codecs;
+use crate::contextual_process::{
+    ContextualProcessController, MyelinContextualProcessConfig, build_contextual_process_spawner,
+};
 use crate::data_namespace::install_namespace_client;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
-use crate::job_data_plane::MyelinChildRouteRegistrar;
-use crate::job_deploy::EmbeddedJobDataPlane;
 use crate::node::prompt_wire::{PromptEvent, TokenizerEvent};
 use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
@@ -60,7 +61,6 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime};
 use swactor::stats::{ActorSnapshot, StatsHook, StatsSnapshotKind};
 use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
-use swactor_job_runner::{NodeJobActor, register_job_codecs};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/myelin/tinygrad_worker.py";
@@ -1364,7 +1364,7 @@ impl WorkerEdgeRuntime {
         };
         self.runtime.establish_inbound(
             edge::ProvisionRx {
-                run_id: edge::RunId(config.run_id),
+                execution_id: edge::ExecutionId(config.run_id),
                 edge_id: edge::EdgeId(edge_wire.edge_id),
                 local_node_id: edge::NodeId(config.logical_node_id),
                 object_spec: edge::ObjectSpec {
@@ -1411,7 +1411,7 @@ impl WorkerEdgeRuntime {
             .expect("consumer endpoint presence checked above");
         self.runtime.establish_outbound(
             edge::ProvisionTx {
-                run_id: edge::RunId(config.run_id),
+                execution_id: edge::ExecutionId(config.run_id),
                 edge_id: edge::EdgeId(edge_wire.edge_id),
                 local_node_id: edge::NodeId(config.logical_node_id),
                 consumer_node_id: edge::NodeId(edge_wire.consumer_node_id),
@@ -1695,7 +1695,6 @@ fn run() -> Result<(), String> {
     let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
         |registry| {
             register_myelin_actor_codecs(registry);
-            register_job_codecs(registry);
             telemetry::wire::register_telemetry_codec(registry);
         },
         Some(worker_stats_hook),
@@ -1953,11 +1952,58 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"actor":orchestrator,"source":orchestrator_source}),
     )?;
-    let node_agent = NodeAgentActor::new(
+    let contextual_spawner = if config.agent_only {
+        let namespace = install_namespace_client(&stack, &driver)?;
+        let blob_receiver = Arc::new(IrohBlobTransferReceiver::new(
+            driver.endpoint_addr(),
+            driver.edge_events_handle(),
+        ));
+        blob_receiver.install_pump(&engine.handle(), stack.runtime.clone(), PUMP_INTERVAL);
+        let transfer_receiver: Arc<dyn BlobTransferReceiver> = blob_receiver;
+        let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
+            driver.edge_connector(),
+            &engine.handle(),
+            stack.runtime.clone(),
+        ));
+        Some(Arc::new(build_contextual_process_spawner(
+            MyelinContextualProcessConfig {
+                runtime: stack.runtime.clone(),
+                engine: engine.handle(),
+                arena_bytes: config.arena_bytes,
+                arena_alignment: config.arena_alignment,
+                namespace: Some(namespace.client),
+                transfer_receiver: Some(transfer_receiver),
+                source_sender: Some(source_sender),
+                source_publisher: Some(namespace.source_publisher),
+                route_view: stack.route_view.clone(),
+                pinned_routes: stack.pinned_routes.clone(),
+                route_binder: stack.route_binder.clone(),
+                stream_transport: Some(driver.stream_transport()),
+                host_endpoint: driver.endpoint_addr(),
+            },
+        )?))
+    } else {
+        None
+    };
+    let contextual_controller = contextual_spawner
+        .as_ref()
+        .map(|spawner| {
+            stack.runtime.spawn(ContextualProcessController::new(
+                config.logical_node_id,
+                Arc::clone(spawner),
+                stack.runtime.create_sender(),
+            ))
+        })
+        .transpose()
+        .map_err(|error| format!("spawn contextual process controller: {error}"))?;
+    let mut node_agent = NodeAgentActor::new(
         stage::NodeId(config.logical_node_id),
         orchestrator,
         Some(*reports.addr()),
     );
+    if let Some(controller) = contextual_controller {
+        node_agent = node_agent.with_contextual_controller(controller);
+    }
     let node_actor = match stack.runtime.spawn(node_agent) {
         Ok(actor) => {
             boot(
@@ -1990,89 +2036,32 @@ fn run() -> Result<(), String> {
             vec![std::process::id()],
         );
     }
-    let job_services = if config.agent_only {
-        let workdir = PathBuf::from("/var/cache/myelin-jobs");
-        let namespace = install_namespace_client(&stack, &driver)?;
-        let blob_receiver = Arc::new(IrohBlobTransferReceiver::new(
-            driver.endpoint_addr(),
-            driver.edge_events_handle(),
-        ));
-        blob_receiver.install_pump(&engine.handle(), stack.runtime.clone(), PUMP_INTERVAL);
-        let transfer_receiver: Arc<dyn BlobTransferReceiver> = blob_receiver;
-        let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
-            driver.edge_connector(),
-            &engine.handle(),
-        ));
-        let data_plane = EmbeddedJobDataPlane::start(
-            &stack,
-            crate::job_deploy::EmbeddedJobDataPlaneConfig {
-                host_endpoint: driver.endpoint_addr(),
-                namespace: namespace.client,
-                transfer_receiver,
-                source_sender,
-                source_publisher: namespace.source_publisher,
-                stream_transport: driver.stream_transport(),
-            },
-        )?;
-        let job_route_registrar = Arc::new(MyelinChildRouteRegistrar::new(
-            stack.route_view.clone(),
-            stack.pinned_routes.clone(),
-            stack.route_binder.clone(),
-        ));
-        let job_actor = stack
-            .runtime
-            .spawn(
-                NodeJobActor::unbound(workdir, stack.runtime.create_sender())
-                    .with_actor_timers(engine.handle())
-                    .with_process_telemetry(telemetry.producer.clone())
-                    .with_route_registrar(job_route_registrar)
-                    .with_data_plane(Arc::new(data_plane.clone())),
-            )
-            .map_err(|error| format!("spawn embedded job actor: {error}"))?;
-        stack.register_local_actor(driver.register_actor(job_actor, 1));
-        boot(
-            "job_actor",
-            "ready",
-            json!({"job_actor":job_actor,"data_plane":"edge+unix-stream"}),
-        )?;
-        Some((job_actor, data_plane))
-    } else {
-        None
-    };
-    let job_actor = job_services.as_ref().map(|(actor, _)| *actor);
     stack.register_local_actor(driver.register_actor(*rejoin_replies.addr(), 1));
     let pending_control_rejoin = PendingControlRejoin::new(
         &config,
         &advertised_self_endpoint,
         driver.node_id(),
         node_actor,
-        job_actor,
         orchestrator,
     )?;
     boot(
-        "node_actor_registration",
+        "network_registration",
         "ready",
-        json!({"node_actor":node_actor,"job_actor":job_actor,"network_reachable":true}),
+        json!({"node_actor":node_actor,"network_reachable":true}),
     )?;
 
     if config.agent_only {
         boot(
             "agent_mode",
             "ready",
-            json!({"framework":"none","workloads":"external_jobs"}),
+            json!({"framework":"none","workloads":"contextual_processes"}),
         )?;
-        let pending_runtime_ready = PendingRuntimeReady::new(
-            &config,
-            advertised_self_endpoint.clone(),
-            node_actor,
-            job_actor,
-        );
+        let pending_runtime_ready =
+            PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
         let ready = json!({
             "type":"ready",
-            "role":"node",
-            "endpoint":advertised_self_endpoint.clone(),
+            "endpoint":advertised_self_endpoint,
             "node_actor":node_actor,
-            "job_actor":job_actor,
             "logical_node_id":config.logical_node_id,
             "stage_index":config.stage_index,
         });
@@ -2082,7 +2071,6 @@ fn run() -> Result<(), String> {
             json!({
                 "endpoint":advertised_self_endpoint,
                 "node_actor":node_actor,
-                "job_actor":job_actor,
                 "logical_node_id":config.logical_node_id,
                 "stage_index":config.stage_index,
                 "readiness_id":pending_runtime_ready.readiness_id,
@@ -2102,9 +2090,6 @@ fn run() -> Result<(), String> {
         let sender = actor_runtime.create_sender();
         let exit_on_stdin_eof = config.exit_on_stdin_eof;
         let completion = ActorCompletion::new();
-        let job_data_plane = job_services
-            .expect("agent-only nodes initialize job services")
-            .1;
         let runtime_actor = actor_runtime
             .spawn(AgentNodeRuntimeActor {
                 effects: AgentNodeRuntimeLive {
@@ -2116,7 +2101,6 @@ fn run() -> Result<(), String> {
                     runtime_stats: runtime_stats.clone(),
                     pending_control_rejoin,
                     rejoin_replies,
-                    _job_data_plane: job_data_plane,
                 },
                 reports,
                 pending_runtime_ready,
@@ -2183,7 +2167,7 @@ fn run() -> Result<(), String> {
     }
     let edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
     let pending_runtime_ready =
-        PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor, None);
+        PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
 
     let ready = json!({
         "type":"ready",
@@ -2314,7 +2298,6 @@ struct AgentNodeRuntimeLive {
     runtime_stats: RuntimeStatsInspector,
     pending_control_rejoin: PendingControlRejoin,
     rejoin_replies: Inbox<ManualControlReply>,
-    _job_data_plane: EmbeddedJobDataPlane,
 }
 
 impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
@@ -3069,7 +3052,6 @@ impl PendingControlRejoin {
         endpoint: &EndpointAddr,
         swim_node_id: DistNodeId,
         node_actor: ActorAddress,
-        job_actor: Option<ActorAddress>,
         orchestrator_actor: ActorAddress,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -3081,7 +3063,6 @@ impl PendingControlRejoin {
                 endpoint: serde_json::to_string(endpoint)
                     .map_err(|error| format!("serialize rejoin endpoint: {error}"))?,
                 swim_node_id,
-                job_actor,
                 stage_index: config.stage_index,
                 node_actor,
             },
@@ -3187,7 +3168,6 @@ struct PendingRuntimeReady {
     stage_index: u32,
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
-    job_actor: Option<ActorAddress>,
     coordinator: Option<DistNodeId>,
     readiness_id: u64,
     attempts: u32,
@@ -3198,19 +3178,13 @@ struct PendingRuntimeReady {
 }
 
 impl PendingRuntimeReady {
-    fn new(
-        config: &DeploymentConfig,
-        endpoint: EndpointAddr,
-        node_actor: ActorAddress,
-        job_actor: Option<ActorAddress>,
-    ) -> Self {
+    fn new(config: &DeploymentConfig, endpoint: EndpointAddr, node_actor: ActorAddress) -> Self {
         Self {
             run_id: config.run_id,
             node_id: config.logical_node_id,
             stage_index: config.stage_index,
             endpoint,
             node_actor,
-            job_actor,
             coordinator: config
                 .coordinator_endpoint
                 .as_ref()
@@ -3272,7 +3246,6 @@ impl PendingRuntimeReady {
                     stage_index: self.stage_index,
                     endpoint: self.endpoint.clone(),
                     node_actor: self.node_actor,
-                    job_actor: self.job_actor,
                     readiness_id: self.readiness_id,
                 },
             )
@@ -5860,7 +5833,6 @@ mod control_flow_properties {
             stage_index: 3,
             endpoint: EndpointAddr::new(SecretKey::from_bytes(&[9; 32]).public()),
             node_actor,
-            job_actor: None,
             coordinator: None,
             readiness_id: 99,
             attempts: 0,

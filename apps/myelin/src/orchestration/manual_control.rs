@@ -39,6 +39,7 @@ pub(crate) enum ProviderReadinessKind {
 pub(crate) struct ProviderReadiness {
     pub name: String,
     pub provisioning_mode: String,
+    pub runtime_image: String,
     pub kind: ProviderReadinessKind,
     pub error: Option<String>,
 }
@@ -46,22 +47,28 @@ pub(crate) struct ProviderReadiness {
 impl ProviderReadiness {
     #[cfg(test)]
     pub(crate) fn ready() -> Self {
-        Self::ready_for("test")
+        Self::ready_for("test", "test-image")
     }
 
-    pub(crate) fn ready_for(name: impl Into<String>) -> Self {
+    pub(crate) fn ready_for(name: impl Into<String>, runtime_image: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             provisioning_mode: "real".to_owned(),
+            runtime_image: runtime_image.into(),
             kind: ProviderReadinessKind::Ready,
             error: None,
         }
     }
 
-    pub(crate) fn unconfigured_for(name: impl Into<String>, error: impl Into<String>) -> Self {
+    pub(crate) fn unconfigured_for(
+        name: impl Into<String>,
+        runtime_image: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             provisioning_mode: "real".to_owned(),
+            runtime_image: runtime_image.into(),
             kind: ProviderReadinessKind::Unconfigured,
             error: Some(error.into()),
         }
@@ -245,8 +252,6 @@ pub(crate) struct RejoinHello {
     pub swim_node_id: distribution::types::NodeId,
     pub stage_index: u32,
     pub node_actor: ActorAddress,
-    #[serde(default)]
-    pub job_actor: Option<ActorAddress>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,7 +781,6 @@ impl ManualControl {
             attempt_id: hello.attempt_id,
             endpoint: hello.endpoint.clone(),
             node_actor: hello.node_actor,
-            job_actor: hello.job_actor,
             swim_node_id: hello.swim_node_id,
             stage_index: hello.stage_index,
             readiness_id: hello.attempt_id,
@@ -1536,6 +1540,23 @@ impl ManualActorControl {
     pub(crate) fn read_model(&self) -> ManualReadModel {
         self.core.read_model()
     }
+    pub(crate) fn running_node_actor(&self, logical_node_id: u64) -> Result<ActorAddress, String> {
+        let node = self
+            .core
+            .snapshot()
+            .node(logical_node_id)
+            .ok_or_else(|| format!("logical node {logical_node_id} does not exist"))?;
+        if node.phase != NodePhase::Running {
+            return Err(format!(
+                "logical node {logical_node_id} is not running (phase={:?})",
+                node.phase
+            ));
+        }
+        node.runtime
+            .as_ref()
+            .map(|runtime| runtime.node_actor)
+            .ok_or_else(|| format!("logical node {logical_node_id} has no runtime actor"))
+    }
 
     pub(crate) fn start(&mut self, actor: ActorAddress) {
         self.core.begin_recovery();
@@ -2162,6 +2183,21 @@ mod tests {
             ProviderReadiness::ready(),
         )
     }
+    #[test]
+    fn read_model_exposes_configured_runtime_image() {
+        let core = ManualControl::new(
+            ClusterSnapshot::fresh(7, "test"),
+            ProviderReadiness::ready_for("vastai", "configured-image:latest")
+                .with_provisioning_mode("mock"),
+        );
+
+        let status = serde_json::to_value(ManualControlReply::Status(core.read_model())).unwrap();
+
+        assert_eq!(
+            status.pointer("/Status/provider/runtime_image"),
+            Some(&serde_json::json!("configured-image:latest"))
+        );
+    }
 
     fn facts(node_id: u64, readiness_id: u64) -> RuntimeFacts {
         RuntimeFacts {
@@ -2169,7 +2205,6 @@ mod tests {
             attempt_id: 0,
             endpoint: format!("endpoint-{node_id}"),
             node_actor: ActorAddress::default(),
-            job_actor: None,
             swim_node_id: DistNodeId([node_id as u8; 32]),
             stage_index: 0,
             readiness_id,
@@ -2214,7 +2249,7 @@ mod tests {
     fn provider_readiness_rejects_without_allocating_and_can_be_corrected() {
         let mut core = ManualControl::new(
             ClusterSnapshot::fresh(7, "test"),
-            ProviderReadiness::unconfigured_for("vastai", "missing key"),
+            ProviderReadiness::unconfigured_for("vastai", "test-image", "missing key"),
         );
         request_one(&mut core, "not-ready", Some(44));
         settle_persistence(&mut core);
@@ -2542,7 +2577,6 @@ mod tests {
                     swim_node_id: DistNodeId([7; 32]),
                     stage_index: 0,
                     node_actor: ActorAddress([8; 32]),
-                    job_actor: None,
                 },
                 current,
                 12,
@@ -2584,7 +2618,6 @@ mod tests {
                     swim_node_id: DistNodeId([7; 32]),
                     stage_index: 0,
                     node_actor: ActorAddress([8; 32]),
-                    job_actor: None,
                 },
                 current,
                 12,
@@ -3716,7 +3749,6 @@ mod tests {
                                     swim_node_id: DistNodeId([selector; 32]),
                                     stage_index: 0,
                                     node_actor: ActorAddress([selector; 32]),
-                                    job_actor: None,
                                 },
                                 reply_to,
                             },

@@ -231,9 +231,6 @@ pub struct ProcessSpec {
 }
 ```
 
-There's a YAML-driven pipeline layer on top (`crates/process/src/pipeline.rs`)
-for multi-step jobs with progress and failure reporting.
-
 ### Zero-copy movement of large byte objects
 
 The data-plane ships large, *typed* byte objects between actors — and across
@@ -355,7 +352,7 @@ flowchart TD
 | `crates/iroh-driver` | iroh/QUIC network driver with its pump/fanout tasks |
 | `crates/telemetry` | Metrics / telemetry pipe — nothing in the middle interprets payloads |
 | `crates/data-plane` | Zero-copy movement of large typed byte objects over IPC or a network link |
-| `crates/process` | Managed external processes and YAML pipelines |
+| `crates/process` | Managed external process lifecycle and owned spawn resources |
 | `crates/dashboard` | Read-only HTML/SSE dashboard over telemetry frames |
 | `crates/provisioning` | Cloud node provisioning |
 | `crates/bindings/{python,wasm-runtime,wasm-crypto}` | Language / target bindings |
@@ -367,9 +364,9 @@ flowchart TD
 - **A drop-in replacement for GPU jobs on cloud infrastructure.** `apps/myelin`
   ships an orchestrator plus a containerized worker node
   (`apps/myelin/node-image`) that provisions, stages models, and runs them.
-- **Orchestration for sharded inference.** The node image includes a
-  [tinygrad](https://github.com/tinygrad/tinygrad) worker
-  (`apps/myelin/node-image/tinygrad_worker.py`); a vLLM backend is planned.
+- **Orchestration for sharded inference.** The standard node image ships only
+  the Rust node; workload-specific images add Python bindings and framework
+  runtimes such as tinygrad or the planned vLLM backend.
 
 ## Examples
 
@@ -390,12 +387,26 @@ Shows spawning, message passing, and death monitoring in one file.
 Requires the pinned nightly toolchain (`rust-toolchain.toml`):
 
 ```sh
-cargo check --workspace
+cargo check              # native default members
+cargo lint              # compiler-enforced architecture and timeout policy
 cargo xtask test          # see `cargo xtask --help`
 ```
 
-The language bindings (`crates/bindings/*`) build on demand with `-p` /
-`--workspace`, not during normal native iteration.
+The language bindings (`crates/bindings/*`) build on demand with `-p` or
+`--workspace` using a supported language toolchain; normal native iteration
+uses the workspace `default-members`.
+
+The real-binary Myelin behavioral harness requires Docker and builds its
+dedicated Python workload image on first use:
+
+```sh
+cargo run -p myelin-e2e-fuzz -- --smoke-only --deadline-secs 180
+cargo run -p myelin-e2e-fuzz -- --failure-cases --deadline-secs 180
+```
+
+Omit `--smoke-only` for the deterministic ordered-pair corpus plus generated
+short DAGs. Every case writes its IR, generated Python, observations, telemetry,
+and any minimized regression under `target/e2e-behavioral-fuzz`.
 
 ## Status
 

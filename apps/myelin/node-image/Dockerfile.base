@@ -1,5 +1,5 @@
 # Myelin node base: CUDA runtime, SSH bootstrap, and the Myelin agent only.
-# Frameworks belong to job payload images, not the control-plane agent image.
+# Frameworks belong to workload-specific images, not the control-plane agent image.
 # Build from workspace root:
 #   docker build -f apps/myelin/node-image/Dockerfile.base -t myelin-node-base:cuda12.6 .
 
@@ -21,7 +21,7 @@ RUN apt-get update && \
            /usr/share/doc/* \
            /usr/share/man/* \
            /usr/share/info/* && \
-    mkdir -p /usr/local/share/myelin /var/cache/myelin-jobs /var/log
+    mkdir -p /usr/local/share/myelin /var/cache/myelin-contexts /var/log
 
 COPY apps/myelin/node-image/myelin_entrypoint.sh /usr/local/bin/myelin_entrypoint.sh
 RUN chmod +x /usr/local/bin/myelin_entrypoint.sh

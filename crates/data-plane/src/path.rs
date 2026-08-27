@@ -1,4 +1,4 @@
-//! Logical data paths and host-side job authorization.
+//! Logical data paths and host-side session authorization.
 
 use std::fmt;
 use std::str::FromStr;
@@ -15,7 +15,7 @@ pub enum DataPathError {
     DotSegment,
     Nul,
     RootNotData,
-    InvalidRunId,
+    InvalidExecutionId,
 }
 
 impl fmt::Display for DataPathError {
@@ -26,7 +26,9 @@ impl fmt::Display for DataPathError {
             Self::DotSegment => f.write_str("data path contains a dot segment"),
             Self::Nul => f.write_str("data path contains NUL"),
             Self::RootNotData => f.write_str("the root path does not name data"),
-            Self::InvalidRunId => f.write_str("run id must be one non-dot path segment"),
+            Self::InvalidExecutionId => {
+                f.write_str("execution id must be one non-dot path segment")
+            }
         }
     }
 }
@@ -103,21 +105,21 @@ impl<'de> Deserialize<'de> for DataPath {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobContext {
-    pub run_id: String,
+pub struct SessionAccess {
+    pub execution_id: String,
     pub read_prefixes: Vec<DataPath>,
     pub write_prefixes: Vec<DataPath>,
 }
 
-impl JobContext {
+impl SessionAccess {
     pub fn validate(&self) -> Result<(), DataPathError> {
-        if self.run_id.is_empty()
-            || self.run_id.contains('/')
-            || self.run_id == "."
-            || self.run_id == ".."
-            || self.run_id.as_bytes().contains(&0)
+        if self.execution_id.is_empty()
+            || self.execution_id.contains('/')
+            || self.execution_id == "."
+            || self.execution_id == ".."
+            || self.execution_id.as_bytes().contains(&0)
         {
-            return Err(DataPathError::InvalidRunId);
+            return Err(DataPathError::InvalidExecutionId);
         }
         Ok(())
     }
@@ -125,9 +127,9 @@ impl JobContext {
     pub fn resolve(&self, logical: &DataPath) -> Result<DataPath, DataPathError> {
         self.validate()?;
         let resolved = if logical.as_str() == "/runs/self" {
-            format!("/runs/{}", self.run_id)
+            format!("/runs/{}", self.execution_id)
         } else if let Some(suffix) = logical.as_str().strip_prefix("/runs/self/") {
-            format!("/runs/{}/{suffix}", self.run_id)
+            format!("/runs/{}/{suffix}", self.execution_id)
         } else {
             logical.as_str().to_owned()
         };

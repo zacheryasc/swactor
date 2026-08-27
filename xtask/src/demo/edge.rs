@@ -24,7 +24,7 @@ use data_plane::edge_lifecycle::{
 pub use data_plane::edge_runtime::Observation;
 use data_plane::edge_runtime::{EdgeRuntime, LoadedObject, WorkerPort};
 use data_plane::edge_wire::EdgeTransport;
-use data_plane::ids::{EdgeId, RunId};
+use data_plane::ids::{EdgeId, ExecutionId};
 use data_plane::object_record::{self, ObjectRecord};
 use iroh::EndpointAddr;
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -200,7 +200,7 @@ impl EdgeSession {
         let mut runtime = EdgeRuntime::new(NodeId(0));
         runtime.establish_outbound(
             ProvisionTx {
-                run_id: RunId(1),
+                execution_id: ExecutionId(1),
                 edge_id,
                 local_node_id: NodeId(0),
                 consumer_node_id: NodeId(attempt),
@@ -697,7 +697,7 @@ impl swactor::actor::ActorInterface for NodeEdgeAgent {
                         self.acked_ready_sent = false;
                         self.runtime.establish_inbound(
                             ProvisionRx {
-                                run_id: RunId(1),
+                                execution_id: ExecutionId(1),
                                 edge_id: EdgeId(provision.edge_id),
                                 local_node_id: NodeId(self.attempt),
                                 object_spec: demo_object_spec(),
@@ -711,7 +711,7 @@ impl swactor::actor::ActorInterface for NodeEdgeAgent {
                         self.edge_id = Some(EdgeId(provision.edge_id));
                         self.runtime.establish_inbound(
                             ProvisionRx {
-                                run_id: RunId(1),
+                                execution_id: ExecutionId(1),
                                 edge_id: EdgeId(provision.edge_id),
                                 local_node_id: NodeId(self.attempt),
                                 object_spec: demo_object_spec(),

@@ -61,8 +61,6 @@ pub(crate) struct RuntimeFacts {
     pub attempt_id: u64,
     pub endpoint: String,
     pub node_actor: ActorAddress,
-    #[serde(default)]
-    pub job_actor: Option<ActorAddress>,
     pub swim_node_id: DistNodeId,
     pub stage_index: u32,
     pub readiness_id: u64,

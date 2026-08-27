@@ -8,9 +8,18 @@ license = "AGPL-3.0-only"
 name = "swactor"
 crate-type = ["cdylib"]
 
+[features]
+# Builds the in-process debug data-plane host and contextual-process probe
+# used by the Python bootstrap tests (`cargo xtask python-test` compiles the
+# wheel with this feature). Off for normal debug and release builds so the
+# Python module never exposes test-only APIs.
+test-host = []
+
 [dependencies]
 swactor = { path = "../../.." }
 swactor-engine = { path = "../../engine", features = ["tokio"] }
+swactor-process = { path = "../../process" }
+swactor-process-context = { path = "../../process-context" }
 swactor-transport = { path = "../../transport" }
 data-plane = { path = "../../data-plane" }
 distribution = { path = "../../distribution" }

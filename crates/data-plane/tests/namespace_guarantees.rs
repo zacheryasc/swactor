@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use data_plane::namespace::{
-    DataDirectoryActor, DirectoryClient, EntryKind, NamespaceClient, NamespaceClientActor,
-    NamespaceClientIn, NamespaceDiscovery, NamespaceError, OperationId, SourceRecovery, StreamRole,
+    DataDirectoryActor, DataDirectoryIn, DirectoryClient, EntryKind, NamespaceClient,
+    NamespaceClientActor, NamespaceClientIn, NamespaceDiscovery, NamespaceError, OperationId,
+    RetirementRetry, SourceRecovery, StreamRole,
 };
 use data_plane::path::DataPath;
 use futures_lite::future;
@@ -62,22 +63,12 @@ fn source(byte: u8) -> ActorAddress {
 fn recovery(actor: ActorAddress) -> SourceRecovery {
     SourceRecovery::Actor { actor }
 }
-
 fn spawn_directory(store: &Path) -> DirectoryHarness {
     let parts = RuntimeParts::new(RuntimeConfig {
         worker_count: 1,
         ..RuntimeConfig::default()
     });
     let runtime = parts.runtime().clone();
-    let actor = DataDirectoryActor::recover(store, |record, _length| match record {
-        SourceRecovery::Actor { actor } => Ok(*actor),
-        SourceRecovery::File { path } => Err(NamespaceError::SourceRecovery(format!(
-            "test cannot recover file source {}",
-            path.display()
-        ))),
-    })
-    .expect("recover directory");
-    let directory = runtime.spawn(actor).expect("spawn directory actor");
     let engine = Engine::new(
         parts,
         TokioBackend::new(TokioConfig {
@@ -87,6 +78,23 @@ fn spawn_directory(store: &Path) -> DirectoryHarness {
         .expect("tokio backend"),
     )
     .expect("directory engine");
+    let actor = DataDirectoryActor::recover(
+        store,
+        Some(RetirementRetry::new(
+            engine.handle(),
+            runtime.create_sender(),
+            Duration::from_millis(50),
+        )),
+        |record, _length| match record {
+            SourceRecovery::Actor { actor } => Ok(*actor),
+            SourceRecovery::File { path } => Err(NamespaceError::SourceRecovery(format!(
+                "test cannot recover file source {}",
+                path.display()
+            ))),
+        },
+    )
+    .expect("recover directory");
+    let directory = runtime.spawn(actor).expect("spawn directory actor");
     DirectoryHarness {
         engine,
         runtime: runtime.clone(),
@@ -180,6 +188,370 @@ fn namespace_mutations_are_linearizable_and_durable() {
 }
 
 #[test]
+fn rename_is_atomic_replayable_and_revisioned() {
+    let state = TempState::new("rename");
+    let directory = spawn_directory(&state.store());
+    let source_path = path("/rename/source");
+    let destination_path = path("/rename/destination");
+    let source_actor = source(7);
+    let destination_actor = source(8);
+
+    future::block_on(async {
+        directory
+            .client
+            .register(
+                source_path.clone(),
+                source_actor,
+                7,
+                recovery(source_actor),
+                OperationId::from_u128(100),
+            )
+            .await
+            .unwrap();
+        directory
+            .client
+            .register(
+                destination_path.clone(),
+                destination_actor,
+                8,
+                recovery(destination_actor),
+                OperationId::from_u128(101),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            directory
+                .client
+                .rename(
+                    source_path.clone(),
+                    destination_path.clone(),
+                    false,
+                    OperationId::from_u128(102),
+                )
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == destination_path
+        ));
+        assert_eq!(
+            directory
+                .client
+                .resolve(source_path.clone())
+                .await
+                .unwrap()
+                .source,
+            source_actor
+        );
+        assert_eq!(
+            directory
+                .client
+                .resolve(destination_path.clone())
+                .await
+                .unwrap()
+                .source,
+            destination_actor
+        );
+
+        let renamed = directory
+            .client
+            .rename(
+                source_path.clone(),
+                destination_path.clone(),
+                true,
+                OperationId::from_u128(103),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.revision, 3);
+        let replayed = directory
+            .client
+            .rename(
+                source_path.clone(),
+                destination_path.clone(),
+                true,
+                OperationId::from_u128(103),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed, renamed);
+        assert!(matches!(
+            directory.client.lookup(source_path.clone()).await,
+            Err(NamespaceError::PathNotFound(path)) if path == source_path
+        ));
+        let resolved = directory
+            .client
+            .resolve(destination_path.clone())
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, source_actor);
+        assert_eq!(resolved.revision, renamed.revision);
+    });
+
+    let recovered = spawn_directory(&state.store());
+    let resolved = future::block_on(recovered.client.resolve(destination_path)).unwrap();
+    assert_eq!(resolved.source, source_actor);
+    assert_eq!(resolved.revision, 3);
+}
+
+#[test]
+fn mutation_rejections_are_sticky_across_reservation_lifecycle() {
+    let state = TempState::new("sticky-rejections");
+    let directory = spawn_directory(&state.store());
+    let source_path = path("/sticky/source");
+    let reserved_path = path("/sticky/reserved");
+    let unbound_path = path("/sticky/unbound");
+    let stream_path = path("/sticky/stream");
+    let source_actor = source(9);
+
+    future::block_on(async {
+        directory
+            .client
+            .register(
+                source_path.clone(),
+                source_actor,
+                5,
+                recovery(source_actor),
+                OperationId::from_u128(200),
+            )
+            .await
+            .unwrap();
+
+        // A concurrent blob upload holds a reservation on the rename target.
+        directory
+            .client
+            .reserve_blob(reserved_path.clone(), OperationId::from_u128(201))
+            .await
+            .unwrap();
+        assert!(matches!(
+            directory
+                .client
+                .rename(
+                    source_path.clone(),
+                    reserved_path.clone(),
+                    true,
+                    OperationId::from_u128(202),
+                )
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == reserved_path
+        ));
+        // The upload is abandoned and its reservation released. Retrying the
+        // SAME operation id must replay the rejection: an id the client saw
+        // rejected may never commit later, whatever else changed.
+        directory
+            .client
+            .release_blob_reservation(reserved_path.clone(), OperationId::from_u128(201))
+            .await
+            .unwrap();
+        assert!(matches!(
+            directory
+                .client
+                .rename(
+                    source_path.clone(),
+                    reserved_path.clone(),
+                    true,
+                    OperationId::from_u128(202),
+                )
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == reserved_path
+        ));
+        assert_eq!(
+            directory
+                .client
+                .resolve(source_path.clone())
+                .await
+                .unwrap()
+                .source,
+            source_actor
+        );
+
+        // Unregister against a reserved-but-unbound path is sticky the same way.
+        directory
+            .client
+            .reserve_blob(unbound_path.clone(), OperationId::from_u128(203))
+            .await
+            .unwrap();
+        assert!(matches!(
+            directory
+                .client
+                .unregister(unbound_path.clone(), OperationId::from_u128(204))
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == unbound_path
+        ));
+        directory
+            .client
+            .release_blob_reservation(unbound_path.clone(), OperationId::from_u128(203))
+            .await
+            .unwrap();
+        assert!(matches!(
+            directory
+                .client
+                .unregister(unbound_path.clone(), OperationId::from_u128(204))
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == unbound_path
+        ));
+
+        // Stream binding against a reserved path replays its rejection too.
+        directory
+            .client
+            .reserve_blob(stream_path.clone(), OperationId::from_u128(205))
+            .await
+            .unwrap();
+        assert!(matches!(
+            directory
+                .client
+                .replace_with_stream(
+                    stream_path.clone(),
+                    StreamRole::Source,
+                    source(4),
+                    OperationId::from_u128(206),
+                )
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == stream_path
+        ));
+        directory
+            .client
+            .release_blob_reservation(stream_path.clone(), OperationId::from_u128(205))
+            .await
+            .unwrap();
+        assert!(matches!(
+            directory
+                .client
+                .replace_with_stream(
+                    stream_path.clone(),
+                    StreamRole::Source,
+                    source(4),
+                    OperationId::from_u128(206),
+                )
+                .await,
+            Err(NamespaceError::PathExists(path)) if path == stream_path
+        ));
+    });
+}
+
+#[test]
+fn committed_mutations_replay_even_when_path_is_reserved_again() {
+    let state = TempState::new("replay-across-reservation");
+    let directory = spawn_directory(&state.store());
+    let logical = path("/replay/reserved");
+    let blob = source(3);
+
+    future::block_on(async {
+        directory
+            .client
+            .register(
+                logical.clone(),
+                blob,
+                12,
+                recovery(blob),
+                OperationId::from_u128(300),
+            )
+            .await
+            .unwrap();
+        let removed = directory
+            .client
+            .unregister(logical.clone(), OperationId::from_u128(301))
+            .await
+            .unwrap();
+
+        // A later upload reserves the freed path. A duplicate delivery of the
+        // already-acknowledged unregister must still replay its receipt
+        // instead of failing against the unrelated reservation.
+        directory
+            .client
+            .reserve_blob(logical.clone(), OperationId::from_u128(302))
+            .await
+            .unwrap();
+        let replayed = directory
+            .client
+            .unregister(logical.clone(), OperationId::from_u128(301))
+            .await
+            .unwrap();
+        assert_eq!(replayed, removed);
+    });
+}
+
+#[test]
+fn active_stream_rename_is_typed_and_quiescent_stream_rename_succeeds() {
+    let state = TempState::new("stream-rename");
+    let directory = spawn_directory(&state.store());
+    let source_path = path("/rename/stream-source");
+    let destination_path = path("/rename/stream-destination");
+
+    future::block_on(async {
+        let mut source_open = Box::pin(directory.client.open_stream(
+            source_path.clone(),
+            StreamRole::Source,
+            source(30),
+            OperationId::from_u128(110),
+        ));
+        assert!(future::poll_once(source_open.as_mut()).await.is_none());
+        let sink_match = directory
+            .client
+            .open_stream(
+                source_path.clone(),
+                StreamRole::Sink,
+                source(31),
+                OperationId::from_u128(111),
+            )
+            .await
+            .unwrap();
+        let source_match = source_open.await.unwrap();
+        assert_eq!(source_match, sink_match);
+        let missing_source = path("/rename/missing-source");
+        assert!(matches!(
+            directory
+                .client
+                .rename(
+                    missing_source.clone(),
+                    source_path.clone(),
+                    true,
+                    OperationId::from_u128(114),
+                )
+                .await,
+            Err(NamespaceError::PathNotFound(path)) if path == missing_source
+        ));
+
+        assert!(matches!(
+            directory
+                .client
+                .rename(
+                    source_path.clone(),
+                    destination_path.clone(),
+                    false,
+                    OperationId::from_u128(112),
+                )
+                .await,
+            Err(NamespaceError::StreamActive(path)) if path == source_path
+        ));
+        directory
+            .client
+            .close_stream(source_path.clone(), source_match.incarnation)
+            .await
+            .unwrap();
+        let renamed = directory
+            .client
+            .rename(
+                source_path.clone(),
+                destination_path.clone(),
+                false,
+                OperationId::from_u128(113),
+            )
+            .await
+            .unwrap();
+        let node = directory
+            .client
+            .lookup(destination_path.clone())
+            .await
+            .unwrap();
+        assert_eq!(node.kind, EntryKind::Stream);
+        assert_eq!(node.revision, renamed.revision);
+        assert!(matches!(
+            directory.client.lookup(source_path.clone()).await,
+            Err(NamespaceError::PathNotFound(path)) if path == source_path
+        ));
+    });
+}
+
+#[test]
 fn stream_rendezvous_is_symmetric_and_incarnations_are_isolated() {
     let state = TempState::new("stream-rendezvous");
     let directory = spawn_directory(&state.store());
@@ -221,6 +593,31 @@ fn stream_rendezvous_is_symmetric_and_incarnations_are_isolated() {
             .await
             .expect("close first incarnation");
 
+        assert!(matches!(
+            directory
+                .client
+                .open_stream(
+                    logical.clone(),
+                    StreamRole::Source,
+                    source(10),
+                    OperationId::from_u128(10),
+                )
+                .await,
+            Err(NamespaceError::StaleIncarnation { .. })
+        ));
+        assert!(matches!(
+            directory
+                .client
+                .open_stream(
+                    logical.clone(),
+                    StreamRole::Sink,
+                    source(11),
+                    OperationId::from_u128(11),
+                )
+                .await,
+            Err(NamespaceError::StaleIncarnation { .. })
+        ));
+
         let mut sink_open = Box::pin(directory.client.open_stream(
             logical.clone(),
             StreamRole::Sink,
@@ -228,6 +625,18 @@ fn stream_rendezvous_is_symmetric_and_incarnations_are_isolated() {
             OperationId::from_u128(12),
         ));
         assert!(future::poll_once(sink_open.as_mut()).await.is_none());
+        assert!(matches!(
+            directory
+                .client
+                .open_stream(
+                    logical.clone(),
+                    StreamRole::Source,
+                    source(10),
+                    OperationId::from_u128(10),
+                )
+                .await,
+            Err(NamespaceError::StaleIncarnation { .. })
+        ));
         let second_source = directory
             .client
             .open_stream(
@@ -495,15 +904,22 @@ fn unresolved_request_waits_for_recovered_authority() {
             "resolve must remain pending while authority is absent"
         );
 
-        let recovered =
-            DataDirectoryActor::recover(state.store(), |record, _length| match record {
+        let recovered = DataDirectoryActor::recover(
+            state.store(),
+            Some(RetirementRetry::new(
+                harness.engine.handle(),
+                harness.runtime.create_sender(),
+                Duration::from_millis(50),
+            )),
+            |record, _length| match record {
                 SourceRecovery::Actor { actor } => Ok(*actor),
                 SourceRecovery::File { path } => Err(NamespaceError::SourceRecovery(format!(
                     "test cannot recover file source {}",
                     path.display()
                 ))),
-            })
-            .expect("recover directory state");
+            },
+        )
+        .expect("recover directory state");
         let recovered = harness
             .runtime
             .spawn(recovered)
@@ -519,6 +935,56 @@ fn unresolved_request_waits_for_recovered_authority() {
         assert_eq!(binding.length, 16);
         assert_eq!(binding.revision, 1);
     });
+}
+
+#[test]
+fn unresolved_request_fails_bounded_when_authority_is_lost() {
+    let discovered = Arc::new(RwLock::new(None));
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
+    )
+    .expect("client engine");
+    let proxy = runtime
+        .spawn(NamespaceClientActor::new_with_deadline(
+            engine.handle(),
+            runtime.create_sender(),
+            Arc::new(StaticDiscovery {
+                directory: Arc::clone(&discovered),
+            }),
+            Duration::from_millis(5),
+            Duration::from_millis(150),
+        ))
+        .expect("spawn namespace client");
+    let client = NamespaceClient::new(runtime.clone(), proxy);
+
+    let outcome = future::block_on(async {
+        let bound = Instant::now() + Duration::from_secs(5);
+        let mut resolving = Box::pin(client.resolve(path("/models/lost")));
+        loop {
+            if let Some(outcome) = future::poll_once(resolving.as_mut()).await {
+                return outcome;
+            }
+            assert!(
+                Instant::now() < bound,
+                "authority loss must fail the request within the deadline, not hang"
+            );
+            std::thread::yield_now();
+        }
+    });
+    assert!(
+        matches!(outcome, Err(NamespaceError::DirectoryUnavailable(_))),
+        "expected a bounded directory-unavailable failure, got {outcome:?}"
+    );
 }
 
 #[test]
@@ -767,5 +1233,106 @@ proptest! {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn retirement_retry_redrives_until_acknowledged() {
+    struct RetireProbe {
+        retire_count: Arc<AtomicU64>,
+        acknowledge: Arc<AtomicBool>,
+    }
+
+    impl swactor::actor::ActorInterface for RetireProbe {
+        type Incoming = data_plane::source::BlobSourceIn;
+        type Response = ();
+
+        fn handle(&mut self, ctx: &swactor::actor::Ctx<'_>, message: Self::Incoming) {
+            if let data_plane::source::BlobSourceIn::Retire { reply_to } = message
+                && let Some(reply_to) = reply_to
+            {
+                self.retire_count.fetch_add(1, Ordering::SeqCst);
+                if self.acknowledge.load(Ordering::SeqCst) {
+                    let _ = ctx.send(
+                        reply_to,
+                        DataDirectoryIn::SourceRetired {
+                            source: ctx.self_addr(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let state = TempState::new("retire-retry");
+    let harness = spawn_directory(&state.store());
+    let retire_count = Arc::new(AtomicU64::new(0));
+    let acknowledge = Arc::new(AtomicBool::new(false));
+    let probe = harness
+        .runtime
+        .spawn(RetireProbe {
+            retire_count: Arc::clone(&retire_count),
+            acknowledge: Arc::clone(&acknowledge),
+        })
+        .expect("spawn retire probe");
+
+    let logical = path("/models/retire-retry");
+    future::block_on(harness.client.register(
+        logical.clone(),
+        probe,
+        8,
+        recovery(probe),
+        OperationId::from_u128(1),
+    ))
+    .expect("register probe source");
+    future::block_on(
+        harness
+            .client
+            .unregister(logical.clone(), OperationId::from_u128(2)),
+    )
+    .expect("unregister probe source");
+
+    // No other directory traffic follows the unregister: only the periodic
+    // retry tick may re-deliver Retire. Poll past several tick periods.
+    let redrive_deadline = Instant::now() + Duration::from_secs(2);
+    let mut redriven = 0;
+    while retire_count.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < redrive_deadline,
+            "retirement was not re-driven without directory traffic (observed {redriven})"
+        );
+        redriven = retire_count.load(Ordering::SeqCst);
+        std::thread::yield_now();
+    }
+
+    // Once the source acknowledges, retries must stop. A tick can already
+    // be in flight when the acknowledgement lands, so require the count to
+    // stay unchanged for a full quiet window rather than stopping at the
+    // first acknowledgement.
+    acknowledge.store(true, Ordering::SeqCst);
+    let settle_deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = retire_count.load(Ordering::SeqCst);
+    while last == redriven {
+        assert!(
+            Instant::now() < settle_deadline,
+            "acknowledged Retire was never observed after enabling replies"
+        );
+        last = retire_count.load(Ordering::SeqCst);
+        std::thread::yield_now();
+    }
+    loop {
+        let quiet_until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < quiet_until {
+            std::thread::yield_now();
+        }
+        let observed = retire_count.load(Ordering::SeqCst);
+        if observed == last {
+            break;
+        }
+        last = observed;
+        assert!(
+            Instant::now() < settle_deadline,
+            "retirement retries never stopped after SourceRetired (observed {observed})"
+        );
     }
 }

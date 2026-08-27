@@ -20,8 +20,8 @@ use data_plane::namespace::{
     DirectoryClient, NamespaceClient, NamespaceClientActor, NamespaceDiscovery, NamespaceError,
     OperationId,
 };
-use data_plane::path::{DataPath, JobContext};
-use data_plane::protocol::JobCapability;
+use data_plane::path::{DataPath, SessionAccess};
+use data_plane::protocol::SessionCapability;
 use data_plane::source::{BlobSourcePublisher, FileBlobSourceActor};
 use futures_lite::future;
 use parking_lot::RwLock;
@@ -31,7 +31,7 @@ use swactor::config::RuntimeConfig;
 use swactor::runtime::{RemoteSink, Runtime, RuntimeParts};
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
-const CAPABILITY: JobCapability = JobCapability::new([0x33; 32]);
+const CAPABILITY: SessionCapability = SessionCapability::new([0x33; 32]);
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
 struct DirectRuntimeSink {
@@ -170,7 +170,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         base_alignment: 64,
     })
     .unwrap();
-    let handoff = bootstrap::write_bootstrap(
+    let handoff = bootstrap::prepare_arena(
         &mut arena,
         BootstrapSpec {
             arena_generation: 1,
@@ -184,7 +184,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         base_alignment: 64,
     })
     .unwrap();
-    let consumer_handoff = bootstrap::write_bootstrap(
+    let consumer_handoff = bootstrap::prepare_arena(
         &mut consumer_arena,
         BootstrapSpec {
             arena_generation: 2,
@@ -227,6 +227,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
     let source_publisher: Arc<dyn BlobSourcePublisher> = Arc::new(NoopSourceRegistrar);
     let service = DataNamespaceService::recover(
         host_runtime.clone(),
+        host_engine.handle(),
         &store_path,
         Arc::clone(&sender),
         Arc::clone(&source_publisher),
@@ -255,12 +256,13 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         .spawn(
             HostDataPlaneSessionActor::new(HostDataPlaneConfig {
                 runtime: host_runtime.clone(),
+                engine: host_engine.handle(),
                 arena,
                 arena_generation: 1,
                 session_generation: 1,
                 capability: CAPABILITY,
-                job_context: JobContext {
-                    run_id: "run-1".to_owned(),
+                session_access: SessionAccess {
+                    execution_id: "run-1".to_owned(),
                     read_prefixes: vec![
                         DataPath::parse("/models").unwrap(),
                         DataPath::parse("/runs/run-1").unwrap(),
@@ -288,12 +290,13 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         .spawn(
             HostDataPlaneSessionActor::new(HostDataPlaneConfig {
                 runtime: host_runtime.clone(),
+                engine: host_engine.handle(),
                 arena: consumer_arena,
                 arena_generation: 2,
                 session_generation: 2,
                 capability: CAPABILITY,
-                job_context: JobContext {
-                    run_id: "run-1".to_owned(),
+                session_access: SessionAccess {
+                    execution_id: "run-1".to_owned(),
                     read_prefixes: vec![
                         DataPath::parse("/models").unwrap(),
                         DataPath::parse("/runs/run-1").unwrap(),

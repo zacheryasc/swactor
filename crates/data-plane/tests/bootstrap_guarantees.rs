@@ -1,12 +1,11 @@
 #![cfg(target_os = "linux")]
 
-use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, RawFd};
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId};
 use data_plane::bootstrap::{
     self, BOOTSTRAP_MAGIC, BOOTSTRAP_VERSION, BootstrapError, BootstrapHeader, ControlRegion,
-    ENV_ARENA_FD, HEADER_END_OFFSET, HEADER_LEN, parse_bootstrap,
+    HEADER_END_OFFSET, HEADER_LEN, parse_bootstrap,
 };
 use data_plane::mapped_arena::MappedArena;
 
@@ -170,24 +169,15 @@ fn malformed_control_geometry_is_rejected() {
 }
 
 #[test]
-fn writer_exports_exactly_one_inheritable_descriptor() {
+fn prepared_arena_descriptor_is_close_on_exec() {
     let mut arena = arena();
-    let handoff = bootstrap::write_bootstrap(&mut arena, spec()).expect("bootstrap write");
+    let prepared = bootstrap::prepare_arena(&mut arena, spec()).expect("bootstrap write");
 
-    assert_eq!(
-        handoff
-            .env
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([ENV_ARENA_FD])
+    assert_eq!(prepared.arena_generation, GENERATION);
+    assert_ne!(
+        fd_flags(prepared.arena_fd.as_raw_fd()) & libc::FD_CLOEXEC,
+        0
     );
-    assert_eq!(
-        handoff.env[ENV_ARENA_FD],
-        handoff.arena_fd.as_raw_fd().to_string()
-    );
-    assert_eq!(handoff.arena_generation, GENERATION);
-    assert_eq!(fd_flags(handoff.arena_fd.as_raw_fd()) & libc::FD_CLOEXEC, 0);
 
     let page = arena.read_arena(0, HEADER_LEN).expect("read header");
     let resolved = parse_bootstrap(&page, arena.arena_len()).expect("written header parses");
@@ -195,12 +185,12 @@ fn writer_exports_exactly_one_inheritable_descriptor() {
 }
 
 #[test]
-fn mapped_arena_owns_mapping_but_closes_inherited_descriptor() {
+fn mapped_arena_owns_mapping_but_closes_transferred_descriptor() {
     let mut host = arena();
-    let handoff = bootstrap::write_bootstrap(&mut host, spec()).expect("bootstrap write");
-    let inherited_fd = handoff.arena_fd.as_raw_fd();
+    let prepared = bootstrap::prepare_arena(&mut host, spec()).expect("bootstrap write");
+    let inherited_fd = prepared.arena_fd.as_raw_fd();
 
-    let (mapped, resolved) = MappedArena::map(handoff.arena_fd).expect("map arena");
+    let (mapped, resolved) = MappedArena::map(prepared.arena_fd).expect("map arena");
     assert_eq!(mapped.len(), ARENA_BYTES as usize);
     assert_eq!(resolved.arena_generation, GENERATION);
     assert_eq!(
@@ -230,7 +220,7 @@ fn writer_rejects_zero_generation_or_alignment() {
         },
     ] {
         assert!(matches!(
-            bootstrap::write_bootstrap(&mut arena(), bad),
+            bootstrap::prepare_arena(&mut arena(), bad),
             Err(bootstrap::BootstrapWriteError::InvalidSpec)
         ));
     }

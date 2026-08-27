@@ -1130,6 +1130,7 @@ name = "distribution"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "proptest",
  "serde",
  "serde_json",
@@ -1266,16 +1267,6 @@ name = "fiat-crypto"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
-
-[[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -2498,14 +2489,27 @@ dependencies = [
  "serde_json",
  "swactor",
  "swactor-engine",
- "swactor-job-runner",
  "swactor-process",
+ "swactor-process-context",
  "swactor-transport",
  "swactor-vastai",
  "telemetry",
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
+name = "myelin-e2e-fuzz"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "flate2",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "ureq",
 ]
 
@@ -3338,6 +3342,8 @@ dependencies = [
  "serde_json",
  "swactor",
  "swactor-engine",
+ "swactor-process",
+ "swactor-process-context",
  "swactor-transport",
  "tokio",
 ]
@@ -4022,19 +4028,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha1"
 version = "0.11.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4308,23 +4301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "swactor-job-runner"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "serde",
- "serde_json",
- "swactor",
- "swactor-engine",
- "swactor-process",
- "swactor-transport",
- "tar",
- "telemetry",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "swactor-process"
 version = "0.1.0"
 dependencies = [
@@ -4334,7 +4310,6 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "serde_yaml",
  "signal-hook",
  "swactor",
  "swactor-engine",
@@ -4343,10 +4318,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "swactor-process-context"
+version = "0.1.0"
+dependencies = [
+ "data-plane",
+ "libc",
+ "proptest",
+ "serde",
+ "swactor",
+ "swactor-engine",
+ "swactor-process",
+ "telemetry",
+]
+
+[[package]]
 name = "swactor-transport"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
+ "parking_lot",
  "proptest",
  "rand_core 0.6.4",
  "rustc-hash",
@@ -4424,17 +4414,6 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
-
-[[package]]
-name = "tar"
-version = "0.4.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
-dependencies = [
- "filetime",
- "libc",
- "xattr",
-]
 
 [[package]]
 name = "target-lexicon"
@@ -4953,12 +4932,6 @@ dependencies = [
  "crypto-common 0.1.7",
  "subtle",
 ]
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -5745,16 +5718,6 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.18",
  "time",
-]
-
-[[package]]
-name = "xattr"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
-dependencies = [
- "libc",
- "rustix",
 ]
 
 [[package]]

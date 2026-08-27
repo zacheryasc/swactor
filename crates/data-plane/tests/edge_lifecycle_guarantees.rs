@@ -15,7 +15,7 @@ use data_plane::edge_lifecycle as edge;
 // where to send. It deliberately carries no remote actor address.
 fn tx_provision() -> edge::ProvisionTx {
     edge::ProvisionTx {
-        run_id: edge::RunId(7),
+        execution_id: edge::ExecutionId(7),
         edge_id: edge::EdgeId(7001),
         local_node_id: edge::NodeId(10),
         consumer_node_id: edge::NodeId(11),
@@ -28,7 +28,7 @@ fn tx_provision() -> edge::ProvisionTx {
 // after leasing; it does not need producer actor addressing for data flow.
 fn rx_provision() -> edge::ProvisionRx {
     edge::ProvisionRx {
-        run_id: edge::RunId(7),
+        execution_id: edge::ExecutionId(7),
         edge_id: edge::EdgeId(7001),
         local_node_id: edge::NodeId(11),
         object_spec: edge::ObjectSpec::test_activation(),

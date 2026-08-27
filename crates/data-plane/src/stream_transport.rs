@@ -105,6 +105,7 @@ impl LocalStreamTransport {
     fn drive(&self, incarnation: StreamIncarnation) {
         let mut notifications = Vec::new();
         let mut fault = None;
+        let mut terminal_moved = false;
         {
             let mut state = self.state.lock();
             let Some(transfer) = state.transfers.get_mut(&incarnation) else {
@@ -165,6 +166,13 @@ impl LocalStreamTransport {
                     break;
                 }
                 moved = true;
+                if matches!(
+                    meta.kind,
+                    crate::byte_ring::RecordKind::Eof | crate::byte_ring::RecordKind::Fault
+                ) {
+                    terminal_moved = true;
+                    break;
+                }
             }
 
             if moved {
@@ -176,6 +184,10 @@ impl LocalStreamTransport {
                     Arc::clone(&sink.notifier),
                     StreamTransportEvent::DataAvailable,
                 ));
+            }
+            if terminal_moved {
+                notifications.push((Arc::clone(&source.notifier), StreamTransportEvent::Quiesced));
+                notifications.push((Arc::clone(&sink.notifier), StreamTransportEvent::Quiesced));
             }
             if let Some(reason) = &fault {
                 notifications.push((

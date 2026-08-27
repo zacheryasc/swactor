@@ -1,15 +1,16 @@
 # Swactor Managed Process Specification
 
 Id: 8
-Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
+Last modified: c705c7428960d287f190cad6bfbf57c193da31df
 Last reviewed:
 > Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 `swactor-process` provides a Swactor actor interface for launching, supervising,
 stopping, and observing one operating-system child process per process actor.
 
-The crate owns process lifecycle/control only. Child stdin/stdout/stderr are not
-managed or observed by this crate.
+The crate owns process lifecycle/control only. Child stdin is not managed.
+Stdout and stderr are observed as uninterpreted process output events
+(`ProcessOutput::Stdout`/`Stderr`).
 
 ---
 
@@ -28,8 +29,6 @@ spawn_local_process
 send_process_command
 ```
 
-Pipeline and YAML exports are separate crate features and are not part of the
-managed-process protocol described here.
 
 ### 1.1 ProcessSpec
 

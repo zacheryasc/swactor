@@ -1,6 +1,6 @@
 //! Persistent fixed-length blob sources.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,8 +14,9 @@ use crate::blob_transfer::{
     BlobTransferCompletion, BlobTransferEvent, BlobTransferId, BlobTransferOffer,
     BlobTransferSender, FileTransferRequest,
 };
-use crate::namespace::{NamespaceClientIn, NamespaceError};
+use crate::namespace::{DataDirectoryIn, NamespaceClientIn, NamespaceError};
 use crate::namespace_store::SourceRecovery;
+const COMPLETED_TRANSFER_HISTORY: usize = 1_024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum BlobSourceIn {
@@ -28,7 +29,9 @@ pub enum BlobSourceIn {
         failure_proxy: Option<ActorAddress>,
         result: Result<(), String>,
     },
-    Retire,
+    Retire {
+        reply_to: Option<ActorAddress>,
+    },
 }
 
 impl NetworkMessage for BlobSourceIn {
@@ -76,6 +79,8 @@ pub struct FileBlobSourceActor {
     offset: u64,
     length: u64,
     active: HashSet<BlobTransferId>,
+    completed: HashSet<BlobTransferId>,
+    completed_order: VecDeque<BlobTransferId>,
     retiring: bool,
     retirement: Option<Arc<dyn BlobSourceRetirement>>,
 }
@@ -105,6 +110,8 @@ impl FileBlobSourceActor {
             offset: 0,
             length,
             active: HashSet::new(),
+            completed: HashSet::new(),
+            completed_order: VecDeque::new(),
             retiring: false,
             retirement: None,
         })
@@ -155,6 +162,8 @@ impl FileBlobSourceActor {
             offset,
             length,
             active: HashSet::new(),
+            completed: HashSet::new(),
+            completed_order: VecDeque::new(),
             retiring: false,
             retirement,
         })
@@ -201,6 +210,18 @@ impl FileBlobSourceActor {
         }
     }
 
+    fn remember_completed(&mut self, transfer_id: BlobTransferId) {
+        if !self.completed.insert(transfer_id) {
+            return;
+        }
+        self.completed_order.push_back(transfer_id);
+        if self.completed_order.len() > COMPLETED_TRANSFER_HISTORY
+            && let Some(expired) = self.completed_order.pop_front()
+        {
+            self.completed.remove(&expired);
+        }
+    }
+
     fn fail_destination(&self, ctx: &Ctx<'_>, offer: &BlobTransferOffer, reason: String) {
         self.send_failure(
             ctx,
@@ -232,12 +253,12 @@ impl ActorInterface for FileBlobSourceActor {
                     self.fail_destination(ctx, &offer, "blob source is retired".to_owned());
                     return;
                 }
-                if !self.active.insert(offer.transfer_id) {
-                    self.fail_destination(
-                        ctx,
-                        &offer,
-                        "duplicate blob transfer identifier".to_owned(),
-                    );
+                if self.completed.contains(&offer.transfer_id)
+                    || !self.active.insert(offer.transfer_id)
+                {
+                    // BeginTransfer is an idempotent rendezvous request. The
+                    // destination repeats it until transfer traffic confirms
+                    // the route.
                     return;
                 }
                 let file = match self.file.try_clone() {
@@ -280,14 +301,25 @@ impl ActorInterface for FileBlobSourceActor {
                 result,
             } => {
                 if self.active.remove(&transfer_id) {
-                    if let Err(reason) = result {
-                        self.send_failure(ctx, destination, failure_proxy, transfer_id, reason);
+                    match result {
+                        Ok(()) => self.remember_completed(transfer_id),
+                        Err(reason) => {
+                            self.send_failure(ctx, destination, failure_proxy, transfer_id, reason);
+                        }
                     }
                     self.maybe_stop_retired(ctx);
                 }
             }
-            BlobSourceIn::Retire => {
+            BlobSourceIn::Retire { reply_to } => {
                 self.retiring = true;
+                if let Some(reply_to) = reply_to {
+                    let _ = ctx.send(
+                        reply_to,
+                        DataDirectoryIn::SourceRetired {
+                            source: ctx.self_addr(),
+                        },
+                    );
+                }
                 self.maybe_stop_retired(ctx);
             }
         }

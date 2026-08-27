@@ -23,8 +23,8 @@ swactor = { path = "../..", features = ["serde", "transport"] }
 swactor-engine = { path = "../../crates/engine" }
 swactor-transport = { path = "../../crates/transport" }
 swactor-process = { path = "../../crates/process" }
+swactor-process-context = { path = "../../crates/process-context" }
 distribution = { path = "../../crates/distribution" }
-swactor-job-runner = { path = "../../crates/job-runner" }
 iroh-driver = { path = "../../crates/iroh-driver" }
 iroh = "0.98"
 tokio.workspace = true
@@ -52,13 +52,6 @@ path = "src/bin/worker_node.rs"
 name = "myelin-orchestrator"
 path = "src/bin/orchestrator.rs"
 
-[[bin]]
-name = "myelin-job-worker"
-path = "src/bin/job_worker.rs"
-
-[[bin]]
-name = "myelin-job"
-path = "src/bin/job.rs"
 
 
 [lints]

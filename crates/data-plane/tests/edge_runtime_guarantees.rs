@@ -126,7 +126,7 @@ fn parse_spec() -> ParseSpec {
 
 fn provision_rx(edge_id: u64) -> ProvisionRx {
     ProvisionRx {
-        run_id: data_plane::ids::RunId(1),
+        execution_id: data_plane::ids::ExecutionId(1),
         edge_id: EdgeId(edge_id),
         local_node_id: NodeId(10),
         object_spec: EdgeObjectSpec {
@@ -144,7 +144,7 @@ fn provision_rx(edge_id: u64) -> ProvisionRx {
 
 fn provision_tx(edge_id: u64) -> ProvisionTx {
     ProvisionTx {
-        run_id: data_plane::ids::RunId(1),
+        execution_id: data_plane::ids::ExecutionId(1),
         edge_id: EdgeId(edge_id),
         local_node_id: NodeId(10),
         consumer_node_id: NodeId(11),

@@ -5,11 +5,10 @@ use std::fmt;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
-use swactor::runtime::{ExternalSender, Runtime};
-use swactor_engine::{ActorCompletion, EngineHandle};
+use swactor::runtime::Runtime;
+use swactor_engine::ActorCompletion;
 
 use crate::blob::{
     Blob, BlobLease, BlobMetadata, BlobView, LeaseReleaser, WritableArenaView, WritableBlobLease,
@@ -22,9 +21,11 @@ use crate::mapped_arena::MappedArena;
 use crate::path::DataPath;
 pub use crate::protocol::{
     AccessMode, BlobAllocation, DataPlaneError, DescriptorCapabilities, DescriptorKind, Errno,
-    OpenOptions,
+    NamespaceOperationResult, OpenOptions,
 };
-use crate::protocol::{ChildSessionIn, HostSessionIn, HostStreamIn, JobCapability, OpenPolicy};
+use crate::protocol::{
+    ChildSessionIn, HostSessionIn, HostStreamIn, NamespaceOperation, OpenPolicy, SessionCapability,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSessionState {
@@ -39,19 +40,14 @@ pub struct DataPlaneBootstrap {
     pub data_plane: DataPlane,
 }
 
-pub struct AttachDeadline {
-    pub engine: EngineHandle,
-    pub timeout: Duration,
-}
-
 impl DataPlaneBootstrap {
     pub async fn attach(
         arena_fd: OwnedFd,
         runtime: Runtime,
         host_session: ActorAddress,
-        job_capability: JobCapability,
+        session_capability: SessionCapability,
     ) -> Result<Self, DataPlaneError> {
-        Self::attach_routed(arena_fd, runtime, host_session, job_capability, None).await
+        Self::attach_routed(arena_fd, runtime, host_session, session_capability, None).await
     }
 
     pub fn map_arena(
@@ -66,7 +62,7 @@ impl DataPlaneBootstrap {
         arena_fd: OwnedFd,
         runtime: Runtime,
         host_session: ActorAddress,
-        job_capability: JobCapability,
+        session_capability: SessionCapability,
         child_node: Option<[u8; 32]>,
     ) -> Result<Self, DataPlaneError> {
         let (arena, resolved) = Self::map_arena(arena_fd)?;
@@ -75,7 +71,7 @@ impl DataPlaneBootstrap {
             resolved,
             runtime,
             host_session,
-            job_capability,
+            session_capability,
             child_node,
         )
         .await
@@ -86,51 +82,8 @@ impl DataPlaneBootstrap {
         resolved: crate::bootstrap::ResolvedBootstrap,
         runtime: Runtime,
         host_session: ActorAddress,
-        job_capability: JobCapability,
+        session_capability: SessionCapability,
         child_node: Option<[u8; 32]>,
-    ) -> Result<Self, DataPlaneError> {
-        Self::attach_mapped_inner(
-            arena,
-            resolved,
-            runtime,
-            host_session,
-            job_capability,
-            child_node,
-            None,
-        )
-        .await
-    }
-
-    pub async fn attach_mapped_with_deadline(
-        arena: Arc<MappedArena>,
-        resolved: crate::bootstrap::ResolvedBootstrap,
-        runtime: Runtime,
-        host_session: ActorAddress,
-        job_capability: JobCapability,
-        child_node: Option<[u8; 32]>,
-        deadline: AttachDeadline,
-    ) -> Result<Self, DataPlaneError> {
-        let sender = runtime.create_sender();
-        Self::attach_mapped_inner(
-            arena,
-            resolved,
-            runtime,
-            host_session,
-            job_capability,
-            child_node,
-            Some((deadline.engine, sender, deadline.timeout)),
-        )
-        .await
-    }
-
-    async fn attach_mapped_inner(
-        arena: Arc<MappedArena>,
-        resolved: crate::bootstrap::ResolvedBootstrap,
-        runtime: Runtime,
-        host_session: ActorAddress,
-        job_capability: JobCapability,
-        child_node: Option<[u8; 32]>,
-        deadline: Option<(EngineHandle, ExternalSender, Duration)>,
     ) -> Result<Self, DataPlaneError> {
         let attached = runtime
             .new_inbox::<Result<u64, DataPlaneError>>()
@@ -141,21 +94,19 @@ impl DataPlaneBootstrap {
                 runtime: runtime.clone(),
                 host_session,
                 arena_generation: resolved.arena_generation,
-                job_capability,
+                session_capability,
                 child_node,
                 session_generation: None,
                 attach_reply: Some(attach_reply),
                 operations: HashSet::new(),
                 open_operations: HashMap::new(),
+                namespace_operations: HashSet::new(),
                 state: ChildSessionState::Attaching,
                 stream_operations: HashMap::new(),
                 pending_blob_releases: 0,
                 deferred_blob_opens: VecDeque::new(),
             })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
-        if let Some((engine, sender, timeout)) = deadline {
-            engine.send_after(timeout, sender, child, ChildSessionIn::AttachmentDeadline);
-        }
 
         attached.recv().await?;
         Ok(Self {
@@ -182,6 +133,26 @@ impl Drop for DescriptorOpenCancellation {
             let _ = self.runtime.send_to(
                 self.child_session,
                 ChildSessionIn::CancelOpen {
+                    reply_to: self.reply_to,
+                },
+            );
+        }
+    }
+}
+
+struct NamespaceOperationCancellation {
+    runtime: Runtime,
+    child_session: ActorAddress,
+    reply_to: ActorAddress,
+    armed: bool,
+}
+
+impl Drop for NamespaceOperationCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.runtime.send_to(
+                self.child_session,
+                ChildSessionIn::CancelNamespace {
                     reply_to: self.reply_to,
                 },
             );
@@ -454,13 +425,6 @@ impl DescriptorMapping {
         self.len() == 0
     }
 
-    pub fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::ReadOnly(view) => view.as_ref(),
-            Self::WritableReadOnly(view) | Self::Writable(view) => view.as_ref(),
-        }
-    }
-
     pub fn as_mut(&mut self) -> Result<&mut [u8], DataPlaneError> {
         match self {
             Self::ReadOnly(_) | Self::WritableReadOnly(_) => Err(DataPlaneError::BadDescriptor),
@@ -470,6 +434,15 @@ impl DescriptorMapping {
 
     pub const fn route(&self) -> TransferRoute {
         TransferRoute::Direct
+    }
+}
+
+impl AsRef<[u8]> for DescriptorMapping {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::ReadOnly(view) => view.as_ref(),
+            Self::WritableReadOnly(view) | Self::Writable(view) => view.as_ref(),
+        }
     }
 }
 
@@ -785,6 +758,80 @@ impl DataPlane {
 
     pub fn arena(&self) -> &Arc<MappedArena> {
         &self.arena
+    }
+
+    async fn namespace_operation(
+        &self,
+        request: NamespaceOperation,
+    ) -> Result<NamespaceOperationResult, DataPlaneError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<Result<NamespaceOperationResult, DataPlaneError>>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        let reply_to = *inbox.addr();
+        self.runtime
+            .send_to(
+                self.child_session,
+                ChildSessionIn::Namespace { request, reply_to },
+            )
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        let mut cancellation = NamespaceOperationCancellation {
+            runtime: self.runtime.clone(),
+            child_session: self.child_session,
+            reply_to,
+            armed: true,
+        };
+        let result = inbox.recv().await;
+        cancellation.armed = false;
+        result
+    }
+
+    pub async fn lookup(
+        &self,
+        path: &DataPath,
+    ) -> Result<crate::namespace::NamespaceNode, DataPlaneError> {
+        match self
+            .namespace_operation(NamespaceOperation::Lookup { path: path.clone() })
+            .await?
+        {
+            NamespaceOperationResult::Node(node) => Ok(node),
+            NamespaceOperationResult::Mutation { .. } => Err(DataPlaneError::SessionFailed(
+                "namespace lookup returned a mutation receipt".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn unlink(&self, path: &DataPath) -> Result<u64, DataPlaneError> {
+        match self
+            .namespace_operation(NamespaceOperation::Unlink { path: path.clone() })
+            .await?
+        {
+            NamespaceOperationResult::Mutation { revision } => Ok(revision),
+            NamespaceOperationResult::Node(_) => Err(DataPlaneError::SessionFailed(
+                "namespace unlink returned a lookup result".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn rename(
+        &self,
+        source: &DataPath,
+        destination: &DataPath,
+        replace: bool,
+    ) -> Result<u64, DataPlaneError> {
+        match self
+            .namespace_operation(NamespaceOperation::Rename {
+                source: source.clone(),
+                destination: destination.clone(),
+                replace,
+            })
+            .await?
+        {
+            NamespaceOperationResult::Mutation { revision } => Ok(revision),
+            NamespaceOperationResult::Node(_) => Err(DataPlaneError::SessionFailed(
+                "namespace rename returned a lookup result".to_owned(),
+            )),
+        }
     }
 
     fn descriptor_from_grant(
@@ -1258,6 +1305,23 @@ impl StreamWriter {
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))
     }
 
+    async fn close_host(&mut self) -> Result<(), DataPlaneError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<ChildStreamIn>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        self.send_control(HostStreamIn::Close {
+            clean: true,
+            reply_to: Some(*inbox.addr()),
+        })?;
+        match inbox.recv().await {
+            ChildStreamIn::Wake(result) => result,
+            ChildStreamIn::Opened(_) => Err(DataPlaneError::StreamFault(
+                "received stream-open result while closing writer".to_owned(),
+            )),
+        }
+    }
+
     async fn send_one(&mut self, kind: RecordKind, bytes: &[u8]) -> Result<(), DataPlaneError> {
         loop {
             match self.endpoint.send_record(kind, bytes) {
@@ -1449,6 +1513,7 @@ impl StreamWriter {
         }
         self.send_one(RecordKind::Eof, &[]).await?;
         self.flush().await?;
+        self.close_host().await?;
         self.closed = true;
         let _ = self.runtime.send_to(
             self.child_session,
@@ -1548,13 +1613,13 @@ impl StreamReader {
             )
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))
     }
-    async fn close_clean(&mut self) -> Result<(), DataPlaneError> {
+    async fn close_host(&mut self, clean: bool) -> Result<(), DataPlaneError> {
         let inbox = self
             .runtime
             .new_inbox::<ChildStreamIn>()
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
         self.send_control(HostStreamIn::Close {
-            clean: true,
+            clean,
             reply_to: Some(*inbox.addr()),
         })?;
         match inbox.recv().await {
@@ -1589,53 +1654,53 @@ impl StreamReader {
             return result;
         }
         loop {
-            if self.pending_record.is_none() {
-                if let Some(cursor) = self.endpoint.record_cursor().map_err(|error| {
+            if self.pending_record.is_none()
+                && let Some(cursor) = self.endpoint.record_cursor().map_err(|error| {
                     DataPlaneError::StreamFault(format!("read stream ring: {error:?}"))
-                })? {
-                    match cursor.kind() {
-                        RecordKind::Data if cursor.is_empty() => {
-                            self.release_record(cursor)?;
-                            continue;
-                        }
-                        RecordKind::Data => {
-                            self.pending_record = Some((cursor, 0));
-                        }
-                        RecordKind::Eof => {
-                            self.release_record(cursor)?;
-                            self.terminal = Some(StreamReadTerminal::Eof);
-                            let close_result = self.close_clean().await;
-                            let _ = self.runtime.send_to(
-                                self.child_session,
-                                ChildSessionIn::OperationDone {
-                                    operation: self.operation,
-                                },
-                            );
-                            close_result?;
-                            return Ok(0);
-                        }
-                        RecordKind::Fault => {
-                            let mut bytes = vec![0_u8; cursor.len()];
-                            let count = self
-                                .endpoint
-                                .copy_record_range(cursor, 0, &mut bytes)
-                                .map_err(|error| {
-                                    DataPlaneError::StreamFault(format!(
-                                        "read stream fault record: {error:?}"
-                                    ))
-                                })?;
-                            bytes.truncate(count);
-                            self.release_record(cursor)?;
-                            let error = DataPlaneError::StreamFault(
-                                String::from_utf8_lossy(&bytes).into_owned(),
-                            );
-                            self.terminal = Some(StreamReadTerminal::Error(error.clone()));
-                            let _ = self.send_control(HostStreamIn::Close {
-                                clean: false,
-                                reply_to: None,
-                            });
-                            return Err(error);
-                        }
+                })?
+            {
+                match cursor.kind() {
+                    RecordKind::Data if cursor.is_empty() => {
+                        self.release_record(cursor)?;
+                        continue;
+                    }
+                    RecordKind::Data => {
+                        self.pending_record = Some((cursor, 0));
+                    }
+                    RecordKind::Eof => {
+                        self.release_record(cursor)?;
+                        self.terminal = Some(StreamReadTerminal::Eof);
+                        let close_result = self.close_host(true).await;
+                        let _ = self.runtime.send_to(
+                            self.child_session,
+                            ChildSessionIn::OperationDone {
+                                operation: self.operation,
+                            },
+                        );
+                        close_result?;
+                        return Ok(0);
+                    }
+                    RecordKind::Fault => {
+                        let mut bytes = vec![0_u8; cursor.len()];
+                        let count = self
+                            .endpoint
+                            .copy_record_range(cursor, 0, &mut bytes)
+                            .map_err(|error| {
+                                DataPlaneError::StreamFault(format!(
+                                    "read stream fault record: {error:?}"
+                                ))
+                            })?;
+                        bytes.truncate(count);
+                        self.release_record(cursor)?;
+                        let error = DataPlaneError::StreamFault(
+                            String::from_utf8_lossy(&bytes).into_owned(),
+                        );
+                        self.terminal = Some(StreamReadTerminal::Error(error.clone()));
+                        let _ = self.send_control(HostStreamIn::Close {
+                            clean: false,
+                            reply_to: None,
+                        });
+                        return Err(error);
                     }
                 }
             }
@@ -1712,7 +1777,7 @@ impl StreamReader {
         if self.terminal.is_some() {
             return Ok(());
         }
-        let result = self.close_clean().await;
+        let result = self.close_host(false).await;
         self.terminal = Some(StreamReadTerminal::Eof);
         let _ = self.runtime.send_to(
             self.child_session,
@@ -2007,13 +2072,14 @@ pub struct ChildDataPlaneSessionActor {
     runtime: Runtime,
     host_session: ActorAddress,
     arena_generation: u64,
-    job_capability: JobCapability,
+    session_capability: SessionCapability,
     child_node: Option<[u8; 32]>,
     session_generation: Option<u64>,
     attach_reply: Option<ActorAddress>,
     operations: HashSet<ActorAddress>,
     open_operations: HashMap<ActorAddress, ActorAddress>,
     state: ChildSessionState,
+    namespace_operations: HashSet<ActorAddress>,
     stream_operations: HashMap<ActorAddress, ActorAddress>,
     pending_blob_releases: usize,
     deferred_blob_opens: VecDeque<ChildSessionIn>,
@@ -2074,7 +2140,7 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 HostSessionIn::Attach {
                     child_session: ctx.self_addr(),
                     arena_generation: self.arena_generation,
-                    job_capability: self.job_capability,
+                    session_capability: self.session_capability,
                     child_node: self.child_node,
                 },
             )
@@ -2110,18 +2176,6 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 if let Some(reply_to) = self.attach_reply.take() {
                     let _ = ctx.send(reply_to, Err::<u64, _>(error));
                 }
-            }
-            ChildSessionIn::AttachmentDeadline if self.state == ChildSessionState::Attaching => {
-                self.state = ChildSessionState::Closed;
-                if let Some(reply_to) = self.attach_reply.take() {
-                    let _ = ctx.send(
-                        reply_to,
-                        Err::<u64, _>(DataPlaneError::SessionFailed(
-                            "data-plane attachment deadline elapsed".to_owned(),
-                        )),
-                    );
-                }
-                ctx.stop_self();
             }
             ChildSessionIn::Open {
                 path,
@@ -2171,6 +2225,47 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                             )),
                         );
                     }
+                }
+            }
+            ChildSessionIn::Namespace { request, reply_to } => {
+                if self.state != ChildSessionState::Running {
+                    let _ = ctx.send(
+                        reply_to,
+                        Err::<NamespaceOperationResult, _>(DataPlaneError::SessionNotRunning),
+                    );
+                    return;
+                }
+                self.namespace_operations.insert(reply_to);
+                if let Err(error) = ctx.send(
+                    self.host_session,
+                    HostSessionIn::Namespace {
+                        operation: reply_to,
+                        request,
+                        child_session: ctx.self_addr(),
+                    },
+                ) {
+                    self.namespace_operations.remove(&reply_to);
+                    let _ = ctx.send(
+                        reply_to,
+                        Err::<NamespaceOperationResult, _>(DataPlaneError::SessionFailed(
+                            error.to_string(),
+                        )),
+                    );
+                }
+            }
+            ChildSessionIn::CancelNamespace { reply_to } => {
+                if self.namespace_operations.remove(&reply_to) {
+                    let _ = ctx.send(
+                        self.host_session,
+                        HostSessionIn::CancelNamespace {
+                            operation: reply_to,
+                        },
+                    );
+                }
+            }
+            ChildSessionIn::NamespaceResolved { reply_to, result } => {
+                if self.namespace_operations.remove(&reply_to) {
+                    let _ = ctx.send(reply_to, result);
                 }
             }
             ChildSessionIn::CancelOpen { reply_to } => {
@@ -2313,7 +2408,19 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 }
                 self.open_operations.clear();
                 self.stream_operations.clear();
-                let _ = ctx.send(self.host_session, HostSessionIn::Close);
+                for reply_to in self.namespace_operations.drain() {
+                    let _ = ctx.send(
+                        self.host_session,
+                        HostSessionIn::CancelNamespace {
+                            operation: reply_to,
+                        },
+                    );
+                    let _ = ctx.send(
+                        reply_to,
+                        Err::<NamespaceOperationResult, _>(DataPlaneError::SessionNotRunning),
+                    );
+                }
+                let _ = ctx.send(self.host_session, HostSessionIn::Revoke);
                 self.state = ChildSessionState::Closed;
             }
             _ => {}

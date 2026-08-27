@@ -16,9 +16,9 @@ use crate::path::DataPath;
 use crate::stream_transport::{StreamPeerDescriptor, StreamTransportEvent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobCapability([u8; 32]);
+pub struct SessionCapability([u8; 32]);
 
-impl JobCapability {
+impl SessionCapability {
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -362,12 +362,33 @@ impl From<BlobError> for DataPlaneError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NamespaceOperation {
+    Lookup {
+        path: DataPath,
+    },
+    Unlink {
+        path: DataPath,
+    },
+    Rename {
+        source: DataPath,
+        destination: DataPath,
+        replace: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NamespaceOperationResult {
+    Node(NamespaceNode),
+    Mutation { revision: u64 },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HostSessionIn {
     Attach {
         child_session: ActorAddress,
         arena_generation: u64,
-        job_capability: JobCapability,
+        session_capability: SessionCapability,
         child_node: Option<[u8; 32]>,
     },
     Open {
@@ -386,6 +407,19 @@ pub enum HostSessionIn {
         path: DataPath,
         reservation: OperationId,
         result: Result<(), NamespaceError>,
+    },
+    Namespace {
+        operation: ActorAddress,
+        request: NamespaceOperation,
+        child_session: ActorAddress,
+    },
+    NamespaceResolved {
+        operation: ActorAddress,
+        child_session: ActorAddress,
+        result: Result<NamespaceOperationResult, DataPlaneError>,
+    },
+    CancelNamespace {
+        operation: ActorAddress,
     },
     CancelOpen {
         operation: ActorAddress,
@@ -422,11 +456,14 @@ pub enum HostSessionIn {
     BindingDetached {
         binding: ActorAddress,
     },
-    ConfigureRun {
-        run_id: String,
+    ConfigureExecution {
+        execution_id: String,
         reply_to: ActorAddress,
     },
-    Close,
+    Revoke,
+    Close {
+        reply_to: Option<ActorAddress>,
+    },
 }
 
 impl NetworkMessage for HostSessionIn {
@@ -443,12 +480,22 @@ pub enum ChildSessionIn {
     AttachmentFailed {
         error: DataPlaneError,
     },
-    AttachmentDeadline,
     Open {
         path: DataPath,
         options: OpenOptions,
         policy: OpenPolicy,
         reply_to: ActorAddress,
+    },
+    Namespace {
+        request: NamespaceOperation,
+        reply_to: ActorAddress,
+    },
+    CancelNamespace {
+        reply_to: ActorAddress,
+    },
+    NamespaceResolved {
+        reply_to: ActorAddress,
+        result: Result<NamespaceOperationResult, DataPlaneError>,
     },
     CancelOpen {
         reply_to: ActorAddress,
@@ -523,6 +570,12 @@ pub enum HostStreamIn {
         incarnation: StreamIncarnation,
         descriptor: StreamPeerDescriptor,
     },
+    PeerOfferAck {
+        incarnation: StreamIncarnation,
+    },
+    PeerOfferRetry {
+        incarnation: StreamIncarnation,
+    },
     Transport(StreamTransportEvent),
     DataAvailable,
     CapacityAvailable,
@@ -542,6 +595,9 @@ pub enum HostStreamIn {
         reply_to: Option<ActorAddress>,
     },
     PeerTerminationAck {
+        incarnation: StreamIncarnation,
+    },
+    PeerTerminationRetry {
         incarnation: StreamIncarnation,
     },
     ReleaseComplete(Result<(), DataPlaneError>),

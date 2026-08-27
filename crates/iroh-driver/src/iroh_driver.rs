@@ -12,7 +12,8 @@
 //! [`IrohDriver::with_engine`].
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 use swactor_engine::{Capabilities, EngineHandle};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use distribution::crypto::{Keypair, KeypairExt};
 use distribution::messages::*;
@@ -63,6 +65,7 @@ pub struct IrohDriverConfig {
     /// Additional ALPNs to register beyond SWIM. Opaque to the driver.
     pub additional_alpns: Vec<Vec<u8>>,
 }
+const PENDING_ACTOR_FRAME_LIMIT: usize = 1_024;
 
 // ─── Pending join result ────────────────────────────────────────────────────
 
@@ -76,6 +79,12 @@ struct JoinResult {
 struct CachedConnection {
     generation: u64,
     conn: Connection,
+    /// Feeds this connection's ordered frame writer. One uni stream carries
+    /// every frame to the peer so arrival order matches send order; a fresh
+    /// uni stream per frame let independent streams overtake each other and
+    /// inverted per-sender message order (e.g. process output observed before
+    /// the context-ready event that precedes it).
+    writer: tokio_mpsc::UnboundedSender<OutFrame>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,13 +253,14 @@ impl TelemetryPublishHandle {
 
 /// Mutable connection state consolidated under a single lock: the cached
 /// connections, the generation counter for generation-aware eviction, and
-/// the per-peer relay URLs learned from join seeds. Held inside an
+/// the per-peer relay and direct addresses learned from join seeds. Held inside an
 /// `Arc<Mutex<ConnCache>>` shared between the driver and the engine-hosted
 /// adapter pump so both can progress connections without `&mut self`.
 struct ConnCache {
     connections: HashMap<NodeId, CachedConnection>,
     next_generation: u64,
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
+    peer_direct_addrs: HashMap<NodeId, Vec<SocketAddr>>,
 }
 
 /// Cloneable capability for opening application-owned data-plane edge streams
@@ -545,6 +555,7 @@ impl IrohDriver {
                 connections: HashMap::new(),
                 next_generation: 1,
                 peer_relay_urls: HashMap::new(),
+                peer_direct_addrs: HashMap::new(),
             })),
             peer_auth: config.peer_auth,
             pending_joins: Arc::new(Mutex::new(Vec::new())),
@@ -856,45 +867,95 @@ impl IrohDriver {
     /// Results are collected in the next `recv()` call.
     pub fn join(&self, seeds: &[EndpointAddr]) {
         for seed_addr in seeds {
-            // Store relay URL for future reconnection, and discard any cached
-            // control connection iroh already reports closed before re-issuing
-            // the semantic join request.
-            let seed_node_id = NodeId(*seed_addr.id.as_bytes());
-            {
-                let mut cache = self.conns.lock();
-                if let Some(relay) = seed_addr.relay_urls().next() {
-                    cache.peer_relay_urls.insert(seed_node_id, relay.clone());
-                }
-                if cache
-                    .connections
-                    .get(&seed_node_id)
-                    .is_some_and(|cached| cached.conn.close_reason().is_some())
-                {
-                    cache.connections.remove(&seed_node_id);
-                }
-            }
-            // Enrich the seed addr with a cached relay URL if it doesn't have
-            // one. The re-peer flow sends only a bare public key because
-            // metadata (including relay URL) is stripped when a node is
-            // declared dead. Without a relay URL iroh cannot reach the peer
-            // through NAT.
-            let enriched = if seed_addr.relay_urls().next().is_none() {
-                let cached_relay = self
-                    .conns
-                    .lock()
-                    .peer_relay_urls
-                    .get(&seed_node_id)
-                    .cloned();
-                if let Some(relay) = cached_relay.or_else(|| self.home_relay_url()) {
-                    seed_addr.clone().with_relay_url(relay)
-                } else {
-                    seed_addr.clone()
-                }
-            } else {
-                seed_addr.clone()
-            };
+            let enriched = self.cache_peer_address(seed_addr);
             self.spawn_join_request(enriched);
         }
+    }
+
+    /// Establish a connection to `peer` without joining its SWIM membership.
+    ///
+    /// Contextual child processes need only a routable transport to their
+    /// host worker: replies ride the same bidirectional connection back.
+    /// Sending a `JoinRequest` instead would admit the child as a cluster
+    /// member; because membership gossips cluster-wide, every short-lived
+    /// child then pollutes each node's alive set, and the extra dying
+    /// members consume directory-claim dissemination budget until fresh
+    /// claims can miss the peers that need them.
+    pub fn connect_peer(&self, peer: EndpointAddr) {
+        let node_id = NodeId(*peer.id.as_bytes());
+        let addr = self.cache_peer_address(&peer);
+        let endpoint = self.endpoint.clone();
+        let pending = Arc::clone(&self.pending_joins);
+        let engine = self.engine.clone();
+        self.engine.spawn(async move {
+            let mut delay = Duration::from_secs(2);
+            let max_delay = Duration::from_secs(30);
+            for attempt in 1..=5_u32 {
+                if attempt > 1 {
+                    engine.timer(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                }
+                if let Ok(Ok(conn)) = engine
+                    .timeout(
+                        Duration::from_secs(10),
+                        endpoint.connect(addr.clone(), ALPN),
+                    )
+                    .await
+                {
+                    pending.lock().push(JoinResult { node_id, conn });
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Fold a peer's advertised direct addresses and relay URL into the
+    /// connection cache so later redials keep the complete address, and
+    /// return the enriched dial address.
+    fn cache_peer_address(&self, seed_addr: &EndpointAddr) -> EndpointAddr {
+        // Retain every advertised direct address and relay URL. Re-peer
+        // commands may contain only the public key; reconnecting after a
+        // cached connection fails must still have a dialable address.
+        let seed_node_id = NodeId(*seed_addr.id.as_bytes());
+        let advertised_direct = seed_addr.ip_addrs().copied().collect::<Vec<_>>();
+        let (cached_direct, cached_relay) = {
+            let mut cache = self.conns.lock();
+            if !advertised_direct.is_empty() {
+                cache
+                    .peer_direct_addrs
+                    .insert(seed_node_id, advertised_direct.clone());
+            }
+            if let Some(relay) = seed_addr.relay_urls().next() {
+                cache.peer_relay_urls.insert(seed_node_id, relay.clone());
+            }
+            if cache
+                .connections
+                .get(&seed_node_id)
+                .is_some_and(|cached| cached.conn.close_reason().is_some())
+            {
+                cache.connections.remove(&seed_node_id);
+            }
+            (
+                cache
+                    .peer_direct_addrs
+                    .get(&seed_node_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                cache.peer_relay_urls.get(&seed_node_id).cloned(),
+            )
+        };
+        let mut enriched = seed_addr.clone();
+        if advertised_direct.is_empty() {
+            for address in cached_direct {
+                enriched = enriched.with_ip_addr(address);
+            }
+        }
+        if seed_addr.relay_urls().next().is_none()
+            && let Some(relay) = cached_relay.or_else(|| self.home_relay_url())
+        {
+            enriched = enriched.with_relay_url(relay);
+        }
+        enriched
     }
 
     fn spawn_join_request(&self, seed_addr: EndpointAddr) {
@@ -972,18 +1033,13 @@ impl IrohDriver {
 
                         let send_result: Result<(), String> = async {
                             let mut send = conn.open_uni().await.map_err(|e| e.to_string())?;
-                            // Frame format must match `read_message`: the 32-byte
-                            // dest precedes the tag. A JoinRequest is gossip to the
-                            // seed, so its dest is the seed's peer-mailbox (the
-                            // receiver routes it by tag).
+                            // A JoinRequest is gossip to the seed, so its dest
+                            // is the seed's peer-mailbox (the receiver routes
+                            // it by tag).
                             let dest = peer_addr(seed_node_id);
-                            let tag_len = (tag.len() as u32).to_be_bytes();
-                            send.write_all(&dest.0).await.map_err(|e| e.to_string())?;
-                            send.write_all(&tag_len).await.map_err(|e| e.to_string())?;
-                            send.write_all(tag.as_bytes())
+                            write_message(&mut send, dest, tag.as_bytes(), &payload)
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            send.write_all(&payload).await.map_err(|e| e.to_string())?;
                             send.finish().map_err(|e| e.to_string())?;
                             Ok(())
                         }
@@ -1061,9 +1117,10 @@ impl IrohDriver {
         let engine = self.engine.clone();
         let conns = Arc::clone(&self.conns);
         let pending_joins = Arc::clone(&self.pending_joins);
+        let evict = Arc::clone(&self.evict);
+        let bridge = self.actor_bridge.clone();
         self.engine.spawn(async move {
             let dest = peer_addr(peer);
-            let tag_len = (tag.len() as u32).to_be_bytes();
             let mut delay = Duration::from_millis(250);
             let max_delay = Duration::from_secs(2);
             for _ in 0..4 {
@@ -1090,11 +1147,21 @@ impl IrohDriver {
                     let mut cache = conns.lock();
                     let generation = cache.next_generation;
                     cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
+                    let conn = result.conn.clone();
+                    let writer = spawn_ordered_frame_writer(
+                        &engine,
+                        &evict,
+                        bridge.as_ref(),
+                        peer,
+                        generation,
+                        conn.clone(),
+                    );
                     cache.connections.insert(
                         peer,
                         CachedConnection {
                             generation,
-                            conn: result.conn.clone(),
+                            conn,
+                            writer,
                         },
                     );
                     Some(result.conn)
@@ -1116,11 +1183,20 @@ impl IrohDriver {
                                 let generation = cache.next_generation;
                                 cache.next_generation =
                                     cache.next_generation.wrapping_add(1).max(1);
+                                let writer = spawn_ordered_frame_writer(
+                                    &engine,
+                                    &evict,
+                                    bridge.as_ref(),
+                                    peer,
+                                    generation,
+                                    conn.clone(),
+                                );
                                 cache.connections.insert(
                                     peer,
                                     CachedConnection {
                                         generation,
                                         conn: conn.clone(),
+                                        writer,
                                     },
                                 );
                                 conn
@@ -1135,10 +1211,11 @@ impl IrohDriver {
                 };
                 let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
                     let mut send = conn.open_uni().await?;
-                    send.write_all(&dest.0).await?;
-                    send.write_all(&tag_len).await?;
-                    send.write_all(&tag).await?;
-                    send.write_all(&payload).await?;
+                    write_message(&mut send, dest, &tag, &payload)
+                        .await
+                        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                            error.to_string().into()
+                        })?;
                     send.finish()?;
                     Ok(())
                 }
@@ -1239,6 +1316,7 @@ impl IrohDriver {
             engine: self.engine.clone(),
             endpoint: self.endpoint.clone(),
             conns: Arc::clone(&self.conns),
+            self_node: self.node_id(),
             incoming: Arc::clone(&self.incoming),
             evict: Arc::clone(&self.evict),
             pending_joins: Arc::clone(&self.pending_joins),
@@ -1252,6 +1330,7 @@ impl IrohDriver {
             peer_auth: self.peer_auth.clone(),
             relay_url: self.relay_url.clone(),
             bridge: Arc::clone(self.actor_bridge.as_ref().expect("bridge installed")),
+            pending_outbound: Arc::new(Mutex::new(VecDeque::new())),
         };
         let engine = self.engine.clone();
         engine.clone().spawn(async move {
@@ -1279,6 +1358,7 @@ struct AdapterPump {
     engine: EngineHandle,
     endpoint: Endpoint,
     conns: Arc<Mutex<ConnCache>>,
+    self_node: NodeId,
     incoming: IncomingActorFrames,
     evict: Arc<Mutex<Vec<FailedConnection>>>,
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
@@ -1292,6 +1372,7 @@ struct AdapterPump {
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     relay_url: Option<iroh::RelayUrl>,
     bridge: Arc<ActorBridge>,
+    pending_outbound: Arc<Mutex<VecDeque<OutFrame>>>,
 }
 
 impl AdapterPump {
@@ -1335,17 +1416,69 @@ impl AdapterPump {
         }
     }
 
-    /// Cache a connection and start reading from it.
+    /// Cache a connection, spawn its ordered frame writer, and start reading
+    /// from it.
+    ///
+    /// When an inbound accept races our outbound dial, two physical
+    /// connections to the same peer exist and both peers must agree on which
+    /// one survives, or each side closes the other's connection and the pair
+    /// is left with nothing. The rule is symmetric and locally computable:
+    /// keep the connection initiated by the lesser node id, close the other.
     fn cache_connection(&self, node_id: NodeId, conn: Connection) {
         let generation = {
             let mut cache = self.conns.lock();
+            if let Some(existing) = cache.connections.get(&node_id) {
+                if existing.conn.stable_id() == conn.stable_id() {
+                    return;
+                }
+                let Ok(peer) = PublicKey::from_bytes(&node_id.0) else {
+                    conn.close(
+                        iroh::endpoint::VarInt::from_u32(0),
+                        b"duplicate connection for node",
+                    );
+                    return;
+                };
+                let Ok(self_id) = PublicKey::from_bytes(&self.self_node.0) else {
+                    conn.close(
+                        iroh::endpoint::VarInt::from_u32(0),
+                        b"duplicate connection for node",
+                    );
+                    return;
+                };
+                if connection_is_preferred(&conn, &self_id, &peer) {
+                    // The newcomer wins: close the superseded connection (its
+                    // writer fails and reports an old generation, which the
+                    // evict path ignores) and re-insert at a new generation.
+                    if let Some(superseded) = cache.connections.remove(&node_id) {
+                        superseded.conn.close(
+                            iroh::endpoint::VarInt::from_u32(0),
+                            b"superseded by preferred connection",
+                        );
+                    }
+                } else {
+                    conn.close(
+                        iroh::endpoint::VarInt::from_u32(0),
+                        b"duplicate connection for node",
+                    );
+                    return;
+                }
+            }
             let generation = cache.next_generation;
             cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
+            let writer = spawn_ordered_frame_writer(
+                &self.engine,
+                &self.evict,
+                Some(&self.bridge),
+                node_id,
+                generation,
+                conn.clone(),
+            );
             cache.connections.insert(
                 node_id,
                 CachedConnection {
                     generation,
                     conn: conn.clone(),
+                    writer,
                 },
             );
             generation
@@ -1368,12 +1501,19 @@ impl AdapterPump {
         self.fold_connections();
         let messages: Vec<(ActorAddress, String, Vec<u8>, NodeId)> =
             self.incoming.lock().drain(..).collect();
-        for (dest, tag, payload, _from) in messages {
+        for (dest, tag, payload, from) in messages {
             let Ok(boxed) = self.bridge.codec.decode(&tag, &payload) else {
                 continue;
             };
             if dest == self.bridge.self_peer_addr {
                 // Gossip: route by tag to the protocol actor that owns it.
+                // Direct SWIM frames carry their sender in plaintext; a
+                // forged `from` would admit arbitrary identities into
+                // membership (and thereby route dissemination), so the
+                // claim must match the connection's verified peer.
+                if is_swim_tag(&tag) && !swim_sender_is_verified(&boxed, from) {
+                    continue;
+                }
                 if let Some(&addr) = self.bridge.routes.get(&tag) {
                     let _ = self.bridge.rt.deliver_raw(addr, boxed);
                 }
@@ -1384,65 +1524,42 @@ impl AdapterPump {
         }
     }
 
-    /// Drain the actors' outbound queue and submit each current frame to iroh
-    /// exactly once. A connection cache miss starts or continues a background
-    /// dial and drops that frame best-effort; stream writes remain
-    /// fire-and-forget on the tokio pool, so this never blocks.
+    /// Drain actor frames onto the wire. Frames that encounter a connection
+    /// cache miss remain bounded in memory until the background dial completes;
+    /// this prevents one-shot lifecycle messages from disappearing during
+    /// ordinary connection replacement.
     fn drain_outbox(&self) {
-        let frames: Vec<OutFrame> = self.bridge.outbox.lock().unwrap().drain(..).collect();
+        let mut frames = {
+            let mut pending = self.pending_outbound.lock();
+            std::mem::take(&mut *pending)
+        };
+        frames.extend(self.bridge.outbox.lock().unwrap().drain(..));
+        let mut retry = VecDeque::new();
         for frame in frames {
-            self.send_wire(frame);
+            if let Some(frame) = self.send_wire(frame)
+                && retry.len() < PENDING_ACTOR_FRAME_LIMIT
+            {
+                retry.push_back(frame);
+            }
         }
+        *self.pending_outbound.lock() = retry;
     }
-
-    /// Write an already-encoded frame over iroh, fire-and-forget. A connection
-    /// cache miss starts or continues a background dial and drops the current
-    /// frame best-effort. A stream-write failure evicts the failed connection,
-    /// drops the current frame, and, for SWIM frames only, delivers
-    /// `SendFailed { to }` to the SwimActor (§4.3).
-    fn send_wire(&self, frame: OutFrame) {
+    /// Enqueue an already-encoded frame onto the peer's ordered writer. A
+    /// connection cache miss starts or continues a background dial and
+    /// returns the frame for a later bounded retry. Once queued, the frame is
+    /// consumed exactly once; the writer reports write failures through
+    /// eviction (and SWIM notification for probe frames).
+    fn send_wire(&self, frame: OutFrame) -> Option<OutFrame> {
         let target_key = match PublicKey::from_bytes(&frame.to.0) {
-            Ok(k) => k,
-            Err(_) => return,
+            Ok(key) => key,
+            Err(_) => return None,
         };
         let cached = match self.get_or_connect(frame.to, target_key) {
             Ok(cached) => cached,
-            Err(_) => return,
+            Err(_) => return Some(frame),
         };
-        let generation = cached.generation;
-        let conn = cached.conn;
-        let OutFrame {
-            to,
-            dest,
-            type_tag,
-            payload,
-        } = frame;
-        let evict = Arc::clone(&self.evict);
-        // Only SWIM frames feed failure detection via SendFailed; gossip is
-        // best-effort and just drops.
-        let send_failed = if is_swim_tag(&type_tag) {
-            Some((self.bridge.rt.clone(), self.bridge.swim_addr))
-        } else {
-            None
-        };
-        self.engine.spawn(async move {
-            let result: Result<(), Box<dyn std::error::Error>> = async {
-                let mut send = conn.open_uni().await?;
-                write_message(&mut send, dest, type_tag.as_bytes(), &payload).await?;
-                send.finish()?;
-                Ok(())
-            }
-            .await;
-            if result.is_err() {
-                evict.lock().push(FailedConnection {
-                    node_id: to,
-                    generation,
-                });
-                if let Some((rt, swim_addr)) = send_failed {
-                    let _ = rt.deliver_raw(swim_addr, Box::new(SwimIn::SendFailed { to }));
-                }
-            }
-        });
+        let _ = cached.writer.send(frame);
+        None
     }
 
     /// Return an open cached connection. On a cache miss or closed entry, start
@@ -1474,34 +1591,37 @@ impl AdapterPump {
             }
         }
 
-        // Resolve relay URL: explicit cache → MetadataActor mirror → own home
-        // relay.
-        let relay = {
-            let cached_relay = self.conns.lock().peer_relay_urls.get(&node_id).cloned();
-            if let Some(r) = cached_relay {
-                Some(r)
-            } else if let Some(r) = self
-                .bridge
-                .relay_mirror
-                .read()
-                .ok()
-                .and_then(|view| view.get(&node_id).cloned())
-                .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
-            {
-                Some(r)
-            } else {
-                self.home_relay_url()
-            }
+        // Reconnect with the complete last advertised peer address. A bare
+        // public key cannot redial direct-only mock/LAN peers after the initial
+        // accepted connection closes.
+        let (direct_addrs, relay) = {
+            let cache = self.conns.lock();
+            (
+                cache
+                    .peer_direct_addrs
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                cache.peer_relay_urls.get(&node_id).cloned(),
+            )
         };
-
-        // Hand the dial to a background task instead of blocking the SWIM
-        // pump. The connection lands in `pending_joins` and is folded into the
-        // cache by the next pump cycle; this send is dropped best-effort and
-        // SWIM re-sends over the cached connection on a later tick.
-        let dial_addr = match &relay {
-            Some(r) => EndpointAddr::new(key).with_relay_url(r.clone()),
-            None => EndpointAddr::new(key),
-        };
+        let mut dial_addr = EndpointAddr::new(key);
+        for address in direct_addrs {
+            dial_addr = dial_addr.with_ip_addr(address);
+        }
+        if let Some(relay) = relay
+            .or_else(|| {
+                self.bridge
+                    .relay_mirror
+                    .read()
+                    .ok()
+                    .and_then(|view| view.get(&node_id).cloned())
+                    .and_then(|url| url.parse::<iroh::RelayUrl>().ok())
+            })
+            .or_else(|| self.home_relay_url())
+        {
+            dial_addr = dial_addr.with_relay_url(relay);
+        }
         self.spawn_connect(node_id, dial_addr);
         Err("connection not ready; background dial started".into())
     }
@@ -1554,12 +1674,11 @@ impl AdapterPump {
         self.engine.spawn(async move {
             loop {
                 match conn.accept_uni().await {
-                    Ok(mut recv) => match read_message(&mut recv).await {
-                        Ok((dest, tag, payload)) => {
+                    Ok(mut recv) => {
+                        while let Ok((dest, tag, payload)) = read_message(&mut recv).await {
                             incoming.lock().push((dest, tag, payload, node_id));
                         }
-                        Err(_) => continue,
-                    },
+                    }
                     Err(_) => {
                         evict.lock().push(FailedConnection {
                             node_id,
@@ -1668,6 +1787,62 @@ impl AdapterPump {
     }
 }
 
+/// Spawn the per-connection task that writes every queued frame onto ONE uni
+/// stream, in arrival order. A fresh uni stream per frame let independent
+/// QUIC streams overtake each other, inverting per-sender message order
+/// across nodes (e.g. process output observed before the context-ready event
+/// that precedes it). A write failure evicts the connection generation
+/// (kicking a redial) and notifies SWIM when the failed frame was a probe;
+/// queued-but-unwritten frames are dropped, preserving the fire-and-forget
+/// at-most-once contract.
+fn spawn_ordered_frame_writer(
+    engine: &EngineHandle,
+    evict: &Arc<Mutex<Vec<FailedConnection>>>,
+    bridge: Option<&Arc<ActorBridge>>,
+    node_id: NodeId,
+    generation: u64,
+    conn: Connection,
+) -> tokio_mpsc::UnboundedSender<OutFrame> {
+    let (queue_tx, mut queue) = tokio_mpsc::unbounded_channel::<OutFrame>();
+    let evict = Arc::clone(evict);
+    let swim = bridge.map(|bridge| (bridge.rt.clone(), bridge.swim_addr));
+    engine.spawn(async move {
+        let mut stream: Option<iroh::endpoint::SendStream> = None;
+        while let Some(frame) = queue.recv().await {
+            let OutFrame {
+                to,
+                dest,
+                type_tag,
+                payload,
+            } = frame;
+            let result: Result<(), Box<dyn std::error::Error>> = async {
+                let send = match stream.as_mut() {
+                    Some(send) => send,
+                    None => {
+                        stream = Some(conn.open_uni().await?);
+                        stream.as_mut().expect("stream just assigned")
+                    }
+                };
+                write_message(send, dest, type_tag.as_bytes(), &payload).await?;
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                if is_swim_tag(&type_tag)
+                    && let Some((runtime, swim_addr)) = &swim
+                {
+                    let _ = runtime.deliver_raw(*swim_addr, Box::new(SwimIn::SendFailed { to }));
+                }
+                evict.lock().push(FailedConnection {
+                    node_id,
+                    generation,
+                });
+                return;
+            }
+        }
+    });
+    queue_tx
+}
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Whether a wire `type_tag` is a SWIM message — the frames whose write failure
@@ -1684,13 +1859,47 @@ fn is_swim_tag(tag: &str) -> bool {
     )
 }
 
+/// Symmetric duplicate-connection rule: among two racing connections between
+/// the same pair of nodes, both peers keep the one initiated by the lesser
+/// node id and close the other, so exactly one connection (and one ordered
+/// writer/reader pair) survives on both sides.
+fn connection_is_preferred(conn: &Connection, self_id: &PublicKey, peer: &PublicKey) -> bool {
+    let initiator = if matches!(conn.side(), iroh::endpoint::Side::Client) {
+        self_id
+    } else {
+        peer
+    };
+    initiator == self_id.min(peer)
+}
+
+/// Whether a decoded SWIM frame's claimed sender matches the peer that
+/// actually delivered it. Ping, Ack, PingReq, and JoinRequest are direct
+/// protocols: they travel only on the sender's own connection, so a
+/// mismatching `from` is a forged identity trying to enter membership.
+/// Indirectly delivered frames (IndirectAck, JoinResponse) carry no such
+/// claim and always pass.
+fn swim_sender_is_verified(message: &Box<dyn Any + Send>, carrier: NodeId) -> bool {
+    let Some(swim) = message.downcast_ref::<SwimIn>() else {
+        return true;
+    };
+    match swim {
+        SwimIn::Ping(ping) => ping.from == carrier,
+        SwimIn::Ack(ack) => ack.from == carrier,
+        SwimIn::PingReq(request) => request.from == carrier,
+        SwimIn::JoinRequest(join) => join.from == carrier,
+        _ => true,
+    }
+}
+
 // ─── Wire Framing Over QUIC Streams ─────────────────────────────────────────
 
 /// Write a tagged message to a QUIC send stream.
 ///
-/// Frame format: `[32B dest][4B tag_len][tag_bytes][payload_bytes]`. `dest` is the
-/// destination actor address (`DIRECTORY.md` §5): the peer's mailbox for gossip,
-/// or a specific actor for a directory-routed application message.
+/// Frame format: `[32B dest][4B tag_len][tag_bytes][4B payload_len][payload_bytes]`.
+/// `dest` is the destination actor address (`DIRECTORY.md` §5): the peer's
+/// mailbox for gossip, or a specific actor for a directory-routed application
+/// message. The explicit payload length lets one uni stream carry many
+/// messages back-to-back, which is what preserves per-peer send order.
 async fn write_message(
     send: &mut iroh::endpoint::SendStream,
     dest: ActorAddress,
@@ -1698,16 +1907,20 @@ async fn write_message(
     payload: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tag_len = (tag.len() as u32).to_be_bytes();
+    let payload_len = (payload.len() as u32).to_be_bytes();
     send.write_all(&dest.0).await?;
     send.write_all(&tag_len).await?;
     send.write_all(tag).await?;
+    send.write_all(&payload_len).await?;
     send.write_all(payload).await?;
     Ok(())
 }
 
-/// Read a tagged message from a QUIC recv stream.
+/// Read one tagged message from a QUIC recv stream.
 ///
-/// Returns `(dest, type_tag, payload)` (see [`write_message`] for the frame format).
+/// Returns `(dest, type_tag, payload)` (see [`write_message`] for the frame
+/// format). Reading exactly one length-bounded message per call lets the
+/// connection reader loop over many messages on one stream.
 async fn read_message(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<(ActorAddress, String, Vec<u8>), Box<dyn std::error::Error>> {
@@ -1727,7 +1940,15 @@ async fn read_message(
     recv.read_exact(&mut tag_buf).await?;
     let tag = String::from_utf8(tag_buf)?;
 
-    let payload = recv.read_to_end(64 * 1024).await?;
+    let mut payload_len_buf = [0u8; 4];
+    recv.read_exact(&mut payload_len_buf).await?;
+    let payload_len = u32::from_be_bytes(payload_len_buf) as usize;
+    if payload_len > 4 * 1024 * 1024 {
+        return Err("payload too large".into());
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    recv.read_exact(&mut payload).await?;
 
     Ok((dest, tag, payload))
 }

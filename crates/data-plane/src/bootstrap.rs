@@ -16,17 +16,13 @@
 //! | 32     | 8    | private control length or zero|
 //! | 40     | 24   | reserved (zero)               |
 
+pub mod channel;
 use std::fmt;
 
 /// `"SWBS"` read little-endian.
 pub const BOOTSTRAP_MAGIC: u32 = u32::from_le_bytes(*b"SWBS");
 /// The only version this crate understands.
 pub const BOOTSTRAP_VERSION: u16 = 2;
-
-pub const ENV_ARENA_FD: &str = "SWACTOR_ARENA_FD";
-pub const ENV_DATA_PLANE_ACTOR: &str = "SWACTOR_DATA_PLANE_ACTOR";
-pub const ENV_JOB_CAPABILITY: &str = "SWACTOR_JOB_CAPABILITY";
-pub const ENV_DATA_PLANE_ENDPOINT: &str = "SWACTOR_DATA_PLANE_ENDPOINT";
 
 /// Fixed byte length of the v2 bootstrap header.
 pub const HEADER_LEN: usize = 64;
@@ -236,8 +232,7 @@ pub fn parse_bootstrap(page: &[u8], backing_len: u64) -> Result<ResolvedBootstra
 
 #[cfg(target_os = "linux")]
 mod write {
-    use std::collections::BTreeMap;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     use crate::arena::{
         ArenaEvent, ArenaManager, ArenaRequest, LeaseRequestId, LeaseRing, RingLease,
@@ -251,10 +246,8 @@ mod write {
         pub arena_generation: u64,
         pub alignment: u64,
     }
-
     #[derive(Debug)]
-    pub struct JobHandoff {
-        pub env: BTreeMap<String, String>,
+    pub struct PreparedArena {
         pub arena_fd: OwnedFd,
         pub arena_generation: u64,
     }
@@ -292,10 +285,10 @@ mod write {
 
     impl std::error::Error for BootstrapWriteError {}
 
-    pub fn write_bootstrap(
+    pub fn prepare_arena(
         arena: &mut ArenaManager,
         spec: BootstrapSpec,
-    ) -> Result<JobHandoff, BootstrapWriteError> {
+    ) -> Result<PreparedArena, BootstrapWriteError> {
         if spec.arena_generation == 0 || spec.alignment == 0 {
             return Err(BootstrapWriteError::InvalidSpec);
         }
@@ -313,14 +306,8 @@ mod write {
             .write_arena(header_lease.layout.start_offset, &header.encode())
             .map_err(BootstrapWriteError::Io)?;
 
-        let arena_fd = dup_without_cloexec(arena.arena_fd())?;
-        let env = BTreeMap::from([(
-            super::ENV_ARENA_FD.to_owned(),
-            arena_fd.as_raw_fd().to_string(),
-        )]);
-
-        Ok(JobHandoff {
-            env,
+        let arena_fd = dup_cloexec(arena.arena_fd())?;
+        Ok(PreparedArena {
             arena_fd,
             arena_generation: spec.arena_generation,
         })
@@ -351,9 +338,9 @@ mod write {
         }
     }
 
-    fn dup_without_cloexec(fd: std::os::fd::RawFd) -> Result<OwnedFd, BootstrapWriteError> {
-        // SAFETY: dup returns a fresh descriptor with FD_CLOEXEC cleared or -1.
-        let duplicated = unsafe { libc::dup(fd) };
+    fn dup_cloexec(fd: std::os::fd::RawFd) -> Result<OwnedFd, BootstrapWriteError> {
+        // SAFETY: F_DUPFD_CLOEXEC returns a fresh close-on-exec descriptor or -1.
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         if duplicated < 0 {
             return Err(BootstrapWriteError::FdSetup(std::io::Error::last_os_error()));
         }
@@ -363,4 +350,4 @@ mod write {
 }
 
 #[cfg(target_os = "linux")]
-pub use write::{BootstrapSpec, BootstrapWriteError, JobHandoff, write_bootstrap};
+pub use write::{BootstrapSpec, BootstrapWriteError, PreparedArena, prepare_arena};

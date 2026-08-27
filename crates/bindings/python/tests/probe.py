@@ -14,13 +14,12 @@ async def main(ctx: swactor.Context) -> None:
     with blob.map() as mapped:
         values = struct.unpack_from("<6f", mapped)
 
-    arena_fd = int(os.environ["SWACTOR_ARENA_FD"])
     try:
-        arena_target = os.readlink(f"/proc/self/fd/{arena_fd}")
+        os.fstat(198)
     except OSError:
-        arena_open = 0
+        bootstrap_open = 0
     else:
-        arena_open = int("data-plane-arena" in arena_target)
+        bootstrap_open = 1
 
     public = {name for name in dir(ctx.data) if not name.startswith("_")}
     leaked = public & {
@@ -33,11 +32,21 @@ async def main(ctx: swactor.Context) -> None:
         "ring",
         "socket",
     }
+    leaked_environment = {
+        name
+        for name in (
+            "SWACTOR_ARENA_FD",
+            "SWACTOR_DATA_PLANE_ACTOR",
+            "SWACTOR_JOB_CAPABILITY",
+            "SWACTOR_DATA_PLANE_ENDPOINT",
+        )
+        if name in os.environ
+    }
     rendered = ",".join(f"{value:g}" for value in values)
     print(
         f"HAS_DATA={int(isinstance(ctx.data, swactor.DataPlane))} "
-        f"LENGTH={blob.length} VALUES={rendered} ARENA_OPEN={arena_open} "
-        f"IDENTITY_LEAKS={len(leaked)}"
+        f"LENGTH={blob.length} VALUES={rendered} BOOTSTRAP_OPEN={bootstrap_open} "
+        f"IDENTITY_LEAKS={len(leaked) + len(leaked_environment)}"
     )
 
 

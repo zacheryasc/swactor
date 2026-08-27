@@ -19,6 +19,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use parking_lot::Mutex as ParkingMutex;
+
 use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor_transport::{Transport, TransportRouter, WireEnvelope};
@@ -101,7 +103,7 @@ impl Transport for OutboxPeerTransport {
 pub struct OutboxPeerDirectory {
     router: Arc<TransportRouter>,
     outbox: Outbox,
-    bound: Mutex<HashSet<NodeId>>,
+    bound: ParkingMutex<HashSet<NodeId>>,
 }
 
 impl OutboxPeerDirectory {
@@ -109,7 +111,7 @@ impl OutboxPeerDirectory {
         Self {
             router,
             outbox,
-            bound: Mutex::new(HashSet::new()),
+            bound: ParkingMutex::new(HashSet::new()),
         }
     }
 }
@@ -118,7 +120,7 @@ impl PeerDirectory for OutboxPeerDirectory {
     fn resolve(&self, node: &NodeId) -> Option<ActorAddress> {
         let addr = peer_addr(*node);
         // Register the egress route once, on first contact.
-        if self.bound.lock().expect("bound set poisoned").insert(*node) {
+        if self.bound.lock().insert(*node) {
             self.router.add_route(
                 addr,
                 Arc::new(OutboxPeerTransport {
@@ -182,6 +184,7 @@ impl Transport for RouteViewTransport {
 /// egress on first contact.
 pub trait RouteBinder: Send + Sync + 'static {
     fn ensure_routable(&self, actor: ActorAddress);
+    fn remove_route(&self, actor: &ActorAddress);
 }
 
 /// Production [`RouteBinder`]: registers each remote actor address against one
@@ -193,7 +196,7 @@ pub trait RouteBinder: Send + Sync + 'static {
 pub struct OutboxRouteBinder {
     router: Arc<TransportRouter>,
     transport: Arc<RouteViewTransport>,
-    bound: Mutex<HashSet<ActorAddress>>,
+    bound: ParkingMutex<HashSet<ActorAddress>>,
 }
 
 impl OutboxRouteBinder {
@@ -201,15 +204,21 @@ impl OutboxRouteBinder {
         Self {
             router,
             transport,
-            bound: Mutex::new(HashSet::new()),
+            bound: ParkingMutex::new(HashSet::new()),
         }
     }
 }
 
 impl RouteBinder for OutboxRouteBinder {
     fn ensure_routable(&self, actor: ActorAddress) {
-        if self.bound.lock().expect("bound set poisoned").insert(actor) {
+        if self.bound.lock().insert(actor) {
             self.router.add_route(actor, self.transport.clone());
+        }
+    }
+
+    fn remove_route(&self, actor: &ActorAddress) {
+        if self.bound.lock().remove(actor) {
+            self.router.remove_route(actor);
         }
     }
 }
@@ -220,6 +229,8 @@ pub struct NoopRouteBinder;
 
 impl RouteBinder for NoopRouteBinder {
     fn ensure_routable(&self, _actor: ActorAddress) {}
+
+    fn remove_route(&self, _actor: &ActorAddress) {}
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_queue::SegQueue;
 
+#[cfg(unix)]
+use crate::resources::ProcessSpawnResources;
 use crate::types::{ExitStatus, ProcessSpec, Signal};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +214,7 @@ pub(crate) struct ProcessSupervisorThread;
 impl ProcessSupervisorThread {
     pub(crate) fn start(
         spec: ProcessSpec,
+        #[cfg(unix)] resources: ProcessSpawnResources,
         events: ThreadEventSink,
     ) -> Result<ProcessThreadHandle, swactor::Error> {
         let commands = Arc::new(SegQueue::new());
@@ -225,7 +228,16 @@ impl ProcessSupervisorThread {
         let thread_wake = wake.clone();
         let join = thread::Builder::new()
             .name("swactor-process-supervisor".to_owned())
-            .spawn(move || supervisor_thread_main(spec, events, thread_commands, thread_wake))
+            .spawn(move || {
+                supervisor_thread_main(
+                    spec,
+                    #[cfg(unix)]
+                    resources,
+                    events,
+                    thread_commands,
+                    thread_wake,
+                )
+            })
             .map_err(|err| {
                 swactor::Error::from(format!("failed to start process supervisor thread: {err}"))
             })?;
@@ -300,6 +312,7 @@ enum CommandOutcome {
 
 fn supervisor_thread_main(
     spec: ProcessSpec,
+    #[cfg(unix)] resources: ProcessSpawnResources,
     events: ThreadEventSink,
     commands: Arc<SegQueue<ThreadCommand>>,
     wake: WakeFd,
@@ -323,6 +336,8 @@ fn supervisor_thread_main(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    resources.configure_command(&mut cmd);
 
     match cmd.spawn() {
         Ok(mut spawned_child) => {
@@ -887,8 +902,12 @@ mod tests {
     #[test]
     fn supervisor_reports_started_exited_and_finished() {
         let (sink, receiver) = thread_event_channel(|| {});
-        let mut handle = ProcessSupervisorThread::start(shell_spec("exit 7"), sink)
-            .expect("supervisor should start");
+        let mut handle = ProcessSupervisorThread::start(
+            shell_spec("exit 7"),
+            ProcessSpawnResources::new(),
+            sink,
+        )
+        .expect("supervisor should start");
 
         let events = collect_until_finished(&receiver, Duration::from_secs(2));
         join_finished(&mut handle);
@@ -910,9 +929,12 @@ mod tests {
     #[test]
     fn supervisor_reports_spawn_failed_and_finished() {
         let (sink, receiver) = thread_event_channel(|| {});
-        let mut handle =
-            ProcessSupervisorThread::start(spec("/definitely/not/a/real/binary", vec![]), sink)
-                .expect("supervisor should start");
+        let mut handle = ProcessSupervisorThread::start(
+            spec("/definitely/not/a/real/binary", vec![]),
+            ProcessSpawnResources::new(),
+            sink,
+        )
+        .expect("supervisor should start");
 
         let events = collect_until_finished(&receiver, Duration::from_secs(2));
         join_finished(&mut handle);
@@ -938,6 +960,7 @@ mod tests {
         let (sink, receiver) = thread_event_channel(|| {});
         let mut handle = ProcessSupervisorThread::start(
             shell_spec("echo stdout; echo stderr >&2; exit 0"),
+            ProcessSpawnResources::new(),
             sink,
         )
         .expect("supervisor should start");
@@ -973,6 +996,7 @@ mod tests {
         let (sink, receiver) = thread_event_channel(|| {});
         let mut handle = ProcessSupervisorThread::start(
             shell_spec("trap '' TERM; while true; do sleep 1; done"),
+            ProcessSpawnResources::new(),
             sink,
         )
         .expect("supervisor should start");

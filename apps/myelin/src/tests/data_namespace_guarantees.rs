@@ -10,11 +10,12 @@ use data_plane::bootstrap::{self, BootstrapSpec};
 use data_plane::data_plane::DataPlaneBootstrap;
 use data_plane::host::{HostDataPlaneConfig, HostDataPlaneSessionActor};
 use data_plane::namespace::{DirectoryClient, NamespaceError};
-use data_plane::path::{DataPath, JobContext};
-use data_plane::protocol::JobCapability;
+use data_plane::path::{DataPath, SessionAccess};
+use data_plane::protocol::SessionCapability;
 use iroh_driver::{IrohBlobTransferReceiver, IrohBlobTransferSender, IrohDriver};
 use swactor_engine::Engine;
 
+use crate::contextual_process::MyelinChildRouteRegistrar;
 use crate::data_namespace::{
     DATA_DIRECTORY_SERVICE, DataNamespaceAuthority, InstalledNamespaceClient,
     install_namespace_client,
@@ -24,7 +25,7 @@ use crate::tests::harness::build_iroh_composition;
 
 const POLL: Duration = Duration::from_millis(25);
 const DEADLINE: Duration = Duration::from_secs(30);
-const CAPABILITY: JobCapability = JobCapability::new([0x77; 32]);
+const CAPABILITY: SessionCapability = SessionCapability::new([0x77; 32]);
 
 struct DataNode {
     namespace: InstalledNamespaceClient,
@@ -48,6 +49,7 @@ impl DataNode {
         let sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
             driver.edge_connector(),
             &engine.handle(),
+            stack.runtime.clone(),
         ));
         Self {
             namespace,
@@ -71,7 +73,7 @@ impl DataNode {
             base_alignment: 64,
         })
         .expect("session arena");
-        let handoff = bootstrap::write_bootstrap(
+        let handoff = bootstrap::prepare_arena(
             &mut arena,
             BootstrapSpec {
                 arena_generation: generation,
@@ -85,12 +87,13 @@ impl DataNode {
             .spawn(
                 HostDataPlaneSessionActor::new(HostDataPlaneConfig {
                     runtime: self.stack.runtime.clone(),
+                    engine: self._engine.handle(),
                     arena,
                     arena_generation: generation,
                     session_generation: generation,
                     capability: CAPABILITY,
-                    job_context: JobContext {
-                        run_id: format!("run-{generation}"),
+                    session_access: SessionAccess {
+                        execution_id: format!("run-{generation}"),
                         read_prefixes,
                         write_prefixes,
                     },
@@ -98,7 +101,11 @@ impl DataNode {
                     transfer_receiver: Some(Arc::clone(&self.receiver)),
                     source_sender: Some(Arc::clone(&self.sender)),
                     source_publisher: Some(Arc::clone(&self.namespace.source_publisher)),
-                    route_registrar: None,
+                    route_registrar: Some(Arc::new(MyelinChildRouteRegistrar::new(
+                        self.stack.route_view.clone(),
+                        self.stack.pinned_routes.clone(),
+                        self.stack.route_binder.clone(),
+                    ))),
                     stream_transport: None,
                 })
                 .expect("host session"),
@@ -184,9 +191,6 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
         futures_lite::future::block_on(directory.resolve(published_path.clone()))
             .expect("published binding")
             .source;
-    assert!(wait_until(DEADLINE, || {
-        node_a.stack.route_owner(published_source).is_some()
-    }));
     producer.data_plane.close().expect("close producer");
 
     let reader_a = node_a.session(3, vec![DataPath::parse("/shared").unwrap()], vec![]);

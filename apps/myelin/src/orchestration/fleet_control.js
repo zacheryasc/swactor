@@ -3,7 +3,6 @@
   const BULK_CONTROL_ID = 'myelin-fleet-bulk-control';
   const CONFIRM_ID = 'myelin-confirm-dialog';
   const STYLE_ID = 'myelin-fleet-control-style';
-  const selectedJobs = new Map();
   const selectedNodes = new Set();
   let lastModel = null;
   let syncing = false;
@@ -211,12 +210,6 @@
     const node = managedNodes(model).find(candidate => candidate.logical_node_id === logicalNodeId);
     if (!node) return;
 
-    let job = { state: 'idle', message: 'No job submitted' };
-    try {
-      const response = await fetch(`/api/control/nodes/${logicalNodeId}/job`, { cache: 'no-store' });
-      if (response.ok) job = await response.json();
-    } catch (_) {}
-
     const heading = nodeView.querySelector('section.panel > h2');
     if (!heading) return;
     let control = document.getElementById(NODE_CONTROL_ID);
@@ -224,75 +217,19 @@
       control = document.createElement('div');
       control.id = NODE_CONTROL_ID;
       control.className = 'myelin-control';
-      control.innerHTML = `<input type="file" accept=".toml,text/plain,application/toml" data-job-file>
-        <button type="button" data-action="job">Submit job</button>
-        <button type="button" class="danger" data-action="kill">Kill</button>
+      control.innerHTML = `<button type="button" class="danger" data-action="kill">Kill</button>
         <span class="myelin-control-message" data-message role="status"></span>`;
-      control.querySelector('[data-job-file]').style.cssText = 'max-width:260px;color:var(--muted);font:12px var(--mono)';
       heading.after(control);
     }
 
-    const fileInput = control.querySelector('[data-job-file]');
-    const jobButton = control.querySelector('[data-action="job"]');
     const killButton = control.querySelector('[data-action="kill"]');
     const message = control.querySelector('[data-message]');
     const terminal = node.phase === 'stopped' || node.phase === 'orphan';
     const pending = node.phase === 'kill_requested' || node.phase === 'stopping';
-    const jobReady = node.phase === 'running' && Boolean(node.runtime?.job_actor);
-    const jobActive = job.state === 'started' || job.state === 'running';
-    const selectedJob = selectedJobs.get(logicalNodeId);
-
-    fileInput.hidden = !jobReady;
-    jobButton.hidden = !jobReady;
-    jobButton.disabled = jobActive || !selectedJob;
-    jobButton.textContent = jobActive ? 'Job active' : 'Submit job';
     killButton.hidden = terminal;
     killButton.disabled = pending;
     killButton.textContent = pending ? 'Kill requested' : 'Kill';
-
-    if (job.state !== 'idle') message.textContent = job.message;
-    else if (selectedJob) message.textContent = `Selected ${selectedJob.name}`;
-    else if (terminal) message.textContent = `managed node ${logicalNodeId}: ${node.phase}`;
-    else message.textContent = 'Select a job TOML file';
-
-    fileInput.onchange = async () => {
-      const file = fileInput.files?.[0];
-      if (!file) {
-        selectedJobs.delete(logicalNodeId);
-        jobButton.disabled = true;
-        message.textContent = 'Select a job TOML file';
-        return;
-      }
-      try {
-        selectedJobs.set(logicalNodeId, { name: file.name, text: await file.text() });
-        jobButton.disabled = jobActive;
-        message.textContent = `Selected ${file.name}`;
-      } catch (error) {
-        selectedJobs.delete(logicalNodeId);
-        jobButton.disabled = true;
-        message.textContent = `Could not read job file: ${error.message}`;
-      }
-    };
-
-    jobButton.onclick = async () => {
-      const selected = selectedJobs.get(logicalNodeId);
-      if (!selected) return;
-      jobButton.disabled = true;
-      message.textContent = 'Submitting job…';
-      try {
-        const response = await fetch(`/api/control/nodes/${logicalNodeId}/job`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/toml; charset=utf-8' },
-          body: selected.text,
-        });
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
-        message.textContent = body.message || 'Job started';
-      } catch (error) {
-        jobButton.disabled = false;
-        message.textContent = error.message;
-      }
-    };
+    message.textContent = `managed node ${logicalNodeId}: ${node.phase}`;
 
     killButton.onclick = async () => {
       if (!await confirmTermination(

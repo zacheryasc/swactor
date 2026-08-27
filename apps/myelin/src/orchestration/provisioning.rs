@@ -2432,7 +2432,7 @@ mod tests {
         let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
         let (mut plugin, backend) = mock_docker_plugin(runtime.clone());
         let mut spec = test_spec();
-        spec.image = "myelin-job-tinygrad:test".to_owned();
+        spec.image = "myelin-tinygrad:test".to_owned();
         spec.env
             .push(("MYELIN_DOCKER_GPUS".to_owned(), "device=0".to_owned()));
 

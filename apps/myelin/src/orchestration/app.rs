@@ -23,7 +23,6 @@ use crate::orchestration::manual_control::{
     ManualControl, ManualControlMsg, ManualControlReply, NodePhase, OfferDto, OfferSearchRequest,
     OfferSearcher, ProviderConfigurationRequest, ProviderFactory, ProviderReadiness, SpecBuilder,
 };
-use swactor_job_runner::{JobDone, OrchestratorJobActor};
 
 use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
@@ -458,7 +457,7 @@ where
         crate::data_namespace::DataNamespaceAuthority::start(&stack, &driver, data_namespace_path)?;
     let tiny_linear_weights = std::env::var_os("MYELIN_TINY_LINEAR_WEIGHTS")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("apps/myelin/jobs/tiny_linear.weights"));
+        .unwrap_or_else(|| std::path::PathBuf::from("apps/myelin/testdata/tiny_linear.weights"));
     futures_lite::future::block_on(
         data_namespace.control().ensure(
             data_plane::path::DataPath::parse("/models/tiny-linear/weights")
@@ -649,11 +648,12 @@ where
     let readiness = if config.provider.as_str() == "vastai" && vastai_provisioning_mode != "mock" {
         ProviderReadiness::unconfigured_for(
             config.provider.as_str(),
+            config.image.clone(),
             "submit a Vast.ai API key, SSH identity, and bootstrap command",
         )
         .with_provisioning_mode(vastai_provisioning_mode)
     } else {
-        ProviderReadiness::ready_for(config.provider.as_str())
+        ProviderReadiness::ready_for(config.provider.as_str(), config.image.clone())
             .with_provisioning_mode(vastai_provisioning_mode)
     };
     let initial_configuration = config
@@ -719,37 +719,8 @@ where
             .map_err(|error| format!("route initial provider validation: {error}"))?;
     }
 
-    let fleet_job_done = stack
-        .runtime
-        .new_inbox::<JobDone>()
-        .map_err(|error| format!("create Fleet job completion inbox: {error}"))?;
-    let fleet_job_actor = stack
-        .runtime
-        .spawn(
-            OrchestratorJobActor::new(
-                *fleet_job_done.addr(),
-                std::env::temp_dir().join("myelin-ui-job-results"),
-            )
-            .with_edge_mode(false)
-            .with_controller_node(driver.node_id().0),
-        )
-        .map_err(|error| format!("spawn Fleet job controller: {error}"))?;
-    stack.register_local_actor(driver.register_actor(fleet_job_actor, 1));
-    let fleet_job_controller = control::FleetJobController::new(
-        stack.runtime.clone(),
-        engine.handle(),
-        fleet_job_actor,
-        fleet_job_done,
-        stack.route_view.clone(),
-        stack.pinned_routes.clone(),
-        stack.route_binder.clone(),
-    );
-    let control_plugin = control::plugin(
-        stack.runtime.clone(),
-        engine.handle(),
-        orchestrator_actor,
-        fleet_job_controller,
-    );
+    let control_plugin =
+        control::plugin(stack.runtime.clone(), engine.handle(), orchestrator_actor);
     dashboard = DashboardSupport::start_with_plugins(
         config.dashboard,
         &engine.handle(),

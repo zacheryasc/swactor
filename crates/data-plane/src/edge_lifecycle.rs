@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-pub use crate::ids::{ActorAddress, EdgeId, LeaseRequestId, NodeId, RingId, RunId};
+pub use crate::ids::{ActorAddress, EdgeId, ExecutionId, LeaseRequestId, NodeId, RingId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingDirection {
@@ -88,7 +88,7 @@ impl QuiescenceProof {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionTx {
-    pub run_id: RunId,
+    pub execution_id: ExecutionId,
     pub edge_id: EdgeId,
     pub local_node_id: NodeId,
     pub consumer_node_id: NodeId,
@@ -98,7 +98,7 @@ pub struct ProvisionTx {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionRx {
-    pub run_id: RunId,
+    pub execution_id: ExecutionId,
     pub edge_id: EdgeId,
     pub local_node_id: NodeId,
     pub object_spec: ObjectSpec,
@@ -655,7 +655,7 @@ impl EdgeEstablisherState {
 }
 
 struct EdgeRecord {
-    run_id: RunId,
+    execution_id: ExecutionId,
     edge_id: EdgeId,
     direction: RingDirection,
     state: EdgeProvisionState,
@@ -678,7 +678,7 @@ struct EdgeRecord {
 impl EdgeRecord {
     fn new_tx(provision: ProvisionTx, request_id: LeaseRequestId, actor: ActorAddress) -> Self {
         Self {
-            run_id: provision.run_id,
+            execution_id: provision.execution_id,
             edge_id: provision.edge_id,
             direction: RingDirection::Egress,
             state: EdgeProvisionState::WaitingForLease,
@@ -701,7 +701,7 @@ impl EdgeRecord {
 
     fn new_rx(provision: ProvisionRx, request_id: LeaseRequestId, actor: ActorAddress) -> Self {
         Self {
-            run_id: provision.run_id,
+            execution_id: provision.execution_id,
             edge_id: provision.edge_id,
             direction: RingDirection::Ingress,
             state: EdgeProvisionState::WaitingForLease,
@@ -733,7 +733,7 @@ impl EdgeRecord {
     }
 
     fn snapshot(&self) -> LocalEdgeRecord {
-        let _ = self.run_id;
+        let _ = self.execution_id;
         LocalEdgeRecord {
             edge_id: self.edge_id,
             direction: self.direction,

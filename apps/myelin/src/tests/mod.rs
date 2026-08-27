@@ -1,10 +1,8 @@
+mod contextual_process_guarantees;
 mod data_namespace_guarantees;
 mod engine_composition;
 pub(crate) mod fuzz_support;
 mod harness;
-mod job_data_plane_guarantees;
-mod job_runner_integration;
-mod job_runner_iroh;
 mod node_guarantees;
 mod observability_guarantees;
 mod orchestration_guarantees;

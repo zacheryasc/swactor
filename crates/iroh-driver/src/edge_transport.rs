@@ -19,11 +19,15 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 pub const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
 
+/// One-shot completion receiver observed by [`EdgeSendHandle::finish`].
+type CompletionReceiver = std::sync::mpsc::Receiver<Result<(), String>>;
+
 /// Cloneable handle for pushing opaque record bytes onto one edge's send
 /// pump. Implements the data-plane [`EdgeWriter`] port.
 #[derive(Clone)]
 pub struct EdgeSendHandle {
     tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+    completion: Arc<Mutex<Option<CompletionReceiver>>>,
 }
 
 impl EdgeSendHandle {
@@ -31,6 +35,16 @@ impl EdgeSendHandle {
         self.tx
             .send(bytes)
             .map_err(|_| "edge sender task stopped".to_owned())
+    }
+    pub fn finish(self, timeout: std::time::Duration) -> Result<(), String> {
+        let Self { tx, completion } = self;
+        drop(tx);
+        completion
+            .lock()
+            .take()
+            .ok_or_else(|| "edge sender completion was already observed".to_owned())?
+            .recv_timeout(timeout)
+            .map_err(|error| format!("edge sender completion: {error}"))?
     }
 }
 
@@ -49,6 +63,7 @@ pub(crate) fn spawn_edge_send_pump(
 ) -> Result<EdgeSendHandle, String> {
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let engine_handle = engine.clone();
     engine.spawn(async move {
         let result: Result<(), String> = async {
@@ -93,10 +108,21 @@ pub(crate) fn spawn_edge_send_pump(
                     match write_result {
                         Ok(()) => break,
                         Err(_error) if attempts < 3 => {
+                            // A dropped quinn SendStream is NOT reset: bytes
+                            // already buffered on the failed attempt can
+                            // still arrive after we move on, duplicating or
+                            // corrupting the record. Reset explicitly so the
+                            // receiver observes a read fault, discards the
+                            // partial edge state, and only then reads the
+                            // resend on the fresh stream.
+                            let _ = send.reset(iroh::endpoint::VarInt::from_u32(0));
                             send = open_edge_stream!();
                             continue;
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            let _ = send.reset(iroh::endpoint::VarInt::from_u32(0));
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -113,9 +139,10 @@ pub(crate) fn spawn_edge_send_pump(
             }
         }
         .await;
-        if let Err(error) = result {
-            let _ = ready_tx.send(Err(error));
+        if let Err(error) = &result {
+            let _ = ready_tx.send(Err(error.clone()));
         }
+        let _ = completion_tx.send(result);
     });
     match ready_timeout {
         Some(timeout) => ready_rx
@@ -125,7 +152,10 @@ pub(crate) fn spawn_edge_send_pump(
             .recv()
             .map_err(|error| format!("edge {edge_id} sender startup channel closed: {error}"))??,
     }
-    Ok(EdgeSendHandle { tx })
+    Ok(EdgeSendHandle {
+        tx,
+        completion: Arc::new(Mutex::new(Some(completion_rx))),
+    })
 }
 
 pub(crate) fn spawn_edge_recv_pump(
