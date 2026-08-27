@@ -25,12 +25,16 @@ pub(crate) struct AppState {
     pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
+async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", port)).await
+}
+
 pub(crate) async fn run_server(state: AppState, port: u16) {
     run_server_with_routes(state, port, Router::new()).await;
 }
 
 pub(crate) async fn run_server_with_routes(state: AppState, port: u16, extra: Router) {
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = bind_listener(port)
         .await
         .expect("failed to bind HTTP server");
     let shutdown = Arc::clone(&state.shutdown_notify);
@@ -340,6 +344,13 @@ mod tests {
             page_script_urls: Arc::new(Vec::new()),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn dashboard_listener_is_loopback_only() {
+        let listener = bind_listener(0).await.expect("bind dashboard listener");
+        let address = listener.local_addr().expect("read dashboard address");
+        assert!(address.ip().is_loopback(), "dashboard bound to {address}");
     }
 
     #[test]
