@@ -23,7 +23,7 @@
 //! [`RegistryActor`]: crate::registry_actor::RegistryActor
 //! [`MetadataActor`]: crate::node_metadata_actor::MetadataActor
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -95,6 +95,10 @@ pub struct DirectoryActor {
     /// Registers a route so the runtime can deliver an app message addressed to a
     /// remotely-hosted actor (the §5 egress seam). Called from [`Self::republish`].
     route_binder: Arc<dyn RouteBinder>,
+    /// Remotely-hosted actors bound by the previous [`Self::republish`]; the
+    /// diff against the next view drives `remove_route` so departed actors
+    /// do not accumulate in the binder and router forever.
+    bound_remote: HashSet<ActorAddress>,
     /// Routes owned outside SWIM membership (for example an exec child actor
     /// runtime attached to this host). Directory republishing always preserves
     /// these entries.
@@ -133,6 +137,7 @@ impl DirectoryActor {
             peer_directory,
             route_view,
             route_binder,
+            bound_remote: HashSet::new(),
             pinned_routes,
         }
     }
@@ -225,13 +230,10 @@ impl DirectoryActor {
 
     /// Republish the §5 route view: every actor whose host is reachable right now
     /// (self, or an alive peer). A dead host's actors are omitted, so the egress
-    /// never routes to a host SWIM has buried; the claim remains cached for recovery.
-    ///
-    /// Builds the new view locally, swaps it in under the lock, then registers a
-    /// route for each remotely-hosted actor *outside* the lock — so the egress
-    /// (which takes the view's read lock on every send) never contends with the
-    /// route registration.
-    fn republish(&self) {
+    /// never routes to a host SWIM has buried; the claim remains cached for
+    /// recovery. Actors that left the remotely-routed set are unbound so the
+    /// binder and transport router do not grow without bound.
+    fn republish(&mut self) {
         let pinned = self
             .pinned_routes
             .read()
@@ -240,7 +242,7 @@ impl DirectoryActor {
         let mut remote = pinned
             .iter()
             .filter_map(|(actor, node)| (*node != self.self_id).then_some(*actor))
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
         drop(pinned);
         for (actor, claim) in &self.map {
             if view.contains_key(actor) {
@@ -250,13 +252,22 @@ impl DirectoryActor {
                 view.insert(*actor, claim.node_id);
             } else if self.alive.contains(&claim.node_id) {
                 view.insert(*actor, claim.node_id);
-                remote.push(*actor);
+                remote.insert(*actor);
             }
         }
         *self.route_view.write().expect("route view poisoned") = view;
-        for actor in remote {
+        // Unbind actors that fell out of the remotely-routed set (host left
+        // the cluster or claim superseded): without this diff the binder and
+        // router retain every ever-seen actor forever.
+        let departed: Vec<ActorAddress> = self.bound_remote.difference(&remote).copied().collect();
+        for actor in departed {
+            self.route_binder.remove_route(&actor);
+        }
+        let joined: Vec<ActorAddress> = remote.difference(&self.bound_remote).copied().collect();
+        for actor in joined {
             self.route_binder.ensure_routable(actor);
         }
+        self.bound_remote = remote;
     }
 
     /// Take up to `limit` armed claims for this tick's batch, spending one unit of
