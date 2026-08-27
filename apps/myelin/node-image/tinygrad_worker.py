@@ -52,22 +52,22 @@ class CpuLineSampler:
         self.samples: dict[tuple[str, int, str], int] = {}
         self.wall_start = time.perf_counter()
         self.process_cpu_start = time.process_time()
-        self._running = True
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="cpu-line-sampler", daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
-        while self._running:
+        while not self._stop.is_set():
             frame = sys._current_frames().get(self.target_thread_id)
             if frame is not None:
                 code = frame.f_code
                 key = (code.co_filename, frame.f_lineno, code.co_name)
                 self.samples[key] = self.samples.get(key, 0) + 1
-            time.sleep(self.interval_secs)
+            self._stop.wait(self.interval_secs)
 
     def stop(self) -> None:
-        self._running = False
-        self._thread.join(timeout=max(0.25, self.interval_secs * 4.0))
+        self._stop.set()
+        self._thread.join()
         wall_elapsed_ms = (time.perf_counter() - self.wall_start) * 1000.0
         process_cpu_elapsed_ms = (time.process_time() - self.process_cpu_start) * 1000.0
         total_samples = sum(self.samples.values())
