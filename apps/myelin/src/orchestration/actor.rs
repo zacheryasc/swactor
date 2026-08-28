@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,79 @@ use crate::orchestration::manual_control::{ManualActorControl, ManualControlMsg}
 use crate::run_fsm as core;
 
 use swactor_transport::JsonCodec;
+#[derive(Clone)]
+pub(crate) struct ContextualArtifactCleanup {
+    directory: ActorAddress,
+    upload_root: PathBuf,
+}
+
+impl ContextualArtifactCleanup {
+    pub(crate) fn new(directory: ActorAddress, upload_root: PathBuf) -> Self {
+        Self {
+            directory,
+            upload_root,
+        }
+    }
+
+    fn cleanup(&self, ctx: &Ctx<'_>, request_id: &str, namespace_path: String) {
+        let Ok(namespace_path) = data_plane::path::DataPath::parse(namespace_path) else {
+            return;
+        };
+        let host_path = self.upload_root.join(format!("{request_id}.py"));
+        let random = ActorAddress::new_random();
+        let operation_id = data_plane::namespace::OperationId::from_u128(u128::from_le_bytes(
+            random.0[..16]
+                .try_into()
+                .expect("actor address contains sixteen operation ID bytes"),
+        ));
+        if ctx
+            .spawn(ContextualArtifactCleanupOperation {
+                directory: self.directory,
+                namespace_path,
+                operation_id,
+            })
+            .is_ok()
+        {
+            // The source actor already owns an open descriptor. Removing the
+            // name after process termination cannot invalidate a transfer,
+            // and avoids retaining completed UI uploads while retirement waits.
+            let _ = std::fs::remove_file(host_path);
+        }
+    }
+}
+
+struct ContextualArtifactCleanupOperation {
+    directory: ActorAddress,
+    namespace_path: data_plane::path::DataPath,
+    operation_id: data_plane::namespace::OperationId,
+}
+
+impl ActorInterface for ContextualArtifactCleanupOperation {
+    type Incoming = data_plane::namespace::DataDirectoryOut;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        let request_id = data_plane::namespace::DirectoryRequestId(1);
+        if ctx
+            .send(
+                self.directory,
+                data_plane::namespace::DataDirectoryIn::Unregister {
+                    request_id,
+                    path: self.namespace_path.clone(),
+                    operation_id: self.operation_id,
+                    reply_to: ctx.self_addr(),
+                },
+            )
+            .is_err()
+        {
+            ctx.stop_self();
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, _reply: Self::Incoming) {
+        ctx.stop_self();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StageRefWire {
@@ -267,6 +341,7 @@ struct ContextualExecutionState {
     next_sequence: u64,
     events: VecDeque<ContextualEventRecord>,
     spawn_waiter: Option<ActorAddress>,
+    staged_source: Option<String>,
 }
 
 impl ContextualExecutionState {
@@ -320,6 +395,7 @@ pub(crate) struct OrchestratorActor {
     manual: Option<ManualActorControl>,
     contextual_executions: HashMap<String, ContextualExecutionState>,
     pending_contextual_replies: HashMap<String, PendingContextualReply>,
+    contextual_artifact_cleanup: Option<ContextualArtifactCleanup>,
 }
 
 impl OrchestratorActor {
@@ -332,12 +408,26 @@ impl OrchestratorActor {
             manual: None,
             contextual_executions: HashMap::new(),
             pending_contextual_replies: HashMap::new(),
+            contextual_artifact_cleanup: None,
         }
     }
 
     pub(crate) fn with_manual_control(mut self, manual: ManualActorControl) -> Self {
         self.manual = Some(manual);
         self
+    }
+    pub(crate) fn with_contextual_artifact_cleanup(
+        mut self,
+        cleanup: ContextualArtifactCleanup,
+    ) -> Self {
+        self.contextual_artifact_cleanup = Some(cleanup);
+        self
+    }
+
+    fn cleanup_contextual_artifact(&self, ctx: &Ctx<'_>, request_id: &str, source: Option<String>) {
+        if let (Some(cleanup), Some(source)) = (&self.contextual_artifact_cleanup, source) {
+            cleanup.cleanup(ctx, request_id, source);
+        }
     }
 
     fn contextual_rejection(
@@ -397,6 +487,13 @@ impl OrchestratorActor {
                         .retain(|_, execution| !execution.terminal);
                 }
                 if self.contextual_executions.len() >= MAX_CONTEXTUAL_EXECUTIONS {
+                    self.cleanup_contextual_artifact(
+                        ctx,
+                        request_id,
+                        spec.staged_program
+                            .as_ref()
+                            .map(|program| program.namespace_path.clone()),
+                    );
                     self.contextual_rejection(
                         ctx,
                         *reply_to,
@@ -413,6 +510,10 @@ impl OrchestratorActor {
                         next_sequence: 0,
                         events: VecDeque::new(),
                         spawn_waiter: Some(*reply_to),
+                        staged_source: spec
+                            .staged_program
+                            .as_ref()
+                            .map(|program| program.namespace_path.clone()),
                     },
                 );
                 if let Err(error) = self.route_contextual(
@@ -424,7 +525,11 @@ impl OrchestratorActor {
                         reply_to: ctx.self_addr(),
                     },
                 ) {
-                    self.contextual_executions.remove(request_id);
+                    let staged_source = self
+                        .contextual_executions
+                        .remove(request_id)
+                        .and_then(|execution| execution.staged_source);
+                    self.cleanup_contextual_artifact(ctx, request_id, staged_source);
                     self.contextual_rejection(ctx, *reply_to, error);
                 }
                 true
@@ -562,10 +667,19 @@ impl OrchestratorActor {
                         );
                         return true;
                     }
-                    if let Some(target) = pending.target_request_id
-                        && let Some(execution) = self.contextual_executions.get_mut(&target)
-                    {
-                        execution.record(observation.clone());
+                    if let Some(target) = pending.target_request_id {
+                        let staged_source =
+                            self.contextual_executions
+                                .get_mut(&target)
+                                .and_then(|execution| {
+                                    execution.record(observation.clone());
+                                    observation
+                                        .event
+                                        .is_terminal()
+                                        .then(|| execution.staged_source.take())
+                                        .flatten()
+                                });
+                        self.cleanup_contextual_artifact(ctx, &target, staged_source);
                     }
                     let _ = ctx.send(
                         pending.reply_to,
@@ -582,6 +696,7 @@ impl OrchestratorActor {
                 if execution.logical_node_id != observation.logical_node_id {
                     let expected = execution.logical_node_id;
                     let waiter = execution.spawn_waiter.take();
+                    let staged_source = execution.staged_source.take();
                     execution.terminal = true;
                     if let Some(waiter) = waiter {
                         let _ = ctx.send(
@@ -594,6 +709,7 @@ impl OrchestratorActor {
                             },
                         );
                     }
+                    self.cleanup_contextual_artifact(ctx, &observation.request_id, staged_source);
                     return true;
                 }
                 let resolves_spawn = matches!(
@@ -601,6 +717,11 @@ impl OrchestratorActor {
                     ContextualProcessEventKindWire::Spawned { .. }
                 ) || observation.event.is_terminal();
                 execution.record(observation.clone());
+                let staged_source = observation
+                    .event
+                    .is_terminal()
+                    .then(|| execution.staged_source.take())
+                    .flatten();
                 if resolves_spawn && let Some(waiter) = execution.spawn_waiter.take() {
                     let _ = ctx.send(
                         waiter,
@@ -609,6 +730,7 @@ impl OrchestratorActor {
                         },
                     );
                 }
+                self.cleanup_contextual_artifact(ctx, &observation.request_id, staged_source);
                 true
             }
             OrchestratorMsg::ContextualControlCancel { control_request_id } => {
@@ -623,6 +745,7 @@ impl OrchestratorActor {
 
     fn fail_contextual_node(&mut self, ctx: &Ctx<'_>, logical_node_id: u64, reason: &str) {
         let mut waiters = Vec::new();
+        let mut artifacts = Vec::new();
         for (request_id, execution) in &mut self.contextual_executions {
             if execution.logical_node_id != logical_node_id || execution.terminal {
                 continue;
@@ -635,9 +758,15 @@ impl OrchestratorActor {
                 },
             };
             execution.record(observation.clone());
+            if let Some(source) = execution.staged_source.take() {
+                artifacts.push((request_id.clone(), source));
+            }
             if let Some(waiter) = execution.spawn_waiter.take() {
                 waiters.push((waiter, observation));
             }
+        }
+        for (request_id, source) in artifacts {
+            self.cleanup_contextual_artifact(ctx, &request_id, Some(source));
         }
         for (waiter, observation) in waiters {
             let _ = ctx.send(waiter, ContextualControlReply::Event { observation });

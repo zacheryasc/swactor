@@ -52,6 +52,17 @@ pub(crate) fn build_workload_image(workspace: &Path, image: &str) -> Result<(), 
         Command::new("docker").current_dir(workspace).args([
             "build",
             "-f",
+            "apps/myelin/node-image/Dockerfile",
+            "-t",
+            "myelin-node:latest",
+            ".",
+        ]),
+        "build Myelin node image",
+    )?;
+    run_checked(
+        Command::new("docker").current_dir(workspace).args([
+            "build",
+            "-f",
             "apps/myelin/node-image/Dockerfile.e2e",
             "-t",
             image,

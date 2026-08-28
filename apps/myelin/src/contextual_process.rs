@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
+use data_plane::blob_transfer::{
+    BlobTransferEvent, BlobTransferId, BlobTransferOffer, BlobTransferReceiver, BlobTransferSender,
+};
 use data_plane::host::HostRouteRegistrar;
-use data_plane::namespace::NamespaceClient;
-use data_plane::source::BlobSourcePublisher;
+use data_plane::namespace::{
+    BlobBinding, DataDirectoryOut, NamespaceClient, NamespaceClientIn, NamespaceRequest,
+};
+use data_plane::source::{BlobSourceIn, BlobSourcePublisher};
 use data_plane::stream_transport::StreamTransport;
 use distribution::transport_bridge::{OutboxRouteBinder, RouteBinder, RouteView};
 use distribution::types::NodeId;
@@ -139,6 +145,11 @@ pub fn build_contextual_process_spawner(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ContextualProgramFileWire {
+    pub namespace_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ContextualProcessSpecWire {
     pub command: String,
     #[serde(default)]
@@ -153,6 +164,8 @@ pub(crate) struct ContextualProcessSpecWire {
     #[serde(default)]
     pub write_prefixes: Vec<String>,
     pub attach_timeout_ms: u64,
+    #[serde(default)]
+    pub staged_program: Option<ContextualProgramFileWire>,
 }
 
 impl ContextualProcessSpecWire {
@@ -316,6 +329,14 @@ pub(crate) enum ContextualProcessControllerIn {
         request_id: String,
         output: ContextualProcessOutput,
     },
+    ProgramResolved {
+        request_id: String,
+        result: Result<BlobBinding, String>,
+    },
+    ProgramPrepared {
+        request_id: String,
+        result: Result<PathBuf, String>,
+    },
 }
 
 struct ContextualOutputRelay {
@@ -349,6 +370,239 @@ impl swactor::actor::ActorInterface for ContextualOutputRelay {
     }
 }
 
+const PROGRAM_TRANSFER_RETRY: Duration = Duration::from_millis(100);
+const PROGRAM_TRANSFER_RETRY_LIMIT: u16 = 300;
+
+#[derive(Clone)]
+pub(crate) struct ContextualProgramMaterializer {
+    pub namespace_proxy: ActorAddress,
+    pub receiver: Arc<dyn BlobTransferReceiver>,
+    pub routes: Arc<dyn HostRouteRegistrar>,
+    pub engine: EngineHandle,
+    pub sender: swactor::runtime::ExternalSender,
+    pub root: PathBuf,
+}
+
+struct PendingProgramSpawn {
+    spec: ContextualProcessSpecWire,
+    reply_to: ActorAddress,
+}
+
+struct ProgramNamespaceResolver {
+    namespace_proxy: ActorAddress,
+    source_path: data_plane::path::DataPath,
+    request_id: String,
+    controller: ActorAddress,
+}
+
+impl swactor::actor::ActorInterface for ProgramNamespaceResolver {
+    type Incoming = DataDirectoryOut;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        if ctx
+            .send(
+                self.namespace_proxy,
+                NamespaceClientIn::Request {
+                    request: NamespaceRequest::Resolve {
+                        path: self.source_path.clone(),
+                    },
+                    reply_to: ctx.self_addr(),
+                },
+            )
+            .is_err()
+        {
+            let _ = ctx.send(
+                self.controller,
+                ContextualProcessControllerIn::ProgramResolved {
+                    request_id: self.request_id.clone(),
+                    result: Err("uploaded program namespace is unavailable".to_owned()),
+                },
+            );
+            ctx.stop_self();
+        }
+    }
+
+    fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, reply: Self::Incoming) {
+        let result = match reply {
+            DataDirectoryOut::Resolved { result, .. } => {
+                result.map_err(|error| format!("resolve uploaded program: {error}"))
+            }
+            other => Err(format!(
+                "resolve uploaded program returned unexpected reply {other:?}"
+            )),
+        };
+        let _ = ctx.send(
+            self.controller,
+            ContextualProcessControllerIn::ProgramResolved {
+                request_id: self.request_id.clone(),
+                result,
+            },
+        );
+        ctx.stop_self();
+    }
+}
+
+struct ProgramFileTransfer {
+    request_id: String,
+    controller: ActorAddress,
+    source: ActorAddress,
+    length: u64,
+    transfer_id: BlobTransferId,
+    receiver: Arc<dyn BlobTransferReceiver>,
+    routes: Arc<dyn HostRouteRegistrar>,
+    engine: EngineHandle,
+    sender: swactor::runtime::ExternalSender,
+    file: Option<File>,
+    path: PathBuf,
+    offer: Option<BlobTransferOffer>,
+    written: u64,
+    source_confirmed: bool,
+    route_attempts: u16,
+}
+
+impl ProgramFileTransfer {
+    fn fail(&mut self, ctx: &swactor::runtime::Ctx<'_>, error: impl Into<String>) {
+        self.finish(ctx, Err(error.into()));
+    }
+
+    fn finish(&mut self, ctx: &swactor::runtime::Ctx<'_>, result: Result<PathBuf, String>) {
+        if let Some(offer) = self.offer.take() {
+            self.receiver.cancel(&offer);
+        }
+        self.file.take();
+        if result.is_err() {
+            remove_program_tree(&self.path);
+        }
+        let _ = ctx.send(
+            self.controller,
+            ContextualProcessControllerIn::ProgramPrepared {
+                request_id: self.request_id.clone(),
+                result,
+            },
+        );
+        ctx.stop_self();
+    }
+
+    fn try_start(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        if self.route_attempts >= PROGRAM_TRANSFER_RETRY_LIMIT {
+            self.fail(
+                ctx,
+                "uploaded program source did not become routable before the transfer deadline",
+            );
+            return;
+        }
+        self.route_attempts += 1;
+        if self.routes.is_routable(self.source) {
+            let offer = self
+                .offer
+                .as_ref()
+                .expect("program transfer retains its offer")
+                .clone();
+            if ctx
+                .send(self.source, BlobSourceIn::BeginTransfer { offer })
+                .is_err()
+            {
+                self.fail(ctx, "route to uploaded program source is unavailable");
+                return;
+            }
+        }
+        if !self.source_confirmed {
+            self.engine.send_after(
+                PROGRAM_TRANSFER_RETRY,
+                self.sender.clone(),
+                ctx.self_addr(),
+                BlobTransferEvent::RouteRetry,
+            );
+        }
+    }
+}
+
+impl swactor::actor::ActorInterface for ProgramFileTransfer {
+    type Incoming = BlobTransferEvent;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        if self.length == 0 {
+            self.finish(ctx, Ok(self.path.clone()));
+            return;
+        }
+        match self.receiver.open(ctx.self_addr(), self.transfer_id) {
+            Ok(offer) => {
+                self.offer = Some(offer);
+                self.try_start(ctx);
+            }
+            Err(error) => self.fail(ctx, format!("open uploaded program transfer: {error}")),
+        }
+    }
+
+    fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, event: Self::Incoming) {
+        match event {
+            BlobTransferEvent::RouteRetry if !self.source_confirmed => self.try_start(ctx),
+            BlobTransferEvent::Chunk { transfer_id, bytes } if transfer_id == self.transfer_id => {
+                self.source_confirmed = true;
+                let Some(next) = self
+                    .written
+                    .checked_add(bytes.len() as u64)
+                    .filter(|written| *written <= self.length)
+                else {
+                    self.fail(
+                        ctx,
+                        format!("uploaded program exceeded declared length {}", self.length),
+                    );
+                    return;
+                };
+                if let Err(error) = self
+                    .file
+                    .as_mut()
+                    .expect("live program transfer owns its file")
+                    .write_all(&bytes)
+                {
+                    self.fail(ctx, format!("write uploaded program: {error}"));
+                    return;
+                }
+                self.written = next;
+            }
+            BlobTransferEvent::Finished { transfer_id } if transfer_id == self.transfer_id => {
+                self.source_confirmed = true;
+                if self.written != self.length {
+                    self.fail(
+                        ctx,
+                        format!(
+                            "uploaded program length mismatch: expected {}, received {}",
+                            self.length, self.written
+                        ),
+                    );
+                    return;
+                }
+                if let Err(error) = self
+                    .file
+                    .as_mut()
+                    .expect("live program transfer owns its file")
+                    .flush()
+                {
+                    self.fail(ctx, format!("flush uploaded program: {error}"));
+                    return;
+                }
+                self.finish(ctx, Ok(self.path.clone()));
+            }
+            BlobTransferEvent::Failed {
+                transfer_id,
+                reason,
+            } if transfer_id == self.transfer_id => {
+                self.fail(ctx, format!("receive uploaded program: {reason}"));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn remove_program_tree(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir_all(parent);
+    }
+}
+
 struct LiveContextualExecution {
     request_id: String,
     process: ActorAddress,
@@ -356,12 +610,15 @@ struct LiveContextualExecution {
     reply_to: ActorAddress,
     started_pid: Option<u32>,
     context_ready: bool,
+    staged_program: Option<PathBuf>,
 }
 
 pub(crate) struct ContextualProcessController {
     logical_node_id: u64,
     spawner: Arc<ContextualProcessSpawner>,
     sender: swactor::runtime::ExternalSender,
+    materializer: Option<ContextualProgramMaterializer>,
+    pending_programs: HashMap<String, PendingProgramSpawn>,
     by_process: HashMap<ActorAddress, LiveContextualExecution>,
     process_by_request: HashMap<String, ActorAddress>,
 }
@@ -376,9 +633,18 @@ impl ContextualProcessController {
             logical_node_id,
             spawner,
             sender,
+            materializer: None,
+            pending_programs: HashMap::new(),
             by_process: HashMap::new(),
             process_by_request: HashMap::new(),
         }
+    }
+    pub(crate) fn with_program_materializer(
+        mut self,
+        materializer: ContextualProgramMaterializer,
+    ) -> Self {
+        self.materializer = Some(materializer);
+        self
     }
 
     fn emit(
@@ -404,10 +670,12 @@ impl ContextualProcessController {
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
-        spec: ContextualProcessSpecWire,
+        mut spec: ContextualProcessSpecWire,
         reply_to: ActorAddress,
     ) {
-        if self.process_by_request.contains_key(&request_id) {
+        if self.process_by_request.contains_key(&request_id)
+            || self.pending_programs.contains_key(&request_id)
+        {
             self.emit(
                 ctx,
                 reply_to,
@@ -418,9 +686,70 @@ impl ContextualProcessController {
             );
             return;
         }
+        let Some(staged_program) = spec.staged_program.take() else {
+            self.spawn_ready(ctx, request_id, spec, reply_to, None);
+            return;
+        };
+        let Some(materializer) = self.materializer.clone() else {
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKindWire::SpawnRejected {
+                    error: "uploaded program materialization is unavailable on this node"
+                        .to_owned(),
+                },
+            );
+            return;
+        };
+        let source_path = match data_plane::path::DataPath::parse(staged_program.namespace_path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.emit(
+                    ctx,
+                    reply_to,
+                    request_id,
+                    ContextualProcessEventKindWire::SpawnRejected {
+                        error: format!("invalid uploaded program path: {error}"),
+                    },
+                );
+                return;
+            }
+        };
+        self.pending_programs
+            .insert(request_id.clone(), PendingProgramSpawn { spec, reply_to });
+        if let Err(error) = ctx.spawn(ProgramNamespaceResolver {
+            namespace_proxy: materializer.namespace_proxy,
+            source_path,
+            request_id: request_id.clone(),
+            controller: ctx.self_addr(),
+        }) {
+            self.pending_programs.remove(&request_id);
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKindWire::SpawnRejected {
+                    error: format!("spawn uploaded program resolver: {error}"),
+                },
+            );
+        }
+    }
+
+    fn spawn_ready(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: String,
+        spec: ContextualProcessSpecWire,
+        reply_to: ActorAddress,
+        staged_program: Option<PathBuf>,
+    ) {
         let spec = match spec.into_spec() {
             Ok(spec) => spec,
             Err(error) => {
+                if let Some(path) = staged_program.as_deref() {
+                    remove_program_tree(path);
+                }
                 self.emit(
                     ctx,
                     reply_to,
@@ -436,6 +765,9 @@ impl ContextualProcessController {
         }) {
             Ok(relay) => relay,
             Err(error) => {
+                if let Some(path) = staged_program.as_deref() {
+                    remove_program_tree(path);
+                }
                 self.emit(
                     ctx,
                     reply_to,
@@ -461,6 +793,7 @@ impl ContextualProcessController {
                         reply_to,
                         started_pid: None,
                         context_ready: false,
+                        staged_program,
                     },
                 );
                 self.emit(
@@ -475,6 +808,9 @@ impl ContextualProcessController {
             }
             Err(error) => {
                 let _ = ctx.stop_actor(relay);
+                if let Some(path) = staged_program.as_deref() {
+                    remove_program_tree(path);
+                }
                 self.emit(
                     ctx,
                     reply_to,
@@ -485,6 +821,129 @@ impl ContextualProcessController {
                 );
             }
         }
+    }
+
+    fn program_resolved(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: String,
+        result: Result<BlobBinding, String>,
+    ) {
+        let Some(pending) = self.pending_programs.get(&request_id) else {
+            return;
+        };
+        let reply_to = pending.reply_to;
+        let binding = match result {
+            Ok(binding) => binding,
+            Err(error) => {
+                let pending = self
+                    .pending_programs
+                    .remove(&request_id)
+                    .expect("pending uploaded program exists");
+                self.emit(
+                    ctx,
+                    pending.reply_to,
+                    request_id,
+                    ContextualProcessEventKindWire::SpawnRejected { error },
+                );
+                return;
+            }
+        };
+        let Some(materializer) = self.materializer.clone() else {
+            return;
+        };
+        let path = program_path(&materializer.root, &request_id);
+        let file = path
+            .parent()
+            .ok_or_else(|| "uploaded program path has no parent".to_owned())
+            .and_then(|parent| {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("create uploaded program directory: {error}"))
+            })
+            .and_then(|()| {
+                File::create(&path)
+                    .map_err(|error| format!("create uploaded program file: {error}"))
+            });
+        let file = match file {
+            Ok(file) => file,
+            Err(error) => {
+                self.pending_programs.remove(&request_id);
+                remove_program_tree(&path);
+                self.emit(
+                    ctx,
+                    reply_to,
+                    request_id,
+                    ContextualProcessEventKindWire::SpawnRejected { error },
+                );
+                return;
+            }
+        };
+        let random = ActorAddress::new_random();
+        let transfer_id = BlobTransferId(u64::from_le_bytes(
+            random.0[..8]
+                .try_into()
+                .expect("actor address contains eight transfer ID bytes"),
+        ));
+        let transfer = ProgramFileTransfer {
+            request_id: request_id.clone(),
+            controller: ctx.self_addr(),
+            source: binding.source,
+            length: binding.length,
+            transfer_id,
+            receiver: materializer.receiver,
+            routes: materializer.routes,
+            engine: materializer.engine,
+            sender: materializer.sender,
+            file: Some(file),
+            path: path.clone(),
+            offer: None,
+            written: 0,
+            source_confirmed: false,
+            route_attempts: 0,
+        };
+        if let Err(error) = ctx.spawn(transfer) {
+            self.pending_programs.remove(&request_id);
+            remove_program_tree(&path);
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKindWire::SpawnRejected {
+                    error: format!("spawn uploaded program transfer: {error}"),
+                },
+            );
+        }
+    }
+
+    fn program_prepared(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: String,
+        result: Result<PathBuf, String>,
+    ) {
+        let Some(mut pending) = self.pending_programs.remove(&request_id) else {
+            if let Ok(path) = result {
+                remove_program_tree(&path);
+            }
+            return;
+        };
+        let path = match result {
+            Ok(path) => path,
+            Err(error) => {
+                self.emit(
+                    ctx,
+                    pending.reply_to,
+                    request_id,
+                    ContextualProcessEventKindWire::SpawnRejected { error },
+                );
+                return;
+            }
+        };
+        pending.spec.args.push(path.display().to_string());
+        if pending.spec.working_dir.is_none() {
+            pending.spec.working_dir = path.parent().map(|parent| parent.display().to_string());
+        }
+        self.spawn_ready(ctx, request_id, pending.spec, pending.reply_to, Some(path));
     }
 
     fn stop(
@@ -586,10 +1045,19 @@ impl ContextualProcessController {
         };
         self.emit(ctx, reply_to, request_id.clone(), event);
         if terminal {
-            self.by_process.remove(&process);
+            if let Some(execution) = self.by_process.remove(&process)
+                && let Some(path) = execution.staged_program
+            {
+                remove_program_tree(&path);
+            }
             self.process_by_request.remove(&request_id);
         }
     }
+}
+
+fn program_path(root: &Path, request_id: &str) -> PathBuf {
+    let digest = blake3::hash(request_id.as_bytes()).to_hex();
+    root.join(digest.as_str()).join("program.py")
 }
 
 fn bootstrap_failure(failure: &BootstrapFailure) -> String {
@@ -631,6 +1099,12 @@ impl swactor::actor::ActorInterface for ContextualProcessController {
             }) => self.query(ctx, request_id, reply_to),
             ContextualProcessControllerIn::Observed { request_id, output } => {
                 self.observe(ctx, request_id, output);
+            }
+            ContextualProcessControllerIn::ProgramResolved { request_id, result } => {
+                self.program_resolved(ctx, request_id, result);
+            }
+            ContextualProcessControllerIn::ProgramPrepared { request_id, result } => {
+                self.program_prepared(ctx, request_id, result);
             }
         }
     }

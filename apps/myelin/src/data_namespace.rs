@@ -154,7 +154,6 @@ impl DataNamespaceAuthority {
         Ok(Self { service })
     }
 
-    #[cfg(test)]
     pub(crate) fn directory(&self) -> ActorAddress {
         self.service.directory()
     }

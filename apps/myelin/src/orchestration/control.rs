@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -12,7 +15,7 @@ use swactor::runtime::{Ctx, ExternalSender, Runtime};
 use swactor_engine::EngineHandle;
 use swactor_vastai::VastClient;
 
-use crate::contextual_process::ContextualProcessSpecWire;
+use crate::contextual_process::{ContextualProcessSpecWire, ContextualProgramFileWire};
 use crate::orchestration::actor::ContextualControlReply;
 use crate::orchestration::actor::OrchestratorMsg;
 use crate::orchestration::manual_control::{
@@ -24,6 +27,9 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const OFFER_SEARCH_REPLY_MARGIN: Duration = Duration::from_secs(5);
 const OFFER_SEARCH_REPLY_TIMEOUT: Duration =
     VastClient::REQUEST_TIMEOUT.saturating_add(OFFER_SEARCH_REPLY_MARGIN);
+const PROGRAM_UPLOAD_LIMIT: usize = 256 * 1024;
+const PROGRAM_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+const PROGRAM_SPAWN_REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 struct ControlReplyObserver {
     reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<ManualControlReply>>>>,
     engine: EngineHandle,
@@ -110,17 +116,23 @@ struct ControlHttpState {
     runtime: Runtime,
     engine: EngineHandle,
     orchestrator: ActorAddress,
+    namespace: Option<data_plane::control::DataPlaneControl>,
+    upload_root: Arc<PathBuf>,
 }
 
 pub(crate) fn plugin(
     runtime: Runtime,
     engine: EngineHandle,
     orchestrator: ActorAddress,
+    namespace: data_plane::control::DataPlaneControl,
+    upload_root: PathBuf,
 ) -> dashboard::DashboardPlugin {
     let state = ControlHttpState {
         runtime,
         engine,
         orchestrator,
+        namespace: Some(namespace),
+        upload_root: Arc::new(upload_root),
     };
     let routes = Router::new()
         .route(FLEET_CONTROL_SCRIPT_URL, get(fleet_control_script))
@@ -135,6 +147,10 @@ pub(crate) fn plugin(
         .route("/api/control/nodes/{logical_node_id}/kill", post(kill_path))
         .route("/api/control/contextual/spawn", post(contextual_spawn))
         .route(
+            "/api/control/contextual/nodes/{logical_node_id}/python",
+            post(contextual_python),
+        )
+        .route(
             "/api/control/contextual/{request_id}/events",
             get(contextual_events),
         )
@@ -146,6 +162,7 @@ pub(crate) fn plugin(
             "/api/control/contextual/nodes/{logical_node_id}",
             get(contextual_query_node),
         )
+        .layer(DefaultBodyLimit::max(PROGRAM_UPLOAD_LIMIT))
         .with_state(state);
     dashboard::DashboardPlugin::new(routes).with_page(dashboard::PluginPage::new(
         "provision",
@@ -299,6 +316,166 @@ async fn contextual_spawn(
     })
     .await
 }
+#[derive(serde::Deserialize)]
+struct ContextualPythonQuery {
+    filename: String,
+}
+
+async fn contextual_python(
+    Path(logical_node_id): Path<u64>,
+    Query(query): Query<ContextualPythonQuery>,
+    State(state): State<ControlHttpState>,
+    body: Bytes,
+) -> Response {
+    let Some(namespace) = state.namespace.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "uploaded program control is unavailable".to_owned(),
+            }),
+        )
+            .into_response();
+    };
+    let filename = query.filename.trim();
+    if filename.is_empty()
+        || filename
+            != PathBuf::from(filename)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+        || !filename.to_ascii_lowercase().ends_with(".py")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "select one Python file with a .py extension".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "selected Python file is empty".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    if body.len() > PROGRAM_UPLOAD_LIMIT {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: format!(
+                    "selected Python file exceeds the {} byte limit",
+                    PROGRAM_UPLOAD_LIMIT
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    let request_id = format!("ui-{}", ActorAddress::new_random().to_full_hex());
+    let host_path = state.upload_root.join(format!("{request_id}.py"));
+    if let Err(error) = write_uploaded_program(&state, host_path.clone(), body).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error }),
+        )
+            .into_response();
+    }
+    let namespace_path = format!("/myelin/contextual/{request_id}/program.py");
+    let data_path = data_plane::path::DataPath::parse(namespace_path.clone())
+        .expect("generated contextual program path is valid");
+    if let Err(error) = namespace
+        .register(data_path.clone(), data_plane::blob::file(&host_path))
+        .await
+    {
+        remove_uploaded_program(&state, host_path);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("register uploaded program: {error}"),
+            }),
+        )
+            .into_response();
+    }
+
+    let spec = ContextualProcessSpecWire {
+        command: "python3".to_owned(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        working_dir: None,
+        label: Some(filename.to_owned()),
+        execution_id: request_id.clone(),
+        read_prefixes: Vec::new(),
+        write_prefixes: Vec::new(),
+        attach_timeout_ms: PROGRAM_ATTACH_TIMEOUT.as_millis() as u64,
+        staged_program: Some(ContextualProgramFileWire {
+            namespace_path: namespace_path.clone(),
+        }),
+    };
+    let response_rx = match begin_contextual_request_reply(
+        &state,
+        None,
+        PROGRAM_SPAWN_REPLY_TIMEOUT,
+        |reply_to| OrchestratorMsg::ContextualSpawn {
+            logical_node_id,
+            request_id,
+            spec,
+            reply_to,
+        },
+    ) {
+        Ok(response_rx) => response_rx,
+        Err(response) => {
+            cleanup_uploaded_program(&state, data_path, host_path).await;
+            return *response;
+        }
+    };
+    contextual_response(response_rx).await
+}
+
+async fn write_uploaded_program(
+    state: &ControlHttpState,
+    path: PathBuf,
+    body: Bytes,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let root = Arc::clone(&state.upload_root);
+    let work = Box::new(move || {
+        let result = std::fs::create_dir_all(root.as_ref())
+            .and_then(|()| std::fs::write(&path, &body))
+            .map_err(|error| format!("store uploaded program: {error}"));
+        let _ = tx.send(result);
+    });
+    state
+        .engine
+        .blocking_work_sender()
+        .submit(work)
+        .map_err(|_| "execution engine stopped before storing uploaded program".to_owned())?;
+    rx.await
+        .map_err(|error| format!("uploaded program writer stopped: {error}"))?
+}
+
+fn remove_uploaded_program(state: &ControlHttpState, path: PathBuf) {
+    let _ = state
+        .engine
+        .blocking_work_sender()
+        .submit(Box::new(move || {
+            let _ = std::fs::remove_file(path);
+        }));
+}
+
+async fn cleanup_uploaded_program(
+    state: &ControlHttpState,
+    data_path: data_plane::path::DataPath,
+    host_path: PathBuf,
+) {
+    if let Some(namespace) = &state.namespace {
+        let _ = namespace.unregister(data_path).await;
+    }
+    remove_uploaded_program(state, host_path);
+}
 
 #[derive(Default, serde::Deserialize)]
 struct ContextualEventsQuery {
@@ -416,10 +593,17 @@ async fn contextual_request_reply(
     cancel_key: Option<String>,
     build: impl FnOnce(ActorAddress) -> OrchestratorMsg,
 ) -> Response {
-    let response_rx = match begin_contextual_request_reply(state, cancel_key, build) {
-        Ok(response_rx) => response_rx,
-        Err(response) => return *response,
-    };
+    let response_rx =
+        match begin_contextual_request_reply(state, cancel_key, CONTROL_REPLY_TIMEOUT, build) {
+            Ok(response_rx) => response_rx,
+            Err(response) => return *response,
+        };
+    contextual_response(response_rx).await
+}
+
+async fn contextual_response(
+    response_rx: tokio::sync::oneshot::Receiver<ContextualControlReply>,
+) -> Response {
     match response_rx.await {
         Ok(ContextualControlReply::TimedOut) => (
             StatusCode::GATEWAY_TIMEOUT,
@@ -445,6 +629,7 @@ async fn contextual_request_reply(
 fn begin_contextual_request_reply(
     state: &ControlHttpState,
     cancel_key: Option<String>,
+    timeout: Duration,
     build: impl FnOnce(ActorAddress) -> OrchestratorMsg,
 ) -> Result<tokio::sync::oneshot::Receiver<ContextualControlReply>, Box<Response>> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -455,7 +640,7 @@ fn begin_contextual_request_reply(
             reply: response_tx,
             engine: state.engine.clone(),
             sender: state.runtime.create_sender(),
-            timeout: CONTROL_REPLY_TIMEOUT,
+            timeout,
             orchestrator: state.orchestrator,
             cancel_key,
         })
@@ -935,6 +1120,8 @@ mod properties {
                 runtime: runtime.clone(),
                 engine: engine.handle(),
                 orchestrator,
+                namespace: None,
+                upload_root: Arc::new(PathBuf::new()),
             };
             let outcome = (|| {
                 let mut responses = Vec::with_capacity(actions.len());
@@ -1081,6 +1268,8 @@ mod properties {
             runtime: runtime.clone(),
             engine: engine.handle(),
             orchestrator: ActorAddress::default(),
+            namespace: None,
+            upload_root: Arc::new(PathBuf::new()),
         };
         let response = match begin_request_reply(&state, Duration::from_millis(1), |reply_to| {
             ManualControlMsg::Query { reply_to }
@@ -1122,6 +1311,8 @@ mod properties {
             runtime: runtime.clone(),
             engine: engine.handle(),
             orchestrator,
+            namespace: None,
+            upload_root: Arc::new(PathBuf::new()),
         };
         let pending = begin_http_action(&state, 0, HttpAction::Status);
         drive_steps(&backend, STEP_BUDGET);
@@ -1164,6 +1355,8 @@ mod properties {
             runtime,
             engine: engine.handle(),
             orchestrator: ActorAddress::default(),
+            namespace: None,
+            upload_root: Arc::new(PathBuf::new()),
         };
         let actions = vec![HttpAction::Status];
         let responses = vec![HttpObservation {

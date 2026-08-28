@@ -23,7 +23,8 @@ use telemetry::{
 
 use crate::codecs::register_myelin_actor_codecs;
 use crate::contextual_process::{
-    ContextualProcessController, MyelinContextualProcessConfig, build_contextual_process_spawner,
+    ContextualProcessController, ContextualProgramMaterializer, MyelinChildRouteRegistrar,
+    MyelinContextualProcessConfig, build_contextual_process_spawner,
 };
 use crate::data_namespace::install_namespace_client;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
@@ -45,6 +46,7 @@ use data_plane::arena;
 use data_plane::blob_transfer::{BlobTransferReceiver, BlobTransferSender};
 use data_plane::edge_lifecycle as edge;
 use data_plane::edge_runtime;
+use data_plane::host::HostRouteRegistrar;
 use data_plane::object_record as ingress;
 use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
@@ -1952,7 +1954,7 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"actor":orchestrator,"source":orchestrator_source}),
     )?;
-    let contextual_spawner = if config.agent_only {
+    let contextual_services = if config.agent_only {
         let namespace = install_namespace_client(&stack, &driver)?;
         let blob_receiver = Arc::new(IrohBlobTransferReceiver::new(
             driver.endpoint_addr(),
@@ -1965,14 +1967,14 @@ fn run() -> Result<(), String> {
             &engine.handle(),
             stack.runtime.clone(),
         ));
-        Some(Arc::new(build_contextual_process_spawner(
+        let spawner = Arc::new(build_contextual_process_spawner(
             MyelinContextualProcessConfig {
                 runtime: stack.runtime.clone(),
                 engine: engine.handle(),
                 arena_bytes: config.arena_bytes,
                 arena_alignment: config.arena_alignment,
-                namespace: Some(namespace.client),
-                transfer_receiver: Some(transfer_receiver),
+                namespace: Some(namespace.client.clone()),
+                transfer_receiver: Some(Arc::clone(&transfer_receiver)),
                 source_sender: Some(source_sender),
                 source_publisher: Some(namespace.source_publisher),
                 route_view: stack.route_view.clone(),
@@ -1981,18 +1983,35 @@ fn run() -> Result<(), String> {
                 stream_transport: Some(driver.stream_transport()),
                 host_endpoint: driver.endpoint_addr(),
             },
-        )?))
+        )?);
+        let routes: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
+            stack.route_view.clone(),
+            stack.pinned_routes.clone(),
+            stack.route_binder.clone(),
+        ));
+        let materializer = ContextualProgramMaterializer {
+            namespace_proxy: namespace.client.proxy(),
+            receiver: transfer_receiver,
+            routes,
+            engine: engine.handle(),
+            sender: stack.runtime.create_sender(),
+            root: std::env::temp_dir().join("myelin-contextual"),
+        };
+        Some((spawner, materializer))
     } else {
         None
     };
-    let contextual_controller = contextual_spawner
+    let contextual_controller = contextual_services
         .as_ref()
-        .map(|spawner| {
-            stack.runtime.spawn(ContextualProcessController::new(
-                config.logical_node_id,
-                Arc::clone(spawner),
-                stack.runtime.create_sender(),
-            ))
+        .map(|(spawner, materializer)| {
+            stack.runtime.spawn(
+                ContextualProcessController::new(
+                    config.logical_node_id,
+                    Arc::clone(spawner),
+                    stack.runtime.create_sender(),
+                )
+                .with_program_materializer(materializer.clone()),
+            )
         })
         .transpose()
         .map_err(|error| format!("spawn contextual process controller: {error}"))?;

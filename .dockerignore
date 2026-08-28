@@ -20,17 +20,6 @@
 !apps/myelin/
 !apps/myelin/node-image/
 !apps/myelin/node-image/**
-!target/
-target/*
-!target/release/
-target/release/*
-!target/release/myelin-worker
-!target/x86_64-unknown-linux-musl/
-target/x86_64-unknown-linux-musl/*
-!target/x86_64-unknown-linux-musl/release/
-target/x86_64-unknown-linux-musl/release/*
-!target/debug/
-target/debug/*
 crates/bindings/python/.venv/
 crates/bindings/python/.venv/**
 crates/**/.pytest_cache/
@@ -41,4 +30,3 @@ crates/**/target/
 crates/**/target/**
 **/.venv
 **/.venv/**
-!target/debug/myelin-worker

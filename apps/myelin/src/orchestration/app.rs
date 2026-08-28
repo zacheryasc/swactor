@@ -14,7 +14,9 @@ use crate::observability::frame_collector::FrameCollector;
 use crate::observability::orch_telemetry::{
     BootstrapEmission, DashboardSupport, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
 };
-use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
+use crate::orchestration::actor::{
+    ContextualArtifactCleanup, OrchestratorActor, OrchestratorMsg, OrchestratorReport,
+};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 use crate::orchestration::control;
 use crate::orchestration::daemon;
@@ -234,6 +236,7 @@ where
         .finalize()?;
     let state_dir = daemon::StateDir::new(config.state_dir.clone());
     let data_namespace_path = config.state_dir.join("data-namespace.json");
+    let contextual_upload_root = config.state_dir.join("contextual-uploads");
     if config.reset_state {
         state_dir.reset()?;
     }
@@ -690,7 +693,11 @@ where
             },
             Some(orchestrator_report_actor),
         )
-        .with_manual_control(manual),
+        .with_manual_control(manual)
+        .with_contextual_artifact_cleanup(ContextualArtifactCleanup::new(
+            data_namespace.directory(),
+            contextual_upload_root.clone(),
+        )),
     ) {
         Ok(actor) => actor,
         Err(error) => return Err(format!("spawn orchestrator actor: {error}")),
@@ -719,8 +726,13 @@ where
             .map_err(|error| format!("route initial provider validation: {error}"))?;
     }
 
-    let control_plugin =
-        control::plugin(stack.runtime.clone(), engine.handle(), orchestrator_actor);
+    let control_plugin = control::plugin(
+        stack.runtime.clone(),
+        engine.handle(),
+        orchestrator_actor,
+        data_namespace.control(),
+        contextual_upload_root,
+    );
     dashboard = DashboardSupport::start_with_plugins(
         config.dashboard,
         &engine.handle(),

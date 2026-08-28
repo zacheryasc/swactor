@@ -1,11 +1,13 @@
 (() => {
   const NODE_CONTROL_ID = 'myelin-fleet-control';
+  const EXECUTION_CONTROL_ID = 'myelin-contextual-execution';
   const BULK_CONTROL_ID = 'myelin-fleet-bulk-control';
   const CONFIRM_ID = 'myelin-confirm-dialog';
   const STYLE_ID = 'myelin-fleet-control-style';
   const selectedNodes = new Set();
   let lastModel = null;
   let syncing = false;
+  let executionPoll = null;
   const page = document.getElementById('page');
   if (!page) return;
 
@@ -22,6 +24,11 @@
       .myelin-bulk-control { width:fit-content;margin:0 0 12px auto;padding:6px 8px;border:1px solid var(--divider);background:transparent;border-radius:var(--r) }
       .node-card[data-bulk-selected="true"] { border-color:var(--bad);background:var(--selected);box-shadow:inset 3px 0 0 var(--bad) }
       .node-card[data-bulk-killable="true"] { user-select:none }
+      .myelin-execution { display:grid;gap:8px;width:min(720px,100%);padding:10px 12px;border:1px solid var(--divider);border-radius:var(--r);background:var(--ghost) }
+      .myelin-execution-row { display:flex;align-items:center;flex-wrap:wrap;gap:8px }
+      .myelin-execution input[type="file"] { max-width:100%;color:var(--text);font:12px var(--mono) }
+      .myelin-execution-output { display:none;max-height:260px;overflow:auto;margin:0;padding:9px;background:var(--inset);border:1px solid var(--divider);white-space:pre-wrap;word-break:break-word;color:var(--text);font:12px/1.45 var(--mono) }
+      .myelin-execution-output[data-active="true"] { display:block }
       .myelin-confirm { width:min(440px,calc(100vw - 32px));padding:0;color:var(--text);background:var(--panel);border:1px solid var(--bad);border-radius:var(--r);box-shadow:0 18px 60px rgba(0,0,0,.55) }
       .myelin-confirm::backdrop { background:rgba(0,6,12,.78) }
       .myelin-confirm form { display:grid;gap:14px;padding:18px }
@@ -206,6 +213,130 @@
     message.textContent = resultMessage(results);
   }
 
+  function stopExecutionPoll() {
+    if (executionPoll?.timer) clearTimeout(executionPoll.timer);
+    executionPoll = null;
+  }
+
+  function appendExecutionEvent(panel, observation) {
+    const event = observation?.event || {};
+    const type = event.type || 'unknown';
+    const status = panel.querySelector('[data-execution-status]');
+    const output = panel.querySelector('[data-execution-output]');
+    if (type === 'stdout' || type === 'stderr') {
+      const bytes = Array.isArray(event.bytes) ? new Uint8Array(event.bytes) : new Uint8Array();
+      output.dataset.active = 'true';
+      output.textContent += new TextDecoder().decode(bytes);
+      output.scrollTop = output.scrollHeight;
+    } else if (type === 'context_ready') {
+      status.textContent = 'Swactor context ready';
+    } else if (type === 'process_started') {
+      status.textContent = `Python started · pid ${event.pid}`;
+    } else if (type === 'spawned') {
+      status.textContent = 'Program transferred; starting Python…';
+    } else if (type === 'exited') {
+      status.textContent = `Exited · ${JSON.stringify(event.status)}`;
+    } else if (event.error) {
+      status.textContent = event.error;
+    }
+    return ['spawn_rejected', 'spawn_failed', 'bootstrap_failed', 'exited', 'process_error'].includes(type);
+  }
+
+  async function pollExecution(panel, requestId, afterSequence) {
+    if (!panel.isConnected || executionPoll?.requestId !== requestId) return;
+    try {
+      const response = await fetch(
+        `/api/control/contextual/${encodeURIComponent(requestId)}/events?after_sequence=${afterSequence}`,
+        { cache: 'no-store' },
+      );
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+      const execution = body.execution;
+      let terminal = Boolean(execution?.terminal);
+      for (const record of execution?.events || []) {
+        terminal = appendExecutionEvent(panel, record.observation) || terminal;
+      }
+      if (terminal) {
+        stopExecutionPoll();
+        panel.querySelector('[data-run]').disabled = false;
+        return;
+      }
+      executionPoll.afterSequence = Number(execution?.next_sequence || afterSequence);
+      executionPoll.timer = setTimeout(
+        () => pollExecution(panel, requestId, executionPoll.afterSequence),
+        300,
+      );
+    } catch (error) {
+      panel.querySelector('[data-execution-status]').textContent = error.message;
+      panel.querySelector('[data-run]').disabled = false;
+      stopExecutionPoll();
+    }
+  }
+
+  function ensureExecutionControl(nodeView, logicalNodeId, disabled) {
+    let panel = document.getElementById(EXECUTION_CONTROL_ID);
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = EXECUTION_CONTROL_ID;
+      panel.className = 'myelin-control myelin-execution';
+      panel.innerHTML = `<div class="myelin-execution-row">
+          <input type="file" accept=".py,text/x-python" data-file aria-label="Python file">
+          <button type="button" data-run disabled>Run with Swactor context</button>
+          <span class="myelin-control-message" data-execution-status role="status">Select one Python file</span>
+        </div>
+        <pre class="myelin-execution-output" data-execution-output data-active="false"></pre>`;
+      const control = document.getElementById(NODE_CONTROL_ID);
+      control.after(panel);
+      const input = panel.querySelector('[data-file]');
+      const run = panel.querySelector('[data-run]');
+      input.onchange = () => {
+        const file = input.files?.[0];
+        run.disabled = !file || disabled;
+        panel.querySelector('[data-execution-status]').textContent =
+          file ? `${file.name} · ${file.size} bytes` : 'Select one Python file';
+      };
+      run.onclick = async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        stopExecutionPoll();
+        run.disabled = true;
+        const status = panel.querySelector('[data-execution-status]');
+        const output = panel.querySelector('[data-execution-output]');
+        output.textContent = '';
+        output.dataset.active = 'false';
+        status.textContent = 'Uploading program…';
+        try {
+          const response = await fetch(
+            `/api/control/contextual/nodes/${logicalNodeId}/python?filename=${encodeURIComponent(file.name)}`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/octet-stream' },
+              body: file,
+            },
+          );
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+          const observation = body.observation;
+          const requestId = observation?.request_id;
+          if (!requestId) throw new Error('spawn response did not include a request ID');
+          const terminal = appendExecutionEvent(panel, observation);
+          if (terminal) {
+            run.disabled = false;
+            return;
+          }
+          executionPoll = { requestId, afterSequence: 0, timer: null };
+          pollExecution(panel, requestId, 0);
+        } catch (error) {
+          status.textContent = error.message;
+          run.disabled = false;
+        }
+      };
+    }
+    const input = panel.querySelector('[data-file]');
+    input.disabled = disabled;
+    if (disabled) panel.querySelector('[data-run]').disabled = true;
+  }
+
   async function syncManagedNodeControl(nodeView, model, logicalNodeId) {
     const node = managedNodes(model).find(candidate => candidate.logical_node_id === logicalNodeId);
     if (!node) return;
@@ -230,6 +361,7 @@
     killButton.disabled = pending;
     killButton.textContent = pending ? 'Kill requested' : 'Kill';
     message.textContent = `managed node ${logicalNodeId}: ${node.phase}`;
+    ensureExecutionControl(nodeView, logicalNodeId, terminal || pending);
 
     killButton.onclick = async () => {
       if (!await confirmTermination(
@@ -298,7 +430,9 @@
       const element = mutation.target.nodeType === Node.ELEMENT_NODE
         ? mutation.target
         : mutation.target.parentElement;
-      return !element?.closest(`#${NODE_CONTROL_ID}, #${BULK_CONTROL_ID}`);
+      return !element?.closest(
+        `#${NODE_CONTROL_ID}, #${EXECUTION_CONTROL_ID}, #${BULK_CONTROL_ID}`,
+      );
     });
     if (dashboardChanged) syncControl();
   }).observe(page, { childList: true, subtree: true });
