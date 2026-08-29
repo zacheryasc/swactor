@@ -503,7 +503,8 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         })
         .map_err(|error| format!("spawn supervisor stop actor: {error}"))?;
     #[cfg(target_os = "linux")]
-    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor);
+    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor)
+        .map_err(|error| format!("install supervisor stop signal handler: {error}"))?;
     println!("demo: dashboard on http://localhost:{port}");
     println!("  /view/fleet        — per-node cards (pid, lifecycle)");
     println!("  /view/demo-control — Fleet Control: stages, feeds, kill / provision / edge");

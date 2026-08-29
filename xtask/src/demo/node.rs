@@ -256,7 +256,8 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         })
         .map_err(|error| format!("spawn node stop actor: {error}"))?;
     #[cfg(target_os = "linux")]
-    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor);
+    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor)
+        .map_err(|error| format!("install node stop signal handler: {error}"))?;
 
     // The actor owns lifecycle; the entrypoint waits only for its terminal signal.
     completion.wait();

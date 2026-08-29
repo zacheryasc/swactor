@@ -2375,7 +2375,8 @@ fn spawn_stop_listener(
     }
 
     #[cfg(target_os = "linux")]
-    swactor_process::spawn_os_stop_signal_wait(sender, actor);
+    swactor_process::spawn_os_stop_signal_wait(sender, actor)
+        .map_err(|error| format!("install orchestrator stop signal handler: {error}"))?;
     Ok(())
 }
 

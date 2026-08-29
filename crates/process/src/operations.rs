@@ -147,19 +147,22 @@ fn spawn_stop_channel_wait_thread(
 }
 
 /// Wait for SIGINT/SIGTERM and notify an actor once.
+///
+/// Signal handlers are installed before this function returns. A caller may
+/// therefore publish readiness immediately after a successful return without
+/// racing the operating system's default signal action.
 #[cfg(target_os = "linux")]
-pub fn spawn_os_stop_signal_wait(sender: ExternalSender, actor: ActorAddress) {
+pub fn spawn_os_stop_signal_wait(sender: ExternalSender, actor: ActorAddress) -> io::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::signal::SIGINT,
+        signal_hook::consts::signal::SIGTERM,
+    ])?;
     thread::spawn(move || {
-        let Ok(mut signals) = signal_hook::iterator::Signals::new([
-            signal_hook::consts::signal::SIGINT,
-            signal_hook::consts::signal::SIGTERM,
-        ]) else {
-            return;
-        };
         if signals.forever().next().is_some() {
             let _ = sender.send_to(actor, ProcessStopSignal);
         }
     });
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
