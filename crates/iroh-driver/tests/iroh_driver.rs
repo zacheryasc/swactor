@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use common::iroh::*;
 use distribution::peer_auth::PeerAllowList;
 use iroh::PublicKey;
+use iroh_driver::{EndpointAddrMask, advertised_endpoint};
 use parking_lot::Mutex;
 
 // ─── Identity tests ─────────────────────────────────────────────────────
@@ -62,6 +63,46 @@ fn endpoint_addr_includes_home_relay() {
     assert!(
         relay_advertised,
         "advertised endpoint did not include home relay {expected_relay_url} within timeout; last relay URL: {observed_relay_url:?}"
+    );
+}
+
+#[test]
+fn relay_masked_local_nodes_join_through_only_the_relay() {
+    let (relay_url, _relay_guard) = spawn_test_relay();
+    let mut node_a = make_driver_with_relay(relay_url.clone());
+    let mut node_b = make_driver_with_relay(relay_url);
+
+    node_a
+        .driver
+        .wait_for_relay_endpoint()
+        .expect("node A relay ready");
+    node_b
+        .driver
+        .wait_for_relay_endpoint()
+        .expect("node B relay ready");
+    let a_addr = advertised_endpoint(node_a.endpoint_addr(), EndpointAddrMask::RelayOnly)
+        .expect("mask node A endpoint");
+    let b_addr = advertised_endpoint(node_b.endpoint_addr(), EndpointAddrMask::RelayOnly)
+        .expect("mask node B endpoint");
+    assert_eq!(a_addr.ip_addrs().count(), 0);
+    assert_eq!(b_addr.ip_addrs().count(), 0);
+    assert_eq!(a_addr.relay_urls().count(), 1);
+    assert_eq!(b_addr.relay_urls().count(), 1);
+
+    node_a.join(std::slice::from_ref(&b_addr));
+    node_b.join(std::slice::from_ref(&a_addr));
+
+    let converged = pump_until_pair(&mut node_a, &mut node_b, Duration::from_secs(5), |a, b| {
+        let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
+        let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
+        sees_alive(a, &b_key) && sees_alive(b, &a_key)
+    });
+    node_a.shutdown();
+    node_b.shutdown();
+
+    assert!(
+        converged,
+        "relay-only masked nodes did not converge through the relay"
     );
 }
 

@@ -261,6 +261,55 @@ impl StateDir {
         write_atomic(&self.snapshot_path(), &bytes)
     }
 
+    /// Removes the crash-recovery checkpoint after a graceful shutdown only
+    /// when neither the snapshot nor the local process registry owns work.
+    pub(crate) fn cleanup_recovery_checkpoint(
+        &self,
+        snapshot: &ClusterSnapshot,
+    ) -> Result<bool, String> {
+        if snapshot
+            .nodes
+            .iter()
+            .any(|node| !matches!(node.phase, NodePhase::Stopped | NodePhase::Orphan))
+        {
+            return Ok(false);
+        }
+
+        let registry_path = self.process_registry_path();
+        match fs::read_to_string(&registry_path) {
+            Ok(content) => {
+                let registry = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(
+                    &content,
+                )
+                .map_err(|error| {
+                    format!(
+                        "parse process registry {} before checkpoint cleanup: {error}",
+                        registry_path.display()
+                    )
+                })?;
+                if !registry.is_empty() {
+                    return Ok(false);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "read process registry {} before checkpoint cleanup: {error}",
+                    registry_path.display()
+                ));
+            }
+        }
+
+        for path in [self.snapshot_path(), registry_path] {
+            if let Err(error) = fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(format!("remove {}: {error}", path.display()));
+            }
+        }
+        Ok(true)
+    }
+
     /// Removes all state files. Explicit operator action only.
     pub(crate) fn reset(&self) -> Result<(), String> {
         for path in [self.identity_path(), self.snapshot_path()] {
@@ -420,5 +469,34 @@ mod tests {
         assert_eq!(loaded.next_node_id, 3);
         assert_eq!(loaded.commands["done"].state, CommandState::Succeeded);
         assert!(!temp.path().join("cluster.tmp").exists());
+    }
+
+    #[test]
+    fn graceful_cleanup_removes_only_completed_recovery_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::new(temp.path());
+        let complete = ClusterSnapshot::fresh(9, "complete");
+        state.save_snapshot(&complete).unwrap();
+        fs::write(state.process_registry_path(), "{}").unwrap();
+
+        assert!(state.cleanup_recovery_checkpoint(&complete).unwrap());
+        assert!(!temp.path().join(SNAPSHOT_FILE).exists());
+        assert!(!state.process_registry_path().exists());
+
+        let mut active = ClusterSnapshot::fresh(10, "active");
+        active.nodes.push(SnapshotNode {
+            logical_node_id: 1,
+            spec: None,
+            selected_offer_id: None,
+            provider_ref: Some("resource-1".to_owned()),
+            phase: NodePhase::Running,
+            runtime: None,
+            last_error: None,
+            last_seen_unix_ms: 0,
+        });
+        state.save_snapshot(&active).unwrap();
+
+        assert!(!state.cleanup_recovery_checkpoint(&active).unwrap());
+        assert!(temp.path().join(SNAPSHOT_FILE).exists());
     }
 }

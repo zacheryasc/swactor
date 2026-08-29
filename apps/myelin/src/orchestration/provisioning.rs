@@ -1806,6 +1806,7 @@ mod tests {
             image: "node:v1".to_owned(),
             env: Vec::new(),
             args: Vec::new(),
+            offer_criteria_json: None,
             mounts: Vec::new(),
         }
     }

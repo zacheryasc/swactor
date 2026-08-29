@@ -1,5 +1,6 @@
 (() => {
   const NODE_CONTROL_ID = 'myelin-fleet-control';
+  const NODE_STATUS_ID = 'myelin-node-status';
   const EXECUTION_CONTROL_ID = 'myelin-contextual-execution';
   const BULK_CONTROL_ID = 'myelin-fleet-bulk-control';
   const CONFIRM_ID = 'myelin-confirm-dialog';
@@ -24,6 +25,10 @@
       .myelin-bulk-control { width:fit-content;margin:0 0 12px auto;padding:6px 8px;border:1px solid var(--divider);background:transparent;border-radius:var(--r) }
       .node-card[data-bulk-selected="true"] { border-color:var(--bad);background:var(--selected);box-shadow:inset 3px 0 0 var(--bad) }
       .node-card[data-bulk-killable="true"] { user-select:none }
+      .myelin-node-status { display:grid;grid-template-columns:max-content minmax(0,1fr);gap:5px 12px;width:min(720px,100%);margin:0 0 12px;padding:10px 12px;border:1px solid var(--divider);border-radius:var(--r);background:var(--ghost);font:12px/1.45 var(--mono) }
+      .myelin-node-status dt { color:var(--muted) }
+      .myelin-node-status dd { margin:0;min-width:0;overflow-wrap:anywhere;color:var(--text) }
+      .myelin-node-status dd[data-error]:not(:empty) { color:var(--bad) }
       .myelin-execution { display:grid;gap:8px;width:min(720px,100%);padding:10px 12px;border:1px solid var(--divider);border-radius:var(--r);background:var(--ghost) }
       .myelin-execution-row { display:flex;align-items:center;flex-wrap:wrap;gap:8px }
       .myelin-execution input[type="file"] { max-width:100%;color:var(--text);font:12px var(--mono) }
@@ -362,6 +367,25 @@
     killButton.textContent = pending ? 'Kill requested' : 'Kill';
     message.textContent = `managed node ${logicalNodeId}: ${node.phase}`;
     ensureExecutionControl(nodeView, logicalNodeId, terminal || pending);
+    let status = document.getElementById(NODE_STATUS_ID);
+    if (!status) {
+      status = document.createElement('dl');
+      status.id = NODE_STATUS_ID;
+      status.className = 'myelin-node-status';
+      status.innerHTML = `<dt>Phase</dt><dd data-phase></dd>
+        <dt>Offer</dt><dd data-offer></dd>
+        <dt>Provider ref</dt><dd data-provider-ref></dd>
+        <dt>Last transition</dt><dd data-transition></dd>
+        <dt>Error</dt><dd data-error></dd>`;
+      control.after(status);
+    }
+    status.querySelector('[data-phase]').textContent = node.phase || 'unknown';
+    status.querySelector('[data-offer]').textContent = node.selected_offer_id ?? '—';
+    status.querySelector('[data-provider-ref]').textContent = node.provider_ref || 'not created';
+    status.querySelector('[data-transition]').textContent = Number.isFinite(node.last_seen_unix_ms)
+      ? new Date(node.last_seen_unix_ms).toISOString()
+      : '—';
+    status.querySelector('[data-error]').textContent = node.last_error || '';
 
     killButton.onclick = async () => {
       if (!await confirmTermination(
@@ -431,7 +455,7 @@
         ? mutation.target
         : mutation.target.parentElement;
       return !element?.closest(
-        `#${NODE_CONTROL_ID}, #${EXECUTION_CONTROL_ID}, #${BULK_CONTROL_ID}`,
+        `#${NODE_CONTROL_ID}, #${NODE_STATUS_ID}, #${EXECUTION_CONTROL_ID}, #${BULK_CONTROL_ID}`,
       );
     });
     if (dashboardChanged) syncControl();

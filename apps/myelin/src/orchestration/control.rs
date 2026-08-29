@@ -183,13 +183,13 @@ async fn provision(
     State(state): State<ControlHttpState>,
     Json(request): Json<ProvisionRequest>,
 ) -> Response {
-    route_mutation(
-        &state,
+    request_reply(&state, CONTROL_REPLY_TIMEOUT, |reply_to| {
         ManualControlMsg::Provision {
             request,
-            reply_to: None,
-        },
-    )
+            reply_to: Some(reply_to),
+        }
+    })
+    .await
 }
 
 async fn kill(State(state): State<ControlHttpState>, Json(request): Json<KillRequest>) -> Response {
@@ -401,20 +401,7 @@ async fn contextual_python(
             .into_response();
     }
 
-    let spec = ContextualProcessSpecWire {
-        command: "python3".to_owned(),
-        args: Vec::new(),
-        env: BTreeMap::new(),
-        working_dir: None,
-        label: Some(filename.to_owned()),
-        execution_id: request_id.clone(),
-        read_prefixes: Vec::new(),
-        write_prefixes: Vec::new(),
-        attach_timeout_ms: PROGRAM_ATTACH_TIMEOUT.as_millis() as u64,
-        staged_program: Some(ContextualProgramFileWire {
-            namespace_path: namespace_path.clone(),
-        }),
-    };
+    let spec = python_contextual_spec(&request_id, filename, namespace_path.clone());
     let response_rx = match begin_contextual_request_reply(
         &state,
         None,
@@ -433,6 +420,25 @@ async fn contextual_python(
         }
     };
     contextual_response(response_rx).await
+}
+
+fn python_contextual_spec(
+    request_id: &str,
+    filename: &str,
+    namespace_path: String,
+) -> ContextualProcessSpecWire {
+    ContextualProcessSpecWire {
+        command: "python3".to_owned(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        working_dir: None,
+        label: Some(filename.to_owned()),
+        execution_id: request_id.to_owned(),
+        read_prefixes: vec!["/models".to_owned(), format!("/runs/{request_id}/results")],
+        write_prefixes: vec![format!("/runs/{request_id}/results")],
+        attach_timeout_ms: PROGRAM_ATTACH_TIMEOUT.as_millis() as u64,
+        staged_program: Some(ContextualProgramFileWire { namespace_path }),
+    }
 }
 
 async fn write_uploaded_program(
@@ -877,7 +883,16 @@ mod properties {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push("SearchOffers".to_owned());
-                    self.finish_reply(ctx, reply_to, ManualControlReply::Offers(Vec::new()));
+                    self.finish_reply(
+                        ctx,
+                        reply_to,
+                        ManualControlReply::Offers(
+                            crate::orchestration::manual_control::OfferSearchResults {
+                                search_id: 0,
+                                offers: Vec::new(),
+                            },
+                        ),
+                    );
                 }
                 _ => {}
             }
@@ -926,6 +941,7 @@ mod properties {
                             command_id: HttpAction::command_id(*command_slot),
                             count: u32::from(*count),
                             selected_offer_ids: Vec::new(),
+                            search_id: None,
                             image: None,
                         },
                         reply_to: None,
@@ -1371,5 +1387,22 @@ mod properties {
                 .is_some(),
             "control HTTP/bridge invariant accepted a controlled duplicate forward"
         );
+    }
+    #[test]
+    fn uploaded_python_receives_model_read_and_execution_scoped_result_access() {
+        let spec = python_contextual_spec(
+            "ui-scenario",
+            "tiny_linear_inference.py",
+            "/myelin/contextual/ui-scenario/program.py".to_owned(),
+        );
+
+        assert_eq!(
+            spec.read_prefixes,
+            vec!["/models", "/runs/ui-scenario/results"],
+        );
+        assert_eq!(spec.write_prefixes, vec!["/runs/ui-scenario/results"],);
+        assert_eq!(spec.execution_id, "ui-scenario");
+        assert_eq!(spec.command, "python3");
+        assert!(spec.args.is_empty());
     }
 }

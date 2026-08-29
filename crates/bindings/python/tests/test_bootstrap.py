@@ -452,7 +452,6 @@ def test_contextual_spawner_launches_real_python_with_usable_context(host):
     reason="CUDA device is unavailable",
 )
 def test_real_exec_tinygrad_cuda_scenario(host):
-    capture = host.capture_stream("/runs/self/results/inference")
     inherited = install_bootstrap(host)
     env = clean_child_environment()
     env.update({"CUDA_PTX": "1", "DEV": "CUDA"})
@@ -478,6 +477,12 @@ def test_real_exec_tinygrad_cuda_scenario(host):
         except OSError:
             pass
     assert result.returncode == 0, result.stderr
-    payload = json.loads(capture.result())
-    assert payload["device"].startswith("CUDA")
-    assert payload["output"] == pytest.approx([2.75, -8.75])
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    calculated = next(record for record in records if record["stage"] == "calculated")
+    streamed = next(
+        record for record in records if record["stage"] == "result_stream_received"
+    )
+    assert calculated["device"].startswith("CUDA")
+    assert calculated["output"] == pytest.approx([2.75, -8.75])
+    assert streamed["path"] == "/runs/self/results/inference"
+    assert streamed["bytes"] > 0

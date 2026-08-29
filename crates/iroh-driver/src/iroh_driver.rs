@@ -721,6 +721,28 @@ impl IrohDriver {
         addr
     }
 
+    /// Returns a cheap source of the endpoint's current advertised address.
+    ///
+    /// The Iroh endpoint is read on every call so long-running provider setup
+    /// cannot freeze an obsolete home relay into a later bootstrap attempt.
+    pub fn endpoint_addr_supplier(&self) -> Arc<dyn Fn() -> EndpointAddr + Send + Sync> {
+        let endpoint = self.endpoint.clone();
+        let configured_relay = self.relay_url.clone();
+        let direct_addresses = self.direct_addresses();
+        Arc::new(move || {
+            let mut addr = endpoint.addr();
+            if addr.relay_urls().next().is_none()
+                && let Some(relay) = configured_relay.clone()
+            {
+                addr = addr.with_relay_url(relay);
+            }
+            for direct in &direct_addresses {
+                addr = addr.with_ip_addr(*direct);
+            }
+            addr
+        })
+    }
+
     /// Compute direct socket addresses from bound sockets + LAN discovery.
     ///
     /// For sockets bound to `0.0.0.0`, emits one `SocketAddr` per discovered
@@ -951,7 +973,7 @@ impl IrohDriver {
             }
         }
         if seed_addr.relay_urls().next().is_none()
-            && let Some(relay) = cached_relay.or_else(|| self.home_relay_url())
+            && let Some(relay) = cached_relay
         {
             enriched = enriched.with_relay_url(relay);
         }
@@ -1259,6 +1281,27 @@ impl IrohDriver {
         }));
     }
 
+    /// Wait indefinitely until this endpoint has completed a relay handshake,
+    /// then return its live advertised address.
+    ///
+    /// Callers must only use this when relays are enabled. Iroh intentionally
+    /// leaves the future pending forever when no relays are configured.
+    pub fn wait_for_relay_endpoint(&self) -> Result<EndpointAddr, String> {
+        let ready_endpoint = self.endpoint.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.engine.spawn(async move {
+            ready_endpoint.online().await;
+            let _ = tx.send(ready_endpoint.addr());
+        });
+        let endpoint = rx
+            .recv()
+            .map_err(|error| format!("relay readiness task dropped: {error}"))?;
+        if endpoint.relay_urls().next().is_none() {
+            return Err("relay became online without an advertised relay URL".to_owned());
+        }
+        Ok(endpoint)
+    }
+
     /// Relay URL configured or exposed by the bound endpoint, if any.
     pub fn relay_url(&self) -> Option<&str> {
         self.relay_url.as_ref().map(|url| url.as_str())
@@ -1328,7 +1371,6 @@ impl IrohDriver {
             next_edge_stream_group: Arc::clone(&self.next_edge_stream_group),
             dialing: Arc::clone(&self.dialing),
             peer_auth: self.peer_auth.clone(),
-            relay_url: self.relay_url.clone(),
             bridge: Arc::clone(self.actor_bridge.as_ref().expect("bridge installed")),
             pending_outbound: Arc::new(Mutex::new(VecDeque::new())),
         };
@@ -1370,7 +1412,6 @@ struct AdapterPump {
     next_edge_stream_group: Arc<AtomicU64>,
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
-    relay_url: Option<iroh::RelayUrl>,
     bridge: Arc<ActorBridge>,
     pending_outbound: Arc<Mutex<VecDeque<OutFrame>>>,
 }
@@ -1609,17 +1650,14 @@ impl AdapterPump {
         for address in direct_addrs {
             dial_addr = dial_addr.with_ip_addr(address);
         }
-        if let Some(relay) = relay
-            .or_else(|| {
-                self.bridge
-                    .relay_mirror
-                    .read()
-                    .ok()
-                    .and_then(|view| view.get(&node_id).cloned())
-                    .and_then(|url| url.parse::<iroh::RelayUrl>().ok())
-            })
-            .or_else(|| self.home_relay_url())
-        {
+        if let Some(relay) = relay.or_else(|| {
+            self.bridge
+                .relay_mirror
+                .read()
+                .ok()
+                .and_then(|view| view.get(&node_id).cloned())
+                .and_then(|url| url.parse::<iroh::RelayUrl>().ok())
+        }) {
             dial_addr = dial_addr.with_relay_url(relay);
         }
         self.spawn_connect(node_id, dial_addr);
@@ -1764,16 +1802,6 @@ impl AdapterPump {
             None => true,
             Some(auth) => auth.lock().is_allowed(node_id),
         }
-    }
-
-    /// The endpoint's live or configured home relay URL, if any.
-    fn home_relay_url(&self) -> Option<iroh::RelayUrl> {
-        self.endpoint
-            .addr()
-            .relay_urls()
-            .next()
-            .cloned()
-            .or_else(|| self.relay_url.clone())
     }
 
     /// One full pump cycle: fold connections, drain inbound/outbound, drive

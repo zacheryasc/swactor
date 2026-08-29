@@ -384,7 +384,7 @@ const TIMING_ALLOWANCES: &[TimingAllowance] = &[
     ),
     timing(
         "myelin-e2e-fuzz",
-        "harness::convergence::<impl harness::ClusterHarness>::provision",
+        "harness::convergence::<impl harness::ClusterHarness>::provision_nodes",
         "std::thread::sleep",
         1,
         "external provisioning polling",
@@ -393,8 +393,15 @@ const TIMING_ALLOWANCES: &[TimingAllowance] = &[
         "myelin-e2e-fuzz",
         "harness::ClusterHarness::teardown",
         "std::thread::sleep",
+        2,
+        "external resource and process teardown polling",
+    ),
+    timing(
+        "myelin-e2e-fuzz",
+        "harness::ClusterHarness::verify_missing_resource_recovery",
+        "std::thread::sleep",
         1,
-        "external process teardown polling",
+        "external provider recovery convergence polling",
     ),
     timing(
         "myelin-e2e-fuzz",

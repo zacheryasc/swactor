@@ -14,6 +14,7 @@ use crate::types::{
 #[derive(Clone)]
 pub struct VastClient {
     http: reqwest::Client,
+    streaming_http: reqwest::Client,
     base_url: String,
     api_key: String,
 }
@@ -38,8 +39,12 @@ impl VastClient {
             .timeout(Self::REQUEST_TIMEOUT)
             .build()
             .expect("valid Vast.ai HTTP client");
+        let streaming_http = reqwest::Client::builder()
+            .build()
+            .expect("valid Vast.ai streaming HTTP client");
         Self {
             http,
+            streaming_http,
             base_url: base_url.into(),
             api_key: api_key.into(),
         }
@@ -87,6 +92,20 @@ impl VastClient {
         criteria: &OfferBrowseCriteria,
     ) -> Result<Vec<Offer>, String> {
         crate::search::browse_offers(&self.http, &self.base_url, &self.api_key, criteria).await
+    }
+    pub async fn request_logs(&self, contract_id: u64) -> Result<String, String> {
+        crate::logs::request_logs(&self.http, &self.base_url, &self.api_key, contract_id).await
+    }
+
+    pub async fn fetch_logs(&self, log_url: &str) -> Result<String, String> {
+        crate::logs::fetch_logs(&self.http, log_url).await
+    }
+
+    pub async fn open_log_stream(
+        &self,
+        log_url: &str,
+    ) -> Result<crate::logs::VastLogStream, String> {
+        crate::logs::open_log_stream(&self.streaming_http, log_url).await
     }
 
     pub async fn provision(&self, req: ProvisionRequest) -> Result<ProvisionedFleet, String> {

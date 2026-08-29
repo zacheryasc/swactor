@@ -412,7 +412,8 @@ pub struct RelayGuard {
 /// Spawn a local HTTP relay server for tests. Returns the relay URL and a
 /// guard that shuts the server down on drop.
 pub fn spawn_test_relay() -> (iroh::RelayUrl, RelayGuard) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();

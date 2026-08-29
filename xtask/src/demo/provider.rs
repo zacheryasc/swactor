@@ -479,6 +479,7 @@ impl EffectBackend for DemoBackend {
                         request.spec.logical_node_id.0.clone(),
                     )],
                     args: Vec::new(),
+                    offer_criteria_json: None,
                     mounts: Vec::new(),
                 };
                 self.plugin

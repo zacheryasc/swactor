@@ -77,6 +77,7 @@
     .pill { display: inline-flex; padding: 3px 6px; border: 1px solid var(--muted); border-radius: var(--r); font: 600 10px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--text); }
     .pill.live { color: var(--ok); border-color: var(--ok); }
     .pill.stale { color: var(--bad); border-color: var(--bad); }
+    .pill.provisioning { color: var(--amber); border-color: var(--amber); }
     .pill.poisoned { color: var(--bad); border-color: var(--bad); font-weight: 700; }
     details.stale { margin-top: 18px; }
     details.stale summary { cursor: pointer; color: var(--muted); padding: 8px 0; font-family: var(--mono); font-size: 12px; }
@@ -275,33 +276,38 @@ function render() {
   const page = document.getElementById('page');
   const status = document.getElementById('status');
   const data = lastSnapshot;
+  const provisioning = data.provisioning || [];
   const live = data.live || [];
   const stale = data.stale || [];
   const totals = data.totals || {};
-  status.textContent = `${fmt(totals.live_nodes)} live · ${fmt(totals.stale_nodes)} stale`;
+  status.textContent = `${fmt(totals.provisioning_nodes)} provisioning · ${fmt(totals.live_nodes)} live · ${fmt(totals.stale_nodes)} stale`;
 
-  const node = live.concat(stale).find(n => n.stream.key === selectedStream)
-    || live.find(n => n.stream.key === selectedStream);
+  const node = provisioning.concat(live, stale).find(n => n.stream.key === selectedStream);
   if (node) {
     renderNode(page, node, live, stale);
   } else {
-    renderFleet(page, live, stale, totals);
+    renderFleet(page, provisioning, live, stale, totals);
   }
   updateAgo();
 }
 
-function renderFleet(page, live, stale, totals) {
+function renderFleet(page, provisioning, live, stale, totals) {
   stopDetailPolling();
   const orchestrators = live.filter(n => (n.stream.origin || '') === 'orchestrator');
   const workers = live.filter(n => (n.stream.origin || '') !== 'orchestrator');
   const parts = [];
-  if (!live.length && !stale.length) {
+  if (!provisioning.length && !live.length && !stale.length) {
     parts.push('<div class="empty">No telemetry streams yet. A live swactor runtime or host publisher will populate this page.</div>');
   } else {
-    parts.push('<div class="grid">' + orchestrators.concat(workers).map(nodeCard).join('') + '</div>');
+    if (provisioning.length) {
+      parts.push(`<h2>Provisioning (${provisioning.length})</h2><div class="grid">${provisioning.map(nodeCard).join('')}</div>`);
+    }
+    if (live.length) {
+      parts.push(`<h2>Live (${live.length})</h2><div class="grid">${orchestrators.concat(workers).map(nodeCard).join('')}</div>`);
+    }
     if (stale.length) {
       parts.push(`<details class="stale">
-        <summary>Stale nodes (${stale.length}) — silent beyond the liveness window</summary>
+        <summary>Stale nodes (${stale.length}) — previously live, now silent beyond the liveness window</summary>
         <div class="grid">${stale.map(nodeCard).join('')}</div>
       </details>`);
     }
@@ -311,13 +317,17 @@ function renderFleet(page, live, stale, totals) {
     page.innerHTML = html;
     lastPageHtml = html;
   }
-  updateCardTexts(orchestrators.concat(workers, stale));
+  updateCardTexts(provisioning.concat(orchestrators, workers, stale));
 }
 
 function nodeCard(node) {
   const summary = node.actor_summary || {};
-  const proc = node.process ? `<span class="pill">${esc(node.process.state)}</span> ` : '';
   const origin = node.stream.origin || '';
+  const isProvisioning = origin === 'bootstrap';
+  const phase = node.output?.phase || 'requested';
+  const proc = isProvisioning
+    ? `<span class="pill provisioning">${esc(phase)}</span> `
+    : node.process ? `<span class="pill">${esc(node.process.state)}</span> ` : '';
   const isOrchestrator = origin === 'orchestrator';
   const role = isOrchestrator ? '<span class="role">orchestrator</span>' : '';
   const label = node.stream.label ? ` · ${esc(node.stream.label)}` : '';
@@ -327,7 +337,7 @@ function nodeCard(node) {
   return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-node="${esc(node.stream.node)}" data-origin="${esc(origin)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
     ${role}
     <h3>${esc(node.stream.node)} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
-    <div class="meta">${proc}seen <span data-seen></span> ago · <span data-stats></span>${label}</div>
+    <div class="meta">${proc}updated <span data-seen></span> ago · <span data-stats></span>${label}</div>
     ${summary.poisoned ? `<div class="notice err">${fmt(summary.poisoned)} poisoned actor(s)</div>` : ''}
   </a>`;
 }

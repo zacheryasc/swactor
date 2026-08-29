@@ -184,6 +184,7 @@ pub fn plugin_spec(attempt: u64) -> NodeProvisionSpec {
         image: "kit-node".to_owned(),
         env: Vec::new(),
         args: Vec::new(),
+        offer_criteria_json: None,
         mounts: Vec::new(),
     }
 }
@@ -414,6 +415,7 @@ impl<P: TestablePlugin + 'static> EffectBackend for PluginBackendAdapter<P> {
                     image: request.spec.shape.image.clone(),
                     env: Vec::new(),
                     args: Vec::new(),
+                    offer_criteria_json: None,
                     mounts: Vec::new(),
                 };
                 let handle = shared

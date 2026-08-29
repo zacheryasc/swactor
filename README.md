@@ -364,9 +364,29 @@ flowchart TD
 - **A drop-in replacement for GPU jobs on cloud infrastructure.** `apps/myelin`
   ships an orchestrator plus a containerized worker node
   (`apps/myelin/node-image`) that provisions, stages models, and runs them.
-- **Orchestration for sharded inference.** The standard node image ships only
-  the Rust node; workload-specific images add Python bindings and framework
+- **Orchestration for sharded inference.** The standard node image ships the
+  Rust node and Python binding; workload-specific images add framework
   runtimes such as tinygrad or the planned vLLM backend.
+
+### Vast.ai GPU smoke scenario
+
+Build the node and tinygrad workload image from the workspace root, then push
+the final image to a registry that Vast.ai can pull:
+
+```sh
+docker build -f apps/myelin/node-image/Dockerfile.base -t myelin-node-base:cuda12.6 .
+docker build -f apps/myelin/node-image/Dockerfile -t myelin-node:latest .
+docker build -f apps/myelin/node-image/Dockerfile.gpu-smoke \
+  -t <registry>/myelin-node-gpu-smoke:<tag> .
+docker push <registry>/myelin-node-gpu-smoke:<tag>
+```
+
+Run `cargo run -p myelin`, provision a Vast.ai offer with that versioned image,
+open the running remote node, and select
+`apps/myelin/testdata/tiny_linear_inference.py`. Myelin supplies the seeded
+weights at `/models/tiny-linear/weights`. A successful run reports CUDA,
+streams `[2.75,-8.75]` through `/runs/self/results/inference`, receives the
+same payload back, and exits with code zero.
 
 ## Examples
 

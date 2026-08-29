@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use telemetry::{ChannelContent, Lifetime, NodeId, StreamId, TelemetryProducer};
+use telemetry::{ChannelContent, TelemetryProducer};
 
 use crate::observability::telemetry::{
     MYELIN_PROVISIONING_LOGS, MyelinProvisionLogRecord, myelin_provision_log_channel,
@@ -8,10 +8,6 @@ use crate::observability::telemetry::{
 use crate::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
 };
-
-pub(crate) fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
-    StreamId::new(NodeId::new(node_id.to_string()), Lifetime(run_id))
-}
 
 #[derive(Clone)]
 pub(crate) struct BootstrapTelemetryBridge {

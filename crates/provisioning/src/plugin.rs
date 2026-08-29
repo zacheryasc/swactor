@@ -13,6 +13,10 @@ pub struct NodeProvisionSpec {
     pub image: String,
     pub env: Vec<(String, String)>,
     pub args: Vec<String>,
+    /// Provider-neutral JSON encoding of the criteria used to display an
+    /// explicitly selected marketplace offer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_criteria_json: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<ProviderMount>,
 }
@@ -36,7 +40,11 @@ pub struct ProvisionEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProvisionEventKind {
-    ProvisionStart,
+    Requested,
+    Creating,
+    Bootstrapping,
+    Joining,
+    Acknowledging,
     NodeLive,
     ProvisionFailed,
     NodeStopped,
@@ -79,6 +87,11 @@ pub enum PluginObservation {
         run_id: u64,
         node_id: u64,
         line: String,
+    },
+    PhaseChanged {
+        run_id: u64,
+        node_id: u64,
+        phase: ProvisionEventKind,
     },
     Exited {
         run_id: u64,
@@ -227,6 +240,7 @@ mod tests {
             image: "runtime:latest".to_owned(),
             env: vec![("A".to_owned(), "B".to_owned())],
             args: vec!["--join".to_owned()],
+            offer_criteria_json: None,
             mounts: vec![ProviderMount {
                 host_path: "/cache/model.gguf".to_owned(),
                 container_path: "/models/model.gguf".to_owned(),

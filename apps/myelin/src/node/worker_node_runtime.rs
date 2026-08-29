@@ -51,7 +51,7 @@ use data_plane::object_record as ingress;
 use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{
     EDGE_ALPN, IrohBlobTransferReceiver, IrohBlobTransferSender, IrohDriver, IrohDriverConfig,
     TELEMETRY_ALPN, spawn_pull_server,
@@ -1737,6 +1737,23 @@ fn run() -> Result<(), String> {
     // ALPN connections available to the node loop instead of the legacy push
     // reader path.
     driver.retain_telemetry_connections();
+    let coordinator_uses_relay = config
+        .coordinator_endpoint
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.relay_urls().next().is_some());
+    if coordinator_uses_relay && !matches!(config.relay_mode, RelayMode::Disabled) {
+        boot(
+            "iroh_relay",
+            "waiting",
+            json!({"relay_mode":format!("{:?}", config.relay_mode)}),
+        )?;
+        let endpoint = driver.wait_for_relay_endpoint()?;
+        boot(
+            "iroh_relay",
+            "ready",
+            json!({"relay_url":endpoint.relay_urls().next().map(ToString::to_string)}),
+        )?;
+    }
     let advertised_self_endpoint =
         advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
     boot(

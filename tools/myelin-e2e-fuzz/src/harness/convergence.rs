@@ -10,7 +10,7 @@ use crate::codegen::{digest, render_python};
 use crate::harness::ClusterHarness;
 use crate::ir::{AccessSpec, Action, ActionOp, ExecutionObservation, ProcessProgram};
 use crate::oracle::BehaviorOracle;
-use crate::resources::http_json;
+use crate::resources::{http_json, transient_actor_identities};
 
 use super::POLL_INTERVAL;
 
@@ -45,7 +45,7 @@ impl ClusterHarness {
         }
     }
 
-    pub(super) fn provision(&mut self) -> Result<(), String> {
+    pub(super) fn provision_nodes(&mut self) -> Result<(), String> {
         let command_id = format!("e2e-provision-{}", self.config.seed);
         let selected_offer_ids = (1..=u64::from(self.config.node_count)).collect::<Vec<_>>();
         http_json(
@@ -74,8 +74,6 @@ impl ClusterHarness {
             if running.len() == usize::from(self.config.node_count) {
                 self.node_ids = running;
                 self.node_ids.sort_unstable();
-                self.wait_contextual_control()?;
-                self.verify_ordered_pair_communication()?;
                 return Ok(());
             }
             if nodes.is_some_and(|nodes| {
@@ -93,8 +91,17 @@ impl ClusterHarness {
                     self.config.node_count
                 )));
             }
+
             thread::sleep(POLL_INTERVAL);
         }
+    }
+    pub fn verify_workload_convergence(&mut self) -> Result<(), String> {
+        self.wait_contextual_control()?;
+        if self.resource_baseline.is_empty() {
+            let baseline = self.health_snapshot()?;
+            self.resource_baseline = transient_actor_identities(&baseline);
+        }
+        self.verify_ordered_pair_communication()
     }
 
     fn wait_contextual_control(&mut self) -> Result<(), String> {

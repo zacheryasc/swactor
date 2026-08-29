@@ -16,6 +16,7 @@ pub struct TestHttpRoute {
     path: String,
     status: u16,
     body: Vec<u8>,
+    keep_open: bool,
 }
 
 impl TestHttpRoute {
@@ -25,6 +26,7 @@ impl TestHttpRoute {
             path: path.to_owned(),
             status,
             body: serde_json::to_vec(&body).expect("test HTTP JSON serializes"),
+            keep_open: false,
         }
     }
 
@@ -34,6 +36,17 @@ impl TestHttpRoute {
             path: path.to_owned(),
             status,
             body: body.into(),
+            keep_open: false,
+        }
+    }
+
+    pub fn open_raw(method: &str, path: &str, status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            status,
+            body: body.into(),
+            keep_open: true,
         }
     }
 }
@@ -114,9 +127,15 @@ fn serve(mut stream: TcpStream, routes: &[TestHttpRoute], requests: &Mutex<Vec<T
                 .map_or(request.path.as_str(), |(path, _)| path)
                 == route.path
     });
-    let (status, body) = route
-        .map(|route| (route.status, route.body.as_slice()))
-        .unwrap_or((404, b"{}"));
+    let route = route.cloned().unwrap_or_else(|| TestHttpRoute {
+        method: request.method,
+        path: request.path,
+        status: 404,
+        body: b"{}".to_vec(),
+        keep_open: false,
+    });
+    let status = route.status;
+    let body = route.body.as_slice();
     let reason = match status {
         200 => "OK",
         201 => "Created",
@@ -125,13 +144,23 @@ fn serve(mut stream: TcpStream, routes: &[TestHttpRoute], requests: &Mutex<Vec<T
         404 => "Not Found",
         _ => "Response",
     };
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    let header = if route.keep_open {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
+        )
+    } else {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+    };
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
+    if route.keep_open {
+        let mut buffer = [0_u8; 1];
+        while stream.read(&mut buffer).is_ok_and(|read| read > 0) {}
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<TestHttpRequest, String> {

@@ -401,6 +401,20 @@ pub(crate) fn list_workload_processes(prefix: &str) -> Result<Option<Vec<String>
     Ok(Some(processes))
 }
 
+pub(crate) fn remove_container(container: &str) -> Result<(), String> {
+    let status = Command::new("docker")
+        .args(["rm", "-f", container])
+        .status()
+        .map_err(|error| format!("remove harness container {container}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "remove harness container {container} exited {status}"
+        ))
+    }
+}
+
 pub(crate) fn remove_containers(prefix: &str) -> Result<(), String> {
     let ids = list_containers(prefix)?;
     if ids.is_empty() {

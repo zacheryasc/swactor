@@ -14,6 +14,7 @@ struct Options {
     max_cases: Option<usize>,
     failure_cases: bool,
     smoke_only: bool,
+    recovery_only: bool,
     artifacts: PathBuf,
     image: Option<String>,
     build_image: bool,
@@ -35,6 +36,7 @@ impl Options {
             random_cases: 16,
             max_cases: None,
             smoke_only: false,
+            recovery_only: false,
             artifacts: PathBuf::from("target/e2e-behavioral-fuzz"),
             image: None,
             build_image: true,
@@ -77,6 +79,7 @@ impl Options {
                 "--no-build-image" => options.build_image = false,
                 "--replay" => options.replay = Some(PathBuf::from(next("--replay")?)),
                 "--failure-cases" => options.failure_cases = true,
+                "--recovery-only" => options.recovery_only = true,
                 "--no-shrink" => options.shrink = false,
                 "--deadline-secs" => {
                     options.deadline = Duration::from_secs(
@@ -88,9 +91,9 @@ impl Options {
                 "--help" | "-h" => {
                     println!(
                         "myelin-e2e-fuzz [--seed N] [--nodes 2|3] [--random-cases N] \
-                         [--max-cases N] [--smoke-only] [--failure-cases] [--artifacts PATH] \
-                         [--image TAG] [--no-build-image] [--no-shrink] [--replay CASE.json] \
-                         [--deadline-secs N]"
+                         [--max-cases N] [--smoke-only] [--failure-cases] [--recovery-only] \
+                         [--artifacts PATH] [--image TAG] [--no-build-image] [--no-shrink] \
+                         [--replay CASE.json] [--deadline-secs N]"
                     );
                     std::process::exit(0);
                 }
@@ -143,7 +146,10 @@ fn run() -> Result<(), String> {
     if let Some(max_cases) = options.max_cases {
         cases.truncate(max_cases);
     }
-    if cases.is_empty() {
+    if options.recovery_only {
+        cases.clear();
+    }
+    if cases.is_empty() && !options.recovery_only {
         return Err("no behavioral cases selected".to_owned());
     }
 
@@ -159,6 +165,10 @@ fn run() -> Result<(), String> {
         deadline: options.deadline,
     };
     let mut harness = ClusterHarness::start(config.clone())?;
+    harness.verify_running_recovery()?;
+    if !options.recovery_only {
+        harness.verify_workload_convergence()?;
+    }
     println!(
         "cluster ready: nodes={:?} image={} cases={} seed={}",
         harness.node_ids(),
@@ -241,6 +251,7 @@ fn run() -> Result<(), String> {
             ));
         }
     }
+    harness.verify_missing_resource_recovery()?;
     harness.teardown()?;
     println!("behavioral fuzz harness completed {} cases", cases.len());
     Ok(())

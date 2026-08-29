@@ -15,6 +15,7 @@ pub mod pricing;
 pub mod provision;
 pub mod search;
 pub mod state;
+mod tasks;
 pub mod teardown;
 #[cfg(feature = "test-support")]
 pub mod test_http;
@@ -23,7 +24,7 @@ pub mod types;
 pub use blocking::BlockingVastClient;
 pub use client::VastClient;
 pub use lease::{confirm_lease, provision_fleet};
-pub use logs::{fetch_logs, request_logs};
+pub use logs::{VastLogStream, fetch_logs, open_log_stream, request_logs};
 pub use monitor::{
     fetch_instance_status, wait_for_running, wait_for_running_with_policy,
     wait_for_ssh_endpoint_with_policy,
@@ -33,6 +34,9 @@ pub use provision::create_instance;
 pub use search::{
     OfferBrowseCriteria, browse_offers, plan_distinct_host_first_wave, select_offer_pool,
     select_offer_pool_with_policy,
+};
+pub use tasks::{
+    VastLogStreamEvent, VastTaskCancellation, spawn_instance_status_task, spawn_log_stream_task,
 };
 pub use teardown::{
     destroy_all_instances, destroy_instance, destroy_instance_with_retry, list_instances_by_label,

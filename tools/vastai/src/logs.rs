@@ -1,3 +1,31 @@
+pub struct VastLogStream {
+    response: reqwest::Response,
+}
+
+impl VastLogStream {
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        self.response
+            .chunk()
+            .await
+            .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+            .map_err(|error| format!("fetch_logs read failed: {error}"))
+    }
+}
+
+pub async fn open_log_stream(
+    client: &reqwest::Client,
+    log_url: &str,
+) -> Result<VastLogStream, String> {
+    let response = client
+        .get(log_url)
+        .send()
+        .await
+        .map_err(|error| format!("fetch_logs failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("fetch_logs status failed: {error}"))?;
+    Ok(VastLogStream { response })
+}
+
 pub async fn request_logs(
     client: &reqwest::Client,
     base_url: &str,

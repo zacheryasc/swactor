@@ -1497,6 +1497,7 @@ mod properties {
             node_id: attempt,
             attempt_id: attempt,
             stage_index: None,
+            offer_criteria_json: None,
             image: "generated-demo-node".to_owned(),
             env: vec![("DEMO_LOGICAL_NODE".to_owned(), format!("node-{attempt}"))],
             args: Vec::new(),

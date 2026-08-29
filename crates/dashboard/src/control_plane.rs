@@ -8,12 +8,15 @@
 //! levels: node cards → per-node roster → per-actor dossier (via the
 //! `/api/view/fleet/detail` endpoint).
 //!
-//! Stale streams (silent beyond [`LIVE_TTL`]) leave the live pool: they
-//! render in a separate collapsed section and are physically capped at
-//! [`STALE_POOL_CAP`]. A newer `life` generation for the same node evicts
-//! older generations immediately — restarts stop accumulating.
+//! Provisioning attempts remain in a phase-driven pool until their runtime
+//! telemetry stream joins or a terminal event removes them. They never enter
+//! the stale pool. Stale therefore means a previously joined stream has been
+//! silent beyond [`LIVE_TTL`]; stale cards render in a separate collapsed
+//! section and are physically capped at [`STALE_POOL_CAP`]. A newer `life`
+//! generation for the same node evicts older generations immediately —
+//! restarts stop accumulating.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -39,6 +42,7 @@ const STALE_POOL_CAP: usize = 50;
 const ORIGIN_ORCHESTRATOR: &str = "orchestrator";
 const OUTPUT_TAIL_CAP: usize = 50;
 const PROVISIONING_EVENTS: &str = "myelin.provisioning.events";
+const ORCHESTRATOR_LOGS: &str = "myelin.orchestrator.logs";
 const PROVISIONING_LOG_PREFIX: &str = "myelin.provisioning.logs.node.";
 
 /// Fused control-plane view serving `/` and `/view/fleet`.
@@ -50,6 +54,8 @@ pub struct ControlPlaneView {
 #[derive(Default)]
 struct FusedState {
     streams: BTreeMap<String, FusedNode>,
+    provisioning: BTreeMap<String, FusedNode>,
+    finished_provisioning: BTreeSet<String>,
 }
 
 struct FusedNode {
@@ -162,17 +168,44 @@ impl DashboardView for ControlPlaneView {
         let mut state = self.state.write();
 
         if let Some(routed) = provisioning_output(event) {
-            {
-                let pending = ensure_node(&mut state.streams, &routed.stream, now);
-                pending.last_seen = now;
-                pending.output.set_phase(&routed.phase);
-                if let (Some(source), Some(text)) = (routed.source, routed.text) {
-                    pending.output.push_line(&source, &routed.phase, text, now);
+            let key = stream_key(&routed.stream);
+            if routed.stream.origin.as_deref() == Some("bootstrap") {
+                let terminal = matches!(routed.phase.as_str(), "failed" | "stopped");
+                if terminal {
+                    if let Some(node) = state.streams.get_mut(&key) {
+                        apply_routed_output(node, &routed, now);
+                    } else {
+                        state.provisioning.remove(&key);
+                    }
+                    state.finished_provisioning.insert(key);
+                    prune_finished_provisioning(&mut state.finished_provisioning);
+                } else {
+                    if routed.phase != "provisioning" {
+                        state.finished_provisioning.remove(&key);
+                    }
+                    if let Some(node) = state.streams.get_mut(&key) {
+                        apply_routed_output(node, &routed, now);
+                    } else if !state.finished_provisioning.contains(&key) {
+                        let pending = ensure_node(&mut state.provisioning, &routed.stream, now);
+                        apply_routed_output(pending, &routed, now);
+                        prune_provisioning(&mut state.provisioning);
+                    }
                 }
+            } else {
+                let node = ensure_node(&mut state.streams, &routed.stream, now);
+                apply_routed_output(node, &routed, now);
+                prune(&mut state.streams, &routed.stream, now);
             }
-            prune(&mut state.streams, &routed.stream, now);
         }
 
+        let joined_output = if event.stream.origin.as_deref() == Some(ORIGIN_ORCHESTRATOR) {
+            None
+        } else {
+            state
+                .provisioning
+                .remove(&stream_key(&event.stream))
+                .map(|pending| pending.output)
+        };
         {
             let node = ensure_node(&mut state.streams, &event.stream, now);
             node.last_seen = now;
@@ -182,6 +215,9 @@ impl DashboardView for ControlPlaneView {
             }
             if let Some(label) = &event.stream.label {
                 node.label = Some(label.clone());
+            }
+            if let Some(output) = joined_output {
+                node.output = output;
             }
             node.hardware.update(&event.channel, &event.payload, now);
             node.actors.update(&event.channel, &event.payload, now);
@@ -195,6 +231,15 @@ impl DashboardView for ControlPlaneView {
     fn snapshot_json(&self) -> Value {
         let now = Instant::now();
         let state = self.state.read();
+        let mut provisioning = state
+            .provisioning
+            .values()
+            .map(|node| {
+                let mut card = node_card(node, now);
+                card.live = true;
+                card
+            })
+            .collect::<Vec<_>>();
         let mut live = Vec::new();
         let mut stale = Vec::new();
         for node in state.streams.values() {
@@ -205,6 +250,12 @@ impl DashboardView for ControlPlaneView {
                 stale.push(card);
             }
         }
+        provisioning.sort_by(|left, right| {
+            left.stream
+                .node
+                .cmp(&right.stream.node)
+                .then_with(|| left.stream.life.cmp(&right.stream.life))
+        });
         live.sort_by(|left, right| {
             // The orchestrator card leads the live pool: it is the control
             // plane every other node hangs off of.
@@ -232,15 +283,17 @@ impl DashboardView for ControlPlaneView {
         // Stale pool: most recently seen first, bounded by the physical cap.
         stale.sort_by_key(|right| std::cmp::Reverse(right.last_seen_ms_ago));
         stale.truncate(STALE_POOL_CAP);
-        let totals = fused_totals(live.len(), stale.len());
+        let totals = fused_totals(provisioning.len(), live.len(), stale.len());
         let snapshot = FusedSnapshot {
             totals,
+            provisioning,
             live,
             stale,
         };
         serde_json::to_value(snapshot).unwrap_or_else(|_| {
             json!({
                 "totals": FusedTotals::default(),
+                "provisioning": [],
                 "live": [],
                 "stale": []
             })
@@ -296,15 +349,30 @@ fn ensure_node<'a>(
 
 fn provisioning_output(event: &FrameEvent) -> Option<RoutedProvisionOutput> {
     let value = serde_json::from_slice::<Value>(&event.payload).ok()?;
+    if event.channel == ORCHESTRATOR_LOGS {
+        return Some(RoutedProvisionOutput {
+            stream: event.stream.clone(),
+            phase: "running".to_owned(),
+            source: value
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text: value.get("line").and_then(Value::as_str).map(str::to_owned),
+        });
+    }
     let (run_id, node_id, phase, source, text) = if event.channel == PROVISIONING_EVENTS {
         let event = value.get("event")?;
         let kind = event.get("kind").and_then(Value::as_str)?;
         let phase = match kind {
-            "ProvisionStart" => "provisioning",
-            "NodeLive" => "joining",
+            "Requested" => "requested",
+            "Creating" => "creating",
+            "Bootstrapping" => "bootstrapping",
+            "Joining" => "joining",
+            "Acknowledging" => "acknowledging",
+            "NodeLive" => "running",
             "ProvisionFailed" => "failed",
             "NodeStopped" => "stopped",
-            _ => "provisioning",
+            _ => return None,
         };
         (
             event.get("run_id").and_then(Value::as_u64)?,
@@ -349,6 +417,36 @@ fn provisioning_output(event: &FrameEvent) -> Option<RoutedProvisionOutput> {
     })
 }
 
+fn apply_routed_output(node: &mut FusedNode, routed: &RoutedProvisionOutput, now: Instant) {
+    node.last_seen = now;
+    let phase = if routed.phase == "provisioning" {
+        node.output
+            .phase
+            .clone()
+            .unwrap_or_else(|| routed.phase.clone())
+    } else {
+        routed.phase.clone()
+    };
+    node.output.set_phase(&phase);
+    if let (Some(source), Some(text)) = (&routed.source, &routed.text) {
+        node.output.push_line(source, &phase, text.clone(), now);
+    }
+}
+
+fn prune_provisioning(provisioning: &mut BTreeMap<String, FusedNode>) {
+    if provisioning.len() <= STALE_POOL_CAP {
+        return;
+    }
+    let mut oldest = provisioning
+        .iter()
+        .map(|(key, node)| (key.clone(), node.last_seen))
+        .collect::<Vec<_>>();
+    oldest.sort_by_key(|(_, seen)| *seen);
+    for (key, _) in oldest.into_iter().take(provisioning.len() - STALE_POOL_CAP) {
+        provisioning.remove(&key);
+    }
+}
+
 fn process_output_channel(channel: &str) -> Option<(&'static str, String)> {
     let label = channel.strip_prefix("proc.")?;
     if let Some(phase) = label.strip_suffix(".stdout") {
@@ -357,6 +455,15 @@ fn process_output_channel(channel: &str) -> Option<(&'static str, String)> {
     label
         .strip_suffix(".stderr")
         .map(|phase| ("stderr", phase.to_owned()))
+}
+
+fn prune_finished_provisioning(finished: &mut BTreeSet<String>) {
+    while finished.len() > STALE_POOL_CAP {
+        let Some(oldest) = finished.first().cloned() else {
+            break;
+        };
+        finished.remove(&oldest);
+    }
 }
 
 /// Evict superseded life generations and enforce the stale-pool cap.
@@ -391,12 +498,14 @@ fn prune(streams: &mut BTreeMap<String, FusedNode>, fresh: &StreamEvent, now: In
 #[derive(Serialize)]
 struct FusedSnapshot {
     totals: FusedTotals,
+    provisioning: Vec<NodeCard>,
     live: Vec<NodeCard>,
     stale: Vec<NodeCard>,
 }
 
 #[derive(Default, Serialize)]
 struct FusedTotals {
+    provisioning_nodes: u32,
     live_nodes: u32,
     stale_nodes: u32,
 }
@@ -670,8 +779,9 @@ fn actor_detail(
     serde_json::to_value(detail).unwrap_or_else(|_| json!({}))
 }
 
-fn fused_totals(live_len: usize, stale_len: usize) -> FusedTotals {
+fn fused_totals(provisioning_len: usize, live_len: usize, stale_len: usize) -> FusedTotals {
     FusedTotals {
+        provisioning_nodes: saturating_u32(provisioning_len),
         live_nodes: saturating_u32(live_len),
         stale_nodes: saturating_u32(stale_len),
     }
@@ -775,21 +885,32 @@ mod tests {
                 "event": {
                     "run_id": 42,
                     "node_id": 7,
-                    "kind": "ProvisionStart",
+                    "kind": "Requested",
                     "message": "leasing GPU"
                 }
             }))
             .unwrap(),
         );
         let pending = view.snapshot_json();
-        let pending_card = pending["live"]
+        let pending_card = pending["provisioning"]
             .as_array()
             .unwrap()
             .iter()
             .find(|card| card["stream"]["node"] == "7")
             .expect("pending card");
         assert_eq!(pending_card["stream"]["origin"], "bootstrap");
-        assert_eq!(pending_card["output"]["phase"], "provisioning");
+        assert_eq!(pending_card["output"]["phase"], "requested");
+        {
+            let mut state = view.state.write();
+            state
+                .provisioning
+                .get_mut("7#42")
+                .expect("provisioning node")
+                .last_seen -= LIVE_TTL + Duration::from_secs(1);
+        }
+        let aged = view.snapshot_json();
+        assert_eq!(aged["provisioning"].as_array().map(Vec::len), Some(1));
+        assert_eq!(aged["stale"].as_array().map(Vec::len), Some(0));
 
         ingest_json(
             &view,
@@ -816,6 +937,7 @@ mod tests {
         );
 
         let joined = view.snapshot_json();
+        assert_eq!(joined["provisioning"].as_array().map(Vec::len), Some(0));
         let cards = joined["live"]
             .as_array()
             .unwrap()
@@ -827,6 +949,92 @@ mod tests {
         assert_eq!(cards[0]["output"]["lines"].as_array().unwrap().len(), 3);
         assert_eq!(cards[0]["output"]["lines"][2]["source"], "stdout");
         assert_eq!(cards[0]["output"]["lines"][2]["text"], "process output");
+    }
+
+    #[test]
+    fn orchestrator_stdio_stays_on_the_orchestrator_stream() {
+        let event = FrameEvent {
+            stream: crate::StreamEvent {
+                node: "myelin-orchestrator".to_owned(),
+                life: 42,
+                origin: Some("orchestrator".to_owned()),
+                label: Some("provisioning supervisor".to_owned()),
+            },
+            channel: ORCHESTRATOR_LOGS.to_owned(),
+            position: 0,
+            payload: serde_json::to_vec(&json!({
+                "source": "stderr",
+                "line": "SSH identity registered"
+            }))
+            .unwrap(),
+        };
+
+        let routed = provisioning_output(&event).expect("orchestrator log route");
+
+        assert_eq!(routed.stream.node, "myelin-orchestrator");
+        assert_eq!(routed.stream.origin.as_deref(), Some("orchestrator"));
+        assert_eq!(routed.source.as_deref(), Some("stderr"));
+        assert_eq!(routed.text.as_deref(), Some("SSH identity registered"));
+    }
+    #[test]
+    fn terminal_provisioning_is_removed_and_late_logs_do_not_recreate_it() {
+        let view = ControlPlaneView::default();
+        let orchestrator = StreamId::new(NodeId::new("orchestrator"), Lifetime(42));
+        for (position, kind) in [(0, "Requested"), (1, "NodeStopped")] {
+            ingest_json(
+                &view,
+                &orchestrator,
+                position,
+                PROVISIONING_EVENTS,
+                serde_json::to_vec(&json!({
+                    "event": {
+                        "run_id": 42,
+                        "node_id": 7,
+                        "kind": kind
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+        ingest_json(
+            &view,
+            &orchestrator,
+            2,
+            "myelin.provisioning.logs.node.7.stdout",
+            serde_json::to_vec(&json!({
+                "line": {
+                    "run_id": 42,
+                    "node_id": 7,
+                    "stream": "Stdout",
+                    "line": "late output"
+                }
+            }))
+            .unwrap(),
+        );
+        for node_id in 100_u64..175 {
+            ingest_json(
+                &view,
+                &orchestrator,
+                node_id,
+                PROVISIONING_EVENTS,
+                serde_json::to_vec(&json!({
+                    "event": {
+                        "run_id": 42,
+                        "node_id": node_id,
+                        "kind": "NodeStopped"
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+
+        let snapshot = view.snapshot_json();
+        assert_eq!(snapshot["provisioning"].as_array().map(Vec::len), Some(0));
+        assert_eq!(snapshot["stale"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            view.state.read().finished_provisioning.len(),
+            STALE_POOL_CAP
+        );
     }
 
     fn actors_payload(worker: u32, actors: serde_json::Value) -> Vec<u8> {

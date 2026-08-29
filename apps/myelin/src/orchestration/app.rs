@@ -33,8 +33,8 @@ use crate::orchestration::provider_adapters::relay::{
     relay_mode_env_value, relay_runtime_config_from_settings,
 };
 use crate::orchestration::provider_adapters::vastai::{
-    SshCommandBootstrapLauncher, ToolsVastAiLeaseClient, VastAiProvisioningConfig,
-    VastAiProvisioningPlugin,
+    BootstrapEnvSource, SshCommandBootstrapLauncher, ToolsVastAiLeaseClient,
+    VastAiProvisioningConfig, VastAiProvisioningPlugin,
 };
 use crate::provisioning::{
     LocalDockerPlugin, LocalProcessPlugin, MockVastAiPlugin, NodeProvisionSpec, PluginObservation,
@@ -47,7 +47,7 @@ use distribution::node::DistributedNodeConfig;
 use distribution::registry_actor::RegistryIn;
 use distribution::swim::telemetry::ObservedTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN};
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
@@ -398,6 +398,28 @@ where
             return Err(format!("create iroh driver: {error}"));
         }
     };
+    let remote_vast_relay_required = config.vastai.as_ref().is_some_and(|vastai| {
+        vastai.provisioning_mode == VastAiProvisioningMode::Real
+            && !matches!(config.relay.mode, RelayMode::Disabled)
+    });
+    if remote_vast_relay_required {
+        bootstrap(
+            &mut orch_telemetry,
+            None,
+            "iroh_relay",
+            "waiting",
+            json!({"relay_mode":format!("{:?}", config.relay.mode)}),
+        );
+        let endpoint = driver.wait_for_relay_endpoint()?;
+        bootstrap(
+            &mut orch_telemetry,
+            None,
+            "iroh_relay",
+            "ready",
+            json!({"relay_url":endpoint.relay_urls().next().map(ToString::to_string)}),
+        );
+    }
+    let live_coordinator_endpoint = driver.endpoint_addr_supplier();
     let coordinator_endpoint =
         advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
     bootstrap(
@@ -544,31 +566,56 @@ where
         tx: Mutex::new(obs_tx),
     }));
     let shared_config = Arc::new(Mutex::new(config.clone()));
+    let live_orchestrator_actor = Arc::new(Mutex::new(None::<ActorAddress>));
+    let bootstrap_route_config = Arc::clone(&shared_config);
+    let bootstrap_route_actor = Arc::clone(&live_orchestrator_actor);
+    let bootstrap_env_source: BootstrapEnvSource = Arc::new(move || {
+        let config = bootstrap_route_config.lock();
+        let endpoint = advertised_endpoint(live_coordinator_endpoint(), config.endpoint_addr_mask)?;
+        let actor = (*bootstrap_route_actor.lock()).ok_or_else(|| {
+            "current orchestrator actor is unavailable before SSH bootstrap".to_owned()
+        })?;
+        Ok(vec![
+            (
+                "MYELIN_COORDINATOR_ENDPOINT".to_owned(),
+                serde_json::to_string(&endpoint)
+                    .map_err(|error| format!("serialize live coordinator endpoint: {error}"))?,
+            ),
+            (
+                "MYELIN_ORCHESTRATOR_ACTOR".to_owned(),
+                serde_json::to_string(&actor)
+                    .map_err(|error| format!("serialize live orchestrator actor: {error}"))?,
+            ),
+        ])
+    });
     let provider_runtime = stack.runtime.clone();
     let provider_engine = engine.handle();
     let provider_config = Arc::clone(&shared_config);
     let provider_registry = state_dir.process_registry_path();
+    let provider_bootstrap_env = Arc::clone(&bootstrap_env_source);
     let provider_factory: ProviderFactory = Arc::new(move || {
         provider_config.lock().clone().build_provisioner(
             provider_runtime.clone(),
             provider_engine.clone(),
             provider_registry.clone(),
+            Arc::clone(&provider_bootstrap_env),
         )
     });
     let spec_config = Arc::clone(&shared_config);
     let spec_coordinator = coordinator_endpoint.clone();
+    let spec_route_actor = Arc::clone(&live_orchestrator_actor);
     let spec_builder: SpecBuilder = Arc::new(move |node_id, orchestrator_actor| {
-        spec_config.lock().node_spec_for_stage(
-            spec_coordinator.clone(),
-            orchestrator_actor,
-            node_id,
-            0,
-        )
+        *spec_route_actor.lock() = Some(orchestrator_actor);
+        let config = spec_config.lock();
+        let spec =
+            config.node_spec_for_stage(spec_coordinator.clone(), orchestrator_actor, node_id, 0)?;
+        Ok(spec)
     });
     let validation_config = Arc::clone(&shared_config);
     let validation_runtime = stack.runtime.clone();
     let validation_engine = engine.handle();
     let validation_registry = state_dir.process_registry_path();
+    let validation_bootstrap_env = Arc::clone(&bootstrap_env_source);
     let config_validator: ConfigValidator = Arc::new(move |request| {
         let mut candidate = validation_config.lock().clone();
         if candidate.provider.as_str() != "vastai" {
@@ -592,6 +639,7 @@ where
                 validation_runtime.clone(),
                 validation_engine.clone(),
                 validation_registry.clone(),
+                Arc::clone(&validation_bootstrap_env),
             )?;
             *validation_config.lock() = candidate;
             return Ok(());
@@ -604,6 +652,7 @@ where
             validation_runtime.clone(),
             validation_engine.clone(),
             validation_registry.clone(),
+            Arc::clone(&validation_bootstrap_env),
         )?;
         *validation_config.lock() = candidate;
         Ok(())
@@ -675,7 +724,7 @@ where
         stack.runtime.clone(),
         stack.engine.blocking_work_sender(),
         ManualActorControlConfig {
-            state_dir,
+            state_dir: state_dir.clone(),
             sink,
             provider_factory,
             spec_builder,
@@ -783,7 +832,12 @@ where
     if let Err(error) = spawn_stop_listener(&runtime, stop_rx, serve_actor) {
         let _ = runtime.send_to(serve_actor, ServeClusterMsg::Abort(error));
     }
-    completion.wait()
+    let result = completion.wait();
+    if result.is_ok() {
+        let snapshot = state_dir.load_snapshot()?;
+        state_dir.cleanup_recovery_checkpoint(&snapshot)?;
+    }
+    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1851,6 +1905,7 @@ impl Config {
         bootstrap_runtime: swactor::runtime::Runtime,
         bootstrap_engine: EngineHandle,
         process_registry_path: PathBuf,
+        bootstrap_env: BootstrapEnvSource,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider.as_str() {
             "process" => Ok(Box::new(LocalProcessPlugin::with_registry(
@@ -1895,6 +1950,7 @@ impl Config {
                     SshCommandBootstrapLauncher::new(
                         Some(ssh_identity),
                         bootstrap_runtime,
+                        bootstrap_env,
                         bootstrap_engine,
                     ),
                     vastai.provisioning.clone(),
@@ -1958,6 +2014,16 @@ impl Config {
                 relay_mode_env_value(&self.relay.mode).to_owned(),
             ),
         ];
+        if provider_name == "vastai"
+            && self
+                .vastai
+                .as_ref()
+                .is_some_and(|vastai| vastai.provisioning_mode == VastAiProvisioningMode::Real)
+        {
+            env.retain(|(key, _)| {
+                key != "MYELIN_COORDINATOR_ENDPOINT" && key != "MYELIN_ORCHESTRATOR_ACTOR"
+            });
+        }
         env.extend(self.extra_worker_env());
         let args = match provider_name {
             "vastai"
@@ -1991,6 +2057,7 @@ impl Config {
             image: self.image.clone(),
             env,
             args,
+            offer_criteria_json: None,
             mounts: Vec::new(),
         })
     }
@@ -2124,22 +2191,12 @@ fn drain_orch_stdio_capture(
     rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     telemetry: &mut OrchTelemetry,
     dashboard: Option<&DashboardSupport>,
-    run_id: u64,
-    node_id: u64,
 ) {
     let Some(rx) = rx else {
         return;
     };
     while let Ok(line) = rx.try_recv() {
-        telemetry.emit_log(
-            dashboard,
-            ProvisionLogLine {
-                run_id,
-                node_id,
-                stream: line.stream,
-                line: line.line,
-            },
-        );
+        telemetry.emit_orchestrator_log(dashboard, line.stream, line.line);
     }
 }
 
@@ -2541,8 +2598,6 @@ impl ServeClusterActor {
             self.orch_stdio_rx.as_ref(),
             &mut self.orch_telemetry,
             self.dashboard.as_ref(),
-            self.run_id,
-            self.orchestrator_node_id,
         );
         self.orch_telemetry
             .flush(self.dashboard.as_ref(), "orchestrator");
@@ -2564,7 +2619,7 @@ impl ServeClusterActor {
             .map_err(|error| format!("spawn shutdown flush reply actor: {error}"))?;
         if let Err(error) = self.stack.runtime.send_to(
             self.orchestrator_actor,
-            OrchestratorMsg::Manual(ManualControlMsg::Flush {
+            OrchestratorMsg::Manual(ManualControlMsg::Shutdown {
                 reply_to: reply_actor,
             }),
         ) {
@@ -2680,6 +2735,20 @@ fn emit_plugin_observation(
                 node_id: *node_id,
                 stream: ProvisionLogStream::Provider,
                 line: line.clone(),
+            },
+        ),
+        PluginObservation::PhaseChanged {
+            run_id,
+            node_id,
+            phase,
+        } => orch_telemetry.emit_event(
+            dashboard,
+            ProvisionEvent {
+                run_id: *run_id,
+                node_id: *node_id,
+                kind: *phase,
+                provider: Some(provider.as_str().to_owned()),
+                message: None,
             },
         ),
         PluginObservation::TelemetryFrame {
@@ -3641,6 +3710,32 @@ mod lifecycle_policy_tests {
             Some("all"),
         );
         assert!(vastai.bootstrap_command.is_none());
+    }
+
+    #[test]
+    fn vastai_real_specs_do_not_persist_orchestrator_routing() {
+        let mut config = ConfigBuilder::hardcoded_defaults()
+            .overlay_cli([
+                "--provider".to_owned(),
+                "vastai".to_owned(),
+                "--vastai-provisioning".to_owned(),
+                "mock".to_owned(),
+            ])
+            .unwrap()
+            .finalize()
+            .unwrap();
+        let vastai = config.vastai.as_mut().unwrap();
+        vastai.provisioning_mode = VastAiProvisioningMode::Real;
+        vastai.bootstrap_command = Some("exec /usr/local/bin/myelin-node".to_owned());
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[8; 32]).public());
+
+        let spec = config
+            .node_spec_for_stage(coordinator, ActorAddress::default(), 1, 0)
+            .unwrap();
+
+        assert!(spec.env.iter().all(|(key, _)| {
+            key != "MYELIN_COORDINATOR_ENDPOINT" && key != "MYELIN_ORCHESTRATOR_ACTOR"
+        }));
     }
 
     #[test]

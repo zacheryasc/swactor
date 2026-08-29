@@ -29,6 +29,7 @@ use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use swactor::stats::StatsHook;
 use swactor_engine::EngineHandle;
 
+const MYELIN_ORCHESTRATOR_LOGS: &str = "myelin.orchestrator.logs";
 pub(crate) const MYELIN_ORCH_BOOTSTRAP: &str = "myelin.orch.bootstrap";
 pub(crate) const MYELIN_ORCH_PROMPT: &str = "myelin.orch.prompt";
 pub(crate) const MYELIN_SWIM_MEMBERSHIP: &str = "myelin.swim.membership";
@@ -142,6 +143,19 @@ impl OrchTelemetry {
         let payload = serde_json::to_vec(&MyelinProvisionLogRecord::new(line))
             .expect("serialize provision log");
         self.emit_bytes(dashboard, &channel, payload);
+    }
+    pub(crate) fn emit_orchestrator_log(
+        &mut self,
+        dashboard: Option<&DashboardSupport>,
+        stream: crate::provisioning::ProvisionLogStream,
+        line: String,
+    ) {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "source": format!("{stream:?}").to_ascii_lowercase(),
+            "line": line,
+        }))
+        .expect("serialize orchestrator log");
+        self.emit_bytes(dashboard, MYELIN_ORCHESTRATOR_LOGS, payload);
     }
 
     pub(crate) fn emit_bootstrap(

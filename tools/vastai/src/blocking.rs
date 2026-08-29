@@ -44,6 +44,13 @@ impl BlockingVastClient {
         self.runtime
             .block_on(self.client.instance_status(contract_id))
     }
+    pub fn request_logs(&self, contract_id: u64) -> Result<String, String> {
+        self.runtime.block_on(self.client.request_logs(contract_id))
+    }
+
+    pub fn fetch_logs(&self, log_url: &str) -> Result<String, String> {
+        self.runtime.block_on(self.client.fetch_logs(log_url))
+    }
 
     pub fn list_by_label(&self, label: &str) -> Result<Vec<LabeledInstance>, String> {
         self.runtime.block_on(self.client.list_by_label(label))

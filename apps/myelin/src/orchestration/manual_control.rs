@@ -19,12 +19,16 @@ use crate::orchestration::actor::OrchestratorMsg;
 use crate::orchestration::daemon::{
     ClusterSnapshot, RuntimeFacts, SnapshotNode, StateDir, unix_ms_now,
 };
-use crate::provisioning::{NodeProvisionSpec, PluginNodeHandle, PluginSink, ProvisionPlugin};
+use crate::provisioning::{
+    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionEventKind,
+    ProvisionPlugin,
+};
 
 pub(crate) const MAX_PROVISION_COUNT: u32 = 8;
 pub(crate) const CONTROL_REGISTRY_NAME: &str = "myelin.manual-control";
 pub(crate) const SELECTED_OFFER_ID_ENV: &str = "MYELIN_SELECTED_OFFER_ID";
 pub(crate) const READ_MODEL_COMMAND_LIMIT: usize = 256;
+const OFFER_SEARCH_RECEIPT_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +133,22 @@ pub(crate) enum NodePhase {
     Orphan,
 }
 
+fn provision_event_kind_for_phase(phase: NodePhase) -> Option<ProvisionEventKind> {
+    match phase {
+        NodePhase::Requested => Some(ProvisionEventKind::Requested),
+        NodePhase::Creating => Some(ProvisionEventKind::Creating),
+        NodePhase::Bootstrapping => Some(ProvisionEventKind::Bootstrapping),
+        NodePhase::Joining => Some(ProvisionEventKind::Joining),
+        NodePhase::Acknowledging => Some(ProvisionEventKind::Acknowledging),
+        NodePhase::Running => Some(ProvisionEventKind::NodeLive),
+        NodePhase::Stopped => Some(ProvisionEventKind::NodeStopped),
+        NodePhase::KillRequested
+        | NodePhase::Stopping
+        | NodePhase::StopFailed
+        | NodePhase::Orphan => None,
+    }
+}
+
 /// Runtime correction input. `api_key` is intentionally absent from Debug and
 /// never enters durable state or a response DTO.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -221,6 +241,12 @@ pub(crate) struct OfferDto {
     pub upload_cost_per_tb: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OfferSearchResults {
+    pub search_id: u64,
+    pub offers: Vec<OfferDto>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProvisionRequest {
     pub command_id: String,
@@ -228,6 +254,8 @@ pub(crate) struct ProvisionRequest {
     pub count: u32,
     #[serde(default)]
     pub selected_offer_ids: Vec<u64>,
+    #[serde(default)]
+    pub search_id: Option<u64>,
     #[serde(default)]
     pub image: Option<String>,
 }
@@ -451,6 +479,7 @@ impl ManualControl {
     pub(crate) fn request_provision<F>(
         &mut self,
         request: ProvisionRequest,
+        offer_criteria: Option<OfferSearchRequest>,
         mut build_spec: F,
     ) -> Result<&CommandRecord, String>
     where
@@ -505,6 +534,11 @@ impl ManualControl {
                 .expect("inserted command exists"));
         }
         let start_id = self.snapshot.next_node_id;
+        let offer_criteria_json = offer_criteria
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| format!("serialize selected offer criteria: {error}"))?;
         let mut intents = Vec::with_capacity(request.count as usize);
         for offset in 0..request.count {
             let node_id = start_id
@@ -518,6 +552,7 @@ impl ManualControl {
             if let Some(offer_id) = selected_offer_id {
                 spec.env
                     .push((SELECTED_OFFER_ID_ENV.to_owned(), offer_id.to_string()));
+                spec.offer_criteria_json = offer_criteria_json.clone();
             }
             intents.push((node_id, spec, selected_offer_id));
         }
@@ -1079,12 +1114,14 @@ impl ManualControl {
                         .expect("effect node exists");
                     match phase {
                         NodePhase::Requested | NodePhase::Creating => {
+                            let reason = "persisted provisioning request has no provider resource; automatic recreation is disabled".to_owned();
                             let node = self.snapshot.node_mut(node_id).expect("effect node exists");
-                            node.phase = NodePhase::Requested;
+                            node.phase = NodePhase::Stopped;
                             node.provider_ref = None;
-                            node.last_error = None;
+                            node.last_error = Some(reason.clone());
                             node.last_seen_unix_ms = unix_ms_now();
-                            self.queue_persist(AfterPersist::CreateMany(vec![node_id]));
+                            self.fail_commands(node_id, CommandKind::Provision, reason);
+                            self.queue_persist(AfterPersist::None);
                         }
                         NodePhase::KillRequested | NodePhase::Stopping | NodePhase::StopFailed => {
                             let provision_error = self
@@ -1320,6 +1357,9 @@ pub(crate) enum ManualControlMsg {
     Flush {
         reply_to: ActorAddress,
     },
+    Shutdown {
+        reply_to: ActorAddress,
+    },
     PersistenceFinished {
         generation: u64,
         error: Option<String>,
@@ -1350,7 +1390,7 @@ pub(crate) enum ManualControlReply {
     Provider(ProviderReadiness),
     Status(ManualReadModel),
     FleetStatus(FleetReadModel),
-    Offers(Vec<OfferDto>),
+    Offers(OfferSearchResults),
     Rejoined(RejoinBinding),
     Flushed,
     Rejected(String),
@@ -1386,6 +1426,7 @@ fn refresh_recovery_routing(
             .into_iter()
             .filter(|(key, _)| ROUTING_KEYS.contains(&key.as_str())),
     );
+    persisted.args = current.args;
     persisted
 }
 
@@ -1469,16 +1510,26 @@ pub(crate) struct ManualActorControl {
     offer_searcher: Option<OfferSearcher>,
     lanes: BTreeMap<u64, SharedLane>,
     active_effect_ids: BTreeMap<u64, u64>,
+    reported_phases: BTreeMap<u64, NodePhase>,
     persistence_queue: VecDeque<(u64, ClusterSnapshot)>,
     persistence_in_flight: Option<u64>,
     flush_failure: Option<String>,
+    shutting_down: bool,
     flush_waiters: Vec<ActorAddress>,
     pending_command_replies: BTreeMap<u64, (ActorAddress, String)>,
     pending_validations: BTreeMap<u64, Option<ActorAddress>>,
     latest_validation_id: Option<u64>,
-    pending_offer_searches: BTreeMap<u64, ActorAddress>,
+    pending_offer_searches: BTreeMap<u64, (ActorAddress, OfferSearchRequest)>,
+    offer_search_receipts: BTreeMap<u64, OfferSearchReceipt>,
     next_work_id: u64,
     control_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct OfferSearchReceipt {
+    request: OfferSearchRequest,
+    offer_ids: Vec<u64>,
+    expires_unix_ms: u64,
 }
 
 pub(crate) struct ManualActorControlConfig {
@@ -1524,9 +1575,12 @@ impl ManualActorControl {
             offer_searcher,
             lanes: BTreeMap::new(),
             active_effect_ids: BTreeMap::new(),
+            reported_phases: BTreeMap::new(),
             persistence_queue: VecDeque::new(),
+            offer_search_receipts: BTreeMap::new(),
             persistence_in_flight: None,
             flush_failure: None,
+            shutting_down: false,
             flush_waiters: Vec::new(),
             pending_command_replies: BTreeMap::new(),
             pending_validations: BTreeMap::new(),
@@ -1572,15 +1626,85 @@ impl ManualActorControl {
         work_id
     }
 
+    fn selected_offer_criteria(
+        &mut self,
+        request: &ProvisionRequest,
+    ) -> Result<Option<OfferSearchRequest>, String> {
+        if request.selected_offer_ids.is_empty() {
+            return Ok(None);
+        }
+        if self.core.provider().provisioning_mode == "mock" {
+            return Ok(None);
+        }
+        let now = unix_ms_now();
+        self.offer_search_receipts
+            .retain(|_, receipt| receipt.expires_unix_ms > now);
+        let search_id = request.search_id.ok_or_else(|| {
+            "selected Vast.ai offers require the search_id returned with the offer list".to_owned()
+        })?;
+        let receipt = self.offer_search_receipts.get(&search_id).ok_or_else(|| {
+            "selected Vast.ai offer search expired; refresh offers and select again".to_owned()
+        })?;
+        if let Some(offer_id) = request
+            .selected_offer_ids
+            .iter()
+            .find(|offer_id| !receipt.offer_ids.contains(offer_id))
+        {
+            return Err(format!(
+                "selected Vast.ai offer {offer_id} was not returned by search {search_id}"
+            ));
+        }
+        Ok(Some(receipt.request.clone()))
+    }
+
     pub(crate) fn handle(&mut self, ctx: &Ctx, msg: ManualControlMsg) {
+        if self.shutting_down {
+            let error = "manual control is shutting down".to_owned();
+            match &msg {
+                ManualControlMsg::Provision { reply_to, .. }
+                | ManualControlMsg::Kill { reply_to, .. } => {
+                    send_command_reply(ctx, *reply_to, Err(error));
+                    return;
+                }
+                ManualControlMsg::Configure { reply_to, .. } => {
+                    if let Some(reply_to) = reply_to {
+                        let _ = ctx.send(*reply_to, ManualControlReply::Rejected(error));
+                    }
+                    return;
+                }
+                ManualControlMsg::SearchOffers { reply_to, .. } => {
+                    let _ = ctx.send(*reply_to, ManualControlReply::Rejected(error));
+                    return;
+                }
+                _ => {}
+            }
+        }
         match msg {
+            ManualControlMsg::Shutdown { reply_to } => {
+                self.shutting_down = true;
+                self.flush_waiters.push(reply_to);
+            }
             ManualControlMsg::Provision { request, reply_to } => {
                 let command_id = request.command_id.clone();
                 let already_durable = self.core.snapshot().commands.contains_key(&command_id);
+                let offer_criteria = if already_durable {
+                    Ok(None)
+                } else {
+                    self.selected_offer_criteria(&request)
+                };
+                let offer_criteria = match offer_criteria {
+                    Ok(criteria) => criteria,
+                    Err(error) => {
+                        send_command_reply(ctx, reply_to, Err(error));
+                        return;
+                    }
+                };
                 let builder = Arc::clone(&self.spec_builder);
                 let result = self
                     .core
-                    .request_provision(request, |node_id| builder(node_id, ctx.self_addr()))
+                    .request_provision(request, offer_criteria, |node_id| {
+                        builder(node_id, ctx.self_addr())
+                    })
                     .cloned();
                 if already_durable || result.is_err() {
                     send_command_reply(ctx, reply_to, result);
@@ -1609,6 +1733,7 @@ impl ManualActorControl {
                 }
             }
             ManualControlMsg::Configure { request, reply_to } => {
+                self.offer_search_receipts.clear();
                 self.core.set_provider_validating();
                 let Some(validator) = self.config_validator.clone() else {
                     self.core.set_provider_validation(Err(
@@ -1695,7 +1820,8 @@ impl ManualActorControl {
                     );
                 } else if let Some(searcher) = self.offer_searcher.clone() {
                     let work_id = self.allocate_work_id();
-                    self.pending_offer_searches.insert(work_id, reply_to);
+                    self.pending_offer_searches
+                        .insert(work_id, (reply_to, request.clone()));
                     let sender = self.sender.clone();
                     let failed_sender = self.sender.clone();
                     let actor = ctx.self_addr();
@@ -1730,11 +1856,27 @@ impl ManualActorControl {
                 }
             }
             ManualControlMsg::OfferSearchFinished { work_id, result } => {
-                let Some(reply_to) = self.pending_offer_searches.remove(&work_id) else {
+                let Some((reply_to, request)) = self.pending_offer_searches.remove(&work_id) else {
                     return;
                 };
                 let reply = match result {
-                    Ok(offers) => ManualControlReply::Offers(offers),
+                    Ok(offers) => {
+                        let now = unix_ms_now();
+                        self.offer_search_receipts
+                            .retain(|_, receipt| receipt.expires_unix_ms > now);
+                        self.offer_search_receipts.insert(
+                            work_id,
+                            OfferSearchReceipt {
+                                request,
+                                offer_ids: offers.iter().map(|offer| offer.offer_id).collect(),
+                                expires_unix_ms: now.saturating_add(OFFER_SEARCH_RECEIPT_TTL_MS),
+                            },
+                        );
+                        ManualControlReply::Offers(OfferSearchResults {
+                            search_id: work_id,
+                            offers,
+                        })
+                    }
                     Err(error) => ManualControlReply::Rejected(error),
                 };
                 let _ = ctx.send(reply_to, reply);
@@ -1863,7 +2005,27 @@ impl ManualActorControl {
         self.dispatch_actions(actor);
     }
 
+    fn emit_phase_changes(&mut self) {
+        let run_id = self.core.snapshot().run_id;
+        for node in &self.core.snapshot().nodes {
+            if self.reported_phases.get(&node.logical_node_id) == Some(&node.phase) {
+                continue;
+            }
+            self.reported_phases
+                .insert(node.logical_node_id, node.phase);
+            let Some(phase) = provision_event_kind_for_phase(node.phase) else {
+                continue;
+            };
+            self.sink.observe(PluginObservation::PhaseChanged {
+                run_id,
+                node_id: node.logical_node_id,
+                phase,
+            });
+        }
+    }
+
     fn dispatch_actions(&mut self, actor: ActorAddress) {
+        self.emit_phase_changes();
         let actions = self.core.take_actions().collect::<Vec<_>>();
         for action in actions {
             match action {
@@ -2146,6 +2308,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn node_phases_publish_explicit_provisioning_events() {
+        let expected = [
+            (NodePhase::Requested, Some(ProvisionEventKind::Requested)),
+            (NodePhase::Creating, Some(ProvisionEventKind::Creating)),
+            (
+                NodePhase::Bootstrapping,
+                Some(ProvisionEventKind::Bootstrapping),
+            ),
+            (NodePhase::Joining, Some(ProvisionEventKind::Joining)),
+            (
+                NodePhase::Acknowledging,
+                Some(ProvisionEventKind::Acknowledging),
+            ),
+            (NodePhase::Running, Some(ProvisionEventKind::NodeLive)),
+            (NodePhase::Stopped, Some(ProvisionEventKind::NodeStopped)),
+            (NodePhase::KillRequested, None),
+            (NodePhase::Stopping, None),
+            (NodePhase::StopFailed, None),
+            (NodePhase::Orphan, None),
+        ];
+        for (phase, event) in expected {
+            assert_eq!(provision_event_kind_for_phase(phase), event);
+        }
+    }
+
+    #[test]
     fn offer_browsing_does_not_inherit_provisioning_defaults() {
         let request = OfferSearchRequest {
             gpu_model: Some("4090".to_owned()),
@@ -2164,6 +2352,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selected_offer_keeps_the_browse_criteria_that_displayed_it() {
+        let request = OfferSearchRequest {
+            gpu_model: Some("A100".to_owned()),
+            min_reliability: Some(0.97),
+            max_hourly_price: Some(1.25),
+            ..OfferSearchRequest::default()
+        };
+        let mut core = ready_core();
+        core.request_provision(
+            ProvisionRequest {
+                command_id: "exact-offer".to_owned(),
+                count: 1,
+                selected_offer_ids: vec![42],
+                search_id: Some(9),
+                image: None,
+            },
+            Some(request.clone()),
+            |node_id| Ok(spec(node_id)),
+        )
+        .unwrap();
+
+        let node = core.snapshot().node(1).expect("allocated node");
+        let persisted = node
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.offer_criteria_json.as_deref())
+            .expect("selected offer criteria");
+        assert_eq!(
+            serde_json::from_str::<OfferSearchRequest>(persisted).unwrap(),
+            request
+        );
+    }
+
     fn spec(node_id: u64) -> NodeProvisionSpec {
         NodeProvisionSpec {
             run_id: 7,
@@ -2173,8 +2395,48 @@ mod tests {
             image: "test-image".to_owned(),
             env: Vec::new(),
             args: Vec::new(),
+            offer_criteria_json: None,
             mounts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn recovery_uses_current_bootstrap_command_and_routing() {
+        let mut persisted = spec(1);
+        persisted.args = vec!["test -x /usr/local/bin/myelin-node".to_owned()];
+        persisted.env = vec![
+            ("PERSISTED".to_owned(), "keep".to_owned()),
+            (
+                "MYELIN_ORCHESTRATOR_ACTOR".to_owned(),
+                "old-actor".to_owned(),
+            ),
+        ];
+        let mut current = spec(1);
+        current.args = vec!["exec /usr/local/bin/myelin-node".to_owned()];
+        current.env = vec![
+            ("CURRENT".to_owned(), "ignore".to_owned()),
+            (
+                "MYELIN_ORCHESTRATOR_ACTOR".to_owned(),
+                "current-actor".to_owned(),
+            ),
+        ];
+
+        let recovered = refresh_recovery_routing(persisted, current);
+
+        assert_eq!(
+            recovered.args,
+            ["exec /usr/local/bin/myelin-node".to_owned()]
+        );
+        assert_eq!(
+            recovered.env,
+            [
+                ("PERSISTED".to_owned(), "keep".to_owned()),
+                (
+                    "MYELIN_ORCHESTRATOR_ACTOR".to_owned(),
+                    "current-actor".to_owned(),
+                ),
+            ]
+        );
     }
 
     fn ready_core() -> ManualControl {
@@ -2238,8 +2500,10 @@ mod tests {
                 command_id: command_id.to_owned(),
                 count: 1,
                 selected_offer_ids: offer.into_iter().collect(),
+                search_id: None,
                 image: None,
             },
+            None,
             |node_id| Ok(spec(node_id)),
         )
         .unwrap();
@@ -2486,33 +2750,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_resource_during_create_resumes_idempotent_create() {
-        let mut snapshot = ClusterSnapshot::fresh(7, "test");
-        snapshot.upsert_node(SnapshotNode {
-            logical_node_id: 1,
-            spec: Some(spec(1)),
-            selected_offer_id: None,
-            provider_ref: Some("missing".to_owned()),
-            phase: NodePhase::Creating,
-            runtime: None,
-            last_error: None,
-            last_seen_unix_ms: 0,
-        });
-        let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
-        core.begin_recovery();
-        core.take_actions().for_each(drop);
-        core.effect_finished(
-            1,
-            EffectKind::Recover,
-            Ok(EffectOutcome::Recovered { provider_ref: None }),
-        )
-        .unwrap();
-        let effects = settle_persistence(&mut core);
-        assert!(matches!(
-            effects.as_slice(),
-            [ManualAction::Create { node_id: 1, .. }]
-        ));
-        assert_eq!(core.snapshot().node(1).unwrap().phase, NodePhase::Creating);
+    fn missing_resource_during_create_does_not_recreate_rental() {
+        for phase in [NodePhase::Requested, NodePhase::Creating] {
+            let mut snapshot = ClusterSnapshot::fresh(7, "test");
+            snapshot.upsert_node(SnapshotNode {
+                logical_node_id: 1,
+                spec: Some(spec(1)),
+                selected_offer_id: None,
+                provider_ref: Some("missing".to_owned()),
+                phase,
+                runtime: None,
+                last_error: None,
+                last_seen_unix_ms: 0,
+            });
+            let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
+            core.begin_recovery();
+            core.take_actions().for_each(drop);
+            core.effect_finished(
+                1,
+                EffectKind::Recover,
+                Ok(EffectOutcome::Recovered { provider_ref: None }),
+            )
+            .unwrap();
+            assert!(settle_persistence(&mut core).is_empty());
+            let node = core.snapshot().node(1).unwrap();
+            assert_eq!(node.phase, NodePhase::Stopped);
+            assert_eq!(node.provider_ref, None);
+            assert!(
+                node.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("automatic recreation is disabled"))
+            );
+        }
     }
 
     #[test]
@@ -2759,8 +3028,10 @@ mod tests {
                                 selected_offer_ids: (0..count)
                                     .map(|offset| 10_000 + u64::from(offset))
                                     .collect(),
+                                search_id: None,
                                 image: None,
                             },
+                            None,
                             |node_id| Ok(spec(node_id)),
                         );
                     }
@@ -2841,8 +3112,10 @@ mod tests {
                                     command_id: existing,
                                     count: 1,
                                     selected_offer_ids: Vec::new(),
+                                    search_id: None,
                                     image: None,
                                 },
+                                None,
                                 |node_id| Ok(spec(node_id)),
                             );
                         }
@@ -2980,8 +3253,10 @@ mod tests {
                                 selected_offer_ids: (0..count)
                                     .map(|offset| 100_000 + command_serial * 8 + u64::from(offset))
                                     .collect(),
+                                search_id: None,
                                 image: None,
                             },
+                            None,
                             |node_id| Ok(spec(node_id)),
                         )
                         .unwrap();
@@ -3018,8 +3293,10 @@ mod tests {
                                 command_id: format!("rejected-{command_serial}"),
                                 count: 1,
                                 selected_offer_ids: vec![200_000 + command_serial],
+                                search_id: None,
                                 image: None,
                             },
+                            None,
                             |node_id| Ok(spec(node_id)),
                         )
                         .unwrap();
@@ -3034,8 +3311,10 @@ mod tests {
                                     command_id: existing,
                                     count: 1,
                                     selected_offer_ids: vec![u64::from(selector)],
+                                    search_id: None,
                                     image: None,
                                 },
+                                None,
                                 |node_id| Ok(spec(node_id)),
                             )
                             .unwrap();
@@ -3676,6 +3955,7 @@ mod tests {
                                     selected_offer_ids: (count == 1)
                                         .then_some(vec![10_000 + request_serial])
                                         .unwrap_or_default(),
+                                    search_id: None,
                                     image: None,
                                 },
                                 reply_to,

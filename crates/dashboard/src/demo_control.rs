@@ -84,7 +84,10 @@ impl DashboardView for DemoControlView {
             let entry = processes.entry(node).or_default();
             entry.seen = Some(Instant::now());
             entry.state = match provision.get("kind").and_then(Value::as_str) {
-                Some("ProvisionStart") => "provisioning",
+                Some("Requested") => "requested",
+                Some("Creating") => "creating",
+                Some("Bootstrapping") => "bootstrapping",
+                Some("Joining") | Some("Acknowledging") => "joining",
                 Some("NodeLive") => "running",
                 Some("ProvisionFailed") => "failed",
                 Some("NodeStopped") => "exited",
