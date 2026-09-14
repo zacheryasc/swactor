@@ -12,7 +12,7 @@ use std::sync::Arc;
 use telemetry::frame::{Frame, StreamId};
 use telemetry::{
     ChannelContent, ChannelId, Lifetime, NodeId, Record, StreamDescriptor, StreamOrigin,
-    TelemetryEndpoint, TelemetryProducer,
+    TelemetryEndpoint, TelemetryProducer, encode_record,
 };
 
 use crate::observability::benchmark;
@@ -101,7 +101,7 @@ impl OrchTelemetry {
         }
         let id = self.producer.register_channel(
             name,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(name.to_owned()),
             },
         );
@@ -129,8 +129,7 @@ impl OrchTelemetry {
         dashboard: Option<&DashboardSupport>,
         event: ProvisionEvent,
     ) {
-        let payload = serde_json::to_vec(&MyelinProvisionEventRecord::new(event))
-            .expect("serialize provisioning event");
+        let payload = MyelinProvisionEventRecord::new(event).encode();
         self.emit_bytes(dashboard, MYELIN_PROVISIONING_EVENTS, payload);
     }
 
@@ -140,8 +139,7 @@ impl OrchTelemetry {
         line: ProvisionLogLine,
     ) {
         let channel = myelin_provision_log_channel(line.node_id, line.stream);
-        let payload = serde_json::to_vec(&MyelinProvisionLogRecord::new(line))
-            .expect("serialize provision log");
+        let payload = MyelinProvisionLogRecord::new(line).encode();
         self.emit_bytes(dashboard, &channel, payload);
     }
     pub(crate) fn emit_orchestrator_log(
@@ -150,7 +148,7 @@ impl OrchTelemetry {
         stream: crate::provisioning::ProvisionLogStream,
         line: String,
     ) {
-        let payload = serde_json::to_vec(&serde_json::json!({
+        let payload = encode_record(&serde_json::json!({
             "source": format!("{stream:?}").to_ascii_lowercase(),
             "line": line,
         }))
@@ -189,7 +187,7 @@ impl OrchTelemetry {
             detail,
         } = emission;
         let benchmark = benchmark::stamp("myelin-orchestrator");
-        let payload = serde_json::to_vec(&json!({
+        let payload = encode_record(&json!({
             "schema_version": benchmark["schema_version"].clone(),
             "type":"OrchBootstrap",
             "event_type":"OrchBootstrap",
@@ -253,8 +251,18 @@ impl OrchTelemetry {
                 .get(&frame.channel)
                 .cloned()
                 .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
-            ingest_dashboard_frame(dashboard, &stream, &channel, &frame, Some(&self.descriptor));
-            self.archive_frame(source, &stream, &channel, &frame);
+            let content = ChannelContent::MessagePackRecord {
+                schema: Some(channel.clone()),
+            };
+            ingest_dashboard_frame(
+                dashboard,
+                &stream,
+                &channel,
+                &content,
+                &frame,
+                Some(&self.descriptor),
+            );
+            self.archive_frame(source, &stream, &channel, &content, &frame);
         }
     }
 
@@ -263,10 +271,11 @@ impl OrchTelemetry {
         source: &str,
         stream: &StreamId,
         channel: &str,
+        content: &ChannelContent,
         frame: &Frame,
     ) {
         if let Some(archive) = &mut self.archive {
-            let _ = archive.record(source, stream, channel, frame);
+            let _ = archive.record(source, stream, channel, content, frame);
         }
     }
 
@@ -323,6 +332,7 @@ impl DashboardSupport {
         stream: &StreamId,
         descriptor: Option<&StreamDescriptor>,
         channel: &str,
+        content: &ChannelContent,
         frame: &Frame,
     ) {
         let origin = descriptor.map(|descriptor| {
@@ -343,6 +353,7 @@ impl DashboardSupport {
             channel: channel.to_owned(),
             position: frame.position.0,
             payload: frame.payload.clone(),
+            content: content.clone(),
         });
     }
 }
@@ -381,6 +392,7 @@ impl DashboardSupport {
         _stream: &StreamId,
         _descriptor: Option<&StreamDescriptor>,
         _channel: &str,
+        _content: &ChannelContent,
         _frame: &Frame,
     ) {
     }

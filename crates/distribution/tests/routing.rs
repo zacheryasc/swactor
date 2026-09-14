@@ -772,7 +772,7 @@ mod directory_route_path {
                 let engine =
                     Engine::new(parts, backend.clone()).expect("create stepping actor engine");
 
-                let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+                let outbox: Outbox = Arc::new(Default::default());
                 let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
                 // Gossip egress (directory → peer) and app egress (RouteView → host)
                 // both feed the one outbox, just like the live driver.

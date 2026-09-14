@@ -1,30 +1,38 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use data_plane::blob_transfer::{
     BlobTransferEvent, BlobTransferId, BlobTransferOffer, BlobTransferReceiver, BlobTransferSender,
 };
-use data_plane::host::HostRouteRegistrar;
+use data_plane::host::{HostRouteRegistrar, HostRouteWatch};
 use data_plane::namespace::{
     BlobBinding, DataDirectoryOut, NamespaceClient, NamespaceClientIn, NamespaceRequest,
 };
 use data_plane::source::{BlobSourceIn, BlobSourcePublisher};
 use data_plane::stream_transport::StreamTransport;
+use distribution::directory_actor::DirectoryIn;
 use distribution::transport_bridge::{OutboxRouteBinder, RouteBinder, RouteView};
 use distribution::types::NodeId;
 use iroh::EndpointAddr;
+use iroh_driver::ConnectionObserver;
+use myelin_control_contract::{
+    ContextualExitStatus, ContextualProcessEvent, ContextualProcessEventKind,
+    ContextualProcessSpec, DeploymentIdentity, ExecutionIdentity, LiveContextualExecution,
+    ResourceActor, ResourceArena, ResourceTransport, SCHEMA_VERSION, WorkerResourceSnapshot,
+};
 use swactor::actor::ActorAddress;
+use swactor::admin::{ListActorsRequest, ListActorsResponse};
 use swactor::runtime::Runtime;
-use swactor_engine::EngineHandle;
+use swactor_engine::{ActorTimer, EngineHandle};
 use swactor_process::{ExitStatus, ProcessOutput, ProcessSpec};
 use swactor_process_context::{
     BootstrapFailure, ContextualProcessCommand, ContextualProcessOutput,
-    ContextualProcessOutputConfig, ContextualProcessSpec, ExecutionIdentity,
-    send_contextual_process_command,
+    ContextualProcessOutputConfig, ContextualProcessSpec as RuntimeContextualProcessSpec,
+    ExecutionIdentity as RuntimeExecutionIdentity, send_contextual_process_command,
 };
 use swactor_process_context::{
     ContextProvisioner, ContextualProcessSpawner, DataPlaneProvisioner, DataPlaneProvisionerConfig,
@@ -34,6 +42,10 @@ pub struct MyelinChildRouteRegistrar {
     route_view: RouteView,
     pinned_routes: RouteView,
     route_binder: Arc<OutboxRouteBinder>,
+    retained_sources: Mutex<HashMap<ActorAddress, (NodeId, u64)>>,
+    runtime: Runtime,
+    directory: ActorAddress,
+    connections: ConnectionObserver,
 }
 
 impl MyelinChildRouteRegistrar {
@@ -41,11 +53,18 @@ impl MyelinChildRouteRegistrar {
         route_view: RouteView,
         pinned_routes: RouteView,
         route_binder: Arc<OutboxRouteBinder>,
+        runtime: Runtime,
+        directory: ActorAddress,
+        connections: ConnectionObserver,
     ) -> Self {
         Self {
             route_view,
             pinned_routes,
             route_binder,
+            retained_sources: Mutex::new(HashMap::new()),
+            runtime,
+            directory,
+            connections,
         }
     }
 
@@ -90,6 +109,59 @@ impl HostRouteRegistrar for MyelinChildRouteRegistrar {
         self.revoke_route(child_session)
     }
 
+    fn retain_source(&self, source: ActorAddress, source_node: [u8; 32]) -> Result<(), String> {
+        let node = NodeId(source_node);
+        let mut retained = self
+            .retained_sources
+            .lock()
+            .map_err(|_| "retained source view is poisoned".to_owned())?;
+        let fresh = !retained.contains_key(&source);
+        let count = retained
+            .get(&source)
+            .map_or(0, |(_, count)| *count)
+            .checked_add(1)
+            .ok_or_else(|| "retained source claim count overflowed".to_owned())?;
+        if fresh {
+            let mut pinned = self
+                .pinned_routes
+                .write()
+                .map_err(|_| "pinned route view is poisoned".to_owned())?;
+            let mut routes = self
+                .route_view
+                .write()
+                .map_err(|_| "route view is poisoned".to_owned())?;
+            pinned.insert(source, node);
+            routes.insert(source, node);
+            drop(routes);
+            drop(pinned);
+            self.route_binder.ensure_routable(source);
+        }
+        retained.insert(source, (node, count));
+        Ok(())
+    }
+
+    fn release_source(&self, source: ActorAddress) {
+        // Keep the claim count and pin transition under the same lock: a new
+        // transfer must not retain between the final decrement and pin removal.
+        let Ok(mut retained) = self.retained_sources.lock() else {
+            return;
+        };
+        let Some((_, count)) = retained.get_mut(&source) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            retained.remove(&source);
+            // Source actors publish an ordinary distribution-directory claim.
+            // Dropping a temporary reader pin must not delete that independently
+            // owned route: the namespace authority still needs it to deliver
+            // Retire after the last reader releases its binding.
+            if let Ok(mut pinned) = self.pinned_routes.write() {
+                pinned.remove(&source);
+            }
+        }
+    }
+
     fn is_routable(&self, actor: ActorAddress) -> bool {
         self.pinned_routes
             .read()
@@ -98,6 +170,42 @@ impl HostRouteRegistrar for MyelinChildRouteRegistrar {
                 .route_view
                 .read()
                 .is_ok_and(|routes| routes.contains_key(&actor))
+    }
+
+    fn watch_route(
+        &self,
+        actor: ActorAddress,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<HostRouteWatch> {
+        let routes = Arc::clone(&self.route_view);
+        let connections = self.connections.clone();
+        // Both watchers deliver an initial observation. Compare the exact
+        // route/connection generation to coalesce them and unrelated changes.
+        let observed = parking_lot::Mutex::new(None);
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let route = routes
+                .read()
+                .ok()
+                .and_then(|routes| routes.get(&actor).copied());
+            let current = (route, route.and_then(|node| connections.generation(&node)));
+            let mut observed = observed.lock();
+            if observed.as_ref() == Some(&current) {
+                return;
+            }
+            *observed = Some(current);
+            drop(observed);
+            changed();
+        });
+        let watch = self.connections.watch_connections(Arc::clone(&wake));
+        // Subscription precedes the initial read; directory registration also
+        // observes current state, closing the publication/registration race.
+        let _ = self.runtime.send_to(
+            self.directory,
+            DirectoryIn::WatchRoutes {
+                changed: Arc::downgrade(&wake),
+            },
+        );
+        Some(HostRouteWatch::new((wake, watch)))
     }
 }
 
@@ -110,9 +218,8 @@ pub struct MyelinContextualProcessConfig {
     pub transfer_receiver: Option<Arc<dyn BlobTransferReceiver>>,
     pub source_sender: Option<Arc<dyn BlobTransferSender>>,
     pub source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
-    pub route_view: RouteView,
-    pub pinned_routes: RouteView,
-    pub route_binder: Arc<OutboxRouteBinder>,
+    /// Shared with uploaded-program materialization for this runtime.
+    pub route_registrar: Arc<dyn HostRouteRegistrar>,
     pub stream_transport: Option<Arc<dyn StreamTransport>>,
     pub host_endpoint: EndpointAddr,
 }
@@ -122,11 +229,6 @@ pub fn build_contextual_process_spawner(
 ) -> Result<ContextualProcessSpawner, String> {
     let routing = serde_json::to_vec(&config.host_endpoint)
         .map_err(|error| format!("serialize contextual routing material: {error}"))?;
-    let registrar: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
-        config.route_view,
-        config.pinned_routes,
-        config.route_binder,
-    ));
     let provisioner: Arc<dyn ContextProvisioner> =
         Arc::new(DataPlaneProvisioner::new(DataPlaneProvisionerConfig {
             runtime: config.runtime,
@@ -137,74 +239,48 @@ pub fn build_contextual_process_spawner(
             transfer_receiver: config.transfer_receiver,
             source_sender: config.source_sender,
             source_publisher: config.source_publisher,
-            route_registrar: Some(registrar),
+            route_registrar: Some(config.route_registrar),
             stream_transport: config.stream_transport,
             routing: Arc::new(move |_| Ok(routing.clone())),
         })?);
     Ok(ContextualProcessSpawner::new(config.engine, provisioner))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct ContextualProgramFileWire {
-    pub namespace_path: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct ContextualProcessSpecWire {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    pub working_dir: Option<String>,
-    pub label: Option<String>,
-    pub execution_id: String,
-    #[serde(default)]
-    pub read_prefixes: Vec<String>,
-    #[serde(default)]
-    pub write_prefixes: Vec<String>,
-    pub attach_timeout_ms: u64,
-    #[serde(default)]
-    pub staged_program: Option<ContextualProgramFileWire>,
-}
-
-impl ContextualProcessSpecWire {
-    fn into_spec(self) -> Result<ContextualProcessSpec, String> {
-        let parse_paths = |paths: Vec<String>| {
-            paths
-                .into_iter()
-                .map(data_plane::path::DataPath::parse)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())
-        };
-        Ok(ContextualProcessSpec {
-            process: ProcessSpec {
-                command: self.command,
-                args: self.args,
-                env: self.env.into_iter().collect(),
-                working_dir: self.working_dir.map(PathBuf::from),
-                label: self.label,
-            },
-            access: data_plane::path::SessionAccess {
-                execution_id: self.execution_id,
-                read_prefixes: parse_paths(self.read_prefixes)?,
-                write_prefixes: parse_paths(self.write_prefixes)?,
-            },
-            attach_deadline: Duration::from_millis(self.attach_timeout_ms),
-        })
-    }
+fn into_runtime_spec(spec: ContextualProcessSpec) -> Result<RuntimeContextualProcessSpec, String> {
+    let parse_paths = |paths: Vec<String>| {
+        paths
+            .into_iter()
+            .map(data_plane::path::DataPath::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    };
+    Ok(RuntimeContextualProcessSpec {
+        process: ProcessSpec {
+            command: spec.command,
+            args: spec.args,
+            env: spec.env.into_iter().collect(),
+            working_dir: spec.working_dir.map(PathBuf::from),
+            label: spec.label,
+        },
+        access: data_plane::path::SessionAccess {
+            execution_id: spec.execution_id,
+            read_prefixes: parse_paths(spec.read_prefixes)?,
+            write_prefixes: parse_paths(spec.write_prefixes)?,
+        },
+        attach_deadline: Duration::from_millis(spec.attach_timeout_ms),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum ContextualNodeCommand {
     Spawn {
         request_id: String,
-        spec: ContextualProcessSpecWire,
+        spec: ContextualProcessSpec,
         reply_to: ActorAddress,
     },
     Stop {
         request_id: String,
-        process: ActorAddress,
+        target_request_id: String,
         kill_after_ms: Option<u64>,
         reply_to: ActorAddress,
     },
@@ -214,112 +290,19 @@ pub(crate) enum ContextualNodeCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct ExecutionIdentityWire {
-    pub execution_id: u64,
-    pub generation: u64,
-}
-
-impl From<ExecutionIdentity> for ExecutionIdentityWire {
-    fn from(identity: ExecutionIdentity) -> Self {
-        Self {
-            execution_id: identity.execution_id,
-            generation: identity.generation,
-        }
+fn execution_identity(identity: RuntimeExecutionIdentity) -> ExecutionIdentity {
+    ExecutionIdentity {
+        execution_id: identity.execution_id,
+        generation: identity.generation,
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub(crate) enum ContextualExitStatusWire {
-    Code(i32),
-    Signal(i32),
-    Unknown,
-}
-
-impl From<ExitStatus> for ContextualExitStatusWire {
-    fn from(status: ExitStatus) -> Self {
-        match status {
-            ExitStatus::Code(code) => Self::Code(code),
-            ExitStatus::Signal(signal) => Self::Signal(signal),
-            ExitStatus::Unknown => Self::Unknown,
-        }
+fn contextual_exit_status(status: ExitStatus) -> ContextualExitStatus {
+    match status {
+        ExitStatus::Code(code) => ContextualExitStatus::Code(code),
+        ExitStatus::Signal(signal) => ContextualExitStatus::Signal(signal),
+        ExitStatus::Unknown => ContextualExitStatus::Unknown,
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct LiveContextualExecutionWire {
-    pub request_id: String,
-    pub process: ActorAddress,
-    pub identity: ExecutionIdentityWire,
-    pub started_pid: Option<u32>,
-    pub context_ready: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ContextualProcessEventKindWire {
-    Spawned {
-        process: ActorAddress,
-        identity: ExecutionIdentityWire,
-    },
-    SpawnRejected {
-        error: String,
-    },
-    ProcessStarted {
-        pid: u32,
-    },
-    ContextReady,
-    Stdout {
-        bytes: Vec<u8>,
-    },
-    Stderr {
-        bytes: Vec<u8>,
-    },
-    SpawnFailed {
-        error: String,
-    },
-    BootstrapFailed {
-        error: String,
-    },
-    Exited {
-        status: ContextualExitStatusWire,
-    },
-    ProcessError {
-        error: String,
-    },
-    StopAccepted {
-        process: ActorAddress,
-    },
-    StopRejected {
-        error: String,
-    },
-    LiveExecutions {
-        executions: Vec<LiveContextualExecutionWire>,
-    },
-    ControlUnavailable {
-        error: String,
-    },
-}
-
-impl ContextualProcessEventKindWire {
-    pub(crate) fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::SpawnRejected { .. }
-                | Self::SpawnFailed { .. }
-                | Self::BootstrapFailed { .. }
-                | Self::Exited { .. }
-                | Self::ProcessError { .. }
-        )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct ContextualProcessEventWire {
-    pub request_id: String,
-    pub logical_node_id: u64,
-    pub event: ContextualProcessEventKindWire,
 }
 
 #[derive(Clone)]
@@ -336,6 +319,13 @@ pub(crate) enum ContextualProcessControllerIn {
     ProgramPrepared {
         request_id: String,
         result: Result<PathBuf, String>,
+    },
+    ResourceCensusObserved {
+        sample_sequence: u64,
+        response: ListActorsResponse,
+    },
+    ResourceCensusDeadline {
+        sample_sequence: u64,
     },
 }
 
@@ -384,7 +374,7 @@ pub(crate) struct ContextualProgramMaterializer {
 }
 
 struct PendingProgramSpawn {
-    spec: ContextualProcessSpecWire,
+    spec: ContextualProcessSpec,
     reply_to: ActorAddress,
 }
 
@@ -459,14 +449,37 @@ struct ProgramFileTransfer {
     written: u64,
     source_confirmed: bool,
     route_attempts: u16,
+    route_watch: Option<HostRouteWatch>,
+    route_retry: Option<ActorTimer>,
+}
+
+impl Drop for ProgramFileTransfer {
+    fn drop(&mut self) {
+        self.stop_route_wait();
+        if let Some(offer) = self.offer.take() {
+            self.receiver.cancel(&offer);
+        }
+        if self.file.take().is_some() {
+            remove_program_tree(&self.path);
+        }
+        self.routes.release_source(self.source);
+    }
 }
 
 impl ProgramFileTransfer {
+    fn stop_route_wait(&mut self) {
+        self.route_watch = None;
+        if let Some(timer) = self.route_retry.take() {
+            timer.cancel();
+        }
+    }
+
     fn fail(&mut self, ctx: &swactor::runtime::Ctx<'_>, error: impl Into<String>) {
         self.finish(ctx, Err(error.into()));
     }
 
     fn finish(&mut self, ctx: &swactor::runtime::Ctx<'_>, result: Result<PathBuf, String>) {
+        self.stop_route_wait();
         if let Some(offer) = self.offer.take() {
             self.receiver.cancel(&offer);
         }
@@ -484,15 +497,17 @@ impl ProgramFileTransfer {
         ctx.stop_self();
     }
 
-    fn try_start(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
-        if self.route_attempts >= PROGRAM_TRANSFER_RETRY_LIMIT {
+    fn try_start(&mut self, ctx: &swactor::runtime::Ctx<'_>, retry: bool) {
+        if retry && self.route_attempts >= PROGRAM_TRANSFER_RETRY_LIMIT {
             self.fail(
                 ctx,
                 "uploaded program source did not become routable before the transfer deadline",
             );
             return;
         }
-        self.route_attempts += 1;
+        if retry {
+            self.route_attempts += 1;
+        }
         if self.routes.is_routable(self.source) {
             let offer = self
                 .offer
@@ -507,13 +522,13 @@ impl ProgramFileTransfer {
                 return;
             }
         }
-        if !self.source_confirmed {
-            self.engine.send_after(
+        if !self.source_confirmed && self.route_retry.is_none() {
+            self.route_retry = Some(self.engine.send_after(
                 PROGRAM_TRANSFER_RETRY,
                 self.sender.clone(),
                 ctx.self_addr(),
                 BlobTransferEvent::RouteRetry,
-            );
+            ));
         }
     }
 }
@@ -530,7 +545,15 @@ impl swactor::actor::ActorInterface for ProgramFileTransfer {
         match self.receiver.open(ctx.self_addr(), self.transfer_id) {
             Ok(offer) => {
                 self.offer = Some(offer);
-                self.try_start(ctx);
+                let sender = self.sender.clone();
+                let target = ctx.self_addr();
+                self.route_watch = self.routes.watch_route(
+                    self.source,
+                    Arc::new(move || {
+                        let _ = sender.send_to(target, BlobTransferEvent::RouteChanged);
+                    }),
+                );
+                self.try_start(ctx, true);
             }
             Err(error) => self.fail(ctx, format!("open uploaded program transfer: {error}")),
         }
@@ -538,9 +561,16 @@ impl swactor::actor::ActorInterface for ProgramFileTransfer {
 
     fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, event: Self::Incoming) {
         match event {
-            BlobTransferEvent::RouteRetry if !self.source_confirmed => self.try_start(ctx),
+            BlobTransferEvent::RouteRetry if !self.source_confirmed => {
+                self.route_retry = None;
+                self.try_start(ctx, true);
+            }
+            BlobTransferEvent::RouteChanged if !self.source_confirmed => {
+                self.try_start(ctx, false);
+            }
             BlobTransferEvent::Chunk { transfer_id, bytes } if transfer_id == self.transfer_id => {
                 self.source_confirmed = true;
+                self.stop_route_wait();
                 let Some(next) = self
                     .written
                     .checked_add(bytes.len() as u64)
@@ -565,6 +595,7 @@ impl swactor::actor::ActorInterface for ProgramFileTransfer {
             }
             BlobTransferEvent::Finished { transfer_id } if transfer_id == self.transfer_id => {
                 self.source_confirmed = true;
+                self.stop_route_wait();
                 if self.written != self.length {
                     self.fail(
                         ctx,
@@ -603,14 +634,35 @@ fn remove_program_tree(path: &Path) {
     }
 }
 
-struct LiveContextualExecution {
+struct LiveExecutionState {
     request_id: String,
     process: ActorAddress,
-    identity: ExecutionIdentity,
+    identity: RuntimeExecutionIdentity,
     reply_to: ActorAddress,
     started_pid: Option<u32>,
     context_ready: bool,
     staged_program: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ContextualResourceProbe {
+    pub runtime: Runtime,
+    pub engine: EngineHandle,
+    pub arena: Arc<parking_lot::Mutex<data_plane::arena::ArenaManager>>,
+    pub stream_transport: Arc<iroh_driver::IrohStreamTransport>,
+    pub generation: u64,
+    pub iroh_node_id: String,
+    pub deployment: Option<DeploymentIdentity>,
+}
+
+struct PendingResourceCensus {
+    request_id: String,
+    reply_to: ActorAddress,
+    executions: Vec<LiveContextualExecution>,
+    started: Instant,
+    deadline: Instant,
+    request: ListActorsRequest,
+    timer: ActorTimer,
 }
 
 pub(crate) struct ContextualProcessController {
@@ -618,10 +670,28 @@ pub(crate) struct ContextualProcessController {
     spawner: Arc<ContextualProcessSpawner>,
     sender: swactor::runtime::ExternalSender,
     materializer: Option<ContextualProgramMaterializer>,
+    resource_probe: Option<ContextualResourceProbe>,
+    resource_sequence: u64,
+    pending_resource_censuses: HashMap<u64, PendingResourceCensus>,
     pending_programs: HashMap<String, PendingProgramSpawn>,
-    by_process: HashMap<ActorAddress, LiveContextualExecution>,
+    by_process: HashMap<ActorAddress, LiveExecutionState>,
     process_by_request: HashMap<String, ActorAddress>,
+    /// Request IDs that reached a terminal state, newest first. A Spawn
+    /// redelivered after completion (client retry or transport redelivery)
+    /// must never execute again: the re-spawned child claims a bootstrap
+    /// material nobody will send, hangs forever, and leaks its whole actor
+    /// assembly past every census.
+    finished_requests: VecDeque<String>,
 }
+
+/// Upper bound on remembered terminal requests. Campaigns issue hundreds of
+/// request IDs; the bound keeps long-lived nodes bounded while covering any
+/// realistic redelivery window.
+const FINISHED_REQUEST_MEMORY: usize = 4096;
+// The HTTP control owner allows two seconds. A local admin census that has not
+// completed in this interval is stalled; fail it promptly so retries cannot
+// accumulate dozens of orphaned censuses behind one overloaded worker.
+const RESOURCE_CENSUS_DEADLINE: Duration = Duration::from_millis(500);
 
 impl ContextualProcessController {
     pub(crate) fn new(
@@ -634,9 +704,13 @@ impl ContextualProcessController {
             spawner,
             sender,
             materializer: None,
+            resource_probe: None,
+            resource_sequence: 0,
+            pending_resource_censuses: HashMap::new(),
             pending_programs: HashMap::new(),
             by_process: HashMap::new(),
             process_by_request: HashMap::new(),
+            finished_requests: VecDeque::new(),
         }
     }
     pub(crate) fn with_program_materializer(
@@ -647,22 +721,25 @@ impl ContextualProcessController {
         self
     }
 
+    pub(crate) fn with_resource_probe(mut self, probe: ContextualResourceProbe) -> Self {
+        self.resource_probe = Some(probe);
+        self
+    }
+
     fn emit(
         &self,
         ctx: &swactor::runtime::Ctx<'_>,
         reply_to: ActorAddress,
         request_id: String,
-        event: ContextualProcessEventKindWire,
+        event: ContextualProcessEventKind,
     ) {
         let _ = ctx.send(
             reply_to,
-            crate::orchestration::actor::OrchestratorMsg::ContextualEvent(
-                ContextualProcessEventWire {
-                    request_id,
-                    logical_node_id: self.logical_node_id,
-                    event,
-                },
-            ),
+            crate::orchestration::actor::OrchestratorMsg::ContextualEvent(ContextualProcessEvent {
+                request_id,
+                logical_node_id: self.logical_node_id,
+                event,
+            }),
         );
     }
 
@@ -670,7 +747,7 @@ impl ContextualProcessController {
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
-        mut spec: ContextualProcessSpecWire,
+        mut spec: ContextualProcessSpec,
         reply_to: ActorAddress,
     ) {
         if self.process_by_request.contains_key(&request_id)
@@ -680,8 +757,25 @@ impl ContextualProcessController {
                 ctx,
                 reply_to,
                 request_id,
-                ContextualProcessEventKindWire::SpawnRejected {
+                ContextualProcessEventKind::SpawnRejected {
                     error: "contextual request ID is already live".to_owned(),
+                },
+            );
+            return;
+        }
+        if self
+            .finished_requests
+            .iter()
+            .any(|finished| finished == &request_id)
+        {
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKind::SpawnRejected {
+                    error: "contextual request ID already completed; spawn redelivery is \
+                            rejected instead of re-executed"
+                        .to_owned(),
                 },
             );
             return;
@@ -695,7 +789,7 @@ impl ContextualProcessController {
                 ctx,
                 reply_to,
                 request_id,
-                ContextualProcessEventKindWire::SpawnRejected {
+                ContextualProcessEventKind::SpawnRejected {
                     error: "uploaded program materialization is unavailable on this node"
                         .to_owned(),
                 },
@@ -709,7 +803,7 @@ impl ContextualProcessController {
                     ctx,
                     reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected {
+                    ContextualProcessEventKind::SpawnRejected {
                         error: format!("invalid uploaded program path: {error}"),
                     },
                 );
@@ -729,7 +823,7 @@ impl ContextualProcessController {
                 ctx,
                 reply_to,
                 request_id,
-                ContextualProcessEventKindWire::SpawnRejected {
+                ContextualProcessEventKind::SpawnRejected {
                     error: format!("spawn uploaded program resolver: {error}"),
                 },
             );
@@ -740,11 +834,11 @@ impl ContextualProcessController {
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
-        spec: ContextualProcessSpecWire,
+        spec: ContextualProcessSpec,
         reply_to: ActorAddress,
         staged_program: Option<PathBuf>,
     ) {
-        let spec = match spec.into_spec() {
+        let spec = match into_runtime_spec(spec) {
             Ok(spec) => spec,
             Err(error) => {
                 if let Some(path) = staged_program.as_deref() {
@@ -754,7 +848,7 @@ impl ContextualProcessController {
                     ctx,
                     reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected { error },
+                    ContextualProcessEventKind::SpawnRejected { error },
                 );
                 return;
             }
@@ -772,7 +866,7 @@ impl ContextualProcessController {
                     ctx,
                     reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected {
+                    ContextualProcessEventKind::SpawnRejected {
                         error: format!("spawn contextual output relay: {error}"),
                     },
                 );
@@ -786,7 +880,7 @@ impl ContextualProcessController {
                     .insert(request_id.clone(), spawned.actor);
                 self.by_process.insert(
                     spawned.actor,
-                    LiveContextualExecution {
+                    LiveExecutionState {
                         request_id: request_id.clone(),
                         process: spawned.actor,
                         identity: spawned.identity,
@@ -800,9 +894,9 @@ impl ContextualProcessController {
                     ctx,
                     reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::Spawned {
-                        process: spawned.actor,
-                        identity: spawned.identity.into(),
+                    ContextualProcessEventKind::Spawned {
+                        process: spawned.actor.to_full_hex(),
+                        identity: execution_identity(spawned.identity),
                     },
                 );
             }
@@ -815,7 +909,7 @@ impl ContextualProcessController {
                     ctx,
                     reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected {
+                    ContextualProcessEventKind::SpawnRejected {
                         error: error.to_string(),
                     },
                 );
@@ -844,7 +938,7 @@ impl ContextualProcessController {
                     ctx,
                     pending.reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected { error },
+                    ContextualProcessEventKind::SpawnRejected { error },
                 );
                 return;
             }
@@ -873,11 +967,31 @@ impl ContextualProcessController {
                     ctx,
                     reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected { error },
+                    ContextualProcessEventKind::SpawnRejected { error },
                 );
                 return;
             }
         };
+        // Namespace resolution carries the exact source node. Pin that route
+        // for this transfer just as ordinary blob reads do, instead of waiting
+        // for background directory gossip to rediscover the same fact.
+        if let Err(error) = materializer
+            .routes
+            .retain_source(binding.source, binding.source_node)
+        {
+            self.pending_programs.remove(&request_id);
+            drop(file);
+            remove_program_tree(&path);
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKind::SpawnRejected {
+                    error: format!("retain uploaded program source route: {error}"),
+                },
+            );
+            return;
+        }
         let random = ActorAddress::new_random();
         let transfer_id = BlobTransferId(u64::from_le_bytes(
             random.0[..8]
@@ -900,6 +1014,8 @@ impl ContextualProcessController {
             written: 0,
             source_confirmed: false,
             route_attempts: 0,
+            route_watch: None,
+            route_retry: None,
         };
         if let Err(error) = ctx.spawn(transfer) {
             self.pending_programs.remove(&request_id);
@@ -908,7 +1024,7 @@ impl ContextualProcessController {
                 ctx,
                 reply_to,
                 request_id,
-                ContextualProcessEventKindWire::SpawnRejected {
+                ContextualProcessEventKind::SpawnRejected {
                     error: format!("spawn uploaded program transfer: {error}"),
                 },
             );
@@ -934,7 +1050,7 @@ impl ContextualProcessController {
                     ctx,
                     pending.reply_to,
                     request_id,
-                    ContextualProcessEventKindWire::SpawnRejected { error },
+                    ContextualProcessEventKind::SpawnRejected { error },
                 );
                 return;
             }
@@ -950,11 +1066,12 @@ impl ContextualProcessController {
         &self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
-        process: ActorAddress,
+        target_request_id: String,
         kill_after_ms: Option<u64>,
         reply_to: ActorAddress,
     ) {
-        let event = if self.by_process.contains_key(&process) {
+        let event = if let Some(process) = self.process_by_request.get(&target_request_id).copied()
+        {
             match send_contextual_process_command(
                 &self.sender,
                 process,
@@ -962,38 +1079,203 @@ impl ContextualProcessController {
                     kill_after: kill_after_ms.map(Duration::from_millis),
                 },
             ) {
-                Ok(()) => ContextualProcessEventKindWire::StopAccepted { process },
-                Err(error) => ContextualProcessEventKindWire::StopRejected {
+                Ok(()) => ContextualProcessEventKind::StopAccepted {
+                    process: process.to_full_hex(),
+                },
+                Err(error) => ContextualProcessEventKind::StopRejected {
                     error: error.to_string(),
                 },
             }
         } else {
-            ContextualProcessEventKindWire::StopRejected {
+            ContextualProcessEventKind::StopRejected {
                 error: "contextual process is not live on this node".to_owned(),
             }
         };
         self.emit(ctx, reply_to, request_id, event);
     }
 
-    fn query(&self, ctx: &swactor::runtime::Ctx<'_>, request_id: String, reply_to: ActorAddress) {
+    fn query(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: String,
+        reply_to: ActorAddress,
+    ) {
         let mut executions = self
             .by_process
             .values()
-            .map(|execution| LiveContextualExecutionWire {
+            .map(|execution| LiveContextualExecution {
                 request_id: execution.request_id.clone(),
-                process: execution.process,
-                identity: execution.identity.into(),
+                process: execution.process.to_full_hex(),
+                identity: execution_identity(execution.identity),
                 started_pid: execution.started_pid,
                 context_ready: execution.context_ready,
             })
             .collect::<Vec<_>>();
         executions.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        if let Some(probe) = &self.resource_probe {
+            self.resource_sequence = self.resource_sequence.saturating_add(1);
+            let sample_sequence = self.resource_sequence;
+            let started = probe.engine.now().to_instant();
+            let deadline = started + RESOURCE_CENSUS_DEADLINE;
+            let request =
+                match probe
+                    .runtime
+                    .admin()
+                    .list_actors_to(ctx.self_addr(), move |response| {
+                        ContextualProcessControllerIn::ResourceCensusObserved {
+                            sample_sequence,
+                            response,
+                        }
+                    }) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.emit(
+                            ctx,
+                            reply_to,
+                            request_id,
+                            ContextualProcessEventKind::ControlUnavailable {
+                                error: format!("request actor census: {error}"),
+                            },
+                        );
+                        return;
+                    }
+                };
+            let timer = probe.engine.send_after(
+                deadline.saturating_duration_since(probe.engine.now().to_instant()),
+                self.sender.clone(),
+                ctx.self_addr(),
+                ContextualProcessControllerIn::ResourceCensusDeadline { sample_sequence },
+            );
+            self.pending_resource_censuses.insert(
+                sample_sequence,
+                PendingResourceCensus {
+                    request_id,
+                    reply_to,
+                    executions,
+                    started,
+                    deadline,
+                    request,
+                    timer,
+                },
+            );
+            return;
+        }
         self.emit(
             ctx,
             reply_to,
             request_id,
-            ContextualProcessEventKindWire::LiveExecutions { executions },
+            ContextualProcessEventKind::LiveExecutions {
+                executions,
+                resources: None,
+            },
         );
+    }
+
+    fn resource_census(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        sample_sequence: u64,
+        response: Option<ListActorsResponse>,
+    ) {
+        let Some(pending) = self.pending_resource_censuses.remove(&sample_sequence) else {
+            return;
+        };
+        pending.timer.cancel();
+        pending.request.cancel();
+        let probe = self
+            .resource_probe
+            .as_ref()
+            .expect("pending resource census has a probe");
+        let response = response.filter(|_| probe.engine.now().to_instant() < pending.deadline);
+        let event = if let Some(mut response) = response {
+            response
+                .actors
+                .sort_unstable_by_key(|actor| actor.address.0);
+            let actors = response
+                .actors
+                .into_iter()
+                .map(|actor| ResourceActor {
+                    address: actor.address.to_full_hex(),
+                    actor_type: actor.actor_type.to_owned(),
+                    worker_id: actor.worker_id as u64,
+                    mailbox_depth: actor.mailbox_depth as u64,
+                    poisoned: actor.status.poisoned,
+                    stopping: actor.status.stopping,
+                })
+                .collect::<Vec<_>>();
+            let arena: data_plane::arena::ArenaSample =
+                probe.arena.lock().sample(sample_sequence).into();
+            let arena = ResourceArena {
+                seq: arena.seq,
+                sample_unix_ms: arena.sample_unix_ms,
+                capacity_bytes: arena.capacity_bytes,
+                live_bytes: arena.live_bytes,
+                free_bytes: arena.free_bytes,
+                active_leases: arena.active_leases,
+                pending_leases: arena.pending_leases,
+                largest_free_range_bytes: arena.largest_free_range_bytes,
+                allocation_failures_total: arena.allocation_failures_total,
+                release_failures_total: arena.release_failures_total,
+            };
+            let transport = match serde_json::from_value::<ResourceTransport>(
+                probe.stream_transport.resource_snapshot(),
+            ) {
+                Ok(transport) => transport,
+                Err(error) => {
+                    self.emit(
+                        ctx,
+                        pending.reply_to,
+                        pending.request_id,
+                        ContextualProcessEventKind::ControlUnavailable {
+                            error: format!("invalid stream transport resource snapshot: {error}"),
+                        },
+                    );
+                    return;
+                }
+            };
+            let resources = WorkerResourceSnapshot {
+                schema_version: SCHEMA_VERSION,
+                request_id: pending.request_id.clone(),
+                logical_node_id: self.logical_node_id,
+                generation: probe.generation,
+                sample_sequence,
+                iroh_node_id: probe.iroh_node_id.clone(),
+                artifact_digest: probe
+                    .deployment
+                    .as_ref()
+                    .map(|identity| identity.artifact_digest.clone()),
+                deployment_generation: probe
+                    .deployment
+                    .as_ref()
+                    .map(|identity| identity.deployment_generation.clone()),
+                actors,
+                arena,
+                collection_elapsed_us: probe
+                    .engine
+                    .now()
+                    .to_instant()
+                    .duration_since(pending.started)
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                transport,
+            };
+            if probe.engine.now().to_instant() < pending.deadline {
+                ContextualProcessEventKind::LiveExecutions {
+                    executions: pending.executions,
+                    resources: Some(resources),
+                }
+            } else {
+                ContextualProcessEventKind::ControlUnavailable {
+                    error: "fresh worker actor/arena census deadline expired".to_owned(),
+                }
+            }
+        } else {
+            ContextualProcessEventKind::ControlUnavailable {
+                error: "fresh worker actor/arena census deadline expired".to_owned(),
+            }
+        };
+        self.emit(ctx, pending.reply_to, pending.request_id, event);
     }
 
     fn observe(
@@ -1012,31 +1294,31 @@ impl ContextualProcessController {
             let event = match output {
                 ContextualProcessOutput::Process(ProcessOutput::Started { pid }) => {
                     execution.started_pid = Some(pid);
-                    ContextualProcessEventKindWire::ProcessStarted { pid }
+                    ContextualProcessEventKind::ProcessStarted { pid }
                 }
                 ContextualProcessOutput::Process(ProcessOutput::Stdout(bytes)) => {
-                    ContextualProcessEventKindWire::Stdout { bytes }
+                    ContextualProcessEventKind::Stdout { bytes }
                 }
                 ContextualProcessOutput::Process(ProcessOutput::Stderr(bytes)) => {
-                    ContextualProcessEventKindWire::Stderr { bytes }
+                    ContextualProcessEventKind::Stderr { bytes }
                 }
                 ContextualProcessOutput::Process(ProcessOutput::SpawnFailed { error }) => {
-                    ContextualProcessEventKindWire::SpawnFailed { error }
+                    ContextualProcessEventKind::SpawnFailed { error }
                 }
                 ContextualProcessOutput::Process(ProcessOutput::Exited { status }) => {
-                    ContextualProcessEventKindWire::Exited {
-                        status: status.into(),
+                    ContextualProcessEventKind::Exited {
+                        status: contextual_exit_status(status),
                     }
                 }
                 ContextualProcessOutput::Process(ProcessOutput::Error { error }) => {
-                    ContextualProcessEventKindWire::ProcessError { error }
+                    ContextualProcessEventKind::ProcessError { error }
                 }
                 ContextualProcessOutput::ContextReady => {
                     execution.context_ready = true;
-                    ContextualProcessEventKindWire::ContextReady
+                    ContextualProcessEventKind::ContextReady
                 }
                 ContextualProcessOutput::BootstrapFailed { reason } => {
-                    ContextualProcessEventKindWire::BootstrapFailed {
+                    ContextualProcessEventKind::BootstrapFailed {
                         error: bootstrap_failure(&reason),
                     }
                 }
@@ -1051,6 +1333,10 @@ impl ContextualProcessController {
                 remove_program_tree(&path);
             }
             self.process_by_request.remove(&request_id);
+            self.finished_requests.push_front(request_id.clone());
+            while self.finished_requests.len() > FINISHED_REQUEST_MEMORY {
+                self.finished_requests.pop_back();
+            }
         }
     }
 }
@@ -1076,6 +1362,15 @@ fn bootstrap_failure(failure: &BootstrapFailure) -> String {
     }
 }
 
+impl Drop for ContextualProcessController {
+    fn drop(&mut self) {
+        for pending in self.pending_resource_censuses.values() {
+            pending.timer.cancel();
+            pending.request.cancel();
+        }
+    }
+}
+
 impl swactor::actor::ActorInterface for ContextualProcessController {
     type Incoming = ContextualProcessControllerIn;
     type Response = ();
@@ -1089,10 +1384,10 @@ impl swactor::actor::ActorInterface for ContextualProcessController {
             }) => self.spawn(ctx, request_id, spec, reply_to),
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Stop {
                 request_id,
-                process,
+                target_request_id,
                 kill_after_ms,
                 reply_to,
-            }) => self.stop(ctx, request_id, process, kill_after_ms, reply_to),
+            }) => self.stop(ctx, request_id, target_request_id, kill_after_ms, reply_to),
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Query {
                 request_id,
                 reply_to,
@@ -1106,6 +1401,174 @@ impl swactor::actor::ActorInterface for ContextualProcessController {
             ContextualProcessControllerIn::ProgramPrepared { request_id, result } => {
                 self.program_prepared(ctx, request_id, result);
             }
+            ContextualProcessControllerIn::ResourceCensusObserved {
+                sample_sequence,
+                response,
+            } => self.resource_census(ctx, sample_sequence, Some(response)),
+            ContextualProcessControllerIn::ResourceCensusDeadline { sample_sequence } => {
+                self.resource_census(ctx, sample_sequence, None);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_wake_tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use swactor::runtime::{RuntimeConfig, RuntimeParts};
+    use swactor_engine::{Engine, SteppingBackend};
+
+    #[derive(Default)]
+    struct Routes {
+        ready: AtomicBool,
+        changed: Mutex<Option<Weak<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl Routes {
+        fn wake(&self) {
+            let changed = self.changed.lock().as_ref().and_then(Weak::upgrade);
+            if let Some(changed) = changed {
+                changed();
+            }
+        }
+    }
+
+    impl HostRouteRegistrar for Routes {
+        fn register_child(&self, _: ActorAddress, _: [u8; 32]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn revoke_child(&self, _: ActorAddress) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn is_routable(&self, _: ActorAddress) -> bool {
+            self.ready.load(Ordering::Acquire)
+        }
+
+        fn watch_route(
+            &self,
+            _: ActorAddress,
+            changed: Arc<dyn Fn() + Send + Sync>,
+        ) -> Option<HostRouteWatch> {
+            *self.changed.lock() = Some(Arc::downgrade(&changed));
+            Some(HostRouteWatch::new(changed))
+        }
+    }
+
+    struct Receiver;
+
+    impl BlobTransferReceiver for Receiver {
+        fn open(
+            &self,
+            destination: ActorAddress,
+            transfer_id: BlobTransferId,
+        ) -> Result<BlobTransferOffer, String> {
+            Ok(BlobTransferOffer {
+                transfer_id,
+                destination,
+                failure_proxy: None,
+                transport: Vec::new(),
+            })
+        }
+
+        fn cancel(&self, _: &BlobTransferOffer) {}
+    }
+
+    fn settle(backend: &SteppingBackend) {
+        for _ in 0..32 {
+            backend.step();
+        }
+    }
+
+    #[test]
+    fn program_route_wakes_preserve_retry_budget_cadence_and_lifetime() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let source = runtime.new_inbox::<BlobSourceIn>().unwrap();
+        let controller = runtime
+            .new_inbox::<ContextualProcessControllerIn>()
+            .unwrap();
+        let routes = Arc::new(Routes::default());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("program");
+        let transfer_id = BlobTransferId(17);
+        let transfer = runtime
+            .spawn(ProgramFileTransfer {
+                request_id: "wake-budget".to_owned(),
+                controller: *controller.addr(),
+                source: *source.addr(),
+                length: 3,
+                transfer_id,
+                receiver: Arc::new(Receiver),
+                routes: routes.clone(),
+                engine: engine.handle(),
+                sender: runtime.create_sender(),
+                file: Some(File::create(&path).unwrap()),
+                path: path.clone(),
+                offer: None,
+                written: 0,
+                source_confirmed: false,
+                route_attempts: 0,
+                route_watch: None,
+                route_retry: None,
+            })
+            .unwrap();
+        settle(&backend);
+        for _ in 0..=PROGRAM_TRANSFER_RETRY_LIMIT {
+            routes.wake();
+            settle(&backend);
+        }
+        assert!(source.try_recv().is_none());
+        assert!(controller.try_recv().is_none());
+
+        // No virtual time passes: becoming routable must initiate the transfer.
+        routes.ready.store(true, Ordering::Release);
+        routes.wake();
+        settle(&backend);
+        assert!(matches!(
+            source.try_recv(),
+            Some(BlobSourceIn::BeginTransfer { .. })
+        ));
+        assert!(source.try_recv().is_none());
+
+        // All earlier notifications still leave exactly one fallback re-drive.
+        backend.advance_time(PROGRAM_TRANSFER_RETRY);
+        settle(&backend);
+        assert!(matches!(
+            source.try_recv(),
+            Some(BlobSourceIn::BeginTransfer { .. })
+        ));
+        assert!(source.try_recv().is_none());
+        runtime
+            .send_to(
+                transfer,
+                BlobTransferEvent::Chunk {
+                    transfer_id,
+                    bytes: b"bin".to_vec(),
+                },
+            )
+            .unwrap();
+        runtime
+            .send_to(transfer, BlobTransferEvent::Finished { transfer_id })
+            .unwrap();
+        settle(&backend);
+        assert!(matches!(
+            controller.try_recv(),
+            Some(ContextualProcessControllerIn::ProgramPrepared { result: Ok(found), .. }) if found == path
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"bin");
+        assert!(routes.changed.lock().as_ref().unwrap().upgrade().is_none());
+        backend.advance_time(PROGRAM_TRANSFER_RETRY);
+        settle(&backend);
+        assert!(source.try_recv().is_none());
     }
 }

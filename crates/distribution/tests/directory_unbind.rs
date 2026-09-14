@@ -108,3 +108,75 @@ fn republish_unbinds_routes_of_departed_hosts() {
         "returning host's actor must be re-bound: {events:?}"
     );
 }
+
+#[test]
+fn verified_generation_changes_wake_observers_without_route_or_clock_changes() {
+    let parts =
+        RuntimeParts::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
+    let rt = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let _engine = Engine::new(parts, backend.clone()).unwrap();
+    let key = Keypair::from_bytes(&[3; 32]);
+    let actor = ActorAddress([9; 32]);
+    let directory = DirectoryActor::new(
+        key.node_id(),
+        Arc::new(SharedPeerDirectory::new()),
+        Arc::new(std::sync::RwLock::new(HashMap::new())),
+        Arc::new(RecordingBinder {
+            events: Mutex::new(Vec::new()),
+        }),
+    );
+    let claims = directory.claims();
+    let directory = rt.spawn(directory).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    let changed: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || observed.lock().push(claims.location(&actor)));
+    rt.send_to(
+        directory,
+        DirectoryIn::WatchRoutes {
+            changed: Arc::downgrade(&changed),
+        },
+    )
+    .unwrap();
+    backend.step();
+    rt.send_to(
+        directory,
+        DirectoryIn::Register(key.sign_directory_entry(actor, 1)),
+    )
+    .unwrap();
+    backend.step();
+    let mut forged = key.sign_directory_entry(actor, 1);
+    forged.generation = 99;
+    rt.send_to(directory, DirectoryIn::Register(forged))
+        .unwrap();
+    rt.send_to(
+        directory,
+        DirectoryIn::Register(key.sign_directory_entry(actor, 2)),
+    )
+    .unwrap();
+    backend.step();
+    rt.send_to(
+        directory,
+        DirectoryIn::Register(key.sign_directory_entry(actor, 1)),
+    )
+    .unwrap();
+    backend.step();
+    assert_eq!(
+        *observations.lock(),
+        vec![None, Some((key.node_id(), 1)), Some((key.node_id(), 2))],
+        "only verified winning generations may wake the authority observer"
+    );
+    drop(changed);
+    rt.send_to(
+        directory,
+        DirectoryIn::Register(key.sign_directory_entry(actor, 3)),
+    )
+    .unwrap();
+    backend.step();
+    assert_eq!(
+        *observations.lock(),
+        vec![None, Some((key.node_id(), 1)), Some((key.node_id(), 2))],
+        "dropping the observation must end callbacks"
+    );
+}

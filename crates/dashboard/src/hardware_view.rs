@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Display;
 use std::time::{Duration, Instant};
 
-use telemetry::Record;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use telemetry::hardware::cpu::{
     CpuCoreSample, CpuHostSample, CpuProcessSample, HOST_CPU_CHANNEL, HostCpuSample,
 };
@@ -12,7 +14,7 @@ use telemetry::hardware::memory::{HOST_MEMORY_CHANNEL, HostMemorySample};
 use telemetry::hardware::net::{HOST_NET_CHANNEL, HostNetSample, NetInterfaceSample};
 use telemetry::hardware::storage::{HOST_STORAGE_CHANNEL, HostStorageSample};
 
-use serde::Serialize;
+use crate::FrameEvent;
 
 const HISTORY_CAP: usize = 300;
 const HISTORY_MIN_INTERVAL: Duration = Duration::from_millis(900);
@@ -51,10 +53,16 @@ impl NodeHardwareState {
         }
     }
 
-    pub(crate) fn update(&mut self, channel: &str, payload: &[u8], now: Instant) {
+    pub(crate) fn update(
+        &mut self,
+        event: &FrameEvent,
+        decoded_payload: Option<&Value>,
+        now: Instant,
+    ) {
+        let channel = event.channel.as_str();
         self.last_seen = now;
         match channel {
-            HOST_CPU_CHANNEL => match HostCpuSample::decode(payload) {
+            HOST_CPU_CHANNEL => match Self::decode_sample(decoded_payload) {
                 Ok(sample) => {
                     self.cpu = Some(sample);
                     self.decode_errors.remove(HOST_CPU_CHANNEL);
@@ -62,7 +70,7 @@ impl NodeHardwareState {
                 }
                 Err(error) => self.store_decode_error(HOST_CPU_CHANNEL, error),
             },
-            HOST_GPU_CHANNEL => match HostGpuSample::decode(payload) {
+            HOST_GPU_CHANNEL => match Self::decode_sample(decoded_payload) {
                 Ok(sample) => {
                     self.gpu = Some(sample);
                     self.decode_errors.remove(HOST_GPU_CHANNEL);
@@ -70,7 +78,7 @@ impl NodeHardwareState {
                 }
                 Err(error) => self.store_decode_error(HOST_GPU_CHANNEL, error),
             },
-            HOST_MEMORY_CHANNEL => match HostMemorySample::decode(payload) {
+            HOST_MEMORY_CHANNEL => match Self::decode_sample(decoded_payload) {
                 Ok(sample) => {
                     self.memory = Some(sample);
                     self.decode_errors.remove(HOST_MEMORY_CHANNEL);
@@ -78,7 +86,7 @@ impl NodeHardwareState {
                 }
                 Err(error) => self.store_decode_error(HOST_MEMORY_CHANNEL, error),
             },
-            HOST_NET_CHANNEL => match HostNetSample::decode(payload) {
+            HOST_NET_CHANNEL => match Self::decode_sample(decoded_payload) {
                 Ok(sample) => {
                     self.net = Some(NetSnapshot::from_sample(sample, self.net.as_ref()));
                     self.decode_errors.remove(HOST_NET_CHANNEL);
@@ -86,7 +94,7 @@ impl NodeHardwareState {
                 }
                 Err(error) => self.store_decode_error(HOST_NET_CHANNEL, error),
             },
-            HOST_STORAGE_CHANNEL => match HostStorageSample::decode(payload) {
+            HOST_STORAGE_CHANNEL => match Self::decode_sample(decoded_payload) {
                 Ok(sample) => {
                     self.storage = Some(sample);
                     self.decode_errors.remove(HOST_STORAGE_CHANNEL);
@@ -96,13 +104,13 @@ impl NodeHardwareState {
             },
             _ => {
                 if channel.starts_with("proc.") && channel.ends_with(".lifecycle") {
-                    self.process = decode_process_snapshot(payload);
+                    self.process = decoded_payload.and_then(decode_process_snapshot);
                     // Lifecycle frames also prove liveness.
                     self.last_seen = now;
                 } else if channel == "node.status" {
                     // Liveness heartbeat from the supervisor.
                     self.last_seen = now;
-                    if let Some(status) = decode_process_snapshot(payload) {
+                    if let Some(status) = decoded_payload.and_then(decode_process_snapshot) {
                         self.process.get_or_insert(status);
                     }
                 }
@@ -110,7 +118,15 @@ impl NodeHardwareState {
         }
     }
 
-    fn store_decode_error(&mut self, channel: &'static str, error: serde_json::Error) {
+    fn decode_sample<'a, T>(payload: Option<&'a Value>) -> Result<T, String>
+    where
+        T: Deserialize<'a>,
+    {
+        let payload = payload.ok_or_else(|| "payload codec decode failed".to_owned())?;
+        T::deserialize(payload).map_err(|error| error.to_string())
+    }
+
+    fn store_decode_error(&mut self, channel: &'static str, error: impl Display) {
         self.decode_errors
             .insert(channel, format!("{channel} decode error: {error}"));
     }
@@ -270,8 +286,7 @@ impl NodeHardwareState {
 }
 
 /// Decode a `swactor_process.lifecycle.v1` payload into fleet-card state.
-pub(crate) fn decode_process_snapshot(payload: &[u8]) -> Option<ProcessSnapshot> {
-    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+pub(crate) fn decode_process_snapshot(value: &Value) -> Option<ProcessSnapshot> {
     let pid = value
         .get("pid")
         .and_then(serde_json::Value::as_u64)
@@ -296,6 +311,7 @@ pub(crate) struct NetSnapshot {
     seq: u64,
     sample_unix_ms: u64,
     pub(crate) interfaces: Vec<NetInterfaceSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
@@ -430,6 +446,7 @@ pub(crate) struct CpuSnapshot {
     pub(crate) host: Option<CpuHostSample>,
     pub(crate) cores: Vec<CpuCoreSample>,
     pub(crate) processes: Vec<CpuProcessSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
 }
 
@@ -454,6 +471,7 @@ pub(crate) struct GpuSnapshot {
     pub(crate) query_elapsed_ms: Option<u64>,
     pub(crate) gpus: Vec<GpuDeviceSample>,
     pub(crate) processes: Vec<GpuProcessSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
 }
 

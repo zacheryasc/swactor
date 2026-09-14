@@ -8,7 +8,7 @@ impl VastLogStream {
             .chunk()
             .await
             .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
-            .map_err(|error| format!("fetch_logs read failed: {error}"))
+            .map_err(|error| format!("fetch_logs read failed: {}", error.without_url()))
     }
 }
 
@@ -20,9 +20,9 @@ pub async fn open_log_stream(
         .get(log_url)
         .send()
         .await
-        .map_err(|error| format!("fetch_logs failed: {error}"))?
+        .map_err(|error| format!("fetch_logs failed: {}", error.without_url()))?
         .error_for_status()
-        .map_err(|error| format!("fetch_logs status failed: {error}"))?;
+        .map_err(|error| format!("fetch_logs status failed: {}", error.without_url()))?;
     Ok(VastLogStream { response })
 }
 
@@ -38,11 +38,10 @@ pub async fn request_logs(
         .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("request_logs failed: {e}"))?;
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("request_logs parse failed: {e}"))?;
+        .map_err(|error| format!("request_logs failed: {}", error.without_url()))?;
+    let body: serde_json::Value = resp.json().await.map_err(|error| {
+        format!("request_logs parse failed: {}", error.without_url()).replace(api_key, "[REDACTED]")
+    })?;
     body["result_url"]
         .as_str()
         .map(|s| s.to_string())
@@ -54,8 +53,8 @@ pub async fn fetch_logs(client: &reqwest::Client, log_url: &str) -> Result<Strin
         .get(log_url)
         .send()
         .await
-        .map_err(|e| format!("fetch_logs failed: {e}"))?;
+        .map_err(|error| format!("fetch_logs failed: {}", error.without_url()))?;
     resp.text()
         .await
-        .map_err(|e| format!("fetch_logs read failed: {e}"))
+        .map_err(|error| format!("fetch_logs read failed: {}", error.without_url()))
 }

@@ -352,14 +352,19 @@ impl ContextualProcessActor {
                 owner: ctx.self_addr(),
             })
             .map_err(|error| format!("spawn session close relay: {error}"))?;
-        self.sender
-            .send_to(
-                active.host_session,
-                HostSessionIn::Close {
-                    reply_to: Some(relay),
-                },
-            )
-            .map_err(|error| format!("close contextual host session: {error}"))
+        match self.sender.send_to(
+            active.host_session,
+            HostSessionIn::Close {
+                reply_to: Some(relay),
+            },
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = ctx.stop_actor(relay);
+                self.session_closed(ctx, Err(format!("close contextual host session: {error}")));
+                Ok(())
+            }
+        }
     }
 
     fn session_closed(&mut self, ctx: &Ctx<'_>, result: Result<(), String>) {

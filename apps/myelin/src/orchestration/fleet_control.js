@@ -257,11 +257,33 @@
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
       const execution = body.execution;
+      if (Number(execution?.truncated_before || 0) > afterSequence) {
+        throw new Error('Execution event history has a gap; output is incomplete');
+      }
       let terminal = Boolean(execution?.terminal);
       for (const record of execution?.events || []) {
         terminal = appendExecutionEvent(panel, record.observation) || terminal;
       }
       if (terminal) {
+        const acknowledged = await fetch(
+          `/api/control/contextual/${encodeURIComponent(requestId)}/ack`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              schema_version: 1, payload: {
+                execution_incarnation: execution.execution_incarnation,
+                through_sequence: execution.next_sequence,
+              },
+            }),
+          },
+        );
+        if (!acknowledged.ok) throw new Error(`Execution acknowledgement failed: HTTP ${acknowledged.status}`);
+        const acknowledgement = await acknowledged.json();
+        if (acknowledgement.schema_version !== 1
+            || acknowledgement.payload?.type !== 'acknowledged') {
+          throw new Error('Unsupported execution acknowledgement response');
+        }
         stopExecutionPoll();
         panel.querySelector('[data-run]').disabled = false;
         return;
@@ -324,11 +346,9 @@
           const observation = body.observation;
           const requestId = observation?.request_id;
           if (!requestId) throw new Error('spawn response did not include a request ID');
-          const terminal = appendExecutionEvent(panel, observation);
-          if (terminal) {
-            run.disabled = false;
-            return;
-          }
+          // Even terminal spawn responses must drain the retained cursor and
+          // acknowledge its exact incarnation; the spawn reply is not a drain.
+          appendExecutionEvent(panel, observation);
           executionPoll = { requestId, afterSequence: 0, timer: null };
           pollExecution(panel, requestId, 0);
         } catch (error) {

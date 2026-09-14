@@ -11,17 +11,21 @@ use swactor::actor::ActorAddress;
 use swactor::runtime::ExternalSender;
 use swactor_engine::EngineHandle;
 use telemetry::frame::{
-    ChannelDescriptor, ChannelId, ChannelRef, FrameDelivery, Position, StreamDescriptor,
+    ChannelDescriptor, ChannelId, ChannelRef, FrameDelivery, Position, StreamDescriptor, StreamId,
     TelemetryEvent,
 };
 use telemetry::{TelemetrySnapshot, TelemetrySubscription};
 
-pub const TELEMETRY_ALPN: &[u8] = b"swactor/telemetry/0";
+pub const TELEMETRY_ALPN: &[u8] = b"swactor/telemetry/1";
 
-const MAGIC: &[u8; 4] = b"DSQ1";
+const MAGIC: &[u8; 4] = b"DSQ2";
 const TAG_CHANNEL_DECLARED: u8 = 0x01;
-const TAG_FRAME: u8 = 0x02;
+const TAG_FRAME_BATCH: u8 = 0x02;
 const TAG_STREAM_ENDED: u8 = 0x03;
+const TAG_LZ4_FRAME_BATCH: u8 = 0x04;
+const TAG_ZSTD_FRAME_BATCH: u8 = 0x05;
+const WRITE_BATCH_TARGET_BYTES: usize = 256 * 1024;
+const WRITE_BATCH_MAX_EVENTS: usize = 1024;
 
 // ─── Pull model: collector-initiated subscriptions ───────────────────────────
 //
@@ -91,7 +95,7 @@ pub fn spawn_pull_server(
         let Ok((_flow_id, token, request)) = read_pull_request(&mut recv).await else {
             return;
         };
-        let subscription = endpoint.subscribe("supervisor-pull", request);
+        let subscription = endpoint.subscribe_retained("supervisor-pull", request);
         let header =
             match TelemetryQuicHeader::from_snapshot(_flow_id, token, subscription.snapshot()) {
                 Ok(header) => header,
@@ -100,9 +104,12 @@ pub fn spawn_pull_server(
         let Ok(send) = conn.open_uni().await else {
             return;
         };
-        let _ =
-            write_subscription_until_closed(&engine_handle, send, header, subscription, idle_sleep)
-                .await;
+        tokio::select! {
+            _ = conn.closed() => {}
+            _ = write_subscription_until_closed(
+                &engine_handle, send, header, subscription, idle_sleep,
+            ) => {}
+        }
     });
 }
 
@@ -215,6 +222,7 @@ fn spawn_pull_collector_with_sink(
         let _completion = PullCollectorCompletion(completion);
         let peer_id = peer.id.to_string();
         let mut retry_delay = Duration::from_millis(250);
+        let mut cursor = None;
         loop {
             if *cancellation_rx.borrow() {
                 return;
@@ -223,6 +231,7 @@ fn spawn_pull_collector_with_sink(
                 _ = cancellation_rx.changed() => return,
                 result = collect_pull_once(
                     &endpoint, &peer, flow_id, &token, &request, &fanout, &on_header,
+                    &mut cursor,
                 ) => result,
             };
             match result {
@@ -258,6 +267,7 @@ async fn collect_pull_once(
     request: &telemetry::SubscriptionRequest,
     fanout: &telemetry::DeliveryFanout,
     on_header: &PullHeaderSink,
+    cursor: &mut Option<(StreamId, Position)>,
 ) -> Result<(), String> {
     let conn = endpoint
         .connect(peer.clone(), TELEMETRY_ALPN)
@@ -281,11 +291,45 @@ async fn collect_pull_once(
         return Ok(());
     }
     let stream = header.stream;
+    if cursor
+        .as_ref()
+        .is_some_and(|(previous, _)| previous != &stream.stream)
+    {
+        *cursor = None;
+    }
     loop {
-        match read_next_event(&mut recv, &stream).await {
-            Ok(Some(event)) => {
-                let ended = matches!(event, TelemetryEvent::StreamEnded(_));
-                fanout.publish(event);
+        match read_next_events(&mut recv, &stream).await {
+            Ok(Some(mut events)) => {
+                // The endpoint replays its retained suffix on every connection.
+                // A cursor belongs to this producer stream, not a channel, and
+                // survives reconnects so a real frame is delivered only once.
+                // Do not commit it past a locally dropped delivery batch: the
+                // reconnect must replay that batch from its previous boundary.
+                let cursor_before_batch = cursor.clone();
+                events.retain(|event| {
+                    let TelemetryEvent::Frame(frame) = event else {
+                        return true;
+                    };
+                    if cursor
+                        .as_ref()
+                        .is_some_and(|(_, position)| frame.position <= *position)
+                    {
+                        return false;
+                    }
+                    *cursor = Some((frame.channel.stream.clone(), frame.position));
+                    true
+                });
+                let ended = events
+                    .iter()
+                    .any(|event| matches!(event, TelemetryEvent::StreamEnded(_)));
+                let delivery = fanout.publish_batch(events);
+                if delivery.dropped_for_subscribers != 0 {
+                    *cursor = cursor_before_batch;
+                    return Err(format!(
+                        "collector fanout dropped {} telemetry events",
+                        delivery.dropped_for_subscribers
+                    ));
+                }
                 if ended {
                     return Ok(());
                 }
@@ -388,18 +432,25 @@ pub async fn write_subscription_until_closed(
 ) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_header(&mut send, &header).await?;
     let mut stats = TelemetryQuicWriteStats::default();
+    let mut compressor = zstd::bulk::Compressor::new(1)?;
+    let mut raw = Vec::with_capacity(WRITE_BATCH_TARGET_BYTES);
+    let mut bytes = Vec::with_capacity(WRITE_BATCH_TARGET_BYTES);
+    let mut events = Vec::with_capacity(WRITE_BATCH_MAX_EVENTS);
     loop {
+        let dropped = subscription.dropped();
+        if dropped != 0 {
+            return Err(format!("telemetry subscription dropped {dropped} events").into());
+        }
         match subscription.try_recv() {
-            Ok(event) => {
-                let bytes = write_event(&mut send, &event).await?;
-                if bytes > 0 {
-                    stats.bytes += bytes;
-                    stats.events += 1;
-                }
+            Ok(first) => {
+                take_event_batch(first, &subscription, &mut events);
+                let written =
+                    write_event_batch(&mut send, &events, &mut compressor, &mut raw, &mut bytes)
+                        .await?;
+                stats.events += written.events;
+                stats.bytes += written.bytes;
             }
-            Err(TryRecvError::Empty) => {
-                engine.timer(idle_sleep).await;
-            }
+            Err(TryRecvError::Empty) => engine.timer(idle_sleep).await,
             Err(TryRecvError::Disconnected) => break,
         }
     }
@@ -416,14 +467,23 @@ async fn write_subscription_inner(
 ) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_header(&mut send, header).await?;
     let mut stats = TelemetryQuicWriteStats::default();
+    let mut compressor = zstd::bulk::Compressor::new(1)?;
+    let mut raw = Vec::with_capacity(WRITE_BATCH_TARGET_BYTES);
+    let mut bytes = Vec::with_capacity(WRITE_BATCH_TARGET_BYTES);
+    let mut events = Vec::with_capacity(WRITE_BATCH_MAX_EVENTS);
     loop {
+        let dropped = subscription.dropped();
+        if dropped != 0 {
+            return Err(format!("telemetry subscription dropped {dropped} events").into());
+        }
         match subscription.try_recv() {
-            Ok(event) => {
-                let bytes = write_event(&mut send, &event).await?;
-                if bytes > 0 {
-                    stats.bytes += bytes;
-                    stats.events += 1;
-                }
+            Ok(first) => {
+                take_event_batch(first, subscription, &mut events);
+                let written =
+                    write_event_batch(&mut send, &events, &mut compressor, &mut raw, &mut bytes)
+                        .await?;
+                stats.events += written.events;
+                stats.bytes += written.bytes;
             }
             Err(TryRecvError::Empty) => match idle_sleep {
                 Some(delay) => engine.timer(delay).await,
@@ -436,30 +496,192 @@ async fn write_subscription_inner(
     Ok(stats)
 }
 
-pub async fn write_event(send: &mut SendStream, event: &TelemetryEvent) -> Result<usize, BoxError> {
-    let mut bytes = Vec::new();
+fn take_event_batch(
+    first: TelemetryEvent,
+    subscription: &TelemetrySubscription,
+    events: &mut Vec<TelemetryEvent>,
+) {
+    let mut estimated_bytes = event_size_hint(&first);
+    events.clear();
+    events.push(first);
+    while estimated_bytes < WRITE_BATCH_TARGET_BYTES && events.len() < WRITE_BATCH_MAX_EVENTS {
+        let Ok(event) = subscription.try_recv() else {
+            break;
+        };
+        estimated_bytes = estimated_bytes.saturating_add(event_size_hint(&event));
+        events.push(event);
+    }
+}
+
+fn event_size_hint(event: &TelemetryEvent) -> usize {
     match event {
-        TelemetryEvent::StreamDeclared(_) => return Ok(0),
-        TelemetryEvent::ChannelDeclared(descriptor) => {
-            bytes.push(TAG_CHANNEL_DECLARED);
-            put_json(&mut bytes, descriptor)?;
-        }
-        TelemetryEvent::Frame(delivery) => {
-            bytes.push(TAG_FRAME);
-            bytes.extend_from_slice(&delivery.channel.channel.0.to_le_bytes());
-            bytes.extend_from_slice(&delivery.position.0.to_le_bytes());
-            put_bytes(&mut bytes, &delivery.payload)?;
-        }
-        TelemetryEvent::StreamEnded(_) => {
-            bytes.push(TAG_STREAM_ENDED);
+        TelemetryEvent::StreamDeclared(_) => 0,
+        TelemetryEvent::ChannelDeclared(descriptor) => descriptor.name.len() + 64,
+        TelemetryEvent::Frame(delivery) => delivery.payload.len() + 16,
+        TelemetryEvent::StreamEnded(_) => 1,
+    }
+}
+
+async fn write_event_batch(
+    send: &mut SendStream,
+    events: &[TelemetryEvent],
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    raw: &mut Vec<u8>,
+    bytes: &mut Vec<u8>,
+) -> Result<TelemetryQuicWriteStats, BoxError> {
+    bytes.clear();
+    bytes.reserve(
+        events
+            .iter()
+            .map(event_size_hint)
+            .sum::<usize>()
+            .min(WRITE_BATCH_TARGET_BYTES * 2),
+    );
+    let stats = encode_event_batch_with(events, bytes, compressor, raw)?;
+    if !bytes.is_empty() {
+        send.write_all(bytes).await?;
+    }
+    Ok(stats)
+}
+
+/// Append telemetry events in the compact batched subscription wire format.
+pub fn encode_event_batch(
+    events: &[TelemetryEvent],
+    out: &mut Vec<u8>,
+) -> Result<TelemetryQuicWriteStats, BoxError> {
+    let mut compressor = zstd::bulk::Compressor::new(1)?;
+    let mut raw = Vec::new();
+    encode_event_batch_with(events, out, &mut compressor, &mut raw)
+}
+
+fn encode_event_batch_with(
+    events: &[TelemetryEvent],
+    out: &mut Vec<u8>,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    raw: &mut Vec<u8>,
+) -> Result<TelemetryQuicWriteStats, BoxError> {
+    let start = out.len();
+    let mut encoded_events = 0;
+    let mut index = 0;
+    while index < events.len() {
+        match &events[index] {
+            TelemetryEvent::StreamDeclared(_) => {
+                index += 1;
+            }
+            TelemetryEvent::ChannelDeclared(descriptor) => {
+                let bytes = postcard::to_allocvec(descriptor)?;
+                if bytes.len() > MAX_RECORD_BYTES {
+                    return Err("telemetry channel declaration exceeds max size".into());
+                }
+                out.push(TAG_CHANNEL_DECLARED);
+                put_varint(out, bytes.len() as u64);
+                out.extend_from_slice(&bytes);
+                encoded_events += 1;
+                index += 1;
+            }
+            TelemetryEvent::Frame(_) => {
+                let start_index = index;
+                let mut estimated_bytes = 0_usize;
+                while index < events.len()
+                    && matches!(events[index], TelemetryEvent::Frame(_))
+                    && index - start_index < WRITE_BATCH_MAX_EVENTS
+                {
+                    let next_bytes = event_size_hint(&events[index]);
+                    if index > start_index
+                        && estimated_bytes.saturating_add(next_bytes) > WRITE_BATCH_TARGET_BYTES
+                    {
+                        break;
+                    }
+                    estimated_bytes = estimated_bytes.saturating_add(next_bytes);
+                    index += 1;
+                }
+                encode_frame_batch(&events[start_index..index], out, raw, compressor)?;
+                encoded_events += index - start_index;
+            }
+            TelemetryEvent::StreamEnded(_) => {
+                out.push(TAG_STREAM_ENDED);
+                encoded_events += 1;
+                index += 1;
+            }
         }
     }
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err("telemetry QUIC record exceeds max size".into());
+    Ok(TelemetryQuicWriteStats {
+        events: encoded_events,
+        bytes: out.len() - start,
+    })
+}
+
+fn encode_frame_batch(
+    events: &[TelemetryEvent],
+    out: &mut Vec<u8>,
+    raw: &mut Vec<u8>,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+) -> Result<(), BoxError> {
+    let raw_capacity = events.iter().fold(0_usize, |total, event| {
+        let TelemetryEvent::Frame(frame) = event else {
+            unreachable!("frame batch contains only frames");
+        };
+        total.saturating_add(frame.payload.len() + 16)
+    });
+    if raw_capacity > MAX_RECORD_BYTES {
+        return Err("telemetry frame batch exceeds max size".into());
     }
-    send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
-    send.write_all(&bytes).await?;
-    Ok(4 + bytes.len())
+    raw.clear();
+    raw.reserve(raw_capacity);
+    let mut previous_position = None;
+    for event in events {
+        let TelemetryEvent::Frame(frame) = event else {
+            unreachable!("frame batch contains only frames");
+        };
+        put_varint(raw, u64::from(frame.channel.channel.0));
+        let position = frame.position.0;
+        let encoded_position = match previous_position {
+            Some(previous) => position
+                .checked_sub(previous)
+                .ok_or("telemetry frame positions are not monotonic")?,
+            None => position,
+        };
+        put_varint(raw, encoded_position);
+        put_varint(raw, frame.payload.len() as u64);
+        raw.extend_from_slice(&frame.payload);
+        previous_position = Some(position);
+    }
+
+    let compressed = compressor.compress(raw)?;
+    let compressed_size =
+        1 + varint_size(raw.len() as u64) + varint_size(compressed.len() as u64) + compressed.len();
+    let raw_size = 1 + varint_size(raw.len() as u64) + raw.len();
+    if compressed_size < raw_size {
+        out.push(TAG_ZSTD_FRAME_BATCH);
+        put_varint(out, raw.len() as u64);
+        put_varint(out, compressed.len() as u64);
+        out.extend_from_slice(&compressed);
+    } else {
+        out.push(TAG_FRAME_BATCH);
+        put_varint(out, raw.len() as u64);
+        out.extend_from_slice(&raw);
+    }
+    Ok(())
+}
+
+/// Append one telemetry event in the compact subscription wire format.
+pub fn encode_event_record(event: &TelemetryEvent, out: &mut Vec<u8>) -> Result<usize, BoxError> {
+    Ok(encode_event_batch(std::slice::from_ref(event), out)?.bytes)
+}
+
+pub async fn write_event(send: &mut SendStream, event: &TelemetryEvent) -> Result<usize, BoxError> {
+    let mut compressor = zstd::bulk::Compressor::new(1)?;
+    let mut raw = Vec::new();
+    let mut bytes = Vec::new();
+    Ok(write_event_batch(
+        send,
+        std::slice::from_ref(event),
+        &mut compressor,
+        &mut raw,
+        &mut bytes,
+    )
+    .await?
+    .bytes)
 }
 
 pub async fn read_stream_header(recv: &mut RecvStream) -> Result<TelemetryQuicHeader, BoxError> {
@@ -469,8 +691,8 @@ pub async fn read_stream_header(recv: &mut RecvStream) -> Result<TelemetryQuicHe
 pub async fn read_events_from_stream(mut recv: RecvStream) -> Result<TelemetryQuicRead, BoxError> {
     let header = read_header(&mut recv).await?;
     let mut events = Vec::new();
-    while let Some(event) = read_next_event(&mut recv, &header.stream).await? {
-        events.push(event);
+    while let Some(batch) = read_next_events(&mut recv, &header.stream).await? {
+        events.extend(batch);
     }
     Ok(TelemetryQuicRead { header, events })
 }
@@ -514,8 +736,8 @@ async fn write_header(send: &mut SendStream, header: &TelemetryQuicHeader) -> Re
     send.write_all(&(header.token.len() as u16).to_le_bytes())
         .await?;
     send.write_all(&header.token).await?;
-    write_json(send, &header.stream).await?;
-    write_json(send, &header.channels).await?;
+    write_postcard(send, &header.stream).await?;
+    write_postcard(send, &header.channels).await?;
     Ok(())
 }
 
@@ -532,8 +754,8 @@ async fn read_header(recv: &mut RecvStream) -> Result<TelemetryQuicHeader, BoxEr
     let token_len = u16::from_le_bytes(token_len) as usize;
     let mut token = vec![0u8; token_len];
     recv.read_exact(&mut token).await?;
-    let stream = read_json(recv).await?;
-    let channels = read_json(recv).await?;
+    let stream = read_postcard(recv).await?;
+    let channels = read_postcard(recv).await?;
     Ok(TelemetryQuicHeader {
         flow_id,
         token,
@@ -542,61 +764,137 @@ async fn read_header(recv: &mut RecvStream) -> Result<TelemetryQuicHeader, BoxEr
     })
 }
 
-pub async fn read_next_event(
+/// Read the next compact event batch from a telemetry subscription stream.
+pub async fn read_next_events(
     recv: &mut RecvStream,
     stream: &StreamDescriptor,
-) -> Result<Option<TelemetryEvent>, BoxError> {
-    let mut len = [0u8; 4];
-    if recv.read_exact(&mut len).await.is_err() {
+) -> Result<Option<Vec<TelemetryEvent>>, BoxError> {
+    let mut tag = [0_u8; 1];
+    if recv.read_exact(&mut tag).await.is_err() {
         return Ok(None);
     }
-    let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_RECORD_BYTES {
-        return Err("telemetry QUIC record exceeds max size".into());
-    }
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await?;
-    decode_record(&buf, stream).map(Some)
-}
-
-fn decode_record(buf: &[u8], stream: &StreamDescriptor) -> Result<TelemetryEvent, BoxError> {
-    if buf.is_empty() {
-        return Err("empty telemetry QUIC record".into());
-    }
-    match buf[0] {
+    match tag[0] {
         TAG_CHANNEL_DECLARED => {
-            let descriptor: ChannelDescriptor = serde_json::from_slice(&buf[1..])?;
-            Ok(TelemetryEvent::ChannelDeclared(descriptor))
+            let len = read_varint(recv).await?;
+            let bytes = read_sized(recv, len, "telemetry channel declaration").await?;
+            let descriptor = postcard::from_bytes(&bytes)?;
+            Ok(Some(vec![TelemetryEvent::ChannelDeclared(descriptor)]))
         }
-        TAG_FRAME => {
-            if buf.len() < 1 + 4 + 8 + 4 {
-                return Err("telemetry QUIC frame record truncated".into());
-            }
-            let channel = ChannelId(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]));
-            let position = Position(u64::from_le_bytes([
-                buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
-            ]));
-            let mut len = [0u8; 4];
-            len.copy_from_slice(&buf[13..17]);
-            let payload_len = u32::from_le_bytes(len) as usize;
-            let payload = buf
-                .get(17..17 + payload_len)
-                .ok_or("telemetry QUIC frame payload truncated")?;
-            if 17 + payload_len != buf.len() {
-                return Err("bytes remain after telemetry QUIC frame record".into());
-            }
-            Ok(TelemetryEvent::Frame(FrameDelivery {
-                channel: ChannelRef {
-                    stream: stream.stream.clone(),
-                    channel,
-                },
-                position,
-                payload: payload.to_vec(),
-            }))
+        TAG_FRAME_BATCH => {
+            let len = read_varint(recv).await?;
+            let raw = read_sized(recv, len, "telemetry frame batch").await?;
+            decode_frame_batch(&raw, stream).map(Some)
         }
-        TAG_STREAM_ENDED => Ok(TelemetryEvent::StreamEnded(stream.stream.clone())),
+        TAG_LZ4_FRAME_BATCH | TAG_ZSTD_FRAME_BATCH => {
+            let raw_len = checked_record_len(read_varint(recv).await?, "telemetry frame batch")?;
+            let compressed_len = read_varint(recv).await?;
+            let compressed =
+                read_sized(recv, compressed_len, "compressed telemetry frame batch").await?;
+            let raw = if tag[0] == TAG_LZ4_FRAME_BATCH {
+                lz4_flex::block::decompress(&compressed, raw_len).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid LZ4 telemetry frame batch: {error}"),
+                    )
+                })?
+            } else {
+                decompress_zstd_batch(&compressed, raw_len)?
+            };
+            decode_frame_batch(&raw, stream).map(Some)
+        }
+        TAG_STREAM_ENDED => Ok(Some(vec![TelemetryEvent::StreamEnded(
+            stream.stream.clone(),
+        )])),
         _ => Err("unknown telemetry QUIC record tag".into()),
     }
+}
+
+/// Decode complete compact event batches from one subscription stream.
+pub fn decode_event_records(
+    bytes: &[u8],
+    stream: &StreamDescriptor,
+) -> Result<Vec<TelemetryEvent>, BoxError> {
+    let mut cursor = RecordCursor::new(bytes);
+    let mut events = Vec::new();
+    while !cursor.is_empty() {
+        match cursor.take_u8()? {
+            TAG_CHANNEL_DECLARED => {
+                let len = cursor.take_record_len("telemetry channel declaration")?;
+                let descriptor: ChannelDescriptor = postcard::from_bytes(cursor.take(len)?)?;
+                events.push(TelemetryEvent::ChannelDeclared(descriptor));
+            }
+            TAG_FRAME_BATCH => {
+                let len = cursor.take_record_len("telemetry frame batch")?;
+                events.extend(decode_frame_batch(cursor.take(len)?, stream)?);
+            }
+            tag @ (TAG_LZ4_FRAME_BATCH | TAG_ZSTD_FRAME_BATCH) => {
+                let raw_len = cursor.take_record_len("telemetry frame batch")?;
+                let compressed_len = cursor.take_record_len("compressed telemetry frame batch")?;
+                let compressed = cursor.take(compressed_len)?;
+                let raw = if tag == TAG_LZ4_FRAME_BATCH {
+                    lz4_flex::block::decompress(compressed, raw_len).map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid LZ4 telemetry frame batch: {error}"),
+                        )
+                    })?
+                } else {
+                    decompress_zstd_batch(compressed, raw_len)?
+                };
+                events.extend(decode_frame_batch(&raw, stream)?);
+            }
+            TAG_STREAM_ENDED => {
+                events.push(TelemetryEvent::StreamEnded(stream.stream.clone()));
+            }
+            _ => return Err("unknown telemetry QUIC record tag".into()),
+        }
+    }
+    Ok(events)
+}
+
+fn decompress_zstd_batch(compressed: &[u8], raw_len: usize) -> Result<Vec<u8>, BoxError> {
+    let raw = zstd::bulk::decompress(compressed, raw_len).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid zstd telemetry frame batch: {error}"),
+        )
+    })?;
+    if raw.len() != raw_len {
+        return Err("zstd telemetry frame batch length mismatch".into());
+    }
+    Ok(raw)
+}
+
+fn decode_frame_batch(
+    bytes: &[u8],
+    stream: &StreamDescriptor,
+) -> Result<Vec<TelemetryEvent>, BoxError> {
+    let mut cursor = RecordCursor::new(bytes);
+    let mut events = Vec::new();
+    let mut previous_position: Option<u64> = None;
+    while !cursor.is_empty() {
+        let channel =
+            u32::try_from(cursor.take_varint()?).map_err(|_| "telemetry channel id exceeds u32")?;
+        let encoded_position = cursor.take_varint()?;
+        let position = match previous_position {
+            Some(previous) => previous
+                .checked_add(encoded_position)
+                .ok_or("telemetry frame position overflow")?,
+            None => encoded_position,
+        };
+        let payload_len = cursor.take_record_len("telemetry frame payload")?;
+        let payload = cursor.take(payload_len)?.to_vec();
+        events.push(TelemetryEvent::Frame(FrameDelivery {
+            channel: ChannelRef {
+                stream: stream.stream.clone(),
+                channel: ChannelId(channel),
+            },
+            position: Position(position),
+            payload,
+        }));
+        previous_position = Some(position);
+    }
+    Ok(events)
 }
 
 pub async fn read_stream_into_fanout(
@@ -608,18 +906,125 @@ pub async fn read_stream_into_fanout(
     Ok(read.header)
 }
 
-fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) -> Result<(), BoxError> {
-    out.extend_from_slice(&serde_json::to_vec(value)?);
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn varint_size(value: u64) -> usize {
+    ((u64::BITS - value.leading_zeros()).max(1) as usize).div_ceil(7)
+}
+
+fn checked_record_len(value: u64, label: &'static str) -> Result<usize, BoxError> {
+    let len = usize::try_from(value).map_err(|_| "telemetry record length exceeds usize")?;
+    if len > MAX_RECORD_BYTES {
+        return Err(format!("{label} exceeds max size").into());
+    }
+    Ok(len)
+}
+
+async fn read_varint(recv: &mut RecvStream) -> Result<u64, BoxError> {
+    let mut value = 0_u64;
+    for shift in (0..u64::BITS).step_by(7) {
+        let mut byte = [0_u8; 1];
+        recv.read_exact(&mut byte).await?;
+        if shift == 63 && byte[0] & 0x7e != 0 {
+            return Err("telemetry varint exceeds u64".into());
+        }
+        value |= u64::from(byte[0] & 0x7f) << shift;
+        if byte[0] & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("telemetry varint exceeds u64".into())
+}
+
+async fn read_sized(
+    recv: &mut RecvStream,
+    len: u64,
+    label: &'static str,
+) -> Result<Vec<u8>, BoxError> {
+    let len = checked_record_len(len, label)?;
+    let mut bytes = vec![0_u8; len];
+    recv.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+struct RecordCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> RecordCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position == self.bytes.len()
+    }
+
+    fn take_u8(&mut self) -> Result<u8, BoxError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], BoxError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or("telemetry record length overflow")?;
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or("telemetry record truncated")?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn take_varint(&mut self) -> Result<u64, BoxError> {
+        let mut value = 0_u64;
+        for shift in (0..u64::BITS).step_by(7) {
+            let byte = self.take_u8()?;
+            if shift == 63 && byte & 0x7e != 0 {
+                return Err("telemetry varint exceeds u64".into());
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err("telemetry varint exceeds u64".into())
+    }
+
+    fn take_record_len(&mut self, label: &'static str) -> Result<usize, BoxError> {
+        checked_record_len(self.take_varint()?, label)
+    }
+}
+
+async fn write_postcard<T: serde::Serialize>(
+    send: &mut SendStream,
+    value: &T,
+) -> Result<(), BoxError> {
+    let bytes = postcard::to_allocvec(value)?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err("telemetry header exceeds max size".into());
+    }
+    let mut len = Vec::with_capacity(10);
+    put_varint(&mut len, bytes.len() as u64);
+    send.write_all(&len).await?;
+    send.write_all(&bytes).await?;
     Ok(())
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), BoxError> {
-    if bytes.len() > u32::MAX as usize {
-        return Err("telemetry delivery exceeds u32 length prefix".into());
-    }
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-    Ok(())
+async fn read_postcard<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+) -> Result<T, BoxError> {
+    let len = read_varint(recv).await?;
+    let bytes = read_sized(recv, len, "telemetry header").await?;
+    Ok(postcard::from_bytes(&bytes)?)
 }
 
 async fn write_json<T: serde::Serialize>(send: &mut SendStream, value: &T) -> Result<(), BoxError> {

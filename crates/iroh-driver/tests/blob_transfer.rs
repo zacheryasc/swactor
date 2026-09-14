@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use data_plane::blob_transfer::{
@@ -57,6 +57,7 @@ fn node() -> Node {
         IrohDriverConfig {
             secret_key: None,
             relay_mode: RelayMode::Disabled,
+            bind_port: None,
             node: distribution::node::DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![EDGE_ALPN.to_vec()],
@@ -73,7 +74,7 @@ fn node() -> Node {
         swim: ActorAddress::default(),
         relay_mirror: Arc::new(RwLock::new(HashMap::new())),
         route_view: Arc::new(RwLock::new(HashMap::new())),
-        outbox: Arc::new(Mutex::new(Vec::new())),
+        outbox: Arc::new(Default::default()),
     });
     driver.install_actor_bridge_pump(Duration::from_millis(5));
     Node {
@@ -95,6 +96,7 @@ fn real_iroh_transfer_delivers_exact_file_bytes() {
         &destination.engine.handle(),
         destination.runtime.clone(),
         Duration::from_millis(5),
+        destination.driver.edge_events_changed(),
     );
     let sender = IrohBlobTransferSender::new(
         source.driver.edge_connector(),

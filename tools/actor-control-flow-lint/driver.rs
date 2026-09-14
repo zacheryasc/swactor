@@ -39,6 +39,11 @@ const TEST_SUPPORT_OWNERS: &[&str] = &[
     "swactor-benchmarks",
 ];
 
+/// Packages whose integration tests coordinate real child processes and file
+/// locks to prove cross-process admission safety. Unit builds stay governed;
+/// only `cargo test` builds of these packages use this exemption.
+const TEST_COORDINATION_OWNERS: &[&str] = &["provisioning"];
+
 /// Policy-bearing crates that must never enter an execution owner's dependency
 /// closure.
 const DOMAIN_CONTROL_CRATES: &[&str] = &["myelin", "provisioning", "xtask"];
@@ -178,7 +183,6 @@ const CAPABILITIES: &[Capability] = &[
 ];
 
 include!("timing_policy.rs");
-
 struct ActorControlFlowCallbacks {
     package: String,
     test_build: bool,
@@ -188,7 +192,8 @@ struct ActorControlFlowCallbacks {
 impl Callbacks for ActorControlFlowCallbacks {
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let role_exempt = TEST_SUPPORT_OWNERS.contains(&self.package.as_str())
-            || EXECUTION_OWNERS.contains(&self.package.as_str());
+            || EXECUTION_OWNERS.contains(&self.package.as_str())
+            || (self.test_build && TEST_COORDINATION_OWNERS.contains(&self.package.as_str()));
         if EXECUTION_OWNERS.contains(&self.package.as_str()) {
             check_owner_dependencies(tcx, &self.package);
         }

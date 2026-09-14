@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use data_plane::host::{HostRouteRegistrar, HostRouteWatch};
 use data_plane::namespace::{
-    DataDirectoryActor, DataDirectoryIn, DirectoryClient, EntryKind, NamespaceClient,
-    NamespaceClientActor, NamespaceClientIn, NamespaceDiscovery, NamespaceError, OperationId,
-    RetirementRetry, SourceRecovery, StreamRole,
+    DataDirectoryActor, DataDirectoryIn, DataDirectoryOut, DirectoryClient, DirectoryRequestId,
+    EntryKind, NamespaceClient, NamespaceClientActor, NamespaceClientIn, NamespaceDiscovery,
+    NamespaceError, NamespaceRequest, OperationId, RetirementRetry, SourceRecovery, StreamRole,
 };
 use data_plane::path::DataPath;
 use futures_lite::future;
@@ -16,7 +17,7 @@ use proptest::prelude::*;
 use swactor::actor::ActorAddress;
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Runtime, RuntimeParts};
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor_engine::{Engine, SteppingBackend, TokioBackend, TokioConfig};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -61,7 +62,11 @@ fn source(byte: u8) -> ActorAddress {
 }
 
 fn recovery(actor: ActorAddress) -> SourceRecovery {
-    SourceRecovery::Actor { actor }
+    SourceRecovery::Actor {
+        actor,
+        node: [9; 32],
+        owner: None,
+    }
 }
 fn spawn_directory(store: &Path) -> DirectoryHarness {
     let parts = RuntimeParts::new(RuntimeConfig {
@@ -84,9 +89,10 @@ fn spawn_directory(store: &Path) -> DirectoryHarness {
             engine.handle(),
             runtime.create_sender(),
             Duration::from_millis(50),
+            None,
         )),
         |record, _length| match record {
-            SourceRecovery::Actor { actor } => Ok(*actor),
+            SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
             SourceRecovery::File { path } => Err(NamespaceError::SourceRecovery(format!(
                 "test cannot recover file source {}",
                 path.display()
@@ -116,6 +122,7 @@ fn namespace_mutations_are_linearizable_and_durable() {
             .register(
                 logical.clone(),
                 first,
+                [9; 32],
                 24,
                 recovery(first),
                 OperationId::from_u128(1),
@@ -145,6 +152,7 @@ fn namespace_mutations_are_linearizable_and_durable() {
             .register(
                 logical.clone(),
                 second,
+                [9; 32],
                 32,
                 recovery(second),
                 OperationId::from_u128(2),
@@ -195,6 +203,7 @@ fn rename_is_atomic_replayable_and_revisioned() {
     let destination_path = path("/rename/destination");
     let source_actor = source(7);
     let destination_actor = source(8);
+    let owner = source(9);
 
     future::block_on(async {
         directory
@@ -202,8 +211,13 @@ fn rename_is_atomic_replayable_and_revisioned() {
             .register(
                 source_path.clone(),
                 source_actor,
+                [9; 32],
                 7,
-                recovery(source_actor),
+                SourceRecovery::Actor {
+                    actor: source_actor,
+                    node: [9; 32],
+                    owner: Some(owner),
+                },
                 OperationId::from_u128(100),
             )
             .await
@@ -213,6 +227,7 @@ fn rename_is_atomic_replayable_and_revisioned() {
             .register(
                 destination_path.clone(),
                 destination_actor,
+                [9; 32],
                 8,
                 recovery(destination_actor),
                 OperationId::from_u128(101),
@@ -284,12 +299,14 @@ fn rename_is_atomic_replayable_and_revisioned() {
             .unwrap();
         assert_eq!(resolved.source, source_actor);
         assert_eq!(resolved.revision, renamed.revision);
+        assert_eq!(resolved.owner, Some(owner));
     });
 
     let recovered = spawn_directory(&state.store());
     let resolved = future::block_on(recovered.client.resolve(destination_path)).unwrap();
     assert_eq!(resolved.source, source_actor);
     assert_eq!(resolved.revision, 3);
+    assert_eq!(resolved.owner, Some(owner));
 }
 
 #[test]
@@ -308,6 +325,7 @@ fn mutation_rejections_are_sticky_across_reservation_lifecycle() {
             .register(
                 source_path.clone(),
                 source_actor,
+                [9; 32],
                 5,
                 recovery(source_actor),
                 OperationId::from_u128(200),
@@ -440,6 +458,7 @@ fn committed_mutations_replay_even_when_path_is_reserved_again() {
             .register(
                 logical.clone(),
                 blob,
+                [9; 32],
                 12,
                 recovery(blob),
                 OperationId::from_u128(300),
@@ -592,6 +611,11 @@ fn stream_rendezvous_is_symmetric_and_incarnations_are_isolated() {
             .close_stream(logical.clone(), source_match.incarnation)
             .await
             .expect("close first incarnation");
+        directory
+            .client
+            .close_stream(logical.clone(), source_match.incarnation)
+            .await
+            .expect("duplicate close is idempotent");
 
         assert!(matches!(
             directory
@@ -666,6 +690,7 @@ fn typed_paths_require_explicit_rebinding() {
             .register(
                 logical.clone(),
                 blob_source,
+                [9; 32],
                 4,
                 recovery(blob_source),
                 OperationId::from_u128(20),
@@ -821,6 +846,7 @@ fn committed_mutation_retry_has_at_most_once_effect() {
     let first_receipt = future::block_on(first_runtime.client.register(
         logical.clone(),
         actor,
+        [9; 32],
         8,
         recovery(actor),
         operation,
@@ -833,6 +859,7 @@ fn committed_mutation_retry_has_at_most_once_effect() {
     let retried = future::block_on(recovered.client.register(
         logical.clone(),
         actor,
+        [9; 32],
         8,
         recovery(actor),
         operation,
@@ -849,6 +876,7 @@ fn committed_mutation_retry_has_at_most_once_effect() {
     let conflict = future::block_on(recovered.client.register(
         logical,
         source(8),
+        [9; 32],
         9,
         recovery(source(8)),
         operation,
@@ -867,6 +895,574 @@ impl NamespaceDiscovery for StaticDiscovery {
 }
 
 #[test]
+fn cancelled_stream_open_never_resurrects_across_reordering() {
+    let state = TempState::new("cancel-tombstone");
+    let harness = spawn_directory(&state.store());
+    let directory = harness.client.directory();
+    let logical = path("/runs/9/parked-sink");
+    let endpoint = source(21);
+    let operation = OperationId::from_u128(21);
+    let replies = harness
+        .runtime
+        .new_inbox::<NamespaceClientIn>()
+        .expect("reply inbox");
+
+    // The cancel races ahead of the open it retracts (the open frame was
+    // lost): the persisted rejection must turn the open's late arrival into
+    // a typed failure, never a fresh pending endpoint.
+    harness
+        .runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::CancelStream {
+                request_id: DirectoryRequestId(1),
+                path: logical.clone(),
+                operation_id: operation,
+                reply_to: Some(*replies.addr()),
+            },
+        )
+        .expect("send cancel before open");
+    match future::block_on(replies.recv()) {
+        NamespaceClientIn::DirectoryReply(DataDirectoryOut::StreamCancelled {
+            result: Ok(()),
+            ..
+        }) => {}
+        other => panic!("expected cancel acknowledgement, got {other:?}"),
+    }
+    harness
+        .runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::OpenStream {
+                request_id: DirectoryRequestId(2),
+                path: logical.clone(),
+                role: StreamRole::Sink,
+                descriptor: Vec::new(),
+                endpoint,
+                replace: false,
+                ensure: true,
+                expected_revision: None,
+                operation_id: operation,
+                reply_to: *replies.addr(),
+            },
+        )
+        .expect("send late open replay");
+    match future::block_on(replies.recv()) {
+        NamespaceClientIn::DirectoryReply(DataDirectoryOut::StreamOpened {
+            result: Err(NamespaceError::PathReplaced(_)),
+            ..
+        }) => {}
+        other => panic!("tombstoned open must replay its rejection, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            future::block_on(harness.client.lookup(logical.clone())),
+            Err(NamespaceError::PathNotFound(_))
+        ),
+        "a cancelled open must not leave a stream node behind"
+    );
+
+    // Once the open did land, cancelling it and replaying it again must be
+    // equally terminal: no resurrected waiter holds the path hostage.
+    let second = OperationId::from_u128(22);
+    harness
+        .runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::OpenStream {
+                request_id: DirectoryRequestId(3),
+                path: logical.clone(),
+                role: StreamRole::Sink,
+                descriptor: Vec::new(),
+                endpoint,
+                replace: false,
+                ensure: true,
+                expected_revision: None,
+                operation_id: second,
+                reply_to: *replies.addr(),
+            },
+        )
+        .expect("send fresh open");
+    let node = future::block_on(harness.client.lookup(logical.clone()))
+        .expect("waiting sink publishes its stream node");
+    assert!(node.active, "waiting sink keeps the node active");
+    harness
+        .runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::CancelStream {
+                request_id: DirectoryRequestId(4),
+                path: logical.clone(),
+                operation_id: second,
+                reply_to: Some(*replies.addr()),
+            },
+        )
+        .expect("cancel the waiting open");
+    match future::block_on(replies.recv()) {
+        NamespaceClientIn::DirectoryReply(DataDirectoryOut::StreamCancelled {
+            result: Ok(()),
+            ..
+        }) => {}
+        other => panic!("expected second cancel acknowledgement, got {other:?}"),
+    }
+    harness
+        .runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::OpenStream {
+                request_id: DirectoryRequestId(5),
+                path: logical.clone(),
+                role: StreamRole::Sink,
+                descriptor: Vec::new(),
+                endpoint,
+                replace: false,
+                ensure: true,
+                expected_revision: None,
+                operation_id: second,
+                reply_to: *replies.addr(),
+            },
+        )
+        .expect("replay the cancelled open");
+    match future::block_on(replies.recv()) {
+        NamespaceClientIn::DirectoryReply(DataDirectoryOut::StreamOpened {
+            result: Err(NamespaceError::StaleIncarnation { .. }),
+            ..
+        }) => {}
+        other => panic!("replayed cancelled open must be stale, got {other:?}"),
+    }
+    let node = future::block_on(harness.client.lookup(logical.clone()))
+        .expect("stream node survives until unlink");
+    assert!(!node.active, "cancelled sink must release the path");
+    future::block_on(
+        harness
+            .client
+            .unregister(logical.clone(), OperationId::from_u128(23)),
+    )
+    .expect("quiescent stream node unlinks");
+}
+
+struct ForwardingSink {
+    destination: Runtime,
+}
+
+impl swactor::runtime::RemoteSink for ForwardingSink {
+    fn send(
+        &self,
+        address: ActorAddress,
+        message: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), swactor::Error> {
+        self.destination.deliver_raw(address, message)
+    }
+}
+
+struct CancelDroppingSink {
+    destination: Runtime,
+    drop_next_cancel: AtomicBool,
+}
+
+impl swactor::runtime::RemoteSink for CancelDroppingSink {
+    fn send(
+        &self,
+        address: ActorAddress,
+        message: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), swactor::Error> {
+        if let Some(frame) = message.downcast_ref::<DataDirectoryIn>()
+            && matches!(frame, DataDirectoryIn::CancelStream { .. })
+            && self.drop_next_cancel.swap(false, Ordering::SeqCst)
+        {
+            // Simulate one lost frame on the at-most-once path.
+            return Ok(());
+        }
+        self.destination.deliver_raw(address, message)
+    }
+}
+
+#[test]
+fn cancelled_stream_open_retracts_despite_a_lost_cancel_frame() {
+    let state = TempState::new("cancel-retry");
+    let directory_harness = spawn_directory(&state.store());
+    let directory = directory_harness.client.directory();
+
+    let client_parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let client_runtime = client_parts.runtime().clone();
+    let client_engine = Engine::new(
+        client_parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
+    )
+    .expect("client engine");
+    client_runtime.set_remote_sink(Arc::new(CancelDroppingSink {
+        destination: directory_harness.runtime.clone(),
+        drop_next_cancel: AtomicBool::new(true),
+    }));
+    directory_harness
+        .runtime
+        .set_remote_sink(Arc::new(ForwardingSink {
+            destination: client_runtime.clone(),
+        }));
+
+    let discovered = Arc::new(RwLock::new(Some(directory)));
+    let proxy = client_runtime
+        .spawn(NamespaceClientActor::new(
+            client_engine.handle(),
+            client_runtime.create_sender(),
+            Arc::new(StaticDiscovery {
+                directory: Arc::clone(&discovered),
+            }),
+            Duration::from_millis(20),
+        ))
+        .expect("spawn namespace proxy");
+    let open_replies = client_runtime
+        .new_inbox::<NamespaceClientIn>()
+        .expect("open reply inbox");
+
+    client_runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::OpenStream {
+                    path: path("/runs/11/parked"),
+                    role: StreamRole::Sink,
+                    endpoint: source(31),
+                    descriptor: Vec::new(),
+                    replace: false,
+                    ensure: true,
+                    expected_revision: None,
+                    operation_id: OperationId::from_u128(31),
+                },
+                reply_to: *open_replies.addr(),
+            },
+        )
+        .expect("send parked sink open");
+    let bound = Instant::now() + Duration::from_secs(10);
+    loop {
+        let active = matches!(
+            future::block_on(directory_harness.client.lookup(path("/runs/11/parked"))),
+            Ok(node) if node.active
+        );
+        if active {
+            break;
+        }
+        assert!(
+            Instant::now() < bound,
+            "parked sink open never reached the directory"
+        );
+        std::thread::yield_now();
+    }
+    // The waiter's endpoint going away must retract the directory entry even
+    // though the first cancel frame is dropped in flight.
+    client_runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Cancel {
+                reply_to: *open_replies.addr(),
+            },
+        )
+        .expect("cancel parked open");
+    loop {
+        let node = future::block_on(directory_harness.client.lookup(path("/runs/11/parked")))
+            .expect("stream node survives the cancel");
+        if !node.active {
+            break;
+        }
+        assert!(
+            Instant::now() < bound,
+            "a lost cancel frame must not strand the pending endpoint forever"
+        );
+        std::thread::yield_now();
+    }
+    future::block_on(
+        directory_harness
+            .client
+            .unregister(path("/runs/11/parked"), OperationId::from_u128(32)),
+    )
+    .expect("quiescent parked stream unlinks after cancel");
+}
+
+#[test]
+fn stream_retractions_outlive_the_request_deadline() {
+    let state = TempState::new("retraction-deadline");
+    let directory_harness = spawn_directory(&state.store());
+    let directory = directory_harness.client.directory();
+
+    let client_parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let client_runtime = client_parts.runtime().clone();
+    let client_engine = Engine::new(
+        client_parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
+    )
+    .expect("client engine");
+    client_runtime.set_remote_sink(Arc::new(ForwardingSink {
+        destination: directory_harness.runtime.clone(),
+    }));
+    directory_harness
+        .runtime
+        .set_remote_sink(Arc::new(ForwardingSink {
+            destination: client_runtime.clone(),
+        }));
+
+    let discovered = Arc::new(RwLock::new(None));
+    let proxy = client_runtime
+        .spawn(NamespaceClientActor::new_with_deadline(
+            client_engine.handle(),
+            client_runtime.create_sender(),
+            Arc::new(StaticDiscovery {
+                directory: Arc::clone(&discovered),
+            }),
+            Duration::from_millis(20),
+            // Ordinary requests must expire within this bound; stream
+            // retractions must outlive it.
+            Duration::from_millis(150),
+        ))
+        .expect("spawn namespace proxy");
+    let open_replies = client_runtime
+        .new_inbox::<NamespaceClientIn>()
+        .expect("open reply inbox");
+    let parked = path("/runs/13/parked");
+    let operation = OperationId::from_u128(41);
+
+    // Park a sink open while no directory is discoverable, then cancel it:
+    // the cancel must survive an authority outage far longer than the
+    // request deadline and still tombstone the open once the authority
+    // returns. Without that survival a reordered late replay of the open
+    // resurrects a pending endpoint nobody will ever close.
+    client_runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::OpenStream {
+                    path: parked.clone(),
+                    role: StreamRole::Sink,
+                    endpoint: source(41),
+                    descriptor: Vec::new(),
+                    replace: false,
+                    ensure: true,
+                    expected_revision: None,
+                    operation_id: operation,
+                },
+                reply_to: *open_replies.addr(),
+            },
+        )
+        .expect("send parked sink open");
+    client_runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Cancel {
+                reply_to: *open_replies.addr(),
+            },
+        )
+        .expect("cancel parked open");
+
+    // Outage: several request-deadline lifetimes with retry ticks flowing.
+    let settle = Instant::now() + Duration::from_millis(700);
+    while Instant::now() < settle {
+        client_runtime
+            .send_to(proxy, NamespaceClientIn::Retry)
+            .expect("drive retry tick");
+        std::thread::yield_now();
+    }
+    *discovered.write() = Some(directory);
+
+    // Give the deadline-surviving retraction clear time to reach the
+    // directory and persist its tombstone (the engine tick plus a wide
+    // margin), then prove the tombstone exists by replaying the cancelled
+    // open: it must be rejected, never resurrected as a pending endpoint.
+    let settle_authority = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < settle_authority {
+        client_runtime
+            .send_to(proxy, NamespaceClientIn::Retry)
+            .expect("drive retry tick");
+        std::thread::yield_now();
+    }
+    assert!(
+        matches!(
+            future::block_on(directory_harness.client.lookup(parked.clone())),
+            Err(NamespaceError::PathNotFound(_))
+        ),
+        "a deadline-surviving cancel leaves no stream node behind"
+    );
+
+    // The tombstone must reject a reordered replay of the same open.
+    let replies = directory_harness
+        .runtime
+        .new_inbox::<NamespaceClientIn>()
+        .expect("reply inbox");
+    directory_harness
+        .runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::OpenStream {
+                request_id: DirectoryRequestId(77),
+                path: parked.clone(),
+                role: StreamRole::Sink,
+                descriptor: Vec::new(),
+                endpoint: source(41),
+                replace: false,
+                ensure: true,
+                expected_revision: None,
+                operation_id: operation,
+                reply_to: *replies.addr(),
+            },
+        )
+        .expect("send late open replay");
+    match future::block_on(replies.recv()) {
+        NamespaceClientIn::DirectoryReply(DataDirectoryOut::StreamOpened {
+            result: Err(NamespaceError::PathReplaced(_)),
+            ..
+        }) => {}
+        other => panic!("late open replay must hit the cancel tombstone, got {other:?}"),
+    }
+}
+
+#[test]
+fn expired_stream_open_retracts_its_parked_endpoint() {
+    let state = TempState::new("expired-open-retract");
+    let directory_harness = spawn_directory(&state.store());
+    let directory = directory_harness.client.directory();
+
+    let client_parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let client_runtime = client_parts.runtime().clone();
+    let client_engine = Engine::new(
+        client_parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
+    )
+    .expect("client engine");
+    client_runtime.set_remote_sink(Arc::new(ForwardingSink {
+        destination: directory_harness.runtime.clone(),
+    }));
+    directory_harness
+        .runtime
+        .set_remote_sink(Arc::new(ForwardingSink {
+            destination: client_runtime.clone(),
+        }));
+
+    let discovered = Arc::new(RwLock::new(Some(directory)));
+    let proxy = client_runtime
+        .spawn(NamespaceClientActor::new_with_deadline(
+            client_engine.handle(),
+            client_runtime.create_sender(),
+            Arc::new(StaticDiscovery {
+                directory: Arc::clone(&discovered),
+            }),
+            Duration::from_millis(20),
+            // The open below parks without a reply; it must expire within
+            // this bound and its retraction must still reach the directory.
+            Duration::from_millis(150),
+        ))
+        .expect("spawn namespace proxy");
+    // Callers of the proxy receive the raw directory reply (the proxy
+    // unwraps NamespaceClientIn::DirectoryReply before forwarding).
+    let open_replies = client_runtime
+        .new_inbox::<DataDirectoryOut>()
+        .expect("open reply inbox");
+    let parked = path("/runs/17/parked");
+    let operation = OperationId::from_u128(51);
+
+    // A first-role stream open that reaches the directory registers its
+    // endpoint and then parks: no reply exists until the peer role arrives.
+    // This is the gated-stream shape that strands in production — the sink
+    // never comes, the caller's request deadline fires while the endpoint
+    // is committed in the directory.
+    client_runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::OpenStream {
+                    path: parked.clone(),
+                    role: StreamRole::Source,
+                    endpoint: source(51),
+                    descriptor: Vec::new(),
+                    replace: false,
+                    ensure: true,
+                    expected_revision: None,
+                    operation_id: operation,
+                },
+                reply_to: *open_replies.addr(),
+            },
+        )
+        .expect("send parked source open");
+    let bound = Instant::now() + Duration::from_secs(10);
+    loop {
+        let active = matches!(
+            future::block_on(directory_harness.client.lookup(parked.clone())),
+            Ok(node) if node.active
+        );
+        if active {
+            break;
+        }
+        assert!(
+            Instant::now() < bound,
+            "parked source open never reached the directory"
+        );
+        std::thread::yield_now();
+    }
+    // Nobody cancels and no sink arrives: drive retry ticks past the request
+    // deadline. The caller must observe the typed deadline failure...
+    let expire = Instant::now() + Duration::from_millis(700);
+    while Instant::now() < expire {
+        client_runtime
+            .send_to(proxy, NamespaceClientIn::Retry)
+            .expect("drive retry tick");
+        std::thread::yield_now();
+    }
+    match future::block_on(open_replies.recv()) {
+        DataDirectoryOut::StreamOpened {
+            result: Err(NamespaceError::DirectoryUnavailable(_)),
+            ..
+        } => {}
+        other => panic!("parked open must expire at the deadline, got {other:?}"),
+    }
+
+    // ...and the expiry must retract the parked endpoint so the path can be
+    // unlinked. Pre-fix, the endpoint survived forever and unregister
+    // failed with WrongEntryType (the campaign's permanent-ENXIO wedge).
+    let retract = Instant::now() + Duration::from_millis(1500);
+    loop {
+        let inactive = matches!(
+            future::block_on(directory_harness.client.lookup(parked.clone())),
+            Ok(node) if !node.active
+        );
+        if inactive {
+            break;
+        }
+        assert!(
+            Instant::now() < retract,
+            "expired open must retract its parked endpoint"
+        );
+        client_runtime
+            .send_to(proxy, NamespaceClientIn::Retry)
+            .expect("drive retry tick");
+        std::thread::yield_now();
+    }
+    future::block_on(
+        directory_harness
+            .client
+            .unregister(parked, OperationId::from_u128(52)),
+    )
+    .expect("quiescent expired stream unlinks");
+}
+
+#[test]
 fn unresolved_request_waits_for_recovered_authority() {
     let state = TempState::new("restart");
     let harness = spawn_directory(&state.store());
@@ -875,6 +1471,7 @@ fn unresolved_request_waits_for_recovered_authority() {
     future::block_on(harness.client.register(
         logical.clone(),
         source,
+        [9; 32],
         16,
         recovery(source),
         OperationId::from_u128(500),
@@ -910,9 +1507,10 @@ fn unresolved_request_waits_for_recovered_authority() {
                 harness.engine.handle(),
                 harness.runtime.create_sender(),
                 Duration::from_millis(50),
+                None,
             )),
             |record, _length| match record {
-                SourceRecovery::Actor { actor } => Ok(*actor),
+                SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
                 SourceRecovery::File { path } => Err(NamespaceError::SourceRecovery(format!(
                     "test cannot recover file source {}",
                     path.display()
@@ -1003,6 +1601,7 @@ fn namespace_process_restart_helper() {
             let receipt = future::block_on(directory.client.register(
                 logical,
                 actor,
+                [9; 32],
                 32,
                 recovery(actor),
                 OperationId::from_u128(900),
@@ -1101,6 +1700,7 @@ proptest! {
                     let receipt = future::block_on(directory.client.register(
                         logical.clone(),
                         actor,
+                        [9; 32],
                         length,
                         recovery(actor),
                         operation,
@@ -1162,6 +1762,7 @@ proptest! {
                     let receipt = future::block_on(directory.client.register(
                         logical.clone(),
                         actor,
+                        [9; 32],
                         length,
                         recovery(actor),
                         OperationId::from_u128(next_operation),
@@ -1174,6 +1775,16 @@ proptest! {
                     }));
                 }
                 1 => {
+                    if let Some(TypedModelEntry::Stream(binding)) = model.get_mut(&logical)
+                        && let Some(binding) = binding.take()
+                    {
+                        future::block_on(
+                            directory
+                                .client
+                                .close_stream(logical.clone(), binding.incarnation),
+                        )
+                        .expect("quiesce prior stream before the next legal replacement");
+                    }
                     let source_actor = source(action.wrapping_add(41));
                     let sink_actor = source(action.wrapping_add(97));
                     let mut source_open = Box::pin(directory.client.replace_with_stream(
@@ -1241,6 +1852,7 @@ fn retirement_retry_redrives_until_acknowledged() {
     struct RetireProbe {
         retire_count: Arc<AtomicU64>,
         acknowledge: Arc<AtomicBool>,
+        acknowledgement_count: Arc<AtomicU64>,
     }
 
     impl swactor::actor::ActorInterface for RetireProbe {
@@ -1253,12 +1865,17 @@ fn retirement_retry_redrives_until_acknowledged() {
             {
                 self.retire_count.fetch_add(1, Ordering::SeqCst);
                 if self.acknowledge.load(Ordering::SeqCst) {
-                    let _ = ctx.send(
-                        reply_to,
-                        DataDirectoryIn::SourceRetired {
-                            source: ctx.self_addr(),
-                        },
-                    );
+                    if ctx
+                        .send(
+                            reply_to,
+                            DataDirectoryIn::SourceRetired {
+                                source: ctx.self_addr(),
+                            },
+                        )
+                        .is_ok()
+                    {
+                        self.acknowledgement_count.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
         }
@@ -1268,11 +1885,13 @@ fn retirement_retry_redrives_until_acknowledged() {
     let harness = spawn_directory(&state.store());
     let retire_count = Arc::new(AtomicU64::new(0));
     let acknowledge = Arc::new(AtomicBool::new(false));
+    let acknowledgement_count = Arc::new(AtomicU64::new(0));
     let probe = harness
         .runtime
         .spawn(RetireProbe {
             retire_count: Arc::clone(&retire_count),
             acknowledge: Arc::clone(&acknowledge),
+            acknowledgement_count: Arc::clone(&acknowledgement_count),
         })
         .expect("spawn retire probe");
 
@@ -1280,6 +1899,7 @@ fn retirement_retry_redrives_until_acknowledged() {
     future::block_on(harness.client.register(
         logical.clone(),
         probe,
+        [9; 32],
         8,
         recovery(probe),
         OperationId::from_u128(1),
@@ -1311,15 +1931,14 @@ fn retirement_retry_redrives_until_acknowledged() {
     // first acknowledgement.
     acknowledge.store(true, Ordering::SeqCst);
     let settle_deadline = Instant::now() + Duration::from_secs(2);
-    let mut last = retire_count.load(Ordering::SeqCst);
-    while last == redriven {
+    while acknowledgement_count.load(Ordering::SeqCst) == 0 {
         assert!(
             Instant::now() < settle_deadline,
             "acknowledged Retire was never observed after enabling replies"
         );
-        last = retire_count.load(Ordering::SeqCst);
         std::thread::yield_now();
     }
+    let mut last = retire_count.load(Ordering::SeqCst);
     loop {
         let quiet_until = Instant::now() + Duration::from_millis(300);
         while Instant::now() < quiet_until {
@@ -1335,4 +1954,664 @@ fn retirement_retry_redrives_until_acknowledged() {
             "retirement retries never stopped after SourceRetired (observed {observed})"
         );
     }
+}
+
+#[test]
+fn retirement_retries_do_not_amplify_with_directory_traffic() {
+    struct SilentRetireProbe {
+        retire_count: Arc<AtomicU64>,
+    }
+
+    impl swactor::actor::ActorInterface for SilentRetireProbe {
+        type Incoming = data_plane::source::BlobSourceIn;
+        type Response = ();
+
+        fn handle(&mut self, _ctx: &swactor::actor::Ctx<'_>, message: Self::Incoming) {
+            if matches!(message, data_plane::source::BlobSourceIn::Retire { .. }) {
+                self.retire_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    // A directory with no retirement retry tick: every Retire delivery is
+    // then attributable to a specific trigger (enqueue, on_start, or — the
+    // bug under test — unrelated inbound traffic).
+    let state = TempState::new("retire-amplify");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
+    )
+    .expect("directory engine");
+    let actor = DataDirectoryActor::recover(&state.store(), None, |record, _length| match record {
+        SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
+        SourceRecovery::File { path } => Err(NamespaceError::SourceRecovery(format!(
+            "test cannot recover file source {}",
+            path.display()
+        ))),
+    })
+    .expect("recover directory");
+    let directory = runtime.spawn(actor).expect("spawn directory actor");
+    let client = DirectoryClient::new(runtime.clone(), directory);
+
+    // Register then unregister several paths so the directory holds several
+    // pending retirements aimed at live-but-silent sources.
+    const RETIREMENTS: u64 = 4;
+    let retire_count = Arc::new(AtomicU64::new(0));
+    for index in 0..RETIREMENTS {
+        let probe = runtime
+            .spawn(SilentRetireProbe {
+                retire_count: Arc::clone(&retire_count),
+            })
+            .expect("spawn silent retire probe");
+        let logical = path(&format!("/models/retire-amplify/{index}"));
+        future::block_on(client.register(
+            logical.clone(),
+            probe,
+            [9; 32],
+            8,
+            recovery(probe),
+            OperationId::from_u128(u128::from(index) + 1),
+        ))
+        .expect("register probe source");
+        future::block_on(
+            client.unregister(logical, OperationId::from_u128(100 + u128::from(index))),
+        )
+        .expect("unregister probe source");
+    }
+
+    // Discard the initial delivery (queue_retirement sends immediately).
+    let baseline = {
+        let settle = Instant::now() + Duration::from_secs(2);
+        loop {
+            let quiet_until = Instant::now() + Duration::from_millis(20);
+            while Instant::now() < quiet_until {
+                std::thread::yield_now();
+            }
+            let observed = retire_count.load(Ordering::SeqCst);
+            if observed >= RETIREMENTS {
+                break observed;
+            }
+            assert!(
+                Instant::now() < settle,
+                "initial Retire deliveries never arrived (observed {observed})"
+            );
+        }
+    };
+    let quiet_until = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < quiet_until {
+        std::thread::yield_now();
+    }
+    let observed = retire_count.load(Ordering::SeqCst);
+    assert_eq!(
+        observed, baseline,
+        "retirements were re-driven without any trigger"
+    );
+
+    // A burst of unrelated read traffic must not multiply pending
+    // retirements: every lookup re-fanned every retirement before the fix,
+    // coupling the outbound Retire frame rate to the inbound request rate.
+    const LOOKUPS: u64 = 64;
+    for _ in 0..LOOKUPS {
+        let _ = future::block_on(client.lookup(path("/models/absent")));
+    }
+    let quiet_until = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < quiet_until {
+        std::thread::yield_now();
+    }
+    let observed = retire_count.load(Ordering::SeqCst);
+    assert_eq!(
+        observed,
+        baseline,
+        "directory traffic amplified retirement re-sends: {LOOKUPS} lookups drove \
+         {} extra Retire deliveries for {RETIREMENTS} pending retirements",
+        observed - baseline
+    );
+    drop(engine);
+}
+
+#[derive(Default)]
+struct Routes {
+    callbacks: parking_lot::Mutex<HashMap<ActorAddress, Weak<dyn Fn() + Send + Sync>>>,
+    routable: parking_lot::Mutex<Option<HashSet<ActorAddress>>>,
+}
+
+impl HostRouteRegistrar for Routes {
+    fn register_child(&self, _: ActorAddress, _: [u8; 32]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn revoke_child(&self, _: ActorAddress) -> Result<(), String> {
+        Ok(())
+    }
+    fn is_routable(&self, actor: ActorAddress) -> bool {
+        self.routable
+            .lock()
+            .as_ref()
+            .is_none_or(|routable| routable.contains(&actor))
+    }
+
+    fn watch_route(
+        &self,
+        actor: ActorAddress,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<HostRouteWatch> {
+        self.callbacks
+            .lock()
+            .insert(actor, Arc::downgrade(&changed));
+        Some(HostRouteWatch::new(changed))
+    }
+}
+
+fn settle(backend: &SteppingBackend) {
+    for _ in 0..32 {
+        backend.step();
+    }
+}
+
+#[test]
+fn retirement_route_wakes_are_targeted_and_end_on_acknowledgement() {
+    use data_plane::source::BlobSourceIn;
+
+    let state = TempState::new("retire-route-wake");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let routes = Arc::new(Routes::default());
+    let period = Duration::from_millis(250);
+    let directory = runtime
+        .spawn(
+            DataDirectoryActor::recover(
+                state.store(),
+                Some(RetirementRetry::new(
+                    engine.handle(),
+                    runtime.create_sender(),
+                    period,
+                    Some(routes.clone()),
+                )),
+                |record, _| match record {
+                    SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
+                    SourceRecovery::File { .. } => unreachable!(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let replies = runtime.new_inbox::<NamespaceClientIn>().unwrap();
+    let sources = [
+        runtime.new_inbox::<BlobSourceIn>().unwrap(),
+        runtime.new_inbox::<BlobSourceIn>().unwrap(),
+    ];
+    for (index, source) in sources.iter().enumerate() {
+        let logical = path(&format!("/retire/{index}"));
+        runtime
+            .send_to(
+                directory,
+                DataDirectoryIn::Register {
+                    request_id: DirectoryRequestId(index as u64),
+                    path: logical.clone(),
+                    source: *source.addr(),
+                    source_node: [9; 32],
+                    length: 1,
+                    recovery: recovery(*source.addr()),
+                    operation_id: OperationId::from_u128(index as u128 * 2 + 1),
+                    reservation: None,
+                    reply_to: *replies.addr(),
+                },
+            )
+            .unwrap();
+        runtime
+            .send_to(
+                directory,
+                DataDirectoryIn::Unregister {
+                    request_id: DirectoryRequestId(index as u64 + 2),
+                    path: logical,
+                    operation_id: OperationId::from_u128(index as u128 * 2 + 2),
+                    reply_to: *replies.addr(),
+                },
+            )
+            .unwrap();
+    }
+    settle(&backend);
+    for source in &sources {
+        assert!(matches!(
+            source.try_recv(),
+            Some(BlobSourceIn::Retire { .. })
+        ));
+        assert!(source.try_recv().is_none());
+    }
+
+    // A ready route re-drives its obligation without moving the virtual clock,
+    // and must not fan out the other pending retirement.
+    let wake = routes.callbacks.lock()[sources[0].addr()]
+        .upgrade()
+        .unwrap();
+    wake();
+    drop(wake);
+    settle(&backend);
+    assert!(matches!(
+        sources[0].try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
+    assert!(sources[1].try_recv().is_none());
+    runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::SourceRetired {
+                source: *sources[0].addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    assert!(
+        routes.callbacks.lock()[sources[0].addr()]
+            .upgrade()
+            .is_none()
+    );
+
+    backend.advance_time(period);
+    settle(&backend);
+    assert!(sources[0].try_recv().is_none());
+    assert!(matches!(
+        sources[1].try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
+    assert!(sources[1].try_recv().is_none());
+}
+
+#[test]
+fn retirement_ticks_skip_unroutable_sources_until_route_wake() {
+    use data_plane::source::BlobSourceIn;
+
+    let state = TempState::new("retire-unroutable");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let routes = Arc::new(Routes::default());
+    *routes.routable.lock() = Some(HashSet::new());
+    let period = Duration::from_millis(250);
+    let directory = runtime
+        .spawn(
+            DataDirectoryActor::recover(
+                state.store(),
+                Some(RetirementRetry::new(
+                    engine.handle(),
+                    runtime.create_sender(),
+                    period,
+                    Some(routes.clone()),
+                )),
+                |record, _| match record {
+                    SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
+                    SourceRecovery::File { .. } => unreachable!(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let replies = runtime.new_inbox::<NamespaceClientIn>().unwrap();
+    let source = runtime.new_inbox::<BlobSourceIn>().unwrap();
+    let logical = path("/retire/unroutable");
+    runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::Register {
+                request_id: DirectoryRequestId(1),
+                path: logical.clone(),
+                source: *source.addr(),
+                source_node: [9; 32],
+                length: 1,
+                recovery: recovery(*source.addr()),
+                operation_id: OperationId::from_u128(1),
+                reservation: None,
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::Unregister {
+                request_id: DirectoryRequestId(2),
+                path: logical,
+                operation_id: OperationId::from_u128(2),
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    assert!(matches!(
+        source.try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
+    assert!(source.try_recv().is_none());
+
+    for _ in 0..4 {
+        backend.advance_time(period);
+        settle(&backend);
+    }
+    assert!(
+        source.try_recv().is_none(),
+        "periodic retries must remain dormant while the route is absent"
+    );
+
+    routes
+        .routable
+        .lock()
+        .as_mut()
+        .unwrap()
+        .insert(*source.addr());
+    let wake = routes.callbacks.lock()[source.addr()].upgrade().unwrap();
+    wake();
+    drop(wake);
+    settle(&backend);
+    assert!(matches!(
+        source.try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
+}
+
+#[test]
+fn retirement_retry_ticks_are_bounded_and_rotate_fairly() {
+    use data_plane::source::BlobSourceIn;
+
+    let state = TempState::new("retire-batch");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let routes = Arc::new(Routes::default());
+    let period = Duration::from_millis(250);
+    let directory = runtime
+        .spawn(
+            DataDirectoryActor::recover(
+                state.store(),
+                Some(RetirementRetry::new(
+                    engine.handle(),
+                    runtime.create_sender(),
+                    period,
+                    Some(routes),
+                )),
+                |record, _| match record {
+                    SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
+                    SourceRecovery::File { .. } => unreachable!(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let replies = runtime.new_inbox::<NamespaceClientIn>().unwrap();
+    let sources = (0..40)
+        .map(|index| {
+            let source = runtime.new_inbox::<BlobSourceIn>().unwrap();
+            let logical = path(&format!("/retire/batch/{index}"));
+            runtime
+                .send_to(
+                    directory,
+                    DataDirectoryIn::Register {
+                        request_id: DirectoryRequestId(index * 2),
+                        path: logical.clone(),
+                        source: *source.addr(),
+                        source_node: [9; 32],
+                        length: 1,
+                        recovery: recovery(*source.addr()),
+                        operation_id: OperationId::from_u128(index as u128 * 2 + 1),
+                        reservation: None,
+                        reply_to: *replies.addr(),
+                    },
+                )
+                .unwrap();
+            runtime
+                .send_to(
+                    directory,
+                    DataDirectoryIn::Unregister {
+                        request_id: DirectoryRequestId(index * 2 + 1),
+                        path: logical,
+                        operation_id: OperationId::from_u128(index as u128 * 2 + 2),
+                        reply_to: *replies.addr(),
+                    },
+                )
+                .unwrap();
+            source
+        })
+        .collect::<Vec<_>>();
+    settle(&backend);
+    for source in &sources {
+        assert!(matches!(
+            source.try_recv(),
+            Some(BlobSourceIn::Retire { .. })
+        ));
+        assert!(source.try_recv().is_none());
+    }
+
+    let mut seen = vec![false; sources.len()];
+    backend.advance_time(period);
+    settle(&backend);
+    let mut first_tick = 0;
+    for (index, source) in sources.iter().enumerate() {
+        if source.try_recv().is_some() {
+            seen[index] = true;
+            first_tick += 1;
+        }
+    }
+    assert_eq!(
+        first_tick, 32,
+        "one retry tick must have a fixed fanout bound"
+    );
+
+    backend.advance_time(period);
+    settle(&backend);
+    let mut second_tick = 0;
+    for (index, source) in sources.iter().enumerate() {
+        if source.try_recv().is_some() {
+            seen[index] = true;
+            second_tick += 1;
+        }
+    }
+    assert_eq!(
+        second_tick, 32,
+        "the next retry tick retains the same bound"
+    );
+    assert!(
+        seen.into_iter().all(|received| received),
+        "the retry cursor must reach every pending source"
+    );
+    assert!(
+        sources.iter().all(|source| source.try_recv().is_none()),
+        "one retry frame per selected source is expected"
+    );
+}
+
+#[test]
+fn displacement_acknowledgements_retry_durability_after_endpoints_stop() {
+    use data_plane::namespace::StreamIncarnation;
+    use data_plane::namespace_store::NamespaceStore;
+    use data_plane::protocol::HostStreamIn;
+    use data_plane::source::BlobSourceIn;
+    use swactor::actor::{ActorInterface, Ctx};
+
+    struct OneShotEndpoint {
+        incarnation: StreamIncarnation,
+        stopped: Arc<AtomicU64>,
+    }
+
+    impl ActorInterface for OneShotEndpoint {
+        type Incoming = HostStreamIn;
+        type Response = ();
+
+        fn handle(&mut self, ctx: &Ctx<'_>, message: Self::Incoming) {
+            if let HostStreamIn::Displaced {
+                incarnation,
+                reply_to: Some(reply_to),
+            } = message
+            {
+                assert_eq!(incarnation, self.incarnation);
+                ctx.send(
+                    reply_to,
+                    DataDirectoryIn::StreamDisplaced {
+                        endpoint: ctx.self_addr(),
+                        incarnation,
+                    },
+                )
+                .unwrap();
+                ctx.stop_self();
+            }
+        }
+
+        fn on_stop(&mut self, _: &Ctx<'_>) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let state = TempState::new("displacement-durable-ack");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let routes = Arc::new(Routes::default());
+    let period = Duration::from_millis(250);
+    let stopped = Arc::new(AtomicU64::new(0));
+    let incarnation = StreamIncarnation {
+        authority_epoch: 1,
+        revision: 1,
+    };
+    let endpoints = [(); 2].map(|()| {
+        runtime
+            .spawn(OneShotEndpoint {
+                incarnation,
+                stopped: stopped.clone(),
+            })
+            .unwrap()
+    });
+    let unrelated_source = runtime.new_inbox::<BlobSourceIn>().unwrap();
+    let replies = runtime.new_inbox::<NamespaceClientIn>().unwrap();
+    let logical = path("/unrelated/stream");
+
+    // Recover real persisted obligations, including an unrelated unacknowledged
+    // retirement that must keep progressing while stream completion is blocked.
+    let mut store = NamespaceStore::open(state.store()).unwrap();
+    let mut snapshot = store.snapshot().clone();
+    snapshot.authority_epoch = incarnation.authority_epoch;
+    snapshot.next_revision = incarnation.revision + 1;
+    snapshot
+        .stream_nodes
+        .insert(logical.clone(), incarnation.revision);
+    snapshot.stream_retirements = endpoints
+        .iter()
+        .map(|endpoint| (*endpoint, incarnation))
+        .collect();
+    snapshot.retirements.push(*unrelated_source.addr());
+    store.commit(snapshot).unwrap();
+    drop(store);
+    let actor = DataDirectoryActor::recover(
+        state.store(),
+        Some(RetirementRetry::new(
+            engine.handle(),
+            runtime.create_sender(),
+            period,
+            Some(routes.clone()),
+        )),
+        |_, _| unreachable!("fixture has no blob bindings"),
+    )
+    .unwrap();
+
+    // Filesystem failpoint: a directory cannot be replaced by the store file.
+    // Arm after recovery, before the endpoints receive their displacement, so
+    // every ACK completion commit fails without a process-global test hook.
+    let saved_store = state.root.join("last-durable-namespace.json");
+    std::fs::rename(state.store(), &saved_store).unwrap();
+    std::fs::create_dir(state.store()).unwrap();
+    let directory = runtime.spawn(actor).unwrap();
+    settle(&backend);
+    assert_eq!(stopped.load(Ordering::SeqCst), 2);
+    for endpoint in endpoints {
+        assert!(routes.callbacks.lock()[&endpoint].upgrade().is_some());
+    }
+    assert!(matches!(
+        unrelated_source.try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
+
+    runtime
+        .send_to(
+            directory,
+            DataDirectoryIn::Lookup {
+                request_id: DirectoryRequestId(1),
+                path: logical,
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    backend.advance_time(period);
+    settle(&backend);
+    assert!(matches!(
+        replies.try_recv(),
+        Some(NamespaceClientIn::DirectoryReply(DataDirectoryOut::LookedUp {
+            request_id: DirectoryRequestId(1),
+            result: Ok(node),
+            ..
+        })) if node.kind == EntryKind::Stream && node.revision == incarnation.revision
+    ));
+    assert!(matches!(
+        unrelated_source.try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
+    for endpoint in endpoints {
+        assert!(routes.callbacks.lock()[&endpoint].upgrade().is_some());
+    }
+
+    std::fs::remove_dir(state.store()).unwrap();
+    std::fs::rename(&saved_store, state.store()).unwrap();
+
+    // A targeted route wake completes only its received ACK, locally. Both
+    // endpoints have stopped and cannot supply another acknowledgement.
+    let source_wake = routes.callbacks.lock()[&endpoints[0]].clone();
+    source_wake.upgrade().unwrap()();
+    settle(&backend);
+    assert!(source_wake.upgrade().is_none());
+    assert!(routes.callbacks.lock()[&endpoints[1]].upgrade().is_some());
+    assert_eq!(
+        NamespaceStore::open(state.store())
+            .unwrap()
+            .snapshot()
+            .stream_retirements,
+        vec![(endpoints[1], incarnation)]
+    );
+    assert!(unrelated_source.try_recv().is_none());
+
+    // The unchanged periodic retry also retries durability, not a dead peer.
+    backend.advance_time(period);
+    settle(&backend);
+    let completed = NamespaceStore::open(state.store()).unwrap();
+    assert!(completed.snapshot().stream_retirements.is_empty());
+    assert_eq!(
+        completed.snapshot().retirements,
+        vec![*unrelated_source.addr()]
+    );
+    assert!(routes.callbacks.lock()[&endpoints[1]].upgrade().is_none());
+    assert!(matches!(
+        unrelated_source.try_recv(),
+        Some(BlobSourceIn::Retire { .. })
+    ));
 }

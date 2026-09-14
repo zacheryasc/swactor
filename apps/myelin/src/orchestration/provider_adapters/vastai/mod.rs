@@ -1,11 +1,12 @@
 // VastAI provider adapter. Actors own provider lifecycle policy; the
 // swactor-vastai and swactor-process crates own API and process mechanics.
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use provisioning::{
+    PaidAdmissionMode, PaidAdmissionSnapshot, PaidFixtureAdmission, PaidNodeAdmission,
+};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
 use swactor_engine::EngineHandle;
@@ -17,13 +18,21 @@ use swactor_vastai::{
 };
 use telemetry::TelemetryProducer;
 
+#[cfg(test)]
+use super::ssh_bootstrap::{
+    BootstrapEnvSource, SshBootstrapActor, SshBootstrapMsg, SshBootstrapStream,
+    idempotent_ssh_bootstrap_command, ssh_bootstrap_command_for_attempt, ssh_bootstrap_lock,
+};
+use super::ssh_bootstrap::{
+    SshBootstrapLauncher as VastAiBootstrapLauncher, SshEndpoint as VastAiSshEndpoint,
+};
+#[cfg(test)]
 use crate::observability::provisioning_logs::BootstrapTelemetryBridge;
-use crate::orchestration::manual_control::OfferSearchRequest;
+use crate::orchestration::manual_control::{OfferSearchRequest, OfferSearchRequestExt};
 use crate::provisioning::{
     AdoptedNode, NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink,
     ProvisionPlugin,
 };
-use swactor_process::{LineReaderHandle, ProcessStream, ProcessStreamObservation};
 
 #[derive(Clone, Debug)]
 pub(crate) struct VastAiProvisioningConfig {
@@ -50,13 +59,6 @@ impl Default for VastAiProvisioningConfig {
             ssh_public_key: None,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct VastAiSshEndpoint {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
 }
 
 pub(crate) struct VastAiProviderMonitor {
@@ -102,6 +104,17 @@ pub(crate) trait VastAiLeaseClient: Send {
         ))
     }
 
+    /// The paid path is separate from generic vanished-offer retry policy.
+    fn provision_paid(
+        &mut self,
+        _request: ProvisionRequest,
+        _spec: &NodeProvisionSpec,
+        _selected_offer_id: Option<u64>,
+        _criteria: Option<OfferBrowseCriteria>,
+    ) -> Result<ProvisionedInstance, String> {
+        Err("VastAI lease client does not implement durable paid admission".to_owned())
+    }
+
     /// Resolves the live contract id carrying `label`, if any.
     fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String>;
 
@@ -145,14 +158,18 @@ pub(crate) struct ToolsVastAiLeaseClient {
     client: BlockingVastClient,
     async_client: VastClient,
     actor_host: Option<(Runtime, EngineHandle)>,
+    paid_admission_path: Option<PathBuf>,
 }
 
 impl ToolsVastAiLeaseClient {
     pub(crate) fn new(client: VastClient) -> Result<Self, String> {
+        let client =
+            client.with_execution_deadline(crate::provisioning::execution_owner_deadline()?);
         Ok(Self {
             client: BlockingVastClient::new(client.clone())?,
             async_client: client,
             actor_host: None,
+            paid_admission_path: configured_paid_admission_path(),
         })
     }
 
@@ -202,9 +219,59 @@ impl ToolsVastAiLeaseClient {
         &mut self,
         request: &ProvisionRequest,
         offer: &Offer,
+        paid_spec: Option<&NodeProvisionSpec>,
     ) -> Result<ProvisionedInstance, String> {
+        let admission = self
+            .paid_admission_path
+            .as_ref()
+            .map(PaidFixtureAdmission::open)
+            .transpose()?;
+        if let Some(admission) = &admission {
+            let spec = paid_spec.ok_or_else(|| {
+                "paid VastAI create requires run-scoped admission context".to_owned()
+            })?;
+            let snapshot = admission.snapshot()?;
+            let expected = paid_node_for_spec(
+                &snapshot,
+                spec,
+                request.label.as_deref().unwrap_or_default(),
+                Some(offer.id),
+            )?;
+            if offer.host_id != Some(expected.host_id) {
+                return Err("paid VastAI offer host differs from selected topology".to_owned());
+            }
+            admission.reserve_create(
+                spec.run_id,
+                spec.node_id,
+                spec.attempt_id,
+                offer.id,
+                &expected.label,
+            )?;
+        } else if paid_spec.is_some() {
+            return Err("paid VastAI create has no configured admission record".to_owned());
+        }
         let create = Self::create_request_for_offer(request, offer.id);
-        let info = self.client.create_instance(&create)?;
+        let info = self.client.create_instance(&create).map_err(|error| {
+            if error.is_definitive_rejection()
+                && let Some(admission) = &admission
+                && let Err(record_error) = admission.record_create_rejection(
+                    paid_spec
+                        .expect("paid admission context was checked")
+                        .node_id,
+                )
+            {
+                return format!("{error}; record definitive create rejection: {record_error}");
+            }
+            error.to_string()
+        })?;
+        if let Some(admission) = &admission {
+            admission.record_contract(
+                paid_spec
+                    .expect("paid admission context was checked")
+                    .node_id,
+                info.contract_id,
+            )?;
+        }
         Ok(ProvisionedInstance {
             index: 0,
             contract_id: info.contract_id,
@@ -735,6 +802,7 @@ impl Clone for ToolsVastAiLeaseClient {
             client: self.client.clone(),
             async_client: self.async_client.clone(),
             actor_host: self.actor_host.clone(),
+            paid_admission_path: self.paid_admission_path.clone(),
         }
     }
 }
@@ -753,7 +821,27 @@ fn adopted_instance(contract_id: u64) -> ProvisionedInstance {
 
 impl VastAiLeaseClient for ToolsVastAiLeaseClient {
     fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String> {
-        let instances = self.client.list_by_label(label)?;
+        let instances = if let Some(path) = &self.paid_admission_path {
+            let snapshot = PaidFixtureAdmission::open(path)?.snapshot()?;
+            let census = self.client.owned_census(
+                &snapshot.cleanup_labels(),
+                &snapshot.known_contract_ids(),
+                Instant::now(),
+                VastClient::REQUEST_TIMEOUT * 4 + Duration::from_secs(180),
+            )?;
+            census
+                .instances
+                .into_iter()
+                .filter(|instance| {
+                    census
+                        .contract_labels
+                        .get(&instance.contract_id)
+                        .is_some_and(|owned| owned == label)
+                })
+                .collect()
+        } else {
+            self.client.list_by_label(label)?
+        };
         match instances.as_slice() {
             [] => Ok(None),
             [instance] => Ok(Some(instance.contract_id)),
@@ -792,6 +880,11 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
     }
 
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String> {
+        if self.paid_admission_path.is_some() {
+            return Err(
+                "paid VastAI provisioning cannot use generic acquisition or retries".to_owned(),
+            );
+        }
         if request.count != 1 {
             return Err(format!(
                 "vastai provision_one expected count=1, got {}",
@@ -823,7 +916,7 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
             }) {
                 continue;
             }
-            match self.create_from_offer(&request, &offer) {
+            match self.create_from_offer(&request, &offer, None) {
                 Ok(instance) => return Ok(instance),
                 Err(error) => {
                     if let Some(label) = request.label.as_deref()
@@ -858,6 +951,11 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         offer_id: u64,
         criteria: OfferBrowseCriteria,
     ) -> Result<ProvisionedInstance, String> {
+        if self.paid_admission_path.is_some() {
+            return Err(
+                "paid VastAI provisioning requires run-scoped admission context".to_owned(),
+            );
+        }
         if request.count != 1 {
             return Err(format!(
                 "vastai provision_exact expected count=1, got {}",
@@ -879,7 +977,7 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
                     "selected offer {offer_id} is no longer available; refresh offers and select again"
                 )
             })?;
-        match self.create_from_offer(&request, &offer) {
+        match self.create_from_offer(&request, &offer, None) {
             Ok(instance) => Ok(instance),
             Err(error) => {
                 if let Some(label) = request.label.as_deref()
@@ -892,6 +990,83 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         }
     }
 
+    fn provision_paid(
+        &mut self,
+        request: ProvisionRequest,
+        spec: &NodeProvisionSpec,
+        selected_offer_id: Option<u64>,
+        criteria: Option<OfferBrowseCriteria>,
+    ) -> Result<ProvisionedInstance, String> {
+        if request.count != 1 {
+            return Err("paid VastAI provisioning requires exactly one logical node".to_owned());
+        }
+        let path = self.paid_admission_path.as_ref().ok_or_else(|| {
+            "paid VastAI provisioning has no configured admission record".to_owned()
+        })?;
+        let admission = PaidFixtureAdmission::open(path)?;
+        let snapshot = admission.snapshot()?;
+        let label = request.label.as_deref().unwrap_or_default();
+        let expected = paid_node_for_spec(&snapshot, spec, label, selected_offer_id)?;
+        if snapshot.mode == PaidAdmissionMode::CleanupOnly {
+            return Err("paid VastAI fixture is cleanup-only".to_owned());
+        }
+        let existing = self.contract_by_label(label)?;
+        if let Some(&contract_id) = snapshot.contracts.get(&spec.node_id) {
+            if existing != Some(contract_id) {
+                return Err("paid VastAI retained contract disappeared or changed".to_owned());
+            }
+            return Ok(ProvisionedInstance {
+                offer_id: expected.offer_id,
+                host_id: Some(expected.host_id),
+                ..adopted_instance(contract_id)
+            });
+        }
+        if snapshot.create_reservations.contains_key(&spec.node_id) {
+            if let Some(contract_id) = existing {
+                admission.record_contract(spec.node_id, contract_id)?;
+            }
+            return Err(
+                "paid VastAI create slot was already consumed; cleanup is required".to_owned(),
+            );
+        }
+        if existing.is_some() {
+            return Err("paid VastAI label exists without a create reservation".to_owned());
+        }
+        let criteria = criteria
+            .filter(|_| selected_offer_id == Some(expected.offer_id))
+            .ok_or_else(|| {
+                "paid VastAI acquisition requires the exact selected offer and criteria".to_owned()
+            })?;
+        let offer = self
+            .client
+            .browse_offers(&criteria)?
+            .into_iter()
+            .find(|offer| offer.id == expected.offer_id)
+            .ok_or_else(|| {
+                format!(
+                    "selected paid offer {} is no longer available",
+                    expected.offer_id
+                )
+            })?;
+        match self.create_from_offer(&request, &offer, Some(spec)) {
+            Ok(instance) => Ok(instance),
+            Err(error) => {
+                // Discovery only: an ambiguous create never becomes a retry or
+                // a successful preparation. Preserve any discovered exact id
+                // for the independent cleanup owner before returning failure.
+                if admission
+                    .snapshot()?
+                    .create_reservations
+                    .contains_key(&spec.node_id)
+                    && let Some(contract_id) = self.contract_by_label(label)?
+                {
+                    admission.record_contract(spec.node_id, contract_id)?;
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn ssh_endpoint(
         &mut self,
         contract_id: u64,
@@ -899,9 +1074,21 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         lifecycle: &LifecyclePolicy,
         ssh_user: &str,
     ) -> Result<VastAiSshEndpoint, String> {
+        let labels = self
+            .paid_admission_path
+            .as_ref()
+            .map(PaidFixtureAdmission::open)
+            .transpose()?
+            .map(|admission| {
+                admission
+                    .snapshot()
+                    .map(|snapshot| snapshot.cleanup_labels())
+            })
+            .transpose()?
+            .unwrap_or_else(|| BTreeSet::from([label.to_owned()]));
         let endpoint = self
             .client
-            .wait_for_ssh_endpoint(contract_id, label, lifecycle)?;
+            .wait_for_ssh_endpoint(contract_id, &labels, lifecycle)?;
         let host = endpoint.ip;
         let port = endpoint.port;
         if host.is_empty() || host == "unknown" {
@@ -988,713 +1175,47 @@ fn provider_status_message_has_terminal_failure(message: &str) -> bool {
         })
 }
 
-pub(crate) trait VastAiBootstrapLauncher: Send {
-    type Handle: Send;
-
-    fn start_bootstrap(
-        &mut self,
-        spec: NodeProvisionSpec,
-        endpoint: VastAiSshEndpoint,
-        sink: PluginSink,
-        producer: Option<TelemetryProducer>,
-        lifecycle: LifecyclePolicy,
-    ) -> Result<Self::Handle, String>;
-
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle);
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SshBootstrapStream {
-    Stdout,
-    Stderr,
-}
-
-#[derive(Clone)]
-enum SshBootstrapMsg {
-    StartAttempt,
-    PollChild,
-    OutputLine {
-        stream: SshBootstrapStream,
-        line: String,
-    },
-    ReaderError {
-        stream: SshBootstrapStream,
-        error: String,
-    },
-    ReaderClosed {
-        stream: SshBootstrapStream,
-    },
-    #[cfg(test)]
-    ScriptedAttemptFinished {
-        result: Result<i32, String>,
-    },
-    Stop,
-}
-
-struct SshOutputRelay {
-    target: ActorAddress,
-}
-
-impl ActorInterface for SshOutputRelay {
-    type Incoming = ProcessStreamObservation;
-    type Response = ();
-
-    fn handle(&mut self, ctx: &Ctx, observation: Self::Incoming) {
-        let message = match observation {
-            ProcessStreamObservation::Line { stream, line } => SshBootstrapMsg::OutputLine {
-                stream: map_process_stream(stream),
-                line,
-            },
-            ProcessStreamObservation::Error { stream, error } => SshBootstrapMsg::ReaderError {
-                stream: map_process_stream(stream),
-                error,
-            },
-            ProcessStreamObservation::Closed { stream } => SshBootstrapMsg::ReaderClosed {
-                stream: map_process_stream(stream),
-            },
-        };
-        let _ = ctx.send(self.target, message);
-    }
-}
-
-fn map_process_stream(stream: ProcessStream) -> SshBootstrapStream {
-    match stream {
-        ProcessStream::Stdout => SshBootstrapStream::Stdout,
-        ProcessStream::Stderr => SshBootstrapStream::Stderr,
-    }
-}
-pub(crate) type BootstrapEnvSource =
-    Arc<dyn Fn() -> Result<Vec<(String, String)>, String> + Send + Sync>;
-
-struct SshBootstrapActor {
-    bridge: BootstrapTelemetryBridge,
-    endpoint: VastAiSshEndpoint,
-    ssh_identity: Option<PathBuf>,
-    sender: ExternalSender,
-    live_env: BootstrapEnvSource,
-    engine: EngineHandle,
-    child: Option<Child>,
-    reader_relay: Option<ActorAddress>,
-    stdout_reader: Option<LineReaderHandle>,
-    stderr_reader: Option<LineReaderHandle>,
-    stdout_closed: bool,
-    stderr_closed: bool,
-    pending_status: Option<std::process::ExitStatus>,
-    pending_wait_error: Option<String>,
-    attempt: u64,
-    backoff: Duration,
-    observation_class: Option<&'static str>,
-    stopped: bool,
-    #[cfg(test)]
-    disable_attempt_spawn: bool,
-    #[cfg(test)]
-    spawn_pending_test_child: bool,
-}
-
-impl SshBootstrapActor {
-    fn new(
-        bridge: BootstrapTelemetryBridge,
-        endpoint: VastAiSshEndpoint,
-        ssh_identity: Option<PathBuf>,
-        live_env: BootstrapEnvSource,
-        sender: ExternalSender,
-        engine: EngineHandle,
-    ) -> Self {
-        Self {
-            bridge,
-            endpoint,
-            live_env,
-            ssh_identity,
-            sender,
-            engine,
-            child: None,
-            stdout_reader: None,
-            stderr_reader: None,
-            stdout_closed: true,
-            reader_relay: None,
-            stderr_closed: true,
-            pending_status: None,
-            pending_wait_error: None,
-            attempt: 1,
-            backoff: Duration::from_secs(1),
-            observation_class: None,
-            stopped: false,
-            #[cfg(test)]
-            disable_attempt_spawn: false,
-            #[cfg(test)]
-            spawn_pending_test_child: false,
-        }
-    }
-
-    fn run_id(&self) -> u64 {
-        self.bridge.spec().run_id
-    }
-
-    fn node_id(&self) -> u64 {
-        self.bridge.spec().node_id
-    }
-
-    #[cfg(test)]
-    fn with_attempt_spawn_disabled(mut self) -> Self {
-        self.disable_attempt_spawn = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_pending_test_child(mut self) -> Self {
-        self.disable_attempt_spawn = true;
-        self.spawn_pending_test_child = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_open_test_streams(mut self) -> Self {
-        self.disable_attempt_spawn = true;
-        self.stdout_closed = false;
-        self.stderr_closed = false;
-        self
-    }
-
-    fn schedule(&self, ctx: &Ctx, message: SshBootstrapMsg, delay: Duration) {
-        self.engine
-            .send_after(delay, self.sender.clone(), ctx.self_addr(), message);
-    }
-
-    fn start_attempt(&mut self, ctx: &Ctx) {
-        if self.stopped {
-            return;
-        }
-        self.bridge.observe_provider_line(format!(
-            "VastAI SSH bootstrap attempt {} to {}@{}:{}",
-            self.attempt, self.endpoint.user, self.endpoint.host, self.endpoint.port
-        ));
-
-        #[cfg(test)]
-        let attempt = if self.disable_attempt_spawn {
-            if self.spawn_pending_test_child {
-                spawn_pending_test_child()
-            } else {
-                return;
-            }
-        } else {
-            spawn_ssh_bootstrap_attempt(
-                self.bridge.spec(),
-                &self.live_env,
-                &self.endpoint,
-                self.ssh_identity.as_deref(),
-            )
-        };
-        #[cfg(not(test))]
-        let attempt = spawn_ssh_bootstrap_attempt(
-            self.bridge.spec(),
-            &self.live_env,
-            &self.endpoint,
-            self.ssh_identity.as_deref(),
-        );
-
-        match attempt {
-            Ok((child, stdout, stderr)) => {
-                self.child = Some(child);
-                self.stdout_closed = false;
-                self.stderr_closed = false;
-                self.observation_class = None;
-                self.pending_status = None;
-                self.pending_wait_error = None;
-                let reader_relay = self
-                    .reader_relay
-                    .expect("SSH output relay is installed before attempts start");
-                self.stdout_reader = Some(swactor_process::spawn_line_reader(
-                    ProcessStream::Stdout,
-                    stdout,
-                    self.sender.clone(),
-                    reader_relay,
-                ));
-                self.stderr_reader = Some(swactor_process::spawn_line_reader(
-                    ProcessStream::Stderr,
-                    stderr,
-                    self.sender.clone(),
-                    reader_relay,
-                ));
-                self.schedule(ctx, SshBootstrapMsg::PollChild, Duration::from_millis(100));
-            }
-            Err(error) => {
-                self.bridge.observe_provider_line(format!(
-                    "spawn VastAI SSH bootstrap attempt {} failed: {error}; retrying",
-                    self.attempt
-                ));
-                self.schedule_retry(ctx);
-            }
-        }
-    }
-
-    fn poll_child(&mut self, ctx: &Ctx) {
-        if self.stopped {
-            return;
-        }
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        match swactor_process::child_try_wait(child) {
-            Ok(Some(status)) => {
-                self.child = None;
-                self.pending_status = Some(status);
-                self.maybe_finish_attempt(ctx);
-            }
-            Ok(None) => {
-                self.schedule(ctx, SshBootstrapMsg::PollChild, Duration::from_millis(100));
-            }
-            Err(error) => {
-                self.child = None;
-                self.pending_wait_error = Some(error.to_string());
-                self.maybe_finish_attempt(ctx);
-            }
-        }
-    }
-
-    fn handle_output_line(&mut self, stream: SshBootstrapStream, line: String) {
-        match stream {
-            SshBootstrapStream::Stdout => self.bridge.observe_stdout_line(line),
-            SshBootstrapStream::Stderr => {
-                if let Some(class) = classify_ssh_observation(&line) {
-                    self.observation_class = Some(class);
-                    self.bridge.observe_provider_line(
-                        serde_json::json!({
-                            "type": "VastAiBootstrapObservationClass",
-                            "run_id": self.run_id(),
-                            "node_id": self.node_id(),
-                            "class": class,
-                        })
-                        .to_string(),
-                    );
-                }
-                self.bridge.observe_stderr_line(line);
-            }
-        }
-    }
-
-    fn handle_reader_error(&self, stream: SshBootstrapStream, error: String) {
-        let stream = match stream {
-            SshBootstrapStream::Stdout => "stdout",
-            SshBootstrapStream::Stderr => "stderr",
-        };
-        self.bridge
-            .observe_provider_line(format!("read VastAI SSH {stream}: {error}"));
-    }
-
-    fn handle_reader_closed(&mut self, ctx: &Ctx, stream: SshBootstrapStream) {
-        match stream {
-            SshBootstrapStream::Stdout => self.stdout_closed = true,
-            SshBootstrapStream::Stderr => self.stderr_closed = true,
-        }
-        self.maybe_finish_attempt(ctx);
-    }
-
-    fn finish_completed_attempt(&mut self, ctx: &Ctx, status: String, success: bool) {
-        self.join_readers();
-        let readiness = if success {
-            "exited before runtime ready"
-        } else {
-            "not ready before runtime ready"
-        };
-        let observation_class = self.observation_class.unwrap_or("process_exit");
-        self.bridge.observe_provider_line(
-            serde_json::json!({
-                "type": "VastAiBootstrapAttemptCompleted",
-                "run_id": self.run_id(),
-                "node_id": self.node_id(),
-                "attempt": self.attempt,
-                "status": status,
-                "class": observation_class,
-                "classification": readiness,
-            })
-            .to_string(),
-        );
-        self.schedule_retry(ctx);
-    }
-
-    fn maybe_finish_attempt(&mut self, ctx: &Ctx) {
-        if self.stopped || !self.stdout_closed || !self.stderr_closed {
-            return;
-        }
-        if let Some(error) = self.pending_wait_error.take() {
-            self.join_readers();
-            self.bridge.observe_provider_line(format!(
-                "wait VastAI SSH bootstrap attempt {}: {error}; retrying",
-                self.attempt
-            ));
-            self.schedule_retry(ctx);
-            return;
-        }
-        let Some(status) = self.pending_status.take() else {
-            return;
-        };
-        let success = status.success();
-        self.finish_completed_attempt(ctx, status.to_string(), success);
-    }
-
-    fn schedule_retry(&mut self, ctx: &Ctx) {
-        if self.stopped {
-            return;
-        }
-        let delay = self.backoff;
-        self.bridge.observe_provider_line(format!(
-            "VastAI SSH bootstrap retrying in {}s after attempt {}",
-            delay.as_secs(),
-            self.attempt
-        ));
-        self.backoff = std::cmp::min(self.backoff.saturating_mul(2), Duration::from_secs(30));
-        self.attempt = self.attempt.saturating_add(1);
-        self.schedule(ctx, SshBootstrapMsg::StartAttempt, delay);
-    }
-
-    fn join_readers(&mut self) {
-        if let Some(reader) = self.stdout_reader.take() {
-            reader.join();
-        }
-        if let Some(reader) = self.stderr_reader.take() {
-            reader.join();
-        }
-        self.stdout_closed = true;
-        self.stderr_closed = true;
-    }
-
-    fn stop_child(&mut self) {
-        stop_ssh_child(&mut self.child);
-        self.join_readers();
-    }
-
-    fn stop_relay(&mut self, ctx: &Ctx) {
-        if let Some(reader_relay) = self.reader_relay.take() {
-            let _ = ctx.stop_actor(reader_relay);
-        }
-    }
-
-    fn mark_stopped(&mut self) {
-        if self.stopped {
-            return;
-        }
-        self.stopped = true;
-        self.bridge.observe_provider_line(
-            serde_json::json!({
-                "type": "VastAiBootstrapStopped",
-                "run_id": self.run_id(),
-                "node_id": self.node_id(),
-                "attempt": self.attempt,
-                "child_active": self.child.is_some(),
-                "classification": "bootstrap_stopped",
-            })
-            .to_string(),
-        );
-    }
-}
-
-impl ActorInterface for SshBootstrapActor {
-    type Incoming = SshBootstrapMsg;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        match ctx.spawn(SshOutputRelay {
-            target: ctx.self_addr(),
-        }) {
-            Ok(reader_relay) => {
-                self.reader_relay = Some(reader_relay);
-                let _ = ctx.send(ctx.self_addr(), SshBootstrapMsg::StartAttempt);
-            }
-            Err(error) => {
-                self.bridge
-                    .observe_provider_line(format!("spawn SSH output relay actor: {error}"));
-                ctx.stop_self();
-            }
-        }
-    }
-
-    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
-        match msg {
-            SshBootstrapMsg::StartAttempt => self.start_attempt(ctx),
-            SshBootstrapMsg::PollChild => self.poll_child(ctx),
-            SshBootstrapMsg::OutputLine { stream, line } => self.handle_output_line(stream, line),
-            SshBootstrapMsg::ReaderError { stream, error } => {
-                self.handle_reader_error(stream, error)
-            }
-            SshBootstrapMsg::ReaderClosed { stream } => self.handle_reader_closed(ctx, stream),
-            #[cfg(test)]
-            SshBootstrapMsg::ScriptedAttemptFinished { result } => {
-                self.stdout_closed = true;
-                self.stderr_closed = true;
-                match result {
-                    Ok(status) => self.finish_completed_attempt(
-                        ctx,
-                        format!("exit status: {status}"),
-                        status == 0,
-                    ),
-                    Err(error) => {
-                        self.stop_child();
-                        self.pending_wait_error = Some(error);
-                        self.maybe_finish_attempt(ctx);
-                    }
-                }
-            }
-            SshBootstrapMsg::Stop => {
-                self.mark_stopped();
-                self.stop_child();
-                self.stop_relay(ctx);
-                ctx.stop_self();
-            }
-        }
-    }
-
-    fn on_stop(&mut self, ctx: &Ctx) {
-        self.mark_stopped();
-        self.stop_child();
-        self.stop_relay(ctx);
-    }
-}
-
-fn stop_ssh_child(child: &mut Option<Child>) {
-    let Some(mut child) = child.take() else {
-        return;
-    };
-    let _ = swactor_process::child_kill(&mut child);
-    let _ = swactor_process::child_wait(&mut child);
-}
-
-#[cfg(test)]
-fn spawn_pending_test_child()
--> Result<(Child, std::process::ChildStdout, std::process::ChildStderr), String> {
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "read _"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = swactor_process::command_spawn(&mut command)
-        .map_err(|error| format!("spawn pending SSH test child: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "pending SSH test child missing stdout".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "pending SSH test child missing stderr".to_owned())?;
-    Ok((child, stdout, stderr))
-}
-
-#[derive(Clone)]
-pub(crate) struct SshCommandBootstrapLauncher {
-    ssh_identity: Option<PathBuf>,
-    runtime: Runtime,
-    engine: EngineHandle,
-    live_env: BootstrapEnvSource,
-}
-pub(crate) struct SshCommandBootstrapHandle {
-    actor: ActorAddress,
-    runtime: Runtime,
-}
-
-impl SshCommandBootstrapLauncher {
-    pub(crate) fn new(
-        ssh_identity: Option<PathBuf>,
-        runtime: Runtime,
-        live_env: BootstrapEnvSource,
-        engine: EngineHandle,
-    ) -> Self {
-        Self {
-            ssh_identity,
-            runtime,
-            live_env,
-            engine,
-        }
-    }
-}
-
-impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
-    type Handle = SshCommandBootstrapHandle;
-
-    fn start_bootstrap(
-        &mut self,
-        spec: NodeProvisionSpec,
-        endpoint: VastAiSshEndpoint,
-        sink: PluginSink,
-        producer: Option<TelemetryProducer>,
-        _lifecycle: LifecyclePolicy,
-    ) -> Result<Self::Handle, String> {
-        if spec.args.is_empty() {
-            return Err(format!(
-                "VastAI node {} SSH bootstrap command missing",
-                spec.node_id
-            ));
-        }
-
-        let sender = self.runtime.create_sender();
-        let bridge = BootstrapTelemetryBridge::new(spec, sink, producer);
-        let actor = self
-            .runtime
-            .spawn(SshBootstrapActor::new(
-                bridge,
-                endpoint,
-                self.ssh_identity.clone(),
-                self.live_env.clone(),
-                sender,
-                self.engine.clone(),
-            ))
-            .map_err(|e| format!("spawn VastAI SSH bootstrap actor: {e}"))?;
-
-        Ok(SshCommandBootstrapHandle {
-            actor,
-            runtime: self.runtime.clone(),
-        })
-    }
-
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
-        let _ = handle.runtime.send_to(handle.actor, SshBootstrapMsg::Stop);
-    }
-}
-
-fn classify_ssh_observation(line: &str) -> Option<&'static str> {
-    let lower = line.to_ascii_lowercase();
-    if lower.contains("permission denied (publickey")
-        || lower.contains("publickey denied")
-        || lower.contains("public key denied")
-        || lower.contains("no supported authentication methods")
-    {
-        return Some("auth_denied");
-    }
-    if lower.contains("connection refused")
-        || lower.contains("connect to host") && lower.contains("refused")
-    {
-        return Some("refused");
-    }
-    if lower.contains("operation timed out")
-        || lower.contains("connection timed out")
-        || lower.contains("connect timed out")
-    {
-        return Some("timeout");
-    }
-    None
-}
-
-fn spawn_ssh_bootstrap_attempt(
-    spec: &NodeProvisionSpec,
-    live_env: &BootstrapEnvSource,
-    endpoint: &VastAiSshEndpoint,
-    ssh_identity: Option<&Path>,
-) -> Result<(Child, std::process::ChildStdout, std::process::ChildStderr), String> {
-    let remote_command = ssh_bootstrap_command_for_attempt(spec, live_env)?;
-    let mut command = Command::new("ssh");
-    command
-        .args(ssh_bootstrap_args(endpoint, &remote_command, ssh_identity))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = swactor_process::command_spawn(&mut command)
-        .map_err(|e| format!("spawn VastAI SSH bootstrap {}: {e}", spec.node_id))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("VastAI node {} SSH stdout missing", spec.node_id))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("VastAI node {} SSH stderr missing", spec.node_id))?;
-    Ok((child, stdout, stderr))
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn ssh_bootstrap_lock(spec: &NodeProvisionSpec) -> String {
-    let command = spec.args.join(" ");
-    let digest = blake3::hash(command.as_bytes()).to_hex();
-    format!(
-        "/tmp/myelin-bootstrap-{}-{}-{}-{}",
-        spec.run_id,
-        spec.node_id,
-        spec.attempt_id,
-        &digest.as_str()[..16],
-    )
-}
-
-fn ssh_bootstrap_command_for_attempt(
-    spec: &NodeProvisionSpec,
-    live_env: &BootstrapEnvSource,
-) -> Result<String, String> {
-    let env = live_env().map_err(|error| {
-        format!(
-            "locate current orchestrator endpoint for VastAI node {}: {error}",
-            spec.node_id
-        )
-    })?;
-    Ok(idempotent_ssh_bootstrap_command(spec, &env))
-}
-
-fn idempotent_ssh_bootstrap_command(
-    spec: &NodeProvisionSpec,
-    live_env: &[(String, String)],
-) -> String {
-    let command = shell_single_quote(&spec.args.join(" "));
-    let mut effective_env = spec.env.iter().cloned().collect::<BTreeMap<_, _>>();
-    effective_env.extend(live_env.iter().cloned());
-    let exports = effective_env
-        .iter()
-        .map(|(key, value)| shell_single_quote(&format!("{key}={value}")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let export_command = if exports.is_empty() {
-        String::new()
-    } else {
-        format!("export {exports}; ")
-    };
-    let lock = ssh_bootstrap_lock(spec);
-    format!(
-        "lock={lock}; command={command}; while :; do \
-         if mkdir \"$lock\" 2>/dev/null; then \
-           echo $$ > \"$lock/pid\"; {export_command}sh -lc \"$command\"; status=$?; \
-           if [ \"$status\" -eq 0 ]; then touch \"$lock/complete\"; else rm -rf \"$lock\"; fi; \
-           exit \"$status\"; \
-         fi; \
-         if [ -f \"$lock/complete\" ]; then echo 'myelin bootstrap already complete'; exit 0; fi; \
-         pid=$(cat \"$lock/pid\" 2>/dev/null || true); \
-         if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then \
-           echo 'myelin bootstrap already running'; exit 0; \
-         fi; \
-         rm -rf \"$lock\"; \
-         done"
-    )
-}
-
-fn ssh_bootstrap_args(
-    endpoint: &VastAiSshEndpoint,
-    remote_command: &str,
-    ssh_identity: Option<&Path>,
-) -> Vec<String> {
-    let mut args = vec![
-        "-v".to_owned(),
-        "-p".to_owned(),
-        endpoint.port.to_string(),
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "StrictHostKeyChecking=accept-new".to_owned(),
-    ];
-    if let Some(identity) = ssh_identity {
-        args.push("-i".to_owned());
-        args.push(identity.to_string_lossy().into_owned());
-        args.push("-o".to_owned());
-        args.push("IdentitiesOnly=yes".to_owned());
-    }
-    args.push(format!("{}@{}", endpoint.user, endpoint.host));
-    args.push(remote_command.to_owned());
-    args
-}
-
 fn emit_node_line(sink: &PluginSink, run_id: u64, node_id: u64, line: impl Into<String>) {
     sink.observe(PluginObservation::ProviderLine {
         run_id,
         node_id,
         line: line.into(),
     });
+}
+
+fn configured_paid_admission_path() -> Option<PathBuf> {
+    // Capture configuration, not a snapshot: offer search precedes authorization.
+    // A missing/invalid configured record is an error at every work boundary.
+    std::env::var_os("MYELIN_PAID_FIXTURE_ADMISSION").map(PathBuf::from)
+}
+
+fn paid_node_for_spec<'a>(
+    snapshot: &'a PaidAdmissionSnapshot,
+    spec: &NodeProvisionSpec,
+    label: &str,
+    selected_offer_id: Option<u64>,
+) -> Result<&'a PaidNodeAdmission, String> {
+    // The orchestrator provisions the initial attempt with attempt_id 0
+    // (admission labels reserve `...-attempt-0`); zero is a valid identity
+    // and only a run mismatch invalidates the spec.
+    if snapshot.run_id != spec.run_id {
+        return Err("paid VastAI run identity mismatch".to_owned());
+    }
+    let expected = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.node_id == spec.node_id)
+        .ok_or_else(|| "paid VastAI node was not selected".to_owned())?;
+    if expected.label != label
+        || selected_offer_id.is_some_and(|offer_id| offer_id != expected.offer_id)
+        || snapshot
+            .create_reservations
+            .get(&spec.node_id)
+            .is_some_and(|reservation| reservation.attempt_id != spec.attempt_id)
+    {
+        return Err("paid VastAI node identity differs from selected topology".to_owned());
+    }
+    Ok(expected)
 }
 
 pub(crate) struct VastAiProvisioningPlugin<C, B>
@@ -1706,6 +1227,7 @@ where
     bootstrap: B,
     config: VastAiProvisioningConfig,
     bootstrap_producer: Option<TelemetryProducer>,
+    paid_admission_path: Option<PathBuf>,
     leased_host_ids: BTreeSet<u64>,
     failed_host_ids: BTreeSet<u64>,
     next_handle_id: u64,
@@ -1736,6 +1258,7 @@ where
             bootstrap,
             config,
             bootstrap_producer: None,
+            paid_admission_path: configured_paid_admission_path(),
             next_handle_id: 1,
             leased_host_ids: BTreeSet::new(),
             failed_host_ids: BTreeSet::new(),
@@ -1831,6 +1354,14 @@ where
             return Err("vastai provider does not support host file mounts".to_owned());
         }
         let label = self.label_for(&spec);
+        let paid_admission = self
+            .paid_admission_path
+            .as_ref()
+            .map(PaidFixtureAdmission::open)
+            .transpose()?;
+        if let Some(admission) = &paid_admission {
+            paid_node_for_spec(&admission.snapshot()?, &spec, &label, selected_offer_id)?;
+        }
 
         let request = self.build_request(&spec, label.clone());
         let exact_criteria = selected_offer_id
@@ -1849,12 +1380,17 @@ where
             spec.node_id,
             "requesting Vast.ai contract".to_owned(),
         );
-        let instance = match (selected_offer_id, exact_criteria) {
-            (Some(offer_id), Some(criteria)) => {
-                self.client.provision_exact(request, offer_id, criteria)
+        let instance = if paid_admission.is_some() {
+            self.client
+                .provision_paid(request, &spec, selected_offer_id, exact_criteria)
+        } else {
+            match (selected_offer_id, exact_criteria) {
+                (Some(offer_id), Some(criteria)) => {
+                    self.client.provision_exact(request, offer_id, criteria)
+                }
+                (None, None) => self.client.provision_one(request),
+                _ => unreachable!("selected offer and exact criteria are paired"),
             }
-            (None, None) => self.client.provision_one(request),
-            _ => unreachable!("selected offer and exact criteria are paired"),
         }
         .map_err(|error| {
             classified_start_error(format!("vastai provision node {}: {error}", spec.node_id))
@@ -2012,6 +1548,27 @@ where
             .endpoint
             .clone()
             .expect("Vast.ai endpoint was discovered above");
+        if let Some(path) = &self.paid_admission_path {
+            let admission = PaidFixtureAdmission::open(path)?;
+            let snapshot = admission.snapshot()?;
+            paid_node_for_spec(&snapshot, &node.spec, &node.label, None)?;
+            if snapshot.contracts.get(&node.node_id) != Some(&node.contract_id) {
+                return Err("paid VastAI bootstrap contract identity mismatch".to_owned());
+            }
+            if snapshot.mode == PaidAdmissionMode::Prepared {
+                let deployment = node.spec.deployment.as_ref().ok_or(
+                    "prepared paid fixture denies bootstrap without an explicit deployment",
+                )?;
+                admission.reserve_retained_bootstrap(
+                    node.run_id,
+                    node.node_id,
+                    node.contract_id,
+                    deployment,
+                )?;
+            } else {
+                admission.reserve_bootstrap(node.run_id, node.node_id)?;
+            }
+        }
         emit_node_line(
             &node.sink,
             node.run_id,
@@ -2142,6 +1699,26 @@ where
         sink: PluginSink,
     ) -> Result<Option<AdoptedNode>, String> {
         let label = self.label_for(spec);
+        if let Some(path) = &self.paid_admission_path {
+            let snapshot = PaidFixtureAdmission::open(path)?.snapshot()?;
+            paid_node_for_spec(&snapshot, spec, &label, None)?;
+            if snapshot.mode == PaidAdmissionMode::CleanupOnly {
+                return Err("paid VastAI fixture is cleanup-only".to_owned());
+            }
+            // The one create/adopt path below makes the fresh provider check.
+            // Do not precede it with ten redundant account scans. Ambiguous
+            // reservations still enter that path and remain cleanup-only errors.
+            if !snapshot.contracts.contains_key(&spec.node_id)
+                && !snapshot.create_reservations.contains_key(&spec.node_id)
+            {
+                return Ok(None);
+            }
+            let handle = self.create_node(spec.clone(), sink)?;
+            return Ok(Some(AdoptedNode {
+                handle,
+                provider_ref: label,
+            }));
+        }
         let contract = self.client.contract_by_label_with_retry(
             &label,
             10,
@@ -2206,6 +1783,7 @@ mod tests {
     #[test]
     fn bootstrap_command_has_stable_remote_idempotency_guard() {
         let spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 9,
@@ -2233,6 +1811,7 @@ mod tests {
     #[test]
     fn ssh_bootstrap_late_binds_the_live_orchestrator_endpoint() {
         let spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 9,
@@ -2277,6 +1856,7 @@ mod tests {
     #[test]
     fn bootstrap_completion_guard_is_scoped_to_the_command() {
         let mut spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 9,
@@ -2453,6 +2033,7 @@ mod tests {
             VastAiProvisioningConfig::default(),
         );
         let spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 9,
@@ -2502,6 +2083,7 @@ mod tests {
             VastAiProvisioningConfig::default(),
         );
         let spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 9,
@@ -2541,6 +2123,268 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn paid_test_admission() -> (
+        tempfile::TempDir,
+        PaidFixtureAdmission,
+        provisioning::PaidCleanupOwner,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let nodes = (1..=5)
+            .map(|node_id| PaidNodeAdmission {
+                node_id,
+                offer_id: 40 + node_id,
+                host_id: node_id,
+                label: format!("myelin-5-{node_id}-attempt-9"),
+            })
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let admission = PaidFixtureAdmission::create(
+            directory.path().join("admission.json"),
+            5,
+            nodes,
+            u64::try_from(now.as_millis()).unwrap()
+                + provisioning::paid_admission::PAID_CLEANUP_RESERVE_MS
+                + 60_000,
+        )
+        .unwrap();
+        admission
+            .install_cleanup_ownership(
+                provisioning::PaidProcessIdentity::current().unwrap(),
+                provisioning::PaidCleanupLimits {
+                    maximum_cost_microusd: 1_000_000,
+                    hourly_price_microusd: 1_000_000,
+                },
+            )
+            .unwrap();
+        let owner = admission.claim_cleanup_owner().unwrap();
+        admission.bind_orchestrator(std::process::id()).unwrap();
+        (directory, admission, owner)
+    }
+
+    #[cfg(unix)]
+    fn paid_test_request() -> ProvisionRequest {
+        ProvisionRequest {
+            label: Some("myelin-5-2-attempt-9".to_owned()),
+            ..exact_request()
+        }
+    }
+
+    #[cfg(unix)]
+    fn paid_test_routes(status: u16, response: serde_json::Value) -> Vec<TestHttpRoute> {
+        vec![
+            TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
+            TestHttpRoute::json(
+                "GET",
+                "/api/v0/bundles/",
+                200,
+                json!({
+                    "offers": [
+                        {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                         "geolocation": "US"},
+                        {"id": 42, "gpu_name": "B", "dph_total": 0.3, "host_id": 2,
+                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                         "geolocation": "US"}
+                    ]
+                }),
+            ),
+            TestHttpRoute::json("PUT", "/api/v0/asks/42/", status, response),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_missing_admission_never_reaches_provider_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = TestHttpServer::start(Vec::new()).unwrap();
+        let mut client =
+            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
+        client.paid_admission_path = Some(directory.path().join("not-authorized.json"));
+        assert!(client.provision_one(paid_test_request()).is_err());
+        assert!(
+            client
+                .provision_exact(paid_test_request(), 42, OfferBrowseCriteria::default())
+                .is_err()
+        );
+        assert!(
+            client
+                .provision_paid(
+                    paid_test_request(),
+                    &monitor_spec(5, 2),
+                    Some(42),
+                    Some(OfferBrowseCriteria::default())
+                )
+                .is_err()
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paid_create_is_durable_before_return_and_missing_contract_cannot_be_replaced() {
+        let (directory, admission, _owner) = paid_test_admission();
+        let server =
+            TestHttpServer::start(paid_test_routes(200, json!({"new_contract": 700}))).unwrap();
+        let mut client =
+            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
+        client.paid_admission_path = Some(directory.path().join("admission.json"));
+        let instance = client
+            .provision_paid(
+                paid_test_request(),
+                &monitor_spec(5, 2),
+                Some(42),
+                Some(OfferBrowseCriteria::default()),
+            )
+            .unwrap();
+        assert_eq!(instance.contract_id, 700);
+        assert_eq!(
+            admission.snapshot().unwrap().contracts,
+            BTreeMap::from([(2, 700)])
+        );
+        // The provider now reports absence. Even a fresh client must not replace it.
+        let mut reopened = client.clone();
+        assert!(
+            reopened
+                .provision_paid(
+                    paid_test_request(),
+                    &monitor_spec(5, 2),
+                    Some(42),
+                    Some(OfferBrowseCriteria::default())
+                )
+                .is_err()
+        );
+        let creates = server
+            .requests()
+            .into_iter()
+            .filter(|request| request.method == "PUT")
+            .map(|request| request.path)
+            .collect::<Vec<_>>();
+        assert_eq!(creates, ["/api/v0/asks/42/"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paid_ambiguous_rate_limit_never_retries_or_substitutes_an_offer() {
+        let (directory, admission, _owner) = paid_test_admission();
+        let server =
+            TestHttpServer::start(paid_test_routes(429, json!({"error": "rate limited"}))).unwrap();
+        let mut client =
+            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
+        client.paid_admission_path = Some(directory.path().join("admission.json"));
+        assert!(
+            client
+                .provision_paid(
+                    paid_test_request(),
+                    &monitor_spec(5, 2),
+                    Some(42),
+                    Some(OfferBrowseCriteria::default())
+                )
+                .is_err()
+        );
+        assert!(
+            client
+                .clone()
+                .provision_paid(
+                    paid_test_request(),
+                    &monitor_spec(5, 2),
+                    Some(42),
+                    Some(OfferBrowseCriteria::default())
+                )
+                .is_err()
+        );
+        assert!(client.provision_one(paid_test_request()).is_err());
+        let creates = server
+            .requests()
+            .into_iter()
+            .filter(|request| request.method == "PUT")
+            .map(|request| request.path)
+            .collect::<Vec<_>>();
+        assert_eq!(creates, ["/api/v0/asks/42/"]);
+        let snapshot = admission.snapshot().unwrap();
+        assert!(snapshot.contracts.is_empty());
+        assert_eq!(
+            snapshot
+                .create_reservations
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paid_offer_host_mismatch_is_rejected_before_create() {
+        let (directory, admission, _owner) = paid_test_admission();
+        let server = TestHttpServer::start(Vec::new()).unwrap();
+        let mut client =
+            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
+        client.paid_admission_path = Some(directory.path().join("admission.json"));
+        let wrong_host: Offer = serde_json::from_value(json!({
+            "id": 42, "host_id": 999, "gpu_name": "B", "dph_total": 0.3,
+            "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+        }))
+        .unwrap();
+        assert!(
+            client
+                .create_from_offer(&paid_test_request(), &wrong_host, Some(&monitor_spec(5, 2)))
+                .is_err()
+        );
+        assert!(server.requests().is_empty());
+        assert!(admission.snapshot().unwrap().create_reservations.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paid_bootstrap_active_session_is_idempotent_but_cancel_does_not_reauthorize() {
+        let (directory, admission, _owner) = paid_test_admission();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut plugin = VastAiProvisioningPlugin::new(
+            RetryDestroyClient {
+                destroy_calls: Arc::new(AtomicUsize::new(0)),
+                destroy_failures: Arc::new(AtomicUsize::new(0)),
+                existing_contract: Some(73),
+                ssh_endpoint_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            CountingBootstrap {
+                starts: starts.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            },
+            VastAiProvisioningConfig::default(),
+        );
+        let spec = monitor_spec(5, 2);
+        let handle = plugin
+            .create_node(spec, PluginSink::new(Arc::new(NullSink)))
+            .unwrap();
+        admission
+            .reserve_create(5, 2, 9, 42, "myelin-5-2-attempt-9")
+            .unwrap();
+        admission.record_contract(2, 73).unwrap();
+        plugin.paid_admission_path = Some(directory.path().join("admission.json"));
+        plugin.start_bootstrap(&handle).unwrap();
+        plugin.start_bootstrap(&handle).unwrap();
+        plugin.cancel_bootstrap(&handle).unwrap();
+        assert!(plugin.start_bootstrap(&handle).is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            admission
+                .snapshot()
+                .unwrap()
+                .initial_bootstraps
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
     #[test]
     fn offer_search_is_read_only() {
         let server = TestHttpServer::start(vec![TestHttpRoute::json(
@@ -2552,6 +2396,8 @@ mod tests {
                     "id": 41,
                     "gpu_name": "A",
                     "dph_total": 0.2,
+                    "internet_down_cost_per_tb": 0.0,
+                    "internet_up_cost_per_tb": 0.0,
                     "host_id": 1,
                     "compute_cap": 800,
                     "reliability2": 0.99,
@@ -2593,9 +2439,11 @@ mod tests {
                 json!({
                     "offers": [
                         {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
                          "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
                          "geolocation": "US"},
                         {"id": 42, "gpu_name": "B", "dph_total": 0.3, "host_id": 2,
+                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
                          "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
                          "geolocation": "US"}
                     ]
@@ -2636,6 +2484,7 @@ mod tests {
                 json!({
                     "offers": [{
                         "id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                        "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
                         "geolocation": "US"
                     }]
@@ -2690,6 +2539,7 @@ mod tests {
             VastAiProvisioningConfig::default(),
         );
         let spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 9,
@@ -2730,6 +2580,8 @@ mod tests {
             "id": id,
             "gpu_name": "RTX 4090",
             "dph_total": 0.2,
+            "internet_down_cost_per_tb": 0.0,
+            "internet_up_cost_per_tb": 0.0,
             "gpu_ram": 24_000.0,
             "host_id": id.saturating_add(100),
             "compute_cap": 890,
@@ -2868,6 +2720,7 @@ mod tests {
 
     fn monitor_spec(run_id: u64, node_id: u64) -> NodeProvisionSpec {
         NodeProvisionSpec {
+            deployment: None,
             run_id,
             node_id,
             attempt_id: 9,
@@ -3107,7 +2960,6 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum SshOrderingAction {
-        Poll,
         Stdout(String),
         ReaderError(bool),
         Advance(u16),
@@ -3117,7 +2969,6 @@ mod tests {
     fn ssh_ordering_actions() -> impl Strategy<Value = Vec<SshOrderingAction>> {
         prop::collection::vec(
             prop_oneof![
-                Just(SshOrderingAction::Poll),
                 "[ -~]{0,16}".prop_map(SshOrderingAction::Stdout),
                 any::<bool>().prop_map(SshOrderingAction::ReaderError),
                 (0_u16..=1_000).prop_map(SshOrderingAction::Advance),
@@ -3267,7 +3118,7 @@ mod tests {
 
         #[test]
         fn wrong_or_missing_offer_fields_are_typed_rejections(kind in 0_u8..8) {
-            let body = match kind {
+            let mut body = match kind {
                 0 => json!({}),
                 1 => json!({"offers": "wrong"}),
                 2 => json!({"offers": {}}),
@@ -3277,6 +3128,12 @@ mod tests {
                 6 => json!({"offers": [{"id": 41, "gpu_name": "A", "dph_total": "cheap"}]}),
                 _ => json!({"offers": null}),
             };
+            if let Some(offers) = body.get_mut("offers").and_then(serde_json::Value::as_array_mut) {
+                for offer in offers {
+                    offer["internet_down_cost_per_tb"] = json!(0.0);
+                    offer["internet_up_cost_per_tb"] = json!(0.0);
+                }
+            }
             let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
                 "GET",
                 "/api/v0/bundles/",
@@ -3972,12 +3829,6 @@ mod tests {
             let mut stopped = false;
             for action in &actions {
                 match action {
-                    SshOrderingAction::Poll => {
-                        let _ = harness
-                            .runtime
-                            .send_to(harness.actor, SshBootstrapMsg::PollChild);
-                        drive_steps(&harness.backend, 4);
-                    }
                     SshOrderingAction::Stdout(line) => {
                         let _ = harness.runtime.send_to(
                             harness.actor,

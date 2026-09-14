@@ -523,3 +523,44 @@ mod run_fsm {
         assert!(fault_pos < torn_down_pos);
     }
 }
+
+mod state_reset_guarantees {
+    //! Reset must remove the complete persisted-state inventory: a partial
+    //! reset recovers a discarded run's bindings onto a "fresh" fixture.
+
+    use crate::orchestration::daemon::StateDir;
+
+    #[test]
+    fn reset_removes_the_complete_state_inventory() {
+        let root = tempfile::tempdir().expect("state dir");
+        let state = StateDir::new(root.path());
+        std::fs::create_dir_all(root.path().join("contextual-uploads/scratch")).unwrap();
+        std::fs::write(root.path().join("identity.key"), [0u8; 32]).unwrap();
+        std::fs::write(root.path().join("data-namespace.json"), "{}").unwrap();
+        std::fs::write(root.path().join("process-nodes.json"), "{}").unwrap();
+        std::fs::write(root.path().join("cluster.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("contextual-uploads/scratch/blob.bin"),
+            b"stale",
+        )
+        .unwrap();
+
+        state.reset().expect("reset state");
+
+        for name in [
+            "identity.key",
+            "data-namespace.json",
+            "process-nodes.json",
+            "cluster.json",
+            "contextual-uploads",
+        ] {
+            assert!(
+                !root.path().join(name).exists(),
+                "reset left {name} behind; a fresh fixture would recover stale state"
+            );
+        }
+
+        // Reset is idempotent: an already-clean state dir succeeds again.
+        state.reset().expect("reset clean state");
+    }
+}

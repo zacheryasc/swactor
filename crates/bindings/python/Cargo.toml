@@ -26,10 +26,10 @@ distribution = { path = "../../distribution" }
 iroh-driver = { path = "../../iroh-driver" }
 libc = "0.2"
 futures-lite = "2"
-iroh = "0.98"
+iroh.workspace = true
 parking_lot = "0.12"
 serde_json = "1"
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py312"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio.workspace = true
 

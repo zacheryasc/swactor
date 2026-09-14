@@ -28,6 +28,38 @@ type CompletionReceiver = std::sync::mpsc::Receiver<Result<(), String>>;
 pub struct EdgeSendHandle {
     tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
     completion: Arc<Mutex<Option<CompletionReceiver>>>,
+    owner: Arc<EdgeSendOwner>,
+}
+
+struct EdgeSendOwner(tokio::sync::watch::Sender<bool>);
+
+impl Drop for EdgeSendOwner {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+/// A cancelled write must reset, not implicitly finish buffered partial
+/// records when Quinn's send stream drops.
+pub(crate) struct ResetOnDrop(pub(crate) iroh::endpoint::SendStream);
+
+impl std::ops::Deref for ResetOnDrop {
+    type Target = iroh::endpoint::SendStream;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ResetOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.reset(iroh::endpoint::VarInt::from_u32(0));
+    }
 }
 
 impl EdgeSendHandle {
@@ -37,14 +69,22 @@ impl EdgeSendHandle {
             .map_err(|_| "edge sender task stopped".to_owned())
     }
     pub fn finish(self, timeout: std::time::Duration) -> Result<(), String> {
-        let Self { tx, completion } = self;
+        let Self {
+            tx,
+            completion,
+            owner,
+        } = self;
         drop(tx);
-        completion
+        let result = completion
             .lock()
             .take()
             .ok_or_else(|| "edge sender completion was already observed".to_owned())?
             .recv_timeout(timeout)
-            .map_err(|error| format!("edge sender completion: {error}"))?
+            .map_err(|error| format!("edge sender completion: {error}"));
+        if result.is_err() {
+            owner.0.send_replace(true);
+        }
+        result?
     }
 }
 
@@ -65,18 +105,21 @@ pub(crate) fn spawn_edge_send_pump(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (completion_tx, completion_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let engine_handle = engine.clone();
+    let (cancel, mut cancellation) = tokio::sync::watch::channel(false);
+    let owner = Arc::new(EdgeSendOwner(cancel));
     engine.spawn(async move {
-        let result: Result<(), String> = async {
+        let operation = async {
             macro_rules! open_edge_stream {
                 () => {{
                     let conn = endpoint
                         .connect(peer.clone(), EDGE_ALPN)
                         .await
                         .map_err(|e| format!("connect edge {edge_id}: {e}"))?;
-                    let mut send = conn
-                        .open_uni()
-                        .await
-                        .map_err(|e| format!("open edge stream {edge_id}: {e}"))?;
+                    let mut send = ResetOnDrop(
+                        conn.open_uni()
+                            .await
+                            .map_err(|e| format!("open edge stream {edge_id}: {e}"))?,
+                    );
                     send.write_all(&encode_edge_preamble(edge_id))
                         .await
                         .map_err(|e| format!("write edge preamble {edge_id}: {e}"))?;
@@ -137,8 +180,12 @@ pub(crate) fn spawn_edge_send_pump(
                 Some(code) => Err(format!("peer stopped edge stream {edge_id}: {code}")),
                 None => Ok(()),
             }
-        }
-        .await;
+        };
+        let result: Result<(), String> = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(format!("edge {edge_id} owner cancelled")),
+            result = operation => result,
+        };
         if let Err(error) = &result {
             let _ = ready_tx.send(Err(error.clone()));
         }
@@ -155,6 +202,7 @@ pub(crate) fn spawn_edge_send_pump(
     Ok(EdgeSendHandle {
         tx,
         completion: Arc::new(Mutex::new(Some(completion_rx))),
+        owner,
     })
 }
 
@@ -163,6 +211,7 @@ pub(crate) fn spawn_edge_recv_pump(
     conn: Connection,
     events: Arc<Mutex<Vec<WireEvent>>>,
     stream_group: u64,
+    activity: tokio::sync::watch::Sender<()>,
 ) {
     engine.spawn(async move {
         let mut next_uni_stream_id = stream_group << 32;
@@ -176,6 +225,7 @@ pub(crate) fn spawn_edge_recv_pump(
                     stream_id: Some(current_stream_id),
                     reason: WireFault::ProtocolError,
                 });
+                activity.send_replace(());
                 continue;
             }
             let edge_id = EdgeId(u64::from_le_bytes(preamble));
@@ -183,6 +233,7 @@ pub(crate) fn spawn_edge_recv_pump(
                 edge_id,
                 stream_id: current_stream_id,
             });
+            activity.send_replace(());
             let mut chunk = vec![0u8; 4096];
             loop {
                 match recv.read(&mut chunk).await {
@@ -191,6 +242,7 @@ pub(crate) fn spawn_edge_recv_pump(
                             edge_id,
                             stream_id: current_stream_id,
                         });
+                        activity.send_replace(());
                         break;
                     }
                     Ok(Some(n)) => {
@@ -199,6 +251,7 @@ pub(crate) fn spawn_edge_recv_pump(
                             stream_id: current_stream_id,
                             bytes: chunk[..n].to_vec(),
                         });
+                        activity.send_replace(());
                     }
                     Err(_) => {
                         events.lock().push(WireEvent::StreamFault {
@@ -206,6 +259,7 @@ pub(crate) fn spawn_edge_recv_pump(
                             stream_id: Some(current_stream_id),
                             reason: WireFault::ReadError,
                         });
+                        activity.send_replace(());
                         break;
                     }
                 }

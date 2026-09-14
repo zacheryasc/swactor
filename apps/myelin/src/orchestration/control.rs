@@ -15,21 +15,26 @@ use swactor::runtime::{Ctx, ExternalSender, Runtime};
 use swactor_engine::EngineHandle;
 use swactor_vastai::VastClient;
 
-use crate::contextual_process::{ContextualProcessSpecWire, ContextualProgramFileWire};
-use crate::orchestration::actor::ContextualControlReply;
-use crate::orchestration::actor::OrchestratorMsg;
+use crate::orchestration::actor::{ContextualReplyObserverMsg, OrchestratorMsg};
 use crate::orchestration::manual_control::{
     KillRequest, ManualControlMsg, ManualControlReply, OfferSearchRequest,
     ProviderConfigurationRequest, ProvisionRequest,
 };
+use myelin_control_contract::{
+    ContextualControlReply, ContextualEventsAckRequest, ContextualEventsRequest,
+    ContextualProcessEventKind, ContextualProcessSpec, ContextualProgramFile,
+    ContextualSpawnRequest, ContextualStopRequest, Versioned,
+};
 
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+const RETAINED_BLOBS_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const NAMESPACE_CLEANUP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFER_SEARCH_REPLY_MARGIN: Duration = Duration::from_secs(5);
 const OFFER_SEARCH_REPLY_TIMEOUT: Duration =
     VastClient::REQUEST_TIMEOUT.saturating_add(OFFER_SEARCH_REPLY_MARGIN);
 const PROGRAM_UPLOAD_LIMIT: usize = 256 * 1024;
-const PROGRAM_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
-const PROGRAM_SPAWN_REPLY_TIMEOUT: Duration = Duration::from_secs(35);
+const PROGRAM_ATTACH_TIMEOUT: Duration = Duration::from_secs(80);
+const PROGRAM_SPAWN_REPLY_TIMEOUT: Duration = Duration::from_secs(85);
 struct ControlReplyObserver {
     reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<ManualControlReply>>>>,
     engine: EngineHandle,
@@ -63,8 +68,14 @@ impl ActorInterface for ControlReplyObserver {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ContextualResponse {
+    Reply(ContextualControlReply),
+    TimedOut,
+}
+
 struct ContextualReplyObserver {
-    reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<ContextualControlReply>>>>,
+    reply: Arc<Mutex<Option<tokio::sync::oneshot::Sender<ContextualResponse>>>>,
     engine: EngineHandle,
     sender: ExternalSender,
     timeout: Duration,
@@ -73,36 +84,40 @@ struct ContextualReplyObserver {
 }
 
 impl ActorInterface for ContextualReplyObserver {
-    type Incoming = ContextualControlReply;
+    type Incoming = ContextualReplyObserverMsg;
     type Response = ();
 
-    fn on_start(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
-        self.engine.send_after(
-            self.timeout,
-            self.sender.clone(),
-            ctx.self_addr(),
-            ContextualControlReply::TimedOut,
-        );
-    }
-
-    fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, reply: Self::Incoming) {
-        if matches!(reply, ContextualControlReply::TimedOut) {
-            // The orchestrator never answers now; drop the parked request so
-            // a later reply cannot be swallowed by a stale entry.
-            if let Some(control_request_id) = self.cancel_key.take() {
-                let _ = ctx.send(
-                    self.orchestrator,
-                    OrchestratorMsg::ContextualControlCancel { control_request_id },
+    fn handle(&mut self, ctx: &Ctx<'_>, message: Self::Incoming) {
+        let response = match message {
+            ContextualReplyObserverMsg::ArmTimeout => {
+                self.engine.send_after(
+                    self.timeout,
+                    self.sender.clone(),
+                    ctx.self_addr(),
+                    ContextualReplyObserverMsg::TimedOut,
                 );
+                return;
             }
-        }
-        if let Some(response) = self
+            ContextualReplyObserverMsg::TimedOut => {
+                // The orchestrator never answers now; drop the parked request so
+                // a later reply cannot be swallowed by a stale entry.
+                if let Some(control_request_id) = self.cancel_key.take() {
+                    let _ = ctx.send(
+                        self.orchestrator,
+                        OrchestratorMsg::ContextualControlCancel { control_request_id },
+                    );
+                }
+                ContextualResponse::TimedOut
+            }
+            ContextualReplyObserverMsg::Reply(reply) => ContextualResponse::Reply(reply),
+        };
+        if let Some(reply) = self
             .reply
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            let _ = response.send(reply);
+            let _ = reply.send(response);
         }
         ctx.stop_self();
     }
@@ -118,6 +133,7 @@ struct ControlHttpState {
     orchestrator: ActorAddress,
     namespace: Option<data_plane::control::DataPlaneControl>,
     upload_root: Arc<PathBuf>,
+    live_env: crate::orchestration::provider_adapters::ssh_bootstrap::BootstrapEnvSource,
 }
 
 pub(crate) fn plugin(
@@ -126,6 +142,7 @@ pub(crate) fn plugin(
     orchestrator: ActorAddress,
     namespace: data_plane::control::DataPlaneControl,
     upload_root: PathBuf,
+    live_env: crate::orchestration::provider_adapters::ssh_bootstrap::BootstrapEnvSource,
 ) -> dashboard::DashboardPlugin {
     let state = ControlHttpState {
         runtime,
@@ -133,12 +150,16 @@ pub(crate) fn plugin(
         orchestrator,
         namespace: Some(namespace),
         upload_root: Arc::new(upload_root),
+        live_env,
     };
     let routes = Router::new()
         .route(FLEET_CONTROL_SCRIPT_URL, get(fleet_control_script))
         .route("/api/control/status", get(status))
+        .route("/api/control/endpoint", get(live_endpoint))
         .route("/api/control/fleet", get(fleet_status))
         .route("/api/control/actors", get(actor_stats))
+        .route("/api/control/actors/snapshot", get(actor_snapshot))
+        .route("/api/control/changes", post(control_changes))
         .route("/api/control/provision", post(provision))
         .route("/api/control/kill", post(kill))
         .route("/api/control/provider", post(configure_provider))
@@ -155,12 +176,28 @@ pub(crate) fn plugin(
             get(contextual_events),
         )
         .route(
+            "/api/control/contextual/events",
+            post(contextual_events_batch),
+        )
+        .route(
+            "/api/control/contextual/{request_id}/ack",
+            post(contextual_events_ack),
+        )
+        .route(
             "/api/control/contextual/{request_id}/stop",
             post(contextual_stop),
         )
         .route(
             "/api/control/contextual/nodes/{logical_node_id}",
             get(contextual_query_node),
+        )
+        .route(
+            "/api/control/contextual/namespace-cleanup",
+            post(namespace_cleanup),
+        )
+        .route(
+            "/api/control/contextual/retained-blobs",
+            post(retained_blobs),
         )
         .layer(DefaultBodyLimit::max(PROGRAM_UPLOAD_LIMIT))
         .with_state(state);
@@ -177,6 +214,27 @@ async fn fleet_control_script() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         FLEET_CONTROL_SCRIPT,
     )
+}
+/// The orchestrator's CURRENT transport endpoint and actor address.
+///
+/// A restarted orchestrator binds a fresh port; remote workers that were
+/// still booting when the previous process died never persisted an endpoint
+/// the recovery join can dial, and they keep targeting the dead address.
+/// Operators (and the e2e harness) read this and push the live endpoint to
+/// those workers through each node's debug-join socket.
+async fn live_endpoint(State(state): State<ControlHttpState>) -> Response {
+    match (state.live_env)() {
+        Ok(env) => Json(serde_json::Map::from_iter(
+            env.into_iter()
+                .map(|(key, value)| (key, serde_json::Value::String(value))),
+        ))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse { error }),
+        )
+            .into_response(),
+    }
 }
 
 async fn provision(
@@ -294,14 +352,6 @@ async fn flush(State(state): State<ControlHttpState>) -> Response {
         ManualControlMsg::Flush { reply_to }
     })
     .await
-}
-
-#[derive(serde::Deserialize)]
-struct ContextualSpawnRequest {
-    logical_node_id: u64,
-    request_id: String,
-    #[serde(flatten)]
-    spec: ContextualProcessSpecWire,
 }
 
 async fn contextual_spawn(
@@ -426,8 +476,8 @@ fn python_contextual_spec(
     request_id: &str,
     filename: &str,
     namespace_path: String,
-) -> ContextualProcessSpecWire {
-    ContextualProcessSpecWire {
+) -> ContextualProcessSpec {
+    ContextualProcessSpec {
         command: "python3".to_owned(),
         args: Vec::new(),
         env: BTreeMap::new(),
@@ -437,7 +487,7 @@ fn python_contextual_spec(
         read_prefixes: vec!["/models".to_owned(), format!("/runs/{request_id}/results")],
         write_prefixes: vec![format!("/runs/{request_id}/results")],
         attach_timeout_ms: PROGRAM_ATTACH_TIMEOUT.as_millis() as u64,
-        staged_program: Some(ContextualProgramFileWire { namespace_path }),
+        staged_program: Some(ContextualProgramFile { namespace_path }),
     }
 }
 
@@ -503,9 +553,177 @@ async fn contextual_events(
 }
 
 #[derive(serde::Deserialize)]
-struct ContextualStopRequest {
-    control_request_id: String,
-    kill_after_ms: Option<u64>,
+struct ActorSnapshotQuery {
+    request_id: String,
+}
+
+async fn actor_snapshot(
+    State(state): State<ControlHttpState>,
+    Query(query): Query<ActorSnapshotQuery>,
+) -> Response {
+    if query.request_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "actor snapshot requires a nonempty request identity".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    let request = match state.runtime.admin().list_actors() {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("request fresh actor census: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let actors = match tokio::time::timeout(CONTROL_REPLY_TIMEOUT, request.recv()).await {
+        Ok(Ok(snapshot)) => snapshot.actors,
+        result => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResponse {
+                    error: format!("fresh actor census incomplete: {result:?}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    Json(serde_json::json!({
+        "schema_version": myelin_control_contract::SCHEMA_VERSION,
+        "request_id": query.request_id,
+        "actors": actors.into_iter().map(|actor| serde_json::json!({
+            "address": actor.address.to_full_hex(),
+            "actor_type": actor.actor_type,
+            "worker_id": actor.worker_id,
+            "mailbox_depth": actor.mailbox_depth,
+            "poisoned": actor.status.poisoned,
+            "stopping": actor.status.stopping,
+        })).collect::<Vec<_>>(),
+        "runtime_stats": state.runtime.stats(),
+        "namespace_commits": data_plane::namespace_store::commit_metrics(),
+    }))
+    .into_response()
+}
+
+async fn control_changes(
+    State(state): State<ControlHttpState>,
+    Json(request): Json<Versioned<myelin_control_contract::ControlChangesRequest>>,
+) -> Response {
+    let request = match request.into_payload() {
+        Ok(request) => request,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    };
+    let wait_ms = request.wait_ms.min(1_000);
+    let wait_key = (wait_ms != 0).then(|| format!("control-{}", ActorAddress::new_random()));
+    let timeout = if wait_ms == 0 {
+        CONTROL_REPLY_TIMEOUT
+    } else {
+        Duration::from_millis(wait_ms)
+    };
+    let receiver =
+        match begin_contextual_request_reply(&state, wait_key.clone(), timeout, |reply_to| {
+            OrchestratorMsg::ControlChanges {
+                generation: request.generation,
+                after_revision: request.after_revision,
+                wait_key,
+                reply_to,
+            }
+        }) {
+            Ok(receiver) => receiver,
+            Err(response) => return *response,
+        };
+    contextual_response(receiver).await
+}
+
+async fn contextual_events_batch(
+    State(state): State<ControlHttpState>,
+    Json(request): Json<Versioned<ContextualEventsRequest>>,
+) -> Response {
+    let request = match request.into_payload() {
+        Ok(request) => request,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    };
+    let wait_ms = request.wait_ms.min(1_000);
+    let wait_key = (wait_ms != 0).then(|| format!("events-{}", ActorAddress::new_random()));
+    let timeout = if wait_ms == 0 {
+        CONTROL_REPLY_TIMEOUT
+    } else {
+        Duration::from_millis(wait_ms)
+    };
+    let cursors = request.cursors;
+    let receiver =
+        match begin_contextual_request_reply(&state, wait_key.clone(), timeout, |reply_to| {
+            OrchestratorMsg::ContextualEventsBatch {
+                cursors: cursors.clone(),
+                wait_key,
+                reply_to,
+            }
+        }) {
+            Ok(receiver) => receiver,
+            Err(response) => return *response,
+        };
+    match receiver.await {
+        Ok(ContextualResponse::TimedOut) if wait_ms != 0 => {
+            let receiver = match begin_contextual_request_reply(
+                &state,
+                None,
+                CONTROL_REPLY_TIMEOUT,
+                |reply_to| OrchestratorMsg::ContextualEventsBatch {
+                    cursors,
+                    wait_key: None,
+                    reply_to,
+                },
+            ) {
+                Ok(receiver) => receiver,
+                Err(response) => return *response,
+            };
+            match receiver.await {
+                Ok(ContextualResponse::Reply(ContextualControlReply::EventsBatch(batch)))
+                    if batch.missing.is_empty()
+                        && batch
+                            .executions
+                            .iter()
+                            .all(|execution| execution.events.is_empty()) =>
+                {
+                    contextual_response_result(Ok(ContextualResponse::TimedOut))
+                }
+                response => contextual_response_result(response),
+            }
+        }
+        response => contextual_response_result(response),
+    }
+}
+
+async fn contextual_events_ack(
+    Path(request_id): Path<String>,
+    State(state): State<ControlHttpState>,
+    Json(request): Json<Versioned<ContextualEventsAckRequest>>,
+) -> Response {
+    let request = match request.into_payload() {
+        Ok(request) => request,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    };
+    contextual_request_reply(&state, None, |reply_to| {
+        OrchestratorMsg::ContextualEventsAck {
+            request_id,
+            through_sequence: request.through_sequence,
+            execution_incarnation: request.execution_incarnation,
+            reply_to,
+        }
+    })
+    .await
 }
 
 async fn contextual_stop(
@@ -536,14 +754,329 @@ async fn contextual_query_node(
     Query(query): Query<ContextualNodeQuery>,
     State(state): State<ControlHttpState>,
 ) -> Response {
-    contextual_request_reply(&state, Some(query.control_request_id.clone()), |reply_to| {
-        OrchestratorMsg::ContextualQuery {
+    use myelin_control_contract::{
+        ContextualHealthEvent, ContextualHealthObservation, ContextualHealthReply,
+        ContextualHealthReplyType, HealthExecution,
+    };
+    let response = match begin_contextual_request_reply(
+        &state,
+        Some(query.control_request_id.clone()),
+        CONTROL_REPLY_TIMEOUT,
+        |reply_to| OrchestratorMsg::ContextualQuery {
             logical_node_id,
-            control_request_id: query.control_request_id,
+            control_request_id: query.control_request_id.clone(),
             reply_to,
+        },
+    ) {
+        Ok(response) => response,
+        Err(response) => return *response,
+    };
+    let reply = match response.await {
+        Ok(ContextualResponse::Reply(ContextualControlReply::Event { observation })) => observation,
+        other => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!(
+                        "contextual health did not return a successful observation: {other:?}"
+                    ),
+                }),
+            )
+                .into_response();
         }
+    };
+    let ContextualProcessEventKind::LiveExecutions {
+        executions,
+        resources: Some(resources),
+    } = reply.event
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "contextual health omitted live executions or fresh resources".to_owned(),
+            }),
+        )
+            .into_response();
+    };
+    let reply = ContextualHealthReply {
+        schema_version: myelin_control_contract::SCHEMA_VERSION,
+        reply_type: ContextualHealthReplyType::Event,
+        observation: ContextualHealthObservation {
+            logical_node_id: reply.logical_node_id,
+            request_id: reply.request_id,
+            event: ContextualHealthEvent::LiveExecutions {
+                executions: executions
+                    .into_iter()
+                    .map(|execution| HealthExecution {
+                        request_id: execution.request_id,
+                        process: execution.process,
+                        execution_id: execution.identity.execution_id,
+                        generation: execution.identity.generation,
+                        started_pid: execution.started_pid,
+                        context_ready: execution.context_ready,
+                    })
+                    .collect(),
+                resources,
+            },
+        },
+    };
+    if let Err(error) = reply.validate(logical_node_id, &query.control_request_id) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse { error }),
+        )
+            .into_response();
+    }
+    Json(reply).into_response()
+}
+
+async fn namespace_cleanup(
+    State(state): State<ControlHttpState>,
+    Json(request): Json<myelin_control_contract::NamespaceCleanupRequest>,
+) -> Response {
+    use data_plane::control::NamespaceCleanupStatus;
+    use myelin_control_contract::{
+        NamespaceCleanupPath, NamespaceCleanupQuiescence, NamespaceCleanupReply, SCHEMA_VERSION,
+    };
+    if request.schema_version != SCHEMA_VERSION
+        || request.request_id.is_empty()
+        || request.paths.is_empty()
+        || request
+            .paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != request.paths.len()
+        || request
+            .paths
+            .iter()
+            .any(|path| !path.starts_with("/cases/") && !path.starts_with("/runs/"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid owned namespace cleanup request".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    let Some(namespace) = &state.namespace else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "namespace is unavailable".to_owned(),
+            }),
+        )
+            .into_response();
+    };
+    let mut parsed = Vec::with_capacity(request.paths.len());
+    for path in &request.paths {
+        match data_plane::path::DataPath::parse(path) {
+            Ok(data_path) => parsed.push((path.clone(), data_path)),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid owned cleanup path: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + NAMESPACE_CLEANUP_REPLY_TIMEOUT;
+    let mut cleanups = tokio::task::JoinSet::new();
+    for (path, data_path) in parsed {
+        let namespace = namespace.clone();
+        cleanups.spawn(async move {
+            let mut quiescence = None;
+            let error = loop {
+                match tokio::time::timeout_at(
+                    deadline,
+                    namespace.try_unregister_quiescent(data_path.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(NamespaceCleanupStatus::ActiveStream)) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(Ok(NamespaceCleanupStatus::Absent)) => break None,
+                    Ok(Ok(NamespaceCleanupStatus::Removed {
+                        quiescent_stream_revision,
+                    })) => {
+                        quiescence =
+                            quiescent_stream_revision.map(|revision| NamespaceCleanupQuiescence {
+                                revision,
+                                active: false,
+                            });
+                        break None;
+                    }
+                    Ok(Err(error)) => break Some(error.to_string()),
+                    Err(error) => break Some(format!("namespace cleanup deadline: {error}")),
+                }
+            };
+            NamespaceCleanupPath {
+                record_type: "path_cleanup".to_owned(),
+                path,
+                attempted: true,
+                absent: error.is_none(),
+                quiescence,
+                error,
+            }
+        });
+    }
+    let mut paths = Vec::with_capacity(request.paths.len());
+    while let Some(result) = cleanups.join_next().await {
+        match result {
+            Ok(path) => paths.push(path),
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: format!("namespace cleanup task failed: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+    paths.sort_by(|left, right| left.path.cmp(&right.path));
+    Json(NamespaceCleanupReply {
+        schema_version: SCHEMA_VERSION,
+        request_id: request.request_id,
+        paths,
     })
-    .await
+    .into_response()
+}
+
+async fn retained_blobs(
+    State(state): State<ControlHttpState>,
+    Json(request): Json<myelin_control_contract::RetainedBlobsRequest>,
+) -> Response {
+    use data_plane::control::RetainedNamespaceResources;
+    use myelin_control_contract::RetainedNonBlob;
+    use myelin_control_contract::{RetainedBlob, RetainedBlobsReply, SCHEMA_VERSION};
+    if request.schema_version != SCHEMA_VERSION
+        || request.request_id.is_empty()
+        || request
+            .paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != request.paths.len()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid retained-blob ownership query".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    let Some(namespace) = &state.namespace else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "namespace is unavailable".to_owned(),
+            }),
+        )
+            .into_response();
+    };
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut non_blobs = std::collections::BTreeMap::new();
+    let mut pending = request
+        .paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let deadline = tokio::time::Instant::now() + RETAINED_BLOBS_REPLY_TIMEOUT;
+    let mut queries = tokio::task::JoinSet::new();
+    for path in request.paths {
+        let parsed = match data_plane::path::DataPath::parse(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid retained path: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let namespace = namespace.clone();
+        queries.spawn(async move {
+            let resources = namespace.retained_blob_resources(parsed).await;
+            (path, resources)
+        });
+    }
+    while !queries.is_empty() {
+        let joined = match tokio::time::timeout_at(deadline, queries.join_next()).await {
+            Ok(Some(joined)) => joined,
+            Ok(None) => break,
+            Err(error) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "retained blob ownership query deadline: {error}; pending={pending:?}"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let (path, binding) = match joined {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: format!("retained blob ownership query task failed: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        pending.remove(&path);
+        match binding {
+            Ok(RetainedNamespaceResources::Blob(binding)) => {
+                blobs.insert(
+                    path,
+                    RetainedBlob {
+                        source: binding.source.to_full_hex(),
+                        binding: binding.owner.map(|owner| owner.to_full_hex()),
+                        source_node: binding.source_node,
+                        length: binding.length,
+                        revision: binding.revision,
+                    },
+                );
+            }
+            Ok(RetainedNamespaceResources::Absent) => {
+                non_blobs.insert(path, RetainedNonBlob::Absent);
+            }
+            Ok(RetainedNamespaceResources::QuiescentStream { revision }) => {
+                non_blobs.insert(path, RetainedNonBlob::QuiescentStream { revision });
+            }
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: format!("retained blob could not be resolved: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+    Json(RetainedBlobsReply {
+        schema_version: SCHEMA_VERSION,
+        request_id: request.request_id,
+        blobs,
+        non_blobs,
+    })
+    .into_response()
 }
 
 fn route_mutation(state: &ControlHttpState, msg: ManualControlMsg) -> Response {
@@ -608,20 +1141,31 @@ async fn contextual_request_reply(
 }
 
 async fn contextual_response(
-    response_rx: tokio::sync::oneshot::Receiver<ContextualControlReply>,
+    response_rx: tokio::sync::oneshot::Receiver<ContextualResponse>,
 ) -> Response {
-    match response_rx.await {
-        Ok(ContextualControlReply::TimedOut) => (
+    contextual_response_result(response_rx.await)
+}
+
+fn contextual_response_result(
+    response: Result<ContextualResponse, tokio::sync::oneshot::error::RecvError>,
+) -> Response {
+    match response {
+        Ok(ContextualResponse::TimedOut) => (
             StatusCode::GATEWAY_TIMEOUT,
             Json(ErrorResponse {
                 error: "contextual control reply timed out".to_owned(),
             }),
         )
             .into_response(),
-        Ok(ContextualControlReply::Rejected { error }) => {
+        Ok(ContextualResponse::Reply(ContextualControlReply::Rejected { error })) => {
             (StatusCode::CONFLICT, Json(ErrorResponse { error })).into_response()
         }
-        Ok(reply) => Json(reply).into_response(),
+        Ok(ContextualResponse::Reply(
+            reply @ (ContextualControlReply::EventsBatch(_)
+            | ContextualControlReply::Acknowledged(_)
+            | ContextualControlReply::ControlRevision(_)),
+        )) => Json(Versioned::new(reply)).into_response(),
+        Ok(ContextualResponse::Reply(reply)) => Json(reply).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -637,7 +1181,7 @@ fn begin_contextual_request_reply(
     cancel_key: Option<String>,
     timeout: Duration,
     build: impl FnOnce(ActorAddress) -> OrchestratorMsg,
-) -> Result<tokio::sync::oneshot::Receiver<ContextualControlReply>, Box<Response>> {
+) -> Result<tokio::sync::oneshot::Receiver<ContextualResponse>, Box<Response>> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     let response_tx = Arc::new(Mutex::new(Some(response_tx)));
     let reply_to = state
@@ -673,6 +1217,12 @@ fn begin_contextual_request_reply(
                 .into_response(),
         ));
     }
+    // The subscription is already queued before its timeout can enqueue
+    // cancellation. Otherwise a short timeout can cancel a not-yet-registered
+    // waiter and strand it after the observer has stopped.
+    let _ = state
+        .runtime
+        .send_to(reply_to, ContextualReplyObserverMsg::ArmTimeout);
     Ok(response_rx)
 }
 
@@ -1138,6 +1688,7 @@ mod properties {
                 orchestrator,
                 namespace: None,
                 upload_root: Arc::new(PathBuf::new()),
+                live_env: Arc::new(|| Ok(Vec::new())),
             };
             let outcome = (|| {
                 let mut responses = Vec::with_capacity(actions.len());
@@ -1286,6 +1837,7 @@ mod properties {
             orchestrator: ActorAddress::default(),
             namespace: None,
             upload_root: Arc::new(PathBuf::new()),
+            live_env: Arc::new(|| Ok(Vec::new())),
         };
         let response = match begin_request_reply(&state, Duration::from_millis(1), |reply_to| {
             ManualControlMsg::Query { reply_to }
@@ -1329,6 +1881,7 @@ mod properties {
             orchestrator,
             namespace: None,
             upload_root: Arc::new(PathBuf::new()),
+            live_env: Arc::new(|| Ok(Vec::new())),
         };
         let pending = begin_http_action(&state, 0, HttpAction::Status);
         drive_steps(&backend, STEP_BUDGET);
@@ -1373,6 +1926,7 @@ mod properties {
             orchestrator: ActorAddress::default(),
             namespace: None,
             upload_root: Arc::new(PathBuf::new()),
+            live_env: Arc::new(|| Ok(Vec::new())),
         };
         let actions = vec![HttpAction::Status];
         let responses = vec![HttpObservation {
@@ -1404,5 +1958,38 @@ mod properties {
         assert_eq!(spec.execution_id, "ui-scenario");
         assert_eq!(spec.command, "python3");
         assert!(spec.args.is_empty());
+    }
+
+    #[test]
+    fn subscription_timeout_starts_only_after_request_is_enqueued() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let observer = runtime
+            .spawn(ContextualReplyObserver {
+                reply: Arc::new(Mutex::new(Some(sender))),
+                engine: engine.handle(),
+                sender: runtime.create_sender(),
+                timeout: Duration::from_millis(1),
+                orchestrator: ActorAddress::default(),
+                cancel_key: Some("withheld-registration".to_owned()),
+            })
+            .unwrap();
+        drive_steps(&backend, STEP_BUDGET);
+        backend.advance_time(Duration::from_secs(1));
+        drive_steps(&backend, STEP_BUDGET);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        runtime
+            .send_to(observer, ContextualReplyObserverMsg::ArmTimeout)
+            .unwrap();
+        drive_steps(&backend, STEP_BUDGET);
+        backend.advance_time(Duration::from_millis(1));
+        drive_steps(&backend, STEP_BUDGET);
+        assert_eq!(receiver.try_recv().unwrap(), ContextualResponse::TimedOut);
     }
 }

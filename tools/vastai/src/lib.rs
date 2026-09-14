@@ -4,6 +4,11 @@
 //! general-purpose actor runtime, while this utility rents, monitors, and tears
 //! down vast.ai machines for apps that choose to use it.
 
+#[ctor::ctor]
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 mod blocking;
 pub mod client;
 pub mod config;
@@ -11,6 +16,7 @@ pub mod filters;
 pub mod lease;
 pub mod logs;
 pub mod monitor;
+mod observation;
 pub mod pricing;
 pub mod provision;
 pub mod search;
@@ -29,8 +35,9 @@ pub use monitor::{
     fetch_instance_status, wait_for_running, wait_for_running_with_policy,
     wait_for_ssh_endpoint_with_policy,
 };
+pub use observation::{OwnedCensus, ProviderObservationCounters};
 pub use pricing::CostModel;
-pub use provision::create_instance;
+pub use provision::{CreateInstanceError, create_instance};
 pub use search::{
     OfferBrowseCriteria, browse_offers, plan_distinct_host_first_wave, select_offer_pool,
     select_offer_pool_with_policy,

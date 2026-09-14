@@ -65,7 +65,7 @@ impl DashboardView for DemoControlView {
     }
 
     fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
-        let Ok(payload) = serde_json::from_slice::<Value>(&event.payload) else {
+        let Some(payload) = event.decoded_payload() else {
             return;
         };
         if event.channel == "myelin.provisioning.events" {

@@ -5,13 +5,73 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 
+use crate::namespace::StreamIncarnation;
 use crate::path::DataPath;
 
 const SCHEMA_VERSION: u32 = 1;
+
+static TRACE_COMMITS: AtomicU64 = AtomicU64::new(0);
+static TRACE_COMMIT_MICROS: AtomicU64 = AtomicU64::new(0);
+static TRACE_WORST_COMMIT_MICROS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static COMMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_BINDINGS: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_OPERATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NamespaceCommitMetrics {
+    pub schema_version: u32,
+    pub attempts: u64,
+    pub failures: u64,
+    pub total_micros: u64,
+    pub worst_micros: u64,
+    pub serialized_bytes: u64,
+    pub bindings: u64,
+    pub operations: u64,
+}
+
+/// Process-local attribution only; these counters never decide durability or
+/// namespace correctness. Readers need no namespace actor scheduling round.
+pub fn commit_metrics() -> NamespaceCommitMetrics {
+    NamespaceCommitMetrics {
+        schema_version: 1,
+        attempts: TRACE_COMMITS.load(Ordering::Relaxed),
+        failures: COMMIT_FAILURES.load(Ordering::Relaxed),
+        total_micros: TRACE_COMMIT_MICROS.load(Ordering::Relaxed),
+        worst_micros: TRACE_WORST_COMMIT_MICROS.load(Ordering::Relaxed),
+        serialized_bytes: COMMIT_BYTES.load(Ordering::Relaxed),
+        bindings: SNAPSHOT_BINDINGS.load(Ordering::Relaxed),
+        operations: SNAPSHOT_OPERATIONS.load(Ordering::Relaxed),
+    }
+}
+
+fn trace_commit_observed(elapsed: std::time::Duration) {
+    let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    TRACE_COMMITS.fetch_add(1, Ordering::Relaxed);
+    TRACE_COMMIT_MICROS.fetch_add(micros, Ordering::Relaxed);
+    TRACE_WORST_COMMIT_MICROS.fetch_max(micros, Ordering::Relaxed);
+}
+
+#[cfg(feature = "directory-trace")]
+pub fn trace_commit_count() -> u64 {
+    TRACE_COMMITS.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "directory-trace")]
+pub fn trace_commit_avg_ms() -> f64 {
+    let commits = TRACE_COMMITS.load(Ordering::Relaxed).max(1);
+    TRACE_COMMIT_MICROS.load(Ordering::Relaxed) as f64 / commits as f64 / 1000.0
+}
+
+#[cfg(feature = "directory-trace")]
+pub fn trace_commit_worst_ms() -> f64 {
+    TRACE_WORST_COMMIT_MICROS.load(Ordering::Relaxed) as f64 / 1000.0
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationId([u8; 16]);
@@ -54,8 +114,16 @@ impl<'de> Deserialize<'de> for OperationId {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceRecovery {
-    File { path: PathBuf },
-    Actor { actor: ActorAddress },
+    File {
+        path: PathBuf,
+    },
+    Actor {
+        actor: ActorAddress,
+        #[serde(default)]
+        node: [u8; 32],
+        #[serde(default)]
+        owner: Option<ActorAddress>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +189,11 @@ pub struct NamespaceSnapshot {
     pub operations: BTreeMap<OperationId, PersistedOperation>,
     #[serde(default)]
     pub retirements: Vec<ActorAddress>,
+    /// Endpoints of stream generations displaced by a replacement whose
+    /// fence has not been acknowledged yet; the directory re-fans the
+    /// displacement until every endpoint acknowledges.
+    #[serde(default)]
+    pub stream_retirements: Vec<(ActorAddress, StreamIncarnation)>,
 }
 
 impl Default for NamespaceSnapshot {
@@ -133,6 +206,7 @@ impl Default for NamespaceSnapshot {
             operations: BTreeMap::new(),
             stream_nodes: BTreeMap::new(),
             retirements: Vec::new(),
+            stream_retirements: Vec::new(),
         }
     }
 }
@@ -258,8 +332,15 @@ impl NamespaceStore {
     }
 
     pub fn commit(&mut self, next: NamespaceSnapshot) -> Result<(), NamespaceStoreError> {
-        next.validate()?;
-        self.persist(&next)?;
+        let started = std::time::Instant::now();
+        let result = next.validate().and_then(|()| self.persist(&next));
+        trace_commit_observed(started.elapsed());
+        if result.is_err() {
+            COMMIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        result?;
+        SNAPSHOT_BINDINGS.store(next.bindings.len() as u64, Ordering::Relaxed);
+        SNAPSHOT_OPERATIONS.store(next.operations.len() as u64, Ordering::Relaxed);
         self.snapshot = next;
         Ok(())
     }
@@ -283,6 +364,7 @@ impl NamespaceStore {
         let temporary = parent.join(format!(".{}.tmp", file_name.to_string_lossy()));
         let bytes = serde_json::to_vec(snapshot)
             .map_err(|error| NamespaceStoreError::Corrupt(error.to_string()))?;
+        COMMIT_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
         let write_result = (|| -> Result<(), NamespaceStoreError> {
             let mut file = OpenOptions::new()
@@ -366,6 +448,8 @@ mod tests {
                 revision: 1,
                 recovery: SourceRecovery::Actor {
                     actor: ActorAddress([7; 32]),
+                    node: [8; 32],
+                    owner: None,
                 },
             },
         );

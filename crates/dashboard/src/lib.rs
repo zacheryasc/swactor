@@ -14,8 +14,9 @@ pub use control_plane::ControlPlaneView;
 
 use std::sync::Arc;
 
-use serde::Serialize;
-use telemetry::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
+use telemetry::frame::{ChannelContent, ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use tokio::sync::broadcast;
 
 use crate::store::DashboardStore;
@@ -90,13 +91,14 @@ impl Default for DashboardConfig {
     }
 }
 
-/// JSON shape emitted for each incoming telemetry frame.
-#[derive(Debug, Clone, Serialize)]
+/// Shape emitted for each incoming telemetry frame.
+#[derive(Debug, Clone)]
 pub struct FrameEvent {
     pub stream: StreamEvent,
     pub channel: String,
     pub position: u64,
     pub payload: Vec<u8>,
+    pub content: ChannelContent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,11 +126,26 @@ impl StreamEvent {
 
 impl FrameEvent {
     pub fn new(stream: &StreamId, frame: &Frame) -> Self {
+        Self::new_with_content(stream, frame, ChannelContent::Bytes)
+    }
+
+    pub fn new_with_content(stream: &StreamId, frame: &Frame, content: ChannelContent) -> Self {
         Self {
             stream: StreamEvent::new(stream),
             channel: frame.channel.to_string(),
             position: frame.position.0,
             payload: frame.payload.clone(),
+            content,
+        }
+    }
+
+    pub fn decoded_payload(&self) -> Option<serde_json::Value> {
+        match &self.content {
+            ChannelContent::JsonRecord { .. } => serde_json::from_slice(&self.payload).ok(),
+            ChannelContent::MessagePackRecord { .. } => {
+                telemetry::decode_record_value(&self.payload).ok()
+            }
+            ChannelContent::Bytes | ChannelContent::TextStream => None,
         }
     }
 
@@ -141,6 +158,22 @@ impl FrameEvent {
             .unwrap_or(ChannelId(0));
         let frame = Frame::new(channel, Position(self.position), self.payload.clone());
         Some((stream, frame))
+    }
+}
+
+impl Serialize for FrameEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut frame = serializer.serialize_struct("FrameEvent", 6)?;
+        frame.serialize_field("stream", &self.stream)?;
+        frame.serialize_field("channel", &self.channel)?;
+        frame.serialize_field("position", &self.position)?;
+        frame.serialize_field("payload", &self.payload)?;
+        frame.serialize_field("content", &self.content)?;
+        frame.serialize_field("decoded_payload", &self.decoded_payload())?;
+        frame.end()
     }
 }
 

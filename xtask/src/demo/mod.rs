@@ -82,6 +82,7 @@ pub(super) fn shared_test_driver() -> Arc<IrohDriver> {
                     IrohDriverConfig {
                         secret_key: None,
                         relay_mode: RelayMode::Disabled,
+                        bind_port: None,
                         node: DistributedNodeConfig::default(),
                         peer_auth: None,
                         additional_alpns: vec![],
@@ -298,6 +299,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         IrohDriverConfig {
             secret_key: None,
             relay_mode: RelayMode::Disabled,
+            bind_port: None,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![],
@@ -353,7 +355,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let route_view: RouteView =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let outbox: Outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
             runtime: runtime.clone(),
             codec: Arc::new(codec),

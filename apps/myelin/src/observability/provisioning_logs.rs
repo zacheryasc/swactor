@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use telemetry::{ChannelContent, TelemetryProducer};
+use telemetry::{ChannelContent, Record, TelemetryProducer};
 
 use crate::observability::telemetry::{
     MYELIN_PROVISIONING_LOGS, MyelinProvisionLogRecord, myelin_provision_log_channel,
@@ -67,6 +67,14 @@ impl BootstrapTelemetryBridge {
         });
     }
 
+    pub(crate) fn observe_failed(&self, reason: impl Into<String>) {
+        self.sink.observe(PluginObservation::Failed {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            reason: reason.into(),
+        });
+    }
+
     fn submit_log(&self, stream: ProvisionLogStream, line: &str) {
         let Some(producer) = &self.producer else {
             return;
@@ -79,12 +87,11 @@ impl BootstrapTelemetryBridge {
         });
         let channel = producer.register_channel(
             myelin_provision_log_channel(self.spec.node_id, stream),
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(MYELIN_PROVISIONING_LOGS.to_owned()),
             },
         );
-        let payload = serde_json::to_vec(&record).expect("serialize bootstrap log record");
-        producer.submit_bytes(channel, payload);
+        producer.submit_bytes(channel, record.encode());
     }
 }
 

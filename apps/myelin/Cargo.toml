@@ -18,6 +18,7 @@ provisioning = { path = "../../crates/provisioning" }
 dashboard = { path = "../../crates/dashboard" }
 futures-lite = "2"
 serde_json = "1"
+myelin-control-contract = { path = "../../crates/myelin-control-contract" }
 serde = { version = "1", features = ["derive"] }
 swactor = { path = "../..", features = ["serde", "transport"] }
 swactor-engine = { path = "../../crates/engine" }
@@ -26,12 +27,13 @@ swactor-process = { path = "../../crates/process" }
 swactor-process-context = { path = "../../crates/process-context" }
 distribution = { path = "../../crates/distribution" }
 iroh-driver = { path = "../../crates/iroh-driver" }
-iroh = "0.98"
+iroh.workspace = true
 tokio.workspace = true
 swactor-vastai = { path = "../../tools/vastai" }
 parking_lot = "0.12"
 blake3 = "1"
-toml = "0.8"
+sha2 = "0.10"
+toml = "1.1"
 ureq = "2"
 axum = "0.8"
 

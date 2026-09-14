@@ -21,8 +21,9 @@ pub use endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 pub use iroh_driver::{
-    ActorBridgeConfig, ActorRegistrar, ConnType, EdgeConnector, IrohDriver, IrohDriverConfig,
-    JoinPhase, JoinStatus, TelemetryPublishHandle, conn_type_of, discover_lan_ips,
+    ActorBridgeConfig, ActorRegistrar, ConnType, ConnectionObserver, ConnectionWatch,
+    EdgeConnector, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus, PeerConnector,
+    TelemetryPublishHandle, conn_type_of, discover_lan_ips,
 };
 
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};
@@ -30,9 +31,10 @@ pub use stream_transport::{IrohStreamTransport, STREAM_ALPN};
 
 pub use telemetry_transport::{
     PullCollectorConfig, PullCollectorHandle, TELEMETRY_ALPN, TelemetryQuicHeader,
-    TelemetryQuicRead, TelemetryQuicWriteStats, read_events_from_stream, read_next_event,
-    read_next_uni_from_connection, read_pull_request, read_stream_header, read_stream_into_fanout,
-    spawn_connection_reader, spawn_pull_collector, spawn_pull_collector_to_actor,
-    spawn_pull_server, spawn_subscription_writer, write_available_subscription, write_event,
-    write_pull_request, write_subscription_until_closed,
+    TelemetryQuicRead, TelemetryQuicWriteStats, decode_event_records, encode_event_batch,
+    encode_event_record, read_events_from_stream, read_next_events, read_next_uni_from_connection,
+    read_pull_request, read_stream_header, read_stream_into_fanout, spawn_connection_reader,
+    spawn_pull_collector, spawn_pull_collector_to_actor, spawn_pull_server,
+    spawn_subscription_writer, write_available_subscription, write_event, write_pull_request,
+    write_subscription_until_closed,
 };

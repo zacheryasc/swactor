@@ -16,7 +16,7 @@
 //! | 16     | generation u64                 | fixed at install       |
 //! | 24     | commit u64 (atomic)            | producer writes only   |
 //! | 32     | consume u64 (atomic)           | consumer writes only   |
-//! | 40..   | reserved (zero)                | fixed at install       |
+//! | 40     | peer terminal reason u64 (atomic) | host writes only       |
 //! | 128    | data[capacity]                 | protocol               |
 //!
 //! Memory model (property P4): the producer copies bytes and then
@@ -103,6 +103,12 @@ pub struct RingHandle {
 pub enum Role {
     Producer,
     Consumer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerTermination {
+    Closed,
+    PathReplaced,
 }
 
 /// A reserved, not-yet-committed span of the data region.
@@ -376,6 +382,9 @@ pub enum FlowError {
         found: u64,
     },
     BadRecord(RecordError),
+    InvalidPeerTermination {
+        found: u64,
+    },
     Io,
 }
 
@@ -585,9 +594,40 @@ pub fn attach_mapped(
 pub fn mark_peer_terminated_mapped(
     arena: &crate::mapped_arena::MappedArena,
     handle: RingHandle,
+    termination: PeerTermination,
 ) -> Result<(), AttachError> {
-    let endpoint = attach_mapped(arena, handle, Role::Producer)?;
-    endpoint.atomic(OFF_TERMINAL).store(1, Ordering::Release);
+    let total = DATA_OFFSET
+        .checked_add(handle.capacity)
+        .ok_or(AttachError::OutOfBounds {
+            end: u64::MAX,
+            arena_len: arena.len() as u64,
+        })?;
+    let range =
+        arena
+            .checked_range(handle.offset, total)
+            .map_err(|_| AttachError::OutOfBounds {
+                end: handle.offset.saturating_add(total),
+                arena_len: arena.len() as u64,
+            })?;
+    let endpoint = Endpoint {
+        header: arena.ptr_at(range.start),
+        info: handle,
+        role: Role::Producer,
+    };
+    endpoint.validate_fixed().map_err(AttachError::Header)?;
+    endpoint
+        .validate_generation(handle.generation)
+        .map_err(AttachError::Header)?;
+    let marker = match termination {
+        PeerTermination::Closed => 1,
+        PeerTermination::PathReplaced => 2,
+    };
+    // Cursor fields change independently while a stream is active. Validating
+    // a multi-atomic cursor snapshot here can spuriously reject the terminal
+    // marker; only fixed identity is required for this host-owned field.
+    endpoint
+        .atomic(OFF_TERMINAL)
+        .fetch_max(marker, Ordering::Release);
     Ok(())
 }
 
@@ -621,11 +661,16 @@ impl Endpoint {
         self.role
     }
 
-    pub fn peer_terminated(&self) -> Result<bool, FlowError> {
+    pub fn peer_termination(&self) -> Result<Option<PeerTermination>, FlowError> {
         self.validate_fixed().map_err(FlowError::Corrupt)?;
         self.validate_generation(self.info.generation)
             .map_err(FlowError::Corrupt)?;
-        Ok(self.atomic(OFF_TERMINAL).load(Ordering::Acquire) != 0)
+        match self.atomic(OFF_TERMINAL).load(Ordering::Acquire) {
+            0 => Ok(None),
+            1 => Ok(Some(PeerTermination::Closed)),
+            2 => Ok(Some(PeerTermination::PathReplaced)),
+            found => Err(FlowError::InvalidPeerTermination { found }),
+        }
     }
 
     /// Current published producer and consumer positions. This role-neutral

@@ -32,6 +32,8 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
         .send_to(
             actor,
             NodeAgentMsg::RuntimeLoaded {
+                artifact_digest: None,
+                deployment_generation: None,
                 run_id: 7,
                 node_id: 11,
                 stage_index: 3,
@@ -46,6 +48,8 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
     assert_eq!(
         orchestrator_inbox.try_recv(),
         Some(OrchestratorMsg::ObserveNodeRuntimeReady {
+            artifact_digest: None,
+            deployment_generation: None,
             run_id: 7,
             node_id: 11,
             stage_index: 3,

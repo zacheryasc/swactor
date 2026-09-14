@@ -19,7 +19,7 @@ use swactor::std::StdExtension;
 use swactor_engine::EngineHandle;
 use swactor_transport::{CodecRegistry, CodecRemoteSink, NetworkMessage, TransportRouter};
 
-use distribution::directory_actor::{DirectoryActor, DirectoryIn};
+use distribution::directory_actor::{DirectoryActor, DirectoryClaims, DirectoryIn};
 use distribution::messages::{
     DirectoryGossip, MetadataGossip, RegistryGossip, actor_codec_registry,
 };
@@ -103,6 +103,7 @@ pub(crate) struct DistributionRuntimeStack {
     pub pinned_routes: RouteView,
     pub route_binder: Arc<OutboxRouteBinder>,
     pub registry_view: RegistryView,
+    pub directory_claims: DirectoryClaims,
     pub membership_mirror: Arc<Mutex<MemberList>>,
     pub swim_telemetry: Arc<SwimTelemetry>,
     pub swim_config: SwimConfig,
@@ -156,7 +157,7 @@ impl DistributionRuntimeStack {
         config: DistributedNodeConfig,
         engine: EngineHandle,
     ) -> Self {
-        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
         let pinned_routes: RouteView = Arc::new(RwLock::new(HashMap::new()));
@@ -201,15 +202,15 @@ impl DistributionRuntimeStack {
             Arc::clone(&transport_router),
             Arc::clone(&route_view_transport),
         ));
-        let directory_addr = runtime
-            .spawn(DirectoryActor::with_pinned_routes(
-                node_id,
-                peer_directory,
-                Arc::clone(&route_view),
-                Arc::clone(&pinned_routes),
-                route_binder.clone(),
-            ))
-            .expect("spawn DirectoryActor");
+        let directory = DirectoryActor::with_pinned_routes(
+            node_id,
+            peer_directory,
+            Arc::clone(&route_view),
+            Arc::clone(&pinned_routes),
+            route_binder.clone(),
+        );
+        let directory_claims = directory.claims();
+        let directory_addr = runtime.spawn(directory).expect("spawn DirectoryActor");
 
         let membership_mirror = Arc::new(Mutex::new(MemberList::new(NodeId([0xFF; 32]))));
         let fanout_addr = runtime
@@ -240,6 +241,7 @@ impl DistributionRuntimeStack {
             pinned_routes,
             membership_mirror,
             registry_view,
+            directory_claims,
             swim_telemetry,
             swim_config,
             actors: DistributionActorAddrs {

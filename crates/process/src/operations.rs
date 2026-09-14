@@ -5,7 +5,11 @@
 //! boundary.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output};
 use std::sync::mpsc::Receiver;
@@ -18,6 +22,64 @@ use swactor::runtime::ExternalSender;
 
 pub fn command_output(command: &mut Command) -> io::Result<Output> {
     command.output()
+}
+
+/// Capture a command's exact output within an absolute owner deadline.
+///
+/// Uses the same process-group, parent-death and joined-I/O ownership as
+/// [`SupervisedChild`], without requiring an actor mailbox to make progress.
+/// Timeout kills and reaps the owned child before returning.
+#[cfg(target_os = "linux")]
+pub fn command_output_until(command: &mut Command, deadline: Instant) -> io::Result<Output> {
+    let output = Arc::new(Mutex::new(CapturedCommandOutput::default()));
+    let (finished, completion) = std::sync::mpsc::channel();
+    let owner = SupervisedChild::spawn_observed(
+        command.stdin(std::process::Stdio::null()),
+        None,
+        Some(deadline),
+        SupervisedOutputObserver::Capture {
+            output: Arc::clone(&output),
+            finished,
+        },
+    )?;
+    let completed = completion.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    // On timeout this cancels the same owner; on completion it joins the
+    // waiter that has already reaped the child and joined both output readers.
+    drop(owner);
+    let status = match completed {
+        Ok(result) => result.map_err(|error| {
+            io::Error::new(
+                if Instant::now() >= deadline {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::Other
+                },
+                error,
+            )
+        })?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process owner deadline expired; pending command output/exit",
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::other(
+                "process owner finished without an exit result",
+            ));
+        }
+    };
+    let mut output = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(error) = output.error.take() {
+        return Err(error);
+    }
+    Ok(Output {
+        status,
+        stdout: std::mem::take(&mut output.stdout),
+        stderr: std::mem::take(&mut output.stderr),
+    })
 }
 
 pub fn command_status(command: &mut Command) -> io::Result<ExitStatus> {
@@ -88,6 +150,29 @@ impl LineReaderHandle {
     }
 }
 
+fn read_process_lines<R: Read>(
+    stream: ProcessStream,
+    reader: R,
+    mut observe: impl FnMut(ProcessStreamObservation) -> bool,
+) {
+    for next in BufReader::new(reader).lines() {
+        let observation = match next {
+            Ok(line) => ProcessStreamObservation::Line { stream, line },
+            Err(error) => {
+                observe(ProcessStreamObservation::Error {
+                    stream,
+                    error: error.to_string(),
+                });
+                break;
+            }
+        };
+        if !observe(observation) {
+            return;
+        }
+    }
+    observe(ProcessStreamObservation::Closed { stream });
+}
+
 /// Read one child stream and deliver typed observations to an actor relay.
 pub fn spawn_line_reader<R>(
     stream: ProcessStream,
@@ -99,25 +184,9 @@ where
     R: Read + Send + 'static,
 {
     let join = thread::spawn(move || {
-        for next in BufReader::new(reader).lines() {
-            let observation = match next {
-                Ok(line) => ProcessStreamObservation::Line { stream, line },
-                Err(error) => {
-                    let _ = sender.send_to(
-                        actor,
-                        ProcessStreamObservation::Error {
-                            stream,
-                            error: error.to_string(),
-                        },
-                    );
-                    break;
-                }
-            };
-            if sender.send_to(actor, observation).is_err() {
-                return;
-            }
-        }
-        let _ = sender.send_to(actor, ProcessStreamObservation::Closed { stream });
+        read_process_lines(stream, reader, |observation| {
+            sender.send_to(actor, observation).is_ok()
+        });
     });
     LineReaderHandle { join }
 }
@@ -239,6 +308,502 @@ pub struct ProcessExitObservation {
     pub error: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+fn process_exit_fd(pid: u32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_process_fds<const N: usize>(
+    fds: &[Option<&OwnedFd>; N],
+    timeout: Duration,
+) -> io::Result<[bool; N]> {
+    let mut descriptors: [libc::pollfd; N] = std::array::from_fn(|index| libc::pollfd {
+        fd: fds[index].map_or(-1, AsRawFd::as_raw_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let result = unsafe {
+        libc::poll(
+            descriptors.as_mut_ptr(),
+            descriptors.len() as libc::nfds_t,
+            millis,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(std::array::from_fn(|index| descriptors[index].revents != 0))
+}
+
+/// A cancellable exit subscription. Dropping it joins its observer without
+/// stopping the process, so adopted workers may outlive their observation.
+#[cfg(target_os = "linux")]
+pub struct ProcessWatch {
+    cancel: Arc<OwnedFd>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProcessWatch {
+    fn drop(&mut self) {
+        let value = 1_u64;
+        unsafe {
+            libc::write(
+                self.cancel.as_raw_fd(),
+                (&value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            );
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn watch_process(
+    identity: ProcessIdentity,
+    child: Option<Arc<Mutex<Option<Child>>>>,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) -> io::Result<ProcessWatch> {
+    let exit = process_exit_fd(identity.pid).ok();
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let cancel = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    let cancelled = Arc::clone(&cancel);
+    let thread = thread::Builder::new().spawn(move || {
+        let mut error = None;
+        let status = loop {
+            if let Some(child) = &child {
+                let mut slot = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(child) = slot.as_mut() else {
+                    return;
+                };
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        *slot = None;
+                        break status.code();
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        error = Some(reason.to_string());
+                        break None;
+                    }
+                }
+            } else if !identity.matches() {
+                break None;
+            }
+            let delay = if exit.is_some() {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(100)
+            };
+            match wait_process_fds(&[exit.as_ref(), Some(&cancelled)], delay) {
+                Ok(ready) if ready[1] => return,
+                Ok(ready) if ready[0] && child.is_none() => break None,
+                Ok(_) => {}
+                Err(reason) => {
+                    error = Some(reason.to_string());
+                    break None;
+                }
+            }
+        };
+        let _ = sender.send_to(actor, ProcessExitObservation { status, error });
+    })?;
+    Ok(ProcessWatch {
+        cancel,
+        thread: Some(thread),
+    })
+}
+
+/// Send a best-effort shutdown command without blocking on stdin, then observe
+/// exit until the absolute deadline. Kill and reap the owned group on expiry.
+#[cfg(target_os = "linux")]
+pub fn stop_shared_child_with_input(
+    child: &Arc<Mutex<Option<Child>>>,
+    stdin: &mut std::process::ChildStdin,
+    input: &[u8],
+    deadline: Instant,
+) -> io::Result<Option<ExitStatus>> {
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0 {
+        let _ = stdin.write_all(input);
+        let _ = stdin.flush();
+    }
+    let exit = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|child| process_exit_fd(child.id()).ok());
+    loop {
+        let mut slot = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(child) = slot.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(status) = child.try_wait()? {
+            *slot = None;
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            terminate_owned_child(child);
+            let status = child.wait()?;
+            *slot = None;
+            return Ok(Some(status));
+        }
+        drop(slot);
+        let left = deadline.saturating_duration_since(Instant::now());
+        wait_process_fds(
+            &[exit.as_ref()],
+            if exit.is_some() {
+                left
+            } else {
+                left.min(Duration::from_millis(50))
+            },
+        )?;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_owned_child(child: &mut Child) {
+    // The unreaped leader pins the process-group number against PID reuse.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[derive(Clone, Debug)]
+pub enum SupervisedProcessObservation {
+    Stream(ProcessStreamObservation),
+    Exited {
+        operation: u64,
+        result: Result<ExitStatus, String>,
+    },
+}
+
+/// Owns an entire command attempt: child, input, incremental output and waiter.
+/// Completion and cancellation both reap the group and join every I/O thread.
+#[cfg(target_os = "linux")]
+pub struct SupervisedChild {
+    child: Arc<Mutex<Option<Child>>>,
+    waiter: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct CapturedCommandOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    error: Option<io::Error>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+enum SupervisedOutputObserver {
+    Actor {
+        sender: ExternalSender,
+        actor: ActorAddress,
+        operation: u64,
+    },
+    Capture {
+        output: Arc<Mutex<CapturedCommandOutput>>,
+        finished: std::sync::mpsc::Sender<Result<ExitStatus, String>>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl SupervisedOutputObserver {
+    fn close_stream(&self, stream: ProcessStream) {
+        if let Self::Actor { sender, actor, .. } = self {
+            let _ = sender.send_to(
+                *actor,
+                SupervisedProcessObservation::Stream(ProcessStreamObservation::Closed { stream }),
+            );
+        }
+    }
+
+    fn exited(&self, result: Result<ExitStatus, String>) {
+        match self {
+            Self::Actor {
+                sender,
+                actor,
+                operation,
+            } => {
+                let _ = sender.send_to(
+                    *actor,
+                    SupervisedProcessObservation::Exited {
+                        operation: *operation,
+                        result,
+                    },
+                );
+            }
+            Self::Capture { finished, .. } => {
+                let _ = finished.send(result);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_supervised_reader<R: Read + Send + 'static>(
+    stream: ProcessStream,
+    mut reader: R,
+    observer: SupervisedOutputObserver,
+) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new().spawn(move || match observer {
+        SupervisedOutputObserver::Actor { sender, actor, .. } => {
+            read_process_lines(stream, reader, |observation| {
+                sender
+                    .send_to(actor, SupervisedProcessObservation::Stream(observation))
+                    .is_ok()
+            });
+        }
+        SupervisedOutputObserver::Capture { output, .. } => {
+            let mut bytes = Vec::new();
+            let result = reader.read_to_end(&mut bytes);
+            let mut output = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match stream {
+                ProcessStream::Stdout => output.stdout = bytes,
+                ProcessStream::Stderr => output.stderr = bytes,
+            }
+            if let Err(error) = result {
+                output.error = Some(error);
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl SupervisedChild {
+    pub fn spawn(
+        command: &mut Command,
+        input: Option<Arc<[u8]>>,
+        deadline: Option<Instant>,
+        sender: ExternalSender,
+        actor: ActorAddress,
+        operation: u64,
+    ) -> io::Result<Self> {
+        Self::spawn_observed(
+            command,
+            input,
+            deadline,
+            SupervisedOutputObserver::Actor {
+                sender,
+                actor,
+                operation,
+            },
+        )
+    }
+
+    fn spawn_observed(
+        command: &mut Command,
+        input: Option<Arc<[u8]>>,
+        deadline: Option<Instant>,
+        observer: SupervisedOutputObserver,
+    ) -> io::Result<Self> {
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process owner deadline expired",
+            ));
+        }
+        command.process_group(0);
+        let parent = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(io::Error::other("process owner exited during spawn"));
+                }
+                Ok(())
+            });
+        }
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if input.is_some() {
+            command.stdin(std::process::Stdio::piped());
+        }
+        let mut child = command.spawn()?;
+        let exit = match process_exit_fd(child.id()) {
+            Ok(exit) => exit,
+            Err(error) => {
+                terminate_owned_child(&mut child);
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let stdout = child
+            .stdout
+            .take()
+            .expect("supervisor configures piped stdout");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("supervisor configures piped stderr");
+        let stdin = input.map(|bytes| {
+            (
+                child
+                    .stdin
+                    .take()
+                    .expect("supervisor configures piped stdin"),
+                bytes,
+            )
+        });
+        let child = Arc::new(Mutex::new(Some(child)));
+        let owned = Arc::clone(&child);
+        let waiter = match thread::Builder::new().spawn(move || {
+            let mut setup_error = None;
+            let readers = [
+                (
+                    ProcessStream::Stdout,
+                    spawn_supervised_reader(ProcessStream::Stdout, stdout, observer.clone()),
+                ),
+                (
+                    ProcessStream::Stderr,
+                    spawn_supervised_reader(ProcessStream::Stderr, stderr, observer.clone()),
+                ),
+            ]
+            .map(|(stream, reader)| {
+                (
+                    stream,
+                    match reader {
+                        Ok(reader) => Some(reader),
+                        Err(error) => {
+                            setup_error = Some(error.to_string());
+                            observer.close_stream(stream);
+                            None
+                        }
+                    },
+                )
+            });
+            let writer = stdin.and_then(|(mut stdin, bytes)| {
+                match thread::Builder::new()
+                    .spawn(move || stdin.write_all(&bytes).and_then(|()| stdin.flush()))
+                {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        setup_error = Some(error.to_string());
+                        None
+                    }
+                }
+            });
+            let waited = if let Some(error) = setup_error {
+                Err(error)
+            } else {
+                loop {
+                    let left = deadline
+                        .map_or(Duration::from_millis(i32::MAX as u64), |deadline| {
+                            deadline.saturating_duration_since(Instant::now())
+                        });
+                    if left.is_zero() {
+                        break Err("process owner deadline expired; pending child exit".to_owned());
+                    }
+                    match wait_process_fds(&[Some(&exit)], left) {
+                        Ok([true]) => break Ok(()),
+                        Ok([false]) => {}
+                        Err(error) => break Err(error.to_string()),
+                    }
+                }
+            };
+            let status = {
+                let mut slot = owned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                slot.take().map(|mut child| {
+                    terminate_owned_child(&mut child);
+                    child.wait().map_err(|error| error.to_string())
+                })
+            };
+            let input_result = writer
+                .map(|writer| {
+                    writer
+                        .join()
+                        .map_err(|_| "process stdin writer panicked".to_owned())?
+                        .map_err(|error| format!("write process stdin: {error}"))
+                })
+                .unwrap_or(Ok(()));
+            let mut reader_error = None;
+            for (stream, reader) in readers {
+                if reader.is_some_and(|reader| reader.join().is_err()) {
+                    reader_error = Some("process output reader panicked".to_owned());
+                    observer.close_stream(stream);
+                }
+            }
+            if let Some(status) = status {
+                let result = waited.and(status).and_then(|status| {
+                    if let Some(error) = reader_error {
+                        return Err(error);
+                    }
+                    if status.success() {
+                        input_result.map(|()| status)
+                    } else {
+                        Ok(status)
+                    }
+                });
+                observer.exited(result);
+            }
+        }) {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                if let Some(mut child) = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    terminate_owned_child(&mut child);
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            child,
+            waiter: Some(waiter),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        let mut slot = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut child) = slot.take() {
+            terminate_owned_child(&mut child);
+            let _ = child.wait();
+        }
+        drop(slot);
+        if let Some(waiter) = self.waiter.take() {
+            let _ = waiter.join();
+        }
+    }
+}
+
 pub fn spawn_shared_child_wait(
     child: Arc<Mutex<Option<Child>>>,
     poll_interval: Duration,
@@ -278,46 +843,6 @@ pub fn spawn_shared_child_wait(
     });
 }
 
-pub fn wait_shared_child_or_kill(
-    child: &Arc<Mutex<Option<Child>>>,
-    timeout: Duration,
-    process_group: bool,
-    poll_interval: Duration,
-) -> io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let mut slot = child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(child) = slot.as_mut() else {
-            return Ok(None);
-        };
-        match child.try_wait()? {
-            Some(status) => {
-                *slot = None;
-                return Ok(Some(status));
-            }
-            None => drop(slot),
-        }
-        thread::sleep(poll_interval);
-    }
-
-    let mut slot = child
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(child) = slot.as_mut() else {
-        return Ok(None);
-    };
-    #[cfg(target_os = "linux")]
-    if process_group {
-        let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-    }
-    child.kill()?;
-    let status = child.wait()?;
-    *slot = None;
-    Ok(Some(status))
-}
-
 #[cfg(target_os = "linux")]
 pub fn terminate_process_group(
     identity: &ProcessIdentity,
@@ -327,7 +852,11 @@ pub fn terminate_process_group(
     if !identity.matches() {
         return Ok(());
     }
-    if unsafe { libc::kill(-(identity.pid as i32), libc::SIGTERM) } != 0 {
+    let exit = process_exit_fd(identity.pid).ok();
+    if !identity.matches() {
+        return Ok(());
+    }
+    if unsafe { libc::kill(-(identity.pid as i32), libc::SIGTERM) } != 0 && identity.matches() {
         return Err(format!(
             "terminate process group {}: {}",
             identity.pid,
@@ -335,18 +864,52 @@ pub fn terminate_process_group(
         ));
     }
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !identity.matches() {
+    while identity.matches() && Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if wait_process_fds(
+            &[exit.as_ref()],
+            if exit.is_some() {
+                left
+            } else {
+                left.min(poll_interval)
+            },
+        )
+        .map_err(|error| format!("wait process group {}: {error}", identity.pid))?[0]
+        {
             return Ok(());
         }
-        thread::sleep(poll_interval);
     }
-    if unsafe { libc::kill(-(identity.pid as i32), libc::SIGKILL) } != 0 && identity.matches() {
-        return Err(format!(
-            "kill process group {}: {}",
-            identity.pid,
-            io::Error::last_os_error()
-        ));
+    if identity.matches() {
+        if unsafe { libc::kill(-(identity.pid as i32), libc::SIGKILL) } != 0 && identity.matches() {
+            return Err(format!(
+                "kill process group {}: {}",
+                identity.pid,
+                io::Error::last_os_error()
+            ));
+        }
+        if let Some(exit) = &exit {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(format!(
+                        "process group {} did not exit after KILL",
+                        identity.pid
+                    ));
+                }
+                if wait_process_fds(&[Some(exit)], left).map_err(|error| {
+                    format!("observe killed process group {}: {error}", identity.pid)
+                })?[0]
+                {
+                    break;
+                }
+            }
+        } else if identity.matches() {
+            return Err(format!(
+                "process group {} exit cannot be confirmed",
+                identity.pid
+            ));
+        }
     }
     Ok(())
 }
@@ -688,6 +1251,82 @@ mod properties {
     use super::*;
 
     const DRIVER_BUDGET: usize = 64;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_command_output_kills_and_reaps_a_withheld_response() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "swactor-command-deadline-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap '' TERM; printf '%s' \"$$\" > \"$1\"; printf partial; printf diagnostic >&2; exec sleep 30",
+                "withheld-response",
+            ])
+            .arg(&pid_path);
+        let started = Instant::now();
+        let result = command_output_until(&mut command, started + Duration::from_secs(1));
+        let elapsed = started.elapsed();
+        let pid = std::fs::read_to_string(&pid_path);
+        let _ = std::fs::remove_file(&pid_path);
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "withheld child lasted {elapsed:?}"
+        );
+        let pid = pid
+            .expect("child reached its withheld response")
+            .parse::<i32>()
+            .unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_command_output_drains_raw_bytes_and_inherited_pipes_on_rejection() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '\\000\\377partial'; printf 'rejected\\n' >&2; sleep 30 & exit 7",
+        ]);
+        let started = Instant::now();
+        let output = command_output_until(&mut command, started + Duration::from_secs(2)).unwrap();
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"\0\xffpartial");
+        assert_eq!(output.stderr, b"rejected\n");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_command_output_does_not_spawn_after_owner_expiry() {
+        // A nonexistent executable distinguishes pre-spawn expiry from a
+        // freshly minted command lifetime that attempts execution anyway.
+        let error = command_output_until(
+            &mut Command::new("/definitely/not/a/real/bounded-command"),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_listener_unlinks_its_bound_path_when_engine_stops() {

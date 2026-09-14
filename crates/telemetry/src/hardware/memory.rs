@@ -26,6 +26,7 @@ pub struct HostMemorySample {
     pub swap_total_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
     pub pressure: Option<PressureSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

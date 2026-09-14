@@ -16,10 +16,10 @@ use swactor::runtime::{ExternalSender, Runtime, RuntimeParts};
 /// Construct with [`Engine::new`]; obtain a scheduler handle with
 /// [`Engine::handle`].
 pub struct Engine {
+    backend: Arc<dyn ExecutionBackend>,
     /// Retained so the engine owns the runtime handle it drives for its full
     /// lifetime. Core workers are moved into substrate tasks at construction.
     _runtime: Runtime,
-    backend: Arc<dyn ExecutionBackend>,
 }
 
 impl Engine {
@@ -41,8 +41,8 @@ impl Engine {
         // disappear when an alternate backend is used (ENGINE_SPEC.md).
         crate::core_driver::install(workers, &backend);
         Ok(Engine {
-            _runtime: runtime,
             backend,
+            _runtime: runtime,
         })
     }
 

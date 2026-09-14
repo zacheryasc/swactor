@@ -79,7 +79,9 @@ pub use publisher_actor::{
     TELEMETRY_PUBLISHER_NAME, TelemetryPublisherActor, TelemetryPublisherMsg, TelemetrySubscribe,
     register_telemetry_publisher_codec,
 };
-pub use record::{ChannelKind, ChannelRegistry, Record};
+pub use record::{
+    ChannelKind, ChannelRegistry, Record, decode_record, decode_record_value, encode_record,
+};
 pub use sink_actor::{TELEMETRY_SINK_NAME, TelemetrySink};
 
 // ── Observer surface (in submodules; NOT re-exported at root) ──

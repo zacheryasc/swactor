@@ -10,14 +10,17 @@ publish = false
 default = []
 test-support = []
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ctor = "0.6"
+reqwest.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 swactor-engine = { path = "../../crates/engine" }
 tokio.workspace = true
+rustls.workspace = true
 urlencoding = "2"
 
 [dev-dependencies]
+parking_lot = "0.12"
 swactor = { path = "../.." }
 wiremock = "0.6"
 

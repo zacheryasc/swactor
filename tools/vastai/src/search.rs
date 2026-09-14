@@ -111,18 +111,21 @@ async fn fetch_offers(
         .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|error| format!("{operation} request failed: {error}"))?;
+        .map_err(|error| format!("{operation} request failed: {}", error.without_url()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("{operation} HTTP {status}: {body}"));
+        return Err(format!("{operation} HTTP {status}: {body}").replace(api_key, "[REDACTED]"));
     }
 
     resp.json::<SearchResponse>()
         .await
         .map(|body| body.offers)
-        .map_err(|error| format!("{operation} parse failed: {error}"))
+        .map_err(|error| {
+            format!("{operation} parse failed: {}", error.without_url())
+                .replace(api_key, "[REDACTED]")
+        })
 }
 
 /// Choose the first batch of offers from one ranked pool, preferring different

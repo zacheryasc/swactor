@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use iroh::EndpointAddr;
+use iroh_base::EndpointAddr;
 use serde::{Deserialize, Serialize as DeriveSerialize};
 use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;

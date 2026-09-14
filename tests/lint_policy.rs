@@ -86,6 +86,42 @@ fn suppression_visitor_detects_direct_and_conditional_attributes() {
 }
 
 #[test]
+fn ssh_and_scp_invocations_live_only_in_the_shared_bootstrap_module() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    for root in ["apps/myelin/src", "src", "tools"] {
+        collect_rust_sources(&workspace.join(root), &mut sources);
+    }
+
+    let mut violations = Vec::new();
+    for source in &sources {
+        let relative = source
+            .strip_prefix(&workspace)
+            .unwrap_or(source)
+            .display()
+            .to_string();
+        let is_shared_bootstrap = relative.ends_with("provider_adapters/ssh_bootstrap.rs");
+        if is_shared_bootstrap {
+            continue;
+        }
+        let text =
+            fs::read_to_string(source).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        for forbidden in ["Command::new(\"ssh\")", "Command::new(\"scp\")"] {
+            if text.contains(forbidden) {
+                violations.push(format!("{relative} contains {forbidden}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "ssh/scp process creation belongs exclusively to \
+         apps/myelin/src/orchestration/provider_adapters/ssh_bootstrap.rs; \
+         SSH is a bootstrap transport, never an orchestration plane:\n{}",
+        violations.join("\n")
+    );
+}
+#[test]
 fn source_tree_test_modules_are_wired() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut test_directories = Vec::new();

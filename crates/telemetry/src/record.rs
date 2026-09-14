@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// How a view should treat a channel's payload bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
-    /// Decode as structured JSON for display.
-    Typed,
+    /// Decode as named-field MessagePack for display.
+    MessagePackRecord,
+    /// Decode as JSON for display.
+    JsonRecord,
     /// Decode as UTF-8 text for display.
     Text,
     /// Unknown to this consumer; preserve and render as raw bytes.
@@ -34,6 +36,25 @@ where
     }
 }
 
+/// Encode a typed telemetry value as named-field MessagePack.
+pub fn encode_record<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    rmp_serde::to_vec_named(value)
+}
+
+/// Decode a named-field MessagePack telemetry value.
+pub fn decode_record<'de, T: Deserialize<'de>>(
+    payload: &'de [u8],
+) -> Result<T, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(payload)
+}
+
+/// Decode named-field MessagePack into a generic structured value.
+pub fn decode_record_value(payload: &[u8]) -> Result<serde_json::Value, rmp_serde::decode::Error> {
+    decode_record(payload)
+}
+
 /// A typed channel record: crates define their own records and bind each one to
 /// the channel name it rides on.
 pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
@@ -45,14 +66,14 @@ pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
         Self::CHANNEL
     }
 
-    /// Encode this record to opaque payload bytes.
+    /// Encode this record as named-field MessagePack.
     fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("record serializes to JSON")
+        encode_record(self).expect("record serializes to MessagePack")
     }
 
-    /// Decode payload bytes back into the record.
-    fn decode(payload: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(payload)
+    /// Decode a named-field MessagePack payload back into the record.
+    fn decode(payload: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        decode_record(payload)
     }
 }
 
@@ -60,7 +81,8 @@ pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
 /// without putting a global catalog inside `telemetry`.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelRegistry {
-    typed: BTreeSet<String>,
+    messagepack: BTreeSet<String>,
+    json: BTreeSet<String>,
     text: BTreeSet<String>,
     text_prefixes: Vec<String>,
 }
@@ -70,13 +92,18 @@ impl ChannelRegistry {
         Self::default()
     }
 
-    pub fn with_typed_channel(mut self, channel: impl Into<String>) -> Self {
-        self.typed.insert(channel.into());
+    pub fn with_messagepack_channel(mut self, channel: impl Into<String>) -> Self {
+        self.messagepack.insert(channel.into());
+        self
+    }
+
+    pub fn with_json_channel(mut self, channel: impl Into<String>) -> Self {
+        self.json.insert(channel.into());
         self
     }
 
     pub fn with_record<R: Record>(self) -> Self {
-        self.with_typed_channel(R::CHANNEL)
+        self.with_messagepack_channel(R::CHANNEL)
     }
 
     pub fn with_text_channel(mut self, channel: impl Into<String>) -> Self {
@@ -90,8 +117,10 @@ impl ChannelRegistry {
     }
 
     pub fn classify_name(&self, channel: &str) -> ChannelKind {
-        if self.typed.contains(channel) {
-            ChannelKind::Typed
+        if self.messagepack.contains(channel) {
+            ChannelKind::MessagePackRecord
+        } else if self.json.contains(channel) {
+            ChannelKind::JsonRecord
         } else if self.text.contains(channel)
             || self
                 .text_prefixes

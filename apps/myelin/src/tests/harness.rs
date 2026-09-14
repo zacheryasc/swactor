@@ -69,6 +69,7 @@ pub(crate) fn build_iroh_composition(
         IrohDriverConfig {
             secret_key: None,
             relay_mode: RelayMode::Disabled,
+            bind_port: None,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![EDGE_ALPN.to_vec()],

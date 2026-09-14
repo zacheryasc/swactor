@@ -96,6 +96,7 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         IrohDriverConfig {
             secret_key: None,
             relay_mode: RelayMode::Disabled,
+            bind_port: None,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![TELEMETRY_ALPN.to_vec(), iroh_driver::EDGE_ALPN.to_vec()],
@@ -180,7 +181,7 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let route_view: RouteView =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let outbox: Outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
             runtime: runtime.clone(),
             codec: Arc::new(codec),

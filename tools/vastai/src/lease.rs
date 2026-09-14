@@ -193,6 +193,7 @@ async fn provision_one(request: ProvisionOneRequest<'_>) -> Result<ProvisionedIn
                 });
             }
             Err(e) => {
+                let e = e.to_string();
                 eprintln!(
                     "lease_chain: index {index} create on offer {} failed (attempt {attempt}): {e}",
                     offer.id,

@@ -45,6 +45,7 @@ pub enum ChannelContentKind {
     Bytes,
     TextStream,
     JsonRecord,
+    MessagePackRecord,
 }
 
 /// How consumers should decode/display payload bytes for a channel.
@@ -53,6 +54,7 @@ pub enum ChannelContent {
     Bytes,
     TextStream,
     JsonRecord { schema: Option<String> },
+    MessagePackRecord { schema: Option<String> },
 }
 
 impl ChannelContent {
@@ -61,6 +63,7 @@ impl ChannelContent {
             ChannelContent::Bytes => ChannelContentKind::Bytes,
             ChannelContent::TextStream => ChannelContentKind::TextStream,
             ChannelContent::JsonRecord { .. } => ChannelContentKind::JsonRecord,
+            ChannelContent::MessagePackRecord { .. } => ChannelContentKind::MessagePackRecord,
         }
     }
 }

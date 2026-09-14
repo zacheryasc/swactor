@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::orchestration::manual_control::{CommandKind, CommandRecord, CommandState, NodePhase};
-use crate::provisioning::NodeProvisionSpec;
+use crate::provisioning::{DeploymentIdentity, NodeProvisionSpec};
 use distribution::types::NodeId as DistNodeId;
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
@@ -64,6 +64,30 @@ pub(crate) struct RuntimeFacts {
     pub swim_node_id: DistNodeId,
     pub stage_index: u32,
     pub readiness_id: u64,
+    /// Deployment identity reported by the worker. None for providers that
+    /// do not ship deployment bundles.
+    #[serde(default)]
+    pub artifact_digest: Option<String>,
+    #[serde(default)]
+    pub deployment_generation: Option<String>,
+}
+
+impl RuntimeFacts {
+    /// Deployment identity reported by the worker, when the provider ships
+    /// deployment bundles.
+    pub(crate) fn deployment_identity(&self) -> Option<DeploymentIdentity> {
+        Some(DeploymentIdentity {
+            artifact_digest: self.artifact_digest.clone()?,
+            deployment_generation: self.deployment_generation.clone()?,
+        })
+    }
+}
+
+/// Readiness is scoped to a launched process, not its reusable provision attempt.
+pub(crate) fn deployment_readiness_id(incarnation: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(incarnation.as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().expect("SHA256 prefix"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,13 +335,31 @@ impl StateDir {
     }
 
     /// Removes all state files. Explicit operator action only.
+    ///
+    /// The full inventory matters: a reset that leaves the data namespace or
+    /// process registry behind recovers bindings from the discarded run, so a
+    /// "fresh" fixture serves stale paths and typed-absence contracts fail
+    /// (observed: a quarantined run's case routes reappeared after reset).
     pub(crate) fn reset(&self) -> Result<(), String> {
-        for path in [self.identity_path(), self.snapshot_path()] {
+        for path in [
+            self.identity_path(),
+            self.snapshot_path(),
+            self.root.join("data-namespace.json"),
+            self.process_registry_path(),
+        ] {
             if let Err(error) = fs::remove_file(&path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
                 return Err(format!("remove {}: {error}", path.display()));
             }
+        }
+        if let Err(error) = fs::remove_dir_all(self.root.join("contextual-uploads"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "remove {}: {error}",
+                self.root.join("contextual-uploads").display()
+            ));
         }
         Ok(())
     }

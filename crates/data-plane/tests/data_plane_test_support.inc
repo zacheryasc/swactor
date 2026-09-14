@@ -150,8 +150,8 @@ impl data_plane::namespace::NamespaceDiscovery for StaticDiscovery {
 struct NoopSourceRegistrar;
 
 impl data_plane::source::BlobSourcePublisher for NoopSourceRegistrar {
-    fn publish_source(&self, _source: ActorAddress) -> Result<(), String> {
-        Ok(())
+    fn publish_source(&self, _source: ActorAddress) -> Result<[u8; 32], String> {
+        Ok([9; 32])
     }
 }
 
@@ -272,6 +272,7 @@ fn harness_with_transport(
         future::block_on(directory_client.register(
             path(logical),
             source,
+            [9; 32],
             length,
             recovery,
             data_plane::namespace::OperationId::from_u128(u128::from(length) + 1),

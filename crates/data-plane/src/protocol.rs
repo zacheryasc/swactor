@@ -464,6 +464,9 @@ pub enum HostSessionIn {
     Close {
         reply_to: Option<ActorAddress>,
     },
+    CloseChild {
+        child_session: ActorAddress,
+    },
 }
 
 impl NetworkMessage for HostSessionIn {
@@ -537,6 +540,7 @@ pub enum ChildSessionIn {
     StreamOpened {
         operation: ActorAddress,
         host_binding: ActorAddress,
+        incarnation: StreamIncarnation,
         ring: RingHandle,
         role: Role,
     },
@@ -553,7 +557,12 @@ pub enum ChildSessionIn {
     OperationDone {
         operation: ActorAddress,
     },
-    Close,
+    Close {
+        reply_to: Option<ActorAddress>,
+    },
+    CloseCompleted {
+        result: Result<(), DataPlaneError>,
+    },
 }
 
 impl NetworkMessage for ChildSessionIn {
@@ -574,6 +583,9 @@ pub enum HostStreamIn {
         incarnation: StreamIncarnation,
     },
     PeerOfferRetry {
+        incarnation: StreamIncarnation,
+    },
+    RouteChanged {
         incarnation: StreamIncarnation,
     },
     Transport(StreamTransportEvent),
@@ -599,6 +611,10 @@ pub enum HostStreamIn {
     },
     PeerTerminationRetry {
         incarnation: StreamIncarnation,
+    },
+    Displaced {
+        incarnation: StreamIncarnation,
+        reply_to: Option<ActorAddress>,
     },
     ReleaseComplete(Result<(), DataPlaneError>),
 }

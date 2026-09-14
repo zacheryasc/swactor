@@ -8,10 +8,12 @@
 pub mod bootstrap;
 pub mod executor;
 pub mod node;
+pub mod paid_admission;
 pub mod plugin;
 pub mod reconciler;
 pub use bootstrap::*;
 
 pub use executor::*;
 pub use node::*;
+pub use paid_admission::*;
 pub use reconciler::*;

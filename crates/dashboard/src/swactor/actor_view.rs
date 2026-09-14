@@ -75,9 +75,9 @@ impl RuntimeState {
         }
     }
 
-    pub(crate) fn update(&mut self, channel: &str, payload: &[u8], now: Instant) {
+    pub(crate) fn update(&mut self, channel: &str, value: Option<&Value>, now: Instant) {
         self.last_seen = now;
-        let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+        let Some(value) = value else {
             return;
         };
         match channel {
@@ -633,7 +633,7 @@ mod tests {
     use super::*;
 
     fn apply_protocol(runtime: &mut RuntimeState, value: Value, at: Instant) {
-        runtime.update(RUNTIME_ACTORS, value.to_string().as_bytes(), at);
+        runtime.update(RUNTIME_ACTORS, Some(&value), at);
     }
 
     #[test]

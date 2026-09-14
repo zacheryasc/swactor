@@ -150,13 +150,19 @@ impl IrohBlobTransferReceiver {
         engine: &EngineHandle,
         runtime: Runtime,
         period: Duration,
+        mut activity: tokio::sync::watch::Receiver<()>,
     ) {
         let receiver = Arc::clone(self);
         let engine = engine.clone();
         engine.clone().spawn(async move {
             let mut interval = engine.interval(period);
             loop {
-                (&mut interval).await;
+                tokio::select! {
+                    _ = &mut interval => {},
+                    changed = activity.changed() => {
+                        if changed.is_err() { break; }
+                    },
+                }
                 receiver.drain(&runtime);
             }
         });

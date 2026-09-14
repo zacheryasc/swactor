@@ -20,6 +20,7 @@ pub struct HostCpuSample {
     pub host: Option<CpuHostSample>,
     pub cores: Vec<CpuCoreSample>,
     pub processes: Vec<CpuProcessSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -71,6 +72,7 @@ pub struct CpuProcessSample {
     pub rss_bytes: Option<u64>,
     pub vms_bytes: Option<u64>,
     pub thread_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

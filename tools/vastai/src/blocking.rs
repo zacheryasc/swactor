@@ -27,6 +27,15 @@ impl BlockingVastClient {
         self.runtime.block_on(self.client.browse_offers(criteria))
     }
 
+    pub fn account_ssh_keys(&self) -> Result<String, String> {
+        self.runtime.block_on(self.client.account_ssh_keys())
+    }
+
+    pub fn register_account_ssh_key(&self, public_key: &str) -> Result<(), String> {
+        self.runtime
+            .block_on(self.client.register_account_ssh_key(public_key))
+    }
+
     pub fn search_offers(
         &self,
         policy: &SelectionPolicy,
@@ -36,7 +45,10 @@ impl BlockingVastClient {
             .block_on(self.client.search_offers(policy, target_count))
     }
 
-    pub fn create_instance(&self, request: &CreateInstanceRequest) -> Result<InstanceInfo, String> {
+    pub fn create_instance(
+        &self,
+        request: &CreateInstanceRequest,
+    ) -> Result<InstanceInfo, crate::CreateInstanceError> {
         self.runtime.block_on(self.client.create_instance(request))
     }
 
@@ -62,32 +74,95 @@ impl BlockingVastClient {
         attempts: usize,
         pace: Duration,
     ) -> Result<Vec<LabeledInstance>, String> {
-        let attempts = attempts.max(1);
-        for attempt in 0..attempts {
-            let instances = self.list_by_label(label)?;
-            if !instances.is_empty() || attempt + 1 == attempts {
-                return Ok(instances);
-            }
-            std::thread::sleep(pace);
-        }
-        unreachable!("at least one Vast.ai label lookup attempt runs")
+        // One owner budget includes all account requests and retry pacing.
+        // Individual retries never manufacture another full request allowance.
+        let deadline = VastClient::REQUEST_TIMEOUT * 4 + Duration::from_secs(180);
+        self.runtime.block_on(
+            self.client
+                .execute("label discovery and retry pacing", async {
+                    tokio::time::timeout(deadline, async {
+                        let attempts = attempts.max(1);
+                        for attempt in 0..attempts {
+                            let instances = self.client.list_by_label(label).await?;
+                            if !instances.is_empty() || attempt + 1 == attempts {
+                                return Ok(instances);
+                            }
+                            tokio::time::sleep(pace).await;
+                        }
+                        unreachable!("at least one Vast.ai label lookup attempt runs")
+                    })
+                    .await
+                    .map_err(|_| format!("Vast.ai label discovery deadline: {label}"))?
+                }),
+        )?
     }
 
     pub fn wait_for_ssh_endpoint(
         &self,
         contract_id: u64,
-        label: &str,
+        labels: &std::collections::BTreeSet<String>,
         policy: &LifecyclePolicy,
     ) -> Result<RunningInstance, String> {
         self.runtime.block_on(
             self.client
-                .wait_for_ssh_endpoint(contract_id, label, policy),
+                .wait_for_ssh_endpoint(contract_id, labels, policy),
         )
     }
 
     pub fn destroy_instance_with_retry(&self, contract_id: u64) -> Result<(), String> {
         self.runtime
             .block_on(self.client.destroy_instance_with_retry(contract_id))
+    }
+
+    pub fn owned_census(
+        &self,
+        labels: &std::collections::BTreeSet<String>,
+        known_ids: &std::collections::BTreeSet<u64>,
+        fresh_after: std::time::Instant,
+        deadline: Duration,
+    ) -> Result<crate::OwnedCensus, String> {
+        self.runtime.block_on(
+            self.client
+                .owned_census(labels, known_ids, fresh_after, deadline),
+        )
+    }
+
+    pub fn cleanup_owned(
+        &self,
+        labels: &std::collections::BTreeSet<String>,
+        known_ids: &std::collections::BTreeSet<u64>,
+        deadline: Duration,
+    ) -> Result<crate::OwnedCensus, String> {
+        self.runtime
+            .block_on(self.client.cleanup_owned(labels, known_ids, deadline))
+    }
+
+    pub fn cleanup_owned_reconciled(
+        &self,
+        labels: &std::collections::BTreeSet<String>,
+        known_ids: &std::collections::BTreeSet<u64>,
+        unresolved_labels: &std::collections::BTreeSet<String>,
+        deadline: Duration,
+        record_discovery: &mut (
+                 dyn FnMut(&std::collections::BTreeMap<u64, String>) -> Result<(), String> + Send
+             ),
+    ) -> Result<crate::OwnedCensus, crate::teardown::CleanupFailure> {
+        self.runtime.block_on(self.client.cleanup_owned_reconciled(
+            labels,
+            known_ids,
+            unresolved_labels,
+            deadline,
+            record_discovery,
+        ))
+    }
+
+    pub fn cleanup_owned_labels(
+        &self,
+        labels: &std::collections::BTreeSet<String>,
+        deadline: Duration,
+    ) -> Result<(), String> {
+        self.runtime
+            .block_on(self.client.cleanup_owned_labels(labels, deadline))
     }
 }
 

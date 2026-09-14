@@ -28,6 +28,7 @@ struct TaskControl {
     wake: mpsc::Sender<()>,
     progress_pending: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    cancellation: Arc<tokio::sync::Notify>,
 }
 
 impl TaskControl {
@@ -38,6 +39,7 @@ impl TaskControl {
                 wake,
                 progress_pending: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(AtomicBool::new(false)),
+                cancellation: Arc::new(tokio::sync::Notify::new()),
             },
             receiver,
         )
@@ -51,7 +53,14 @@ impl TaskControl {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.cancellation.notify_one();
         self.progress();
+    }
+
+    async fn cancelled(&self) {
+        if !self.cancelled.load(Ordering::Acquire) {
+            self.cancellation.notified().await;
+        }
     }
 
     async fn wait(&self, receiver: &mut mpsc::Receiver<()>) -> bool {
@@ -71,14 +80,25 @@ struct PendingSink {
     notifier: Arc<dyn StreamTransportNotifier>,
 }
 
+struct PendingInbound {
+    stream: RecvStream,
+    connection: Connection,
+    token: u64,
+}
+
 #[derive(Default)]
 struct TransportState {
     pending_sinks: BTreeMap<StreamIncarnation, PendingSink>,
-    pending_inbound: BTreeMap<StreamIncarnation, RecvStream>,
+    pending_inbound: BTreeMap<StreamIncarnation, PendingInbound>,
     controls: BTreeMap<StreamIncarnation, Vec<TaskControl>>,
     source_probes: BTreeMap<StreamIncarnation, RingProbe>,
     sink_probes: BTreeMap<StreamIncarnation, RingProbe>,
     local_incarnations: BTreeSet<StreamIncarnation>,
+    next_pending_token: u64,
+    // Incarnation identities are never reused by an authority. Retain exact
+    // fences for this endpoint lifetime: elapsed time cannot prove a delayed
+    // stream belongs to a live owner.
+    retired: BTreeSet<StreamIncarnation>,
 }
 
 struct Inner {
@@ -106,33 +126,64 @@ impl IrohStreamTransport {
         }
     }
 
+    /// Current ownership, read under the same lock as install/terminate.
+    /// Retired identity fences are history, not live transport resources.
+    pub fn resource_snapshot(&self) -> serde_json::Value {
+        let state = self.inner.state.lock();
+        serde_json::json!({
+            "pending_sinks": state.pending_sinks.len(),
+            "pending_inbound": state.pending_inbound.len(),
+            "active_controls": state.controls.values().map(Vec::len).sum::<usize>(),
+            "source_probes": state.source_probes.len(),
+            "sink_probes": state.sink_probes.len(),
+            "local_incarnations": state.local_incarnations.len(),
+            "retired_incarnations": state.retired.len(),
+        })
+    }
+
     pub(crate) fn accept_connection(&self, connection: Connection) {
         let transport = self.clone();
         self.inner.engine.spawn(async move {
             while let Ok(mut recv) = connection.accept_uni().await {
                 let mut preamble = [0_u8; PREAMBLE_LEN];
-                if recv.read_exact(&mut preamble).await.is_err() {
+                if !transport
+                    .inner
+                    .engine
+                    .timeout(PENDING_INBOUND_TIMEOUT, recv.read_exact(&mut preamble))
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+                {
                     continue;
                 }
                 let incarnation = decode_incarnation(preamble);
                 let mut recv = Some(recv);
                 let (pending, retained) = {
                     let mut state = transport.inner.state.lock();
+                    if state.retired.contains(&incarnation) {
+                        continue;
+                    }
                     if let Some(pending) = state.pending_sinks.remove(&incarnation) {
-                        (Some(pending), false)
+                        (Some(pending), None)
                     } else if !state.pending_inbound.contains_key(&incarnation)
                         && state.pending_inbound.len() < MAX_PENDING_INBOUND
                     {
-                        state
-                            .pending_inbound
-                            .insert(incarnation, recv.take().expect("unclaimed inbound stream"));
-                        (None, true)
+                        state.next_pending_token = state.next_pending_token.wrapping_add(1);
+                        let token = state.next_pending_token;
+                        state.pending_inbound.insert(
+                            incarnation,
+                            PendingInbound {
+                                stream: recv.take().expect("unclaimed inbound stream"),
+                                connection: connection.clone(),
+                                token,
+                            },
+                        );
+                        (None, Some(token))
                     } else {
-                        (None, false)
+                        (None, None)
                     }
                 };
-                if retained {
-                    transport.schedule_pending_timeout(incarnation);
+                if let Some(token) = retained {
+                    transport.schedule_pending_timeout(incarnation, token);
                 }
                 if let Some(pending) = pending {
                     transport.start_sink(
@@ -142,22 +193,36 @@ impl IrohStreamTransport {
                     );
                 }
             }
+            // A closed owner cannot complete unmatched incarnations. Remove
+            // only its streams; another connection may already have rejoined.
+            transport
+                .inner
+                .state
+                .lock()
+                .pending_inbound
+                .retain(|_, pending| pending.connection.stable_id() != connection.stable_id());
         });
-    }
-
-    fn register_control(&self, incarnation: StreamIncarnation, control: TaskControl) {
-        self.inner
-            .state
-            .lock()
-            .controls
-            .entry(incarnation)
-            .or_default()
-            .push(control);
     }
 
     fn start_sink(&self, incarnation: StreamIncarnation, recv: RecvStream, pending: PendingSink) {
         let (control, receiver) = TaskControl::pair();
-        self.register_control(incarnation, control.clone());
+        {
+            let mut state = self.inner.state.lock();
+            if !state.sink_probes.contains_key(&incarnation) {
+                // Termination raced the accepted stream's transfer out of
+                // pending_sinks. Hand back quiescence, never revive its task.
+                drop(state);
+                drop(recv);
+                drop(pending.endpoint);
+                pending.notifier.notify(StreamTransportEvent::Quiesced);
+                return;
+            }
+            state
+                .controls
+                .entry(incarnation)
+                .or_default()
+                .push(control.clone());
+        }
         self.inner.engine.spawn(run_sink(
             incarnation,
             recv,
@@ -168,18 +233,19 @@ impl IrohStreamTransport {
         ));
     }
 
-    fn schedule_pending_timeout(&self, incarnation: StreamIncarnation) {
+    fn schedule_pending_timeout(&self, incarnation: StreamIncarnation, token: u64) {
         let engine = self.inner.engine.clone();
         let transport = self.clone();
         engine.clone().spawn(async move {
-            let mut deadline = engine.interval(PENDING_INBOUND_TIMEOUT);
-            (&mut deadline).await;
-            transport
-                .inner
-                .state
-                .lock()
+            engine.timer(PENDING_INBOUND_TIMEOUT).await;
+            let mut state = transport.inner.state.lock();
+            if state
                 .pending_inbound
-                .remove(&incarnation);
+                .get(&incarnation)
+                .is_some_and(|pending| pending.token == token)
+            {
+                state.pending_inbound.remove(&incarnation);
+            }
         });
     }
 
@@ -194,6 +260,9 @@ impl IrohStreamTransport {
         let incarnation = request.incarnation;
         let pending = {
             let mut state = self.inner.state.lock();
+            if state.retired.contains(&incarnation) {
+                return Err("iroh stream incarnation is retired".to_owned());
+            }
             state.local_incarnations.insert(incarnation);
             state.pending_inbound.remove(&incarnation);
             state.sink_probes.remove(&incarnation);
@@ -241,14 +310,23 @@ impl StreamTransport for IrohStreamTransport {
             return self.install_local_source(request);
         }
         let (control, receiver) = TaskControl::pair();
-        self.register_control(request.incarnation, control.clone());
         let endpoint = self.inner.endpoint.clone();
         let probe = request.endpoint.probe();
-        self.inner
-            .state
-            .lock()
-            .source_probes
-            .insert(request.incarnation, probe);
+        {
+            let mut state = self.inner.state.lock();
+            if state.retired.contains(&request.incarnation) {
+                return Err("iroh stream incarnation is retired".to_owned());
+            }
+            if state.source_probes.contains_key(&request.incarnation) {
+                return Err("iroh stream source is already installed".to_owned());
+            }
+            state
+                .controls
+                .entry(request.incarnation)
+                .or_default()
+                .push(control.clone());
+            state.source_probes.insert(request.incarnation, probe);
+        }
         self.inner.engine.spawn(run_source(
             request.incarnation,
             endpoint,
@@ -279,12 +357,15 @@ impl StreamTransport for IrohStreamTransport {
         });
         let inbound = {
             let mut state = self.inner.state.lock();
+            if state.retired.contains(&incarnation) {
+                return Err("iroh stream incarnation is retired".to_owned());
+            }
             if state.sink_probes.contains_key(&incarnation) {
                 return Err("iroh stream sink is already installed".to_owned());
             }
             state.sink_probes.insert(incarnation, probe);
             if let Some(inbound) = state.pending_inbound.remove(&incarnation) {
-                Some(inbound)
+                Some(inbound.stream)
             } else {
                 state
                     .pending_sinks
@@ -369,6 +450,7 @@ impl StreamTransport for IrohStreamTransport {
     fn terminate(&self, incarnation: StreamIncarnation) {
         let (local, pending, _inbound, controls) = {
             let mut state = self.inner.state.lock();
+            state.retired.insert(incarnation);
             let local = state.local_incarnations.remove(&incarnation);
             let pending = state.pending_sinks.remove(&incarnation);
             let inbound = state.pending_inbound.remove(&incarnation);
@@ -382,6 +464,7 @@ impl StreamTransport for IrohStreamTransport {
             return;
         }
         if let Some(pending) = pending {
+            drop(pending.endpoint);
             pending.notifier.notify(StreamTransportEvent::Quiesced);
         }
         for control in controls {
@@ -399,15 +482,17 @@ async fn run_source(
     control: TaskControl,
     mut receiver: mpsc::Receiver<()>,
 ) {
-    let result = async {
+    let operation = async {
         let connection = endpoint
             .connect(peer, STREAM_ALPN)
             .await
             .map_err(|error| format!("connect stream incarnation: {error}"))?;
-        let mut send = connection
-            .open_uni()
-            .await
-            .map_err(|error| format!("open stream incarnation: {error}"))?;
+        let mut send = crate::edge_transport::ResetOnDrop(
+            connection
+                .open_uni()
+                .await
+                .map_err(|error| format!("open stream incarnation: {error}"))?,
+        );
         send.write_all(&encode_incarnation(incarnation))
             .await
             .map_err(|error| format!("write stream preamble: {error}"))?;
@@ -455,8 +540,14 @@ async fn run_source(
                 return Ok(());
             }
         }
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        _ = control.cancelled() => Ok(()),
+        result = operation => result,
+    };
+    // Quiesced transfers ownership of the ring back to the arena allocator.
+    drop(source);
     if let Err(reason) = result {
         notifier.notify(StreamTransportEvent::Fault(reason));
     }
@@ -498,7 +589,7 @@ async fn run_sink(
     mut receiver: mpsc::Receiver<()>,
 ) {
     notifier.notify(StreamTransportEvent::Ready);
-    let result = async {
+    let operation = async {
         loop {
             if control.cancelled.load(Ordering::Acquire) {
                 return Ok(());
@@ -548,8 +639,14 @@ async fn run_sink(
                 }
             }
         }
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        _ = control.cancelled() => Ok(()),
+        result = operation => result,
+    };
+    drop(recv);
+    drop(sink);
     if let Err(reason) = result {
         notifier.notify(StreamTransportEvent::Fault(reason));
     }

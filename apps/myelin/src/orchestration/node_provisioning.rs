@@ -21,13 +21,18 @@ pub(crate) mod provider_kind {
         ProviderKind::new("vastai")
     }
 
+    pub(crate) fn static_ssh() -> ProviderKind {
+        ProviderKind::new("static-ssh")
+    }
+
     pub(crate) fn parse_deploy(value: &str) -> Result<ProviderKind, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "process" | "local_process" | "local-process" => Ok(process()),
             "docker" | "local_docker" | "local-docker" => Ok(docker()),
             "vastai" | "vast_ai" | "vast-ai" => Ok(vastai()),
+            "static-ssh" | "static_ssh" | "staticssh" => Ok(static_ssh()),
             other => Err(format!(
-                "unsupported provider {other:?}; use process, docker, or vastai"
+                "unsupported provider {other:?}; use process, docker, vastai, or static-ssh"
             )),
         }
     }

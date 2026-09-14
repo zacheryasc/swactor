@@ -595,18 +595,32 @@ impl Worker {
     fn apply_admin_command(pool: &mut ActorPool, tc: &TickContext, cmd: AdminCommand) {
         match cmd {
             AdminCommand::ListActors { acc } => {
-                let mut local = Vec::new();
-                pool.actor_summaries_into(&mut local, tc.worker_id);
-                {
-                    let mut summaries = acc.summaries.lock();
-                    summaries.extend(local);
-                }
-                if acc.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let actors = {
-                        let mut summaries = acc.summaries.lock();
-                        std::mem::take(&mut *summaries)
+                let Some(acc) = acc.upgrade() else {
+                    return;
+                };
+                let completed = {
+                    let mut state = acc.state.lock();
+                    let Some(pending) = state.as_mut() else {
+                        return;
                     };
-                    Self::send_admin_reply(tc, acc.reply_to, Ok(ListActorsResponse { actors }));
+                    pool.actor_summaries_into(&mut pending.summaries, tc.worker_id);
+                    pending.remaining -= 1;
+                    if pending.remaining == 0 {
+                        state.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(completed) = completed {
+                    let message = (completed.reply)(ListActorsResponse {
+                        actors: completed.summaries,
+                    });
+                    if let Some(worker) = tc.worker_of(&completed.reply_to) {
+                        tc.transfer_tx(worker)
+                            .send(Envelope::new(completed.reply_to, message));
+                    } else {
+                        let _ = tc.inbox_registry.try_deliver(completed.reply_to, message);
+                    }
                 }
             }
             AdminCommand::InspectActor { actor, reply_to } => {
@@ -940,7 +954,6 @@ impl ActorPool {
     }
 
     fn actor_summaries_into(&self, out: &mut Vec<ActorSummary>, worker: WorkerId) {
-        out.clear();
         out.extend(
             self.actors
                 .iter()

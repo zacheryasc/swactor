@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::{
@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use telemetry::frame::TelemetryEvent;
 use telemetry::{
     ChannelContent, ChannelId, Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
-    TelemetryEndpoint, TelemetryProducer, TelemetrySubscription,
+    TelemetryEndpoint, TelemetryProducer, TelemetrySubscription, decode_record_value,
+    encode_record,
 };
 
 use crate::codecs::register_myelin_actor_codecs;
@@ -57,6 +58,7 @@ use iroh_driver::{
     TELEMETRY_ALPN, spawn_pull_server,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
+use myelin_control_contract::DeploymentIdentity;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -166,10 +168,8 @@ fn emit_node_event(
     detail: Value,
 ) {
     let channel = telemetry.channel_by_name(channel);
-    telemetry.submit_text(
-        channel,
-        node_event_payload(config, phase, status, detail).to_string(),
-    );
+    let payload = node_event_payload(config, phase, status, detail);
+    telemetry.submit_value(channel, &payload);
     telemetry.tick();
 }
 
@@ -272,6 +272,8 @@ enum DebugJoinClientError {
     Runtime(String),
 }
 
+pub(crate) const DEBUG_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn debug_join_client_main(args: Vec<String>) -> ExitCode {
     match run_debug_join_client(args) {
         Ok(response) => {
@@ -303,6 +305,7 @@ fn debug_join_client_main(args: Vec<String>) -> ExitCode {
 fn run_debug_join_client(args: Vec<String>) -> Result<DebugJoinResponseWire, DebugJoinClientError> {
     let mut socket = None;
     let mut endpoint_json = None;
+    let mut orchestrator_actor_json = None;
     let mut read_endpoint_stdin = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -318,16 +321,21 @@ fn run_debug_join_client(args: Vec<String>) -> Result<DebugJoinResponseWire, Deb
                 })?);
             }
             "--endpoint-json-stdin" => read_endpoint_stdin = true,
+            "--orchestrator-actor-json" => {
+                orchestrator_actor_json = Some(iter.next().ok_or_else(|| {
+                    DebugJoinClientError::Cli("--orchestrator-actor-json requires JSON".to_owned())
+                })?);
+            }
             other => {
                 return Err(DebugJoinClientError::Cli(format!(
-                    "unknown argument {other:?}; usage: debug-join --socket <path> (--endpoint-json <json> | --endpoint-json-stdin)"
+                    "unknown argument {other:?}; usage: debug-join --socket <path> (--endpoint-json <json> | --endpoint-json-stdin) [--orchestrator-actor-json <json>]"
                 )));
             }
         }
     }
     let socket = socket.ok_or_else(|| {
         DebugJoinClientError::Cli(
-            "missing --socket <path>; usage: debug-join --socket <path> (--endpoint-json <json> | --endpoint-json-stdin)".to_owned(),
+            "missing --socket <path>; usage: debug-join --socket <path> (--endpoint-json <json> | --endpoint-json-stdin) [--orchestrator-actor-json <json>]".to_owned(),
         )
     })?;
     let endpoint_json = match (endpoint_json, read_endpoint_stdin) {
@@ -353,15 +361,33 @@ fn run_debug_join_client(args: Vec<String>) -> Result<DebugJoinResponseWire, Deb
     };
     let endpoint = serde_json::from_str::<EndpointAddr>(&endpoint_json)
         .map_err(|e| DebugJoinClientError::Cli(format!("parse endpoint JSON: {e}")))?;
-    send_debug_join_request(&socket, endpoint, None).map_err(DebugJoinClientError::Runtime)
+    let orchestrator_actor = orchestrator_actor_json
+        .as_deref()
+        .map(serde_json::from_str::<ActorAddress>)
+        .transpose()
+        .map_err(|error| {
+            DebugJoinClientError::Cli(format!("parse orchestrator actor JSON: {error}"))
+        })?;
+    let deadline = Instant::now() + DEBUG_JOIN_TIMEOUT;
+    let deadline = crate::provisioning::execution_owner_deadline()
+        .map_err(DebugJoinClientError::Runtime)?
+        .map_or(deadline, |owner| owner.min(deadline));
+    send_debug_join_request(
+        &socket,
+        endpoint,
+        orchestrator_actor,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .map_err(DebugJoinClientError::Runtime)
 }
 
 pub(crate) fn request_debug_join(
     socket: &Path,
     endpoint: EndpointAddr,
     orchestrator_actor: ActorAddress,
+    timeout: Duration,
 ) -> Result<(), String> {
-    match send_debug_join_request(socket, endpoint, Some(orchestrator_actor))? {
+    match send_debug_join_request(socket, endpoint, Some(orchestrator_actor), timeout)? {
         DebugJoinResponseWire::JoinQueued { .. } => Ok(()),
         DebugJoinResponseWire::JoinRejected { error, detail } => {
             Err(format!("worker join rejected: {error}: {detail}"))
@@ -376,23 +402,110 @@ fn send_debug_join_request(
     socket: &Path,
     endpoint: EndpointAddr,
     orchestrator_actor: Option<ActorAddress>,
+    timeout: Duration,
 ) -> Result<DebugJoinResponseWire, String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "debug join deadline overflow".to_owned())?;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| "debug join request deadline expired".to_owned())
+    };
     let request = debug_join_request_line(endpoint, orchestrator_actor)?;
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)
-        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("write request: {e}"))?;
-    stream.flush().map_err(|e| format!("flush request: {e}"))?;
-    let mut response_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response_line)
-        .map_err(|e| format!("read response: {e}"))?;
+    let mut stream = connect_debug_socket(socket, remaining()?)?;
+    let mut request = request.as_bytes();
+    while !request.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining()?))
+            .map_err(|error| error.to_string())?;
+        match stream.write(request) {
+            Ok(0) => return Err("debug join socket closed while writing".to_owned()),
+            Ok(written) => request = &request[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("write debug join request: {error}")),
+        }
+    }
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        stream
+            .set_read_timeout(Some(remaining()?))
+            .map_err(|error| error.to_string())?;
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("read debug join response: {error}")),
+        };
+        if read == 0 {
+            break;
+        }
+        let end = buffer[..read].iter().position(|byte| *byte == b'\n');
+        response.extend_from_slice(&buffer[..end.unwrap_or(read)]);
+        if response.len() > 64 * 1024 {
+            return Err("debug join response exceeds 64 KiB".to_owned());
+        }
+        if end.is_some() {
+            break;
+        }
+    }
+    let response_line = String::from_utf8(response).map_err(|error| error.to_string())?;
     if response_line.trim().is_empty() {
         return Err("debug join socket closed without response".to_owned());
     }
     serde_json::from_str::<DebugJoinResponseWire>(&response_line)
         .map_err(|e| format!("parse response JSON: {e}"))
+}
+
+fn connect_debug_socket(
+    path: &Path,
+    timeout: Duration,
+) -> Result<std::os::unix::net::UnixStream, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err("debug join socket path is invalid or too long".to_owned());
+        }
+        address.sun_family = libc::AF_UNIX as _;
+        for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as _;
+        }
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        // Linux AF_UNIX connect observes SO_SNDTIMEO, including a full
+        // listener backlog. Configure it before the potentially blocking call.
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| error.to_string())?;
+        let result = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of_val(&address) as _,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "connect {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(stream)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, timeout);
+        Err("bounded worker debug join requires Linux AF_UNIX sockets".to_owned())
+    }
 }
 
 fn debug_join_request_line(
@@ -652,9 +765,10 @@ fn submit_sampler_health(
     status: &str,
     detail: Value,
 ) {
-    producer.submit_text(
+    let payload = sampler_health_payload(context, sampler, sample_channel, status, detail);
+    producer.submit_bytes(
         channel,
-        sampler_health_payload(context, sampler, sample_channel, status, detail).to_string(),
+        encode_record(&payload).expect("serialize sampler health telemetry"),
     );
 }
 
@@ -1678,7 +1792,7 @@ fn run() -> Result<(), String> {
 
     // Telemetry must exist before the runtime: its stats hook is wired in
     // during runtime construction.
-    let mut telemetry = NodeTelemetry::new(&config);
+    let mut telemetry = NodeTelemetry::new(&config)?;
 
     // Build the core swactor runtime parts, clone the routing handle needed by
     // integrations, then hand the workers to the engine. The engine owns both
@@ -1722,6 +1836,7 @@ fn run() -> Result<(), String> {
         IrohDriverConfig {
             secret_key: None,
             relay_mode: config.relay_mode.clone(),
+            bind_port: None,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
@@ -1958,6 +2073,33 @@ fn run() -> Result<(), String> {
             return Err(format!("node report inbox: {error}"));
         }
     };
+    let report_wake_target = Arc::new(Mutex::new(None));
+    let report_forwarder = stack
+        .runtime
+        .spawn(NodeReportWakeForwarder {
+            destination: *reports.addr(),
+            target: Arc::clone(&report_wake_target),
+        })
+        .map_err(|error| format!("spawn node report wake forwarder: {error}"))?;
+    let route_target = Arc::clone(&report_wake_target);
+    let route_sender = stack.runtime.create_sender();
+    let route_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(target) = *route_target.lock() {
+            let _ = route_sender.send_to(target, NodeRuntimeMsg::RoutingChanged);
+        }
+    });
+    stack
+        .runtime
+        .send_to(
+            stack.actors.directory,
+            distribution::directory_actor::DirectoryIn::WatchRoutes {
+                changed: Arc::downgrade(&route_wake),
+            },
+        )
+        .map_err(|error| format!("watch runtime ready routes: {error}"))?;
+    // The synchronous entrypoint retains the transport watch until its runtime
+    // actor completes; teardown cancels the watch even on startup failure.
+    let _route_watch = driver.connection_observer().watch_connections(route_wake);
     let rejoin_replies = stack
         .runtime
         .new_inbox::<ManualControlReply>()
@@ -1977,12 +2119,25 @@ fn run() -> Result<(), String> {
             driver.endpoint_addr(),
             driver.edge_events_handle(),
         ));
-        blob_receiver.install_pump(&engine.handle(), stack.runtime.clone(), PUMP_INTERVAL);
+        blob_receiver.install_pump(
+            &engine.handle(),
+            stack.runtime.clone(),
+            PUMP_INTERVAL,
+            driver.edge_events_changed(),
+        );
         let transfer_receiver: Arc<dyn BlobTransferReceiver> = blob_receiver;
         let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
             driver.edge_connector(),
             &engine.handle(),
             stack.runtime.clone(),
+        ));
+        let routes: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
+            stack.route_view.clone(),
+            stack.pinned_routes.clone(),
+            stack.route_binder.clone(),
+            stack.runtime.clone(),
+            stack.actors.directory,
+            driver.connection_observer(),
         ));
         let spawner = Arc::new(build_contextual_process_spawner(
             MyelinContextualProcessConfig {
@@ -1994,18 +2149,11 @@ fn run() -> Result<(), String> {
                 transfer_receiver: Some(Arc::clone(&transfer_receiver)),
                 source_sender: Some(source_sender),
                 source_publisher: Some(namespace.source_publisher),
-                route_view: stack.route_view.clone(),
-                pinned_routes: stack.pinned_routes.clone(),
-                route_binder: stack.route_binder.clone(),
+                route_registrar: Arc::clone(&routes),
                 stream_transport: Some(driver.stream_transport()),
                 host_endpoint: driver.endpoint_addr(),
             },
         )?);
-        let routes: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
-            stack.route_view.clone(),
-            stack.pinned_routes.clone(),
-            stack.route_binder.clone(),
-        ));
         let materializer = ContextualProgramMaterializer {
             namespace_proxy: namespace.client.proxy(),
             receiver: transfer_receiver,
@@ -2027,7 +2175,18 @@ fn run() -> Result<(), String> {
                     Arc::clone(spawner),
                     stack.runtime.create_sender(),
                 )
-                .with_program_materializer(materializer.clone()),
+                .with_program_materializer(materializer.clone())
+                .with_resource_probe(
+                    crate::contextual_process::ContextualResourceProbe {
+                        runtime: stack.runtime.clone(),
+                        engine: engine.handle(),
+                        arena: Arc::clone(&arena_manager),
+                        stream_transport: driver.stream_transport(),
+                        generation: telemetry.producer.stream_id().life.0,
+                        iroh_node_id: driver.node_id().to_string(),
+                        deployment: config.deployment.clone(),
+                    },
+                ),
             )
         })
         .transpose()
@@ -2035,8 +2194,10 @@ fn run() -> Result<(), String> {
     let mut node_agent = NodeAgentActor::new(
         stage::NodeId(config.logical_node_id),
         orchestrator,
-        Some(*reports.addr()),
-    );
+        Some(report_forwarder),
+    )
+    .with_directory_actor(stack.actors.directory)
+    .with_peer_connector(driver.peer_connector());
     if let Some(controller) = contextual_controller {
         node_agent = node_agent.with_contextual_controller(controller);
     }
@@ -2147,6 +2308,8 @@ fn run() -> Result<(), String> {
                 completion: completion.clone(),
             })
             .map_err(|error| format!("spawn agent node runtime actor: {error}"))?;
+        *report_wake_target.lock() = Some(runtime_actor);
+        let _ = sender.send_to(runtime_actor, NodeRuntimeMsg::RoutingChanged);
         let stop_actor = actor_runtime
             .spawn(StdinStopForwarder {
                 sender: sender.clone(),
@@ -2279,6 +2442,8 @@ fn run() -> Result<(), String> {
             completion: completion.clone(),
         })
         .map_err(|error| format!("spawn worker node runtime actor: {error}"))?;
+    *report_wake_target.lock() = Some(runtime_actor);
+    let _ = sender.send_to(runtime_actor, NodeRuntimeMsg::RoutingChanged);
     let stop_actor = actor_runtime
         .spawn(StdinStopForwarder {
             sender: sender.clone(),
@@ -2291,7 +2456,26 @@ fn run() -> Result<(), String> {
 #[derive(Clone, Copy)]
 enum NodeRuntimeMsg {
     Tick,
+    Progress,
+    RoutingChanged,
     Shutdown,
+}
+
+struct NodeReportWakeForwarder {
+    destination: ActorAddress,
+    target: Arc<Mutex<Option<ActorAddress>>>,
+}
+
+impl ActorInterface for NodeReportWakeForwarder {
+    type Incoming = NodeAgentReport;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, report: NodeAgentReport) {
+        let _ = ctx.send(self.destination, report);
+        if let Some(target) = *self.target.lock() {
+            let _ = ctx.send(target, NodeRuntimeMsg::Progress);
+        }
+    }
 }
 
 struct StdinStopForwarder {
@@ -2369,7 +2553,7 @@ impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
             }),
         );
         self.telemetry
-            .submit_text(self.telemetry.channels.node_ready, ready.to_string());
+            .submit_value(self.telemetry.channels.node_ready, ready);
     }
 
     fn tick_after_reports(
@@ -2505,6 +2689,14 @@ impl<E: AgentNodeRuntimeEffects> ActorInterface for AgentNodeRuntimeActor<E> {
                 Ok(()) => self.schedule_tick(ctx),
                 Err(error) => self.finish(ctx, Err(error)),
             },
+            NodeRuntimeMsg::Progress | NodeRuntimeMsg::RoutingChanged => {
+                if matches!(message, NodeRuntimeMsg::RoutingChanged) {
+                    self.pending_runtime_ready.next_attempt_at = Instant::now();
+                }
+                if let Err(error) = self.tick() {
+                    self.finish(ctx, Err(error));
+                }
+            }
             NodeRuntimeMsg::Shutdown => {
                 self.effects.shutdown();
                 self.finish(ctx, Ok(()));
@@ -2787,6 +2979,14 @@ impl<E: WorkerNodeRuntimeEffects> ActorInterface for WorkerNodeRuntimeActor<E> {
                 Ok(()) => self.schedule_tick(ctx),
                 Err(error) => self.finish(ctx, Err(error)),
             },
+            NodeRuntimeMsg::Progress | NodeRuntimeMsg::RoutingChanged => {
+                if matches!(message, NodeRuntimeMsg::RoutingChanged) {
+                    self.pending_runtime_ready.next_attempt_at = Instant::now();
+                }
+                if let Err(error) = self.tick() {
+                    self.finish(ctx, Err(error));
+                }
+            }
             NodeRuntimeMsg::Shutdown => {
                 self.effects.shutdown();
                 self.finish(ctx, Ok(()));
@@ -2845,21 +3045,88 @@ struct NodeTelemetry {
     archive: Option<TelemetryArchive>,
 }
 
+fn allocate_telemetry_lifetime(
+    state_root: &Path,
+    node_id: u64,
+    run_id: u64,
+) -> Result<u64, String> {
+    let directory = state_root.join(format!("node-{node_id}"));
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("create telemetry state {}: {error}", directory.display()))?;
+    // Lock a stable inode: the counter itself is atomically replaced below.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("generation.lock"))
+        .map_err(|error| format!("open telemetry generation lock: {error}"))?;
+    lock.lock()
+        .map_err(|error| format!("lock telemetry generation: {error}"))?;
+    let path = directory.join("generation");
+    let previous = match fs::read_to_string(&path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("read telemetry generation {}: {error}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(format!(
+                "read telemetry generation {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let next = previous
+        .max(run_id)
+        .checked_add(1)
+        .ok_or_else(|| format!("telemetry generation exhausted for node {node_id}"))?;
+    let pending = directory.join("generation.next");
+    let mut file = File::create(&pending)
+        .map_err(|error| format!("create telemetry generation {}: {error}", pending.display()))?;
+    file.write_all(next.to_string().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "persist telemetry generation {}: {error}",
+                pending.display()
+            )
+        })?;
+    fs::rename(&pending, &path)
+        .map_err(|error| format!("commit telemetry generation {}: {error}", path.display()))?;
+    File::open(&directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync telemetry state {}: {error}", directory.display()))?;
+    Ok(next)
+}
+
 impl NodeTelemetry {
-    fn new(config: &DeploymentConfig) -> Self {
+    fn new(config: &DeploymentConfig) -> Result<Self, String> {
+        // Lifetimes are ordered generations, not random readiness identities.
+        // Persist the next one before any producer can emit startup records.
+        let state_root = env_optional("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env_optional("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .ok_or_else(|| "telemetry requires XDG_STATE_HOME or HOME for node state".to_owned())?
+            .join("myelin/telemetry");
+        let lifetime =
+            allocate_telemetry_lifetime(&state_root, config.logical_node_id, config.run_id)?;
         let stream = StreamId::new(
             NodeId::new(config.logical_node_id.to_string()),
-            Lifetime(config.run_id),
+            Lifetime(lifetime),
         );
-        let endpoint = Arc::new(TelemetryEndpoint::with_descriptor(
-            StreamDescriptor {
-                stream: stream.clone(),
-                label: Some("myelin worker node".to_owned()),
-                origin: StreamOrigin::RemoteNode,
-            },
-            256,
-            1024,
-        ));
+        let endpoint = Arc::new(
+            TelemetryEndpoint::with_descriptor(
+                StreamDescriptor {
+                    stream: stream.clone(),
+                    label: Some("myelin worker node".to_owned()),
+                    origin: StreamOrigin::RemoteNode,
+                },
+                16_384,
+                16_384,
+            )
+            .with_retention(16_384, 16 * 1024 * 1024),
+        );
         let producer = endpoint.producer();
         let mut by_name = BTreeMap::new();
         let mut by_id = BTreeMap::new();
@@ -2883,29 +3150,29 @@ impl NodeTelemetry {
             "myelin.worker.device_object",
             "myelin.worker.shutdown",
         ] {
-            register_json_channel(&producer, &mut by_name, &mut by_id, name);
+            register_messagepack_channel(&producer, &mut by_name, &mut by_id, name);
         }
 
         let channels = TelemetryChannelSet {
-            node_ready: register_json_channel(
+            node_ready: register_messagepack_channel(
                 &producer,
                 &mut by_name,
                 &mut by_id,
                 "myelin.node.ready",
             ),
-            node_lifecycle: register_json_channel(
+            node_lifecycle: register_messagepack_channel(
                 &producer,
                 &mut by_name,
                 &mut by_id,
                 "myelin.node.lifecycle",
             ),
-            node_self_test: register_json_channel(
+            node_self_test: register_messagepack_channel(
                 &producer,
                 &mut by_name,
                 &mut by_id,
                 "myelin.node.self_test",
             ),
-            worker_stderr: register_json_channel(
+            worker_stderr: register_messagepack_channel(
                 &producer,
                 &mut by_name,
                 &mut by_id,
@@ -2956,25 +3223,26 @@ impl NodeTelemetry {
             TelemetryArchive::open(path, endpoint.subscribe_all("frame-log")).ok()
         });
 
-        Self {
+        Ok(Self {
             endpoint,
             producer,
             channels,
             by_name,
             by_id,
             archive,
-        }
+        })
     }
 
     fn channel_by_name(&mut self, name: &str) -> ChannelId {
         if let Some(id) = self.by_name.get(name).copied() {
             return id;
         }
-        register_json_channel(&self.producer, &mut self.by_name, &mut self.by_id, name)
+        register_messagepack_channel(&self.producer, &mut self.by_name, &mut self.by_id, name)
     }
 
-    fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) {
-        self.producer.submit_text(channel, text);
+    fn submit_value(&self, channel: ChannelId, value: &Value) {
+        let payload = encode_record(value).expect("serialize node telemetry record");
+        self.producer.submit_bytes(channel, payload);
     }
 
     fn tick(&mut self) {
@@ -3000,7 +3268,7 @@ fn serve_telemetry_pulls(
     }
 }
 
-fn register_json_channel(
+fn register_messagepack_channel(
     producer: &TelemetryProducer,
     by_name: &mut BTreeMap<String, ChannelId>,
     by_id: &mut BTreeMap<ChannelId, String>,
@@ -3008,7 +3276,7 @@ fn register_json_channel(
 ) -> ChannelId {
     let id = producer.register_channel(
         name,
-        ChannelContent::JsonRecord {
+        ChannelContent::MessagePackRecord {
             schema: Some(name.to_owned()),
         },
     );
@@ -3048,12 +3316,15 @@ impl TelemetryArchive {
                     .get(&frame.channel.channel)
                     .cloned()
                     .unwrap_or_else(|| format!("channel#{}", frame.channel.channel.0));
+                let payload = decode_record_value(&frame.payload)
+                    .map(|value| json!({"encoding":"messagepack","value":value}))
+                    .unwrap_or_else(|_| json!({"encoding":"bytes","value":frame.payload}));
                 let record = json!({
                     "stream":frame.channel.stream.to_string(),
                     "channel":channel,
                     "channel_id":frame.channel.channel.0,
                     "position":frame.position.0,
-                    "payload":String::from_utf8_lossy(&frame.payload),
+                    "payload":payload,
                 });
                 let _ = serde_json::to_writer(&mut self.file, &record);
                 let _ = writeln!(self.file);
@@ -3095,12 +3366,21 @@ impl PendingControlRejoin {
                 run_id: config.run_id,
                 logical_node_id: config.logical_node_id,
                 attempt_id: config.attempt_id,
+                readiness_id: config.readiness_id,
                 selected_offer_id: config.selected_offer_id,
                 endpoint: serde_json::to_string(endpoint)
                     .map_err(|error| format!("serialize rejoin endpoint: {error}"))?,
                 swim_node_id,
                 stage_index: config.stage_index,
                 node_actor,
+                artifact_digest: config
+                    .deployment
+                    .as_ref()
+                    .map(|identity| identity.artifact_digest.clone()),
+                deployment_generation: config
+                    .deployment
+                    .as_ref()
+                    .map(|identity| identity.deployment_generation.clone()),
             },
             last_bound_actor: orchestrator_actor,
             pending_actor: None,
@@ -3211,6 +3491,7 @@ struct PendingRuntimeReady {
     backoff: Duration,
     acked: bool,
     swim_logged: bool,
+    deployment: Option<DeploymentIdentity>,
 }
 
 impl PendingRuntimeReady {
@@ -3225,12 +3506,13 @@ impl PendingRuntimeReady {
                 .coordinator_endpoint
                 .as_ref()
                 .map(|endpoint| DistNodeId(*endpoint.id.as_bytes())),
-            readiness_id: config.attempt_id,
+            readiness_id: config.readiness_id,
             attempts: 0,
             next_attempt_at: Instant::now(),
             backoff: RUNTIME_READY_RETRY_INITIAL,
             acked: false,
             swim_logged: false,
+            deployment: config.deployment.clone(),
         }
     }
 
@@ -3283,6 +3565,14 @@ impl PendingRuntimeReady {
                     endpoint: self.endpoint.clone(),
                     node_actor: self.node_actor,
                     readiness_id: self.readiness_id,
+                    artifact_digest: self
+                        .deployment
+                        .as_ref()
+                        .map(|identity| identity.artifact_digest.clone()),
+                    deployment_generation: self
+                        .deployment
+                        .as_ref()
+                        .map(|identity| identity.deployment_generation.clone()),
                 },
             )
             .map_err(|error| format!("signal runtime loaded: {error}"))?;
@@ -3350,10 +3640,8 @@ fn handle_node_report(
         }
         NodeAgentReport::Lifecycle(event) => {
             let event = format!("{event:?}");
-            telemetry.submit_text(
-                telemetry.channels.node_lifecycle,
-                json!({"type":"node_lifecycle","event":event}).to_string(),
-            );
+            let payload = json!({"type":"node_lifecycle","event":event});
+            telemetry.submit_value(telemetry.channels.node_lifecycle, &payload);
             node_stage(telemetry, "lifecycle", "observed", json!({"event":event}));
             Ok(NodeReportOutcome::None)
         }
@@ -4014,7 +4302,7 @@ fn publish_stage_shard_fetch_event(
 ) -> Result<(), String> {
     let channel = telemetry.channel_by_name("myelin.worker.weights");
     let payload = node_event_payload(config, "stage_shard_fetch", "event", event.clone());
-    telemetry.submit_text(channel, payload.to_string());
+    telemetry.submit_value(channel, &payload);
     emit_stdio_telemetry_frame("myelin.worker.weights", &payload)
         .map_err(|e| format!("emit stage shard fetch telemetry frame: {e}"))?;
     telemetry.tick();
@@ -4421,7 +4709,7 @@ fn run_self_test(
     )?;
     let result = worker.infer_prompt(0, prompt, config.self_test_max_tokens, config, telemetry)?;
     let record = json!({"type":"self_test_completed","prompt_bytes":prompt.len(),"result":result});
-    telemetry.submit_text(telemetry.channels.node_self_test, record.to_string());
+    telemetry.submit_value(telemetry.channels.node_self_test, &record);
     emit_node_event(
         telemetry,
         config,
@@ -4445,11 +4733,13 @@ struct DeploymentConfig {
     run_id: u64,
     logical_node_id: u64,
     attempt_id: u64,
+    readiness_id: u64,
     selected_offer_id: Option<u64>,
     stage_index: u32,
     coordinator_endpoint: Option<EndpointAddr>,
     orchestrator_actor: Option<ActorAddress>,
     telemetry_frame_log: Option<String>,
+    deployment: Option<DeploymentIdentity>,
     debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
     endpoint_addr_mask: EndpointAddrMask,
@@ -4482,6 +4772,41 @@ impl DeploymentConfig {
         let run_id = env_parse!("MYELIN_RUN_ID", 1)?;
         let logical_node_id = env_parse!("MYELIN_LOGICAL_NODE_ID", 1)?;
         let attempt_id = env_parse!("MYELIN_NODE_ATTEMPT_ID", 1)?;
+        let deployment = match (
+            env_optional("MYELIN_ARTIFACT_DIGEST"),
+            env_optional("MYELIN_DEPLOYMENT_GENERATION"),
+        ) {
+            (None, None) => None,
+            (Some(artifact_digest), Some(deployment_generation)) => Some(DeploymentIdentity {
+                artifact_digest,
+                deployment_generation,
+            }),
+            (Some(_), None) => {
+                return Err(
+                    "MYELIN_ARTIFACT_DIGEST requires MYELIN_DEPLOYMENT_GENERATION".to_owned(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "MYELIN_DEPLOYMENT_GENERATION requires MYELIN_ARTIFACT_DIGEST".to_owned(),
+                );
+            }
+        };
+        let readiness_id = if let Some(identity) = &deployment {
+            let stat = std::fs::read_to_string("/proc/self/stat")
+                .map_err(|error| format!("read deployment process identity: {error}"))?;
+            let start_ticks = stat
+                .rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                .ok_or_else(|| "process stat omitted start ticks".to_owned())?;
+            crate::orchestration::daemon::deployment_readiness_id(&format!(
+                "{}:{start_ticks}:{}",
+                std::process::id(),
+                identity.deployment_generation,
+            ))
+        } else {
+            attempt_id
+        };
         let relay = relay_runtime_config_from_env(run_id)?;
         let debug_join_socket = match env_optional("MYELIN_DEBUG_JOIN_SOCKET").as_deref() {
             Some("disabled") => None,
@@ -4505,6 +4830,7 @@ impl DeploymentConfig {
             run_id,
             logical_node_id,
             attempt_id,
+            readiness_id,
             selected_offer_id: env_optional(SELECTED_OFFER_ID_ENV)
                 .map(|value| {
                     value.parse().map_err(|error| {
@@ -4526,6 +4852,7 @@ impl DeploymentConfig {
                 })
                 .transpose()?,
             telemetry_frame_log: env_optional("MYELIN_TELEMETRY_FRAME_LOG"),
+            deployment,
             debug_join_socket,
             relay_mode: relay.mode,
             endpoint_addr_mask: env_optional(MVP_IROH_ENDPOINT_ADDR_MASK_ENV)
@@ -4609,7 +4936,7 @@ fn drain_worker_stderr(
     let mut emitted = false;
     while let Ok(line) = stderr_rx.lock().try_recv() {
         let payload = node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
-        telemetry.submit_text(telemetry.channels.worker_stderr, payload.to_string());
+        telemetry.submit_value(telemetry.channels.worker_stderr, &payload);
         emitted = true;
     }
     if emitted {
@@ -4816,7 +5143,7 @@ fn wait_for_helper_event(
     let outcome = completion.wait();
     for line in outcome.stderr_lines {
         let payload = node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
-        telemetry.submit_text(telemetry.channels.worker_stderr, payload.to_string());
+        telemetry.submit_value(telemetry.channels.worker_stderr, &payload);
     }
     for (elapsed_ms, wait_cycles) in outcome.wait_samples {
         emit_node_event(
@@ -4872,7 +5199,7 @@ fn wait_for_helper_event(
             "ready",
             json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes,"worker_event_type":worker_event_type}),
         );
-        telemetry.submit_text(channel, value.to_string());
+        telemetry.submit_value(channel, &value);
         emit_stdio_telemetry_frame(channel_name, &value)
             .map_err(|error| format!("emit worker stdio telemetry frame: {error}"))?;
         if worker_event_type != expected {
@@ -5417,6 +5744,44 @@ mod control_flow_properties {
 
     const DRIVE_PER_ACTION: usize = 16;
     const FINAL_DRIVE_BUDGET: usize = 256;
+
+    #[test]
+    fn telemetry_lifetimes_survive_restarts_and_serialize_concurrent_boots() {
+        let state = tempfile::tempdir().expect("telemetry state");
+        let run_id = 1 << 62;
+        assert_eq!(
+            allocate_telemetry_lifetime(state.path(), 7, run_id).unwrap(),
+            run_id + 1
+        );
+        let mut generations = std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| {
+                    scope.spawn(|| allocate_telemetry_lifetime(state.path(), 7, run_id).unwrap())
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        generations.sort_unstable();
+        assert_eq!(generations, (run_id + 2..=run_id + 5).collect::<Vec<_>>());
+        // A new process opening the same state cannot regress with a lower run id.
+        assert_eq!(
+            allocate_telemetry_lifetime(state.path(), 7, 1).unwrap(),
+            run_id + 6
+        );
+        assert_eq!(
+            allocate_telemetry_lifetime(state.path(), 7, run_id + 100).unwrap(),
+            run_id + 101
+        );
+        assert!(allocate_telemetry_lifetime(state.path(), 7, u64::MAX).is_err());
+        assert_eq!(
+            allocate_telemetry_lifetime(state.path(), 7, 1).unwrap(),
+            run_id + 102
+        );
+    }
+
     #[test]
     fn sampler_health_emits_only_state_transitions() {
         let endpoint = TelemetryEndpoint::with_descriptor(
@@ -5431,7 +5796,7 @@ mod control_flow_properties {
         let producer = endpoint.producer();
         let health_channel = producer.register_channel(
             NODE_SAMPLER_CHANNEL,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
             },
         );
@@ -5503,7 +5868,7 @@ mod control_flow_properties {
             .into_iter()
             .filter_map(|event| match event {
                 TelemetryEvent::Frame(delivery) if delivery.channel.channel == health_channel => {
-                    serde_json::from_slice::<Value>(&delivery.payload)
+                    decode_record_value(&delivery.payload)
                         .ok()
                         .and_then(|value| value["status"].as_str().map(str::to_owned))
                 }
@@ -5538,7 +5903,7 @@ mod control_flow_properties {
         let sample_channel = producer.register_record::<telemetry::hardware::net::HostNetSample>();
         let health_channel = producer.register_channel(
             NODE_SAMPLER_CHANNEL,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
             },
         );
@@ -5595,7 +5960,7 @@ mod control_flow_properties {
         let sample_channel = producer.register_record::<telemetry::hardware::cpu::HostCpuSample>();
         let health_channel = producer.register_channel(
             NODE_SAMPLER_CHANNEL,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
             },
         );
@@ -5876,6 +6241,7 @@ mod control_flow_properties {
             backoff: RUNTIME_READY_RETRY_INITIAL,
             acked: false,
             swim_logged: false,
+            deployment: None,
         }
     }
 

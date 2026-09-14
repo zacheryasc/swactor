@@ -3,7 +3,7 @@
 use std::fmt;
 
 use super::frame::{ChannelId, Frame, Position};
-use super::record::{ChannelClassifier, ChannelKind, Record};
+use super::record::{ChannelClassifier, ChannelKind, Record, decode_record_value};
 use super::store::{GapSpan, StoredStream};
 
 /// One entry on the merged timeline: either a frame or a surfaced gap.
@@ -44,7 +44,11 @@ pub fn decode_body_with<C: ChannelClassifier + ?Sized>(
     classifier: &C,
 ) -> Body {
     match classifier.classify(channel_name) {
-        ChannelKind::Typed => match serde_json::from_slice::<serde_json::Value>(payload) {
+        ChannelKind::MessagePackRecord => match decode_record_value(payload) {
+            Ok(value) => Body::Record(value),
+            Err(_) => Body::Raw(payload.to_vec()),
+        },
+        ChannelKind::JsonRecord => match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(value) => Body::Record(value),
             Err(_) => Body::Raw(payload.to_vec()),
         },

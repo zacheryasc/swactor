@@ -1,6 +1,8 @@
-use crate::types::{
-    InstanceResponse, LabeledInstance, LifecyclePolicy, ProviderInstanceStatus, RunningInstance,
-};
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+use crate::observation::ProviderObserver;
+use crate::types::{LabeledInstance, LifecyclePolicy, ProviderInstanceStatus, RunningInstance};
 
 pub async fn fetch_instance_status(
     client: &reqwest::Client,
@@ -8,35 +10,9 @@ pub async fn fetch_instance_status(
     api_key: &str,
     contract_id: u64,
 ) -> Result<ProviderInstanceStatus, String> {
-    let url = format!("{base_url}/api/v0/instances/{contract_id}/");
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
+    ProviderObserver::default()
+        .status(client, base_url, api_key, contract_id)
         .await
-        .map_err(|e| format!("fetch_instance_status request failed: {e}"))?;
-
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "instance {contract_id} not found while fetching provider status: {}",
-            body.chars().take(80).collect::<String>(),
-        ));
-    }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "fetch_instance_status HTTP {status}: {}",
-            body.chars().take(80).collect::<String>(),
-        ));
-    }
-
-    let wrapper: InstanceResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("fetch_instance_status parse failed: {e}"))?;
-    Ok(wrapper.instances.into())
 }
 
 fn provider_terminal_error(
@@ -108,6 +84,25 @@ pub async fn wait_for_running_with_policy(
     contract_id: u64,
     policy: &LifecyclePolicy,
 ) -> Result<RunningInstance, String> {
+    wait_for_running_with_observer(
+        client,
+        base_url,
+        api_key,
+        &ProviderObserver::default(),
+        contract_id,
+        policy,
+    )
+    .await
+}
+
+pub(crate) async fn wait_for_running_with_observer(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    observer: &ProviderObserver,
+    contract_id: u64,
+    policy: &LifecyclePolicy,
+) -> Result<RunningInstance, String> {
     let mut state_since = std::time::Instant::now();
     let mut last_state: Option<String> = None;
     let mut running_without_endpoint_since = None;
@@ -115,7 +110,10 @@ pub async fn wait_for_running_with_policy(
 
     loop {
         poll += 1;
-        let status = match fetch_instance_status(client, base_url, api_key, contract_id).await {
+        let status = match observer
+            .status(client, base_url, api_key, contract_id)
+            .await
+        {
             Ok(status) => status,
             Err(error) if missing_instance(&error) => {
                 return Err(error.replace(
@@ -186,14 +184,72 @@ pub async fn wait_for_ssh_endpoint_with_policy(
     label: &str,
     policy: &LifecyclePolicy,
 ) -> Result<RunningInstance, String> {
+    wait_for_ssh_endpoint_with_observer(
+        client,
+        base_url,
+        api_key,
+        &ProviderObserver::default(),
+        contract_id,
+        &BTreeSet::from([label.to_owned()]),
+        policy,
+    )
+    .await
+}
+
+pub(crate) async fn wait_for_ssh_endpoint_with_observer(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    observer: &ProviderObserver,
+    contract_id: u64,
+    labels: &BTreeSet<String>,
+    policy: &LifecyclePolicy,
+) -> Result<RunningInstance, String> {
     let mut running_without_endpoint_since = None;
     let mut poll = 0_u64;
 
     loop {
         poll += 1;
-        match crate::teardown::list_instances_by_label(client, base_url, api_key, label).await {
-            Ok(instances) => {
-                if let Some(instance) = instances
+        // Either provider shape may publish SSH first. A rate-limited account
+        // listing must not hide a usable exact endpoint, nor may stale exact
+        // status hide an already usable provider proxy endpoint.
+        let status = observer.status(client, base_url, api_key, contract_id);
+        let boundary = Instant::now();
+        let known = BTreeSet::new();
+        let census = observer.census(
+            client,
+            base_url,
+            api_key,
+            labels,
+            &known,
+            boundary,
+            boundary + crate::VastClient::REQUEST_TIMEOUT * 4 + Duration::from_secs(180),
+        );
+        tokio::pin!(status, census);
+        let (status, census) = tokio::select! {
+            status = &mut status => {
+                if let Ok(status) = &status
+                    && let Some(endpoint) = status.ssh_endpoint()
+                {
+                    return Ok(endpoint);
+                }
+                (status, census.await)
+            }
+            census = &mut census => {
+                if let Ok(census) = &census
+                    && let Some(endpoint) = census.instances.iter()
+                        .find(|instance| instance.contract_id == contract_id)
+                        .and_then(labeled_endpoint)
+                {
+                    return Ok(endpoint);
+                }
+                (status.await, census)
+            }
+        };
+        match census {
+            Ok(census) => {
+                if let Some(instance) = census
+                    .instances
                     .iter()
                     .find(|instance| instance.contract_id == contract_id)
                 {
@@ -217,7 +273,7 @@ pub async fn wait_for_ssh_endpoint_with_policy(
             }
         }
 
-        let status = match fetch_instance_status(client, base_url, api_key, contract_id).await {
+        let status = match status {
             Ok(status) => status,
             Err(error) if missing_instance(&error) => return Err(error),
             Err(error) if parse_failed(&error) => return Err(error),
@@ -276,6 +332,50 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn provider_status_redacts_echoed_credentials_before_truncation() {
+        let server = MockServer::start().await;
+        let key = "status-credential-marker-never-persist";
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/901/"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(format!("{}rejected key {key}", "x".repeat(55))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/902/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "instances": {
+                    "actual_status": "error",
+                    "intended_status": "running",
+                    "status_msg": format!("authorization failed for {key}")
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let error = fetch_instance_status(&client, &server.uri(), key, 901)
+            .await
+            .unwrap_err();
+        assert!(error.contains("403"));
+        assert!(error.contains("rejected key"));
+        assert!(!error.contains("status-"));
+        let status = fetch_instance_status(&client, &server.uri(), key, 902)
+            .await
+            .unwrap();
+        assert_eq!(status.actual_status, "error");
+        assert!(
+            status
+                .status_msg
+                .as_ref()
+                .unwrap()
+                .contains("authorization failed")
+        );
+        assert!(!status.status_msg.as_ref().unwrap().contains(key));
+    }
+
+    #[tokio::test]
     async fn loading_state_remains_slow_progress_before_terminal_evidence() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -331,6 +431,11 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/789/"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+            .mount(&server)
+            .await;
 
         let policy = LifecyclePolicy {
             poll_interval: Duration::from_secs(60),
@@ -338,15 +443,19 @@ mod tests {
             ..LifecyclePolicy::default()
         };
 
-        let endpoint = wait_for_ssh_endpoint_with_policy(
-            &reqwest::Client::new(),
-            &server.uri(),
-            "secret",
-            789,
-            "node-789",
-            &policy,
+        let endpoint = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_ssh_endpoint_with_policy(
+                &reqwest::Client::new(),
+                &server.uri(),
+                "secret",
+                789,
+                "node-789",
+                &policy,
+            ),
         )
         .await
+        .expect("usable proxy SSH must not wait for rate-limited exact status")
         .expect("known endpoint should start bootstrap observation before running status");
 
         assert_eq!(
@@ -356,12 +465,63 @@ mod tests {
                 port: 22017,
             }
         );
-        let requests = server.received_requests().await.expect("requests recorded");
-        assert!(
-            requests
+    }
+
+    #[tokio::test]
+    async fn usable_exact_endpoint_cancels_listing_wait_without_resetting_provider_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/790/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(json!({
+                        "instances": {"actual_status": "loading", "intended_status": "running",
+                            "public_ipaddr": "127.0.0.1", "ssh_port": 22018}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let client = crate::VastClient::with_base_url(server.uri(), "secret");
+        let labels = BTreeSet::from(["node-790".to_owned()]);
+        let endpoint = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.wait_for_ssh_endpoint(790, &labels, &LifecyclePolicy::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            endpoint,
+            RunningInstance {
+                ip: "127.0.0.1".to_owned(),
+                port: 22018
+            }
+        );
+        let error = client
+            .owned_census(
+                &labels,
+                &BTreeSet::new(),
+                Instant::now(),
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("capacity deadline"));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
                 .iter()
-                .all(|request| request.url.path() != "/api/v0/instances/789/"),
-            "endpoint discovery should not wait for provider-running status once label data has a usable endpoint"
+                .filter(|request| request.url.path() == "/api/v0/instances/")
+                .count(),
+            1
         );
     }
 

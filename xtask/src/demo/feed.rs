@@ -160,7 +160,7 @@ pub enum SupervisorMsg {
 struct RemoteStreamMeta {
     logical_node: String,
     attempt: u64,
-    channels: BTreeMap<telemetry::ChannelId, String>,
+    channels: BTreeMap<telemetry::ChannelId, (String, telemetry::ChannelContent)>,
 }
 
 /// Per-node telemetry handle kept while the attempt is live.
@@ -663,7 +663,8 @@ impl SupervisorActor {
         meta.logical_node = logical_node.clone();
         meta.attempt = attempt;
         for channel in &header.channels {
-            meta.channels.insert(channel.id, channel.name.clone());
+            meta.channels
+                .insert(channel.id, (channel.name.clone(), channel.content.clone()));
         }
         println!(
             "demo: fusing telemetry of node {logical_node} (stream {key}, {} channels)",
@@ -689,11 +690,16 @@ impl SupervisorActor {
                     let target_stream = node_stream.telemetry.endpoint.stream_id().clone();
                     let origin = node_stream.telemetry.origin;
                     let label = node_stream.telemetry.label.clone();
-                    let channel_name = meta
+                    let (channel_name, content) = meta
                         .channels
                         .get(&delivery.channel.channel)
                         .cloned()
-                        .unwrap_or_else(|| format!("channel#{}", delivery.channel.channel.0));
+                        .unwrap_or_else(|| {
+                            (
+                                format!("channel#{}", delivery.channel.channel.0),
+                                telemetry::ChannelContent::Bytes,
+                            )
+                        });
                     let frame = telemetry::frame::Frame {
                         channel: delivery.channel.channel,
                         position: delivery.position,
@@ -703,6 +709,7 @@ impl SupervisorActor {
                         &self.dashboard,
                         &target_stream,
                         &channel_name,
+                        &content,
                         &frame,
                         origin,
                         &label,
@@ -714,7 +721,7 @@ impl SupervisorActor {
                         .entry(key)
                         .or_default()
                         .channels
-                        .insert(descriptor.id, descriptor.name);
+                        .insert(descriptor.id, (descriptor.name, descriptor.content));
                 }
                 _ => {}
             }
@@ -941,17 +948,26 @@ impl SupervisorActor {
     /// Drain every telemetry endpoint into the dashboard.
     fn flush_telemetry(&mut self) {
         let supervisor_stream = self.telemetry.endpoint.stream_id().clone();
+        let supervisor_catalog = self.telemetry.endpoint.catalog_snapshot();
         for frame in self.telemetry.endpoint.mux().drain() {
-            let channel = self
-                .telemetry
-                .names
-                .get(&frame.channel)
-                .cloned()
-                .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
+            let (channel, content) = supervisor_catalog
+                .channels
+                .get(&telemetry::frame::ChannelRef {
+                    stream: supervisor_stream.clone(),
+                    channel: frame.channel,
+                })
+                .map(|descriptor| (descriptor.name.clone(), descriptor.content.clone()))
+                .unwrap_or_else(|| {
+                    (
+                        format!("channel#{}", frame.channel.0),
+                        telemetry::ChannelContent::Bytes,
+                    )
+                });
             publish_frame(
                 &self.dashboard,
                 &supervisor_stream,
                 &channel,
+                &content,
                 &frame,
                 self.telemetry.origin,
                 self.telemetry.label,
@@ -965,18 +981,24 @@ impl SupervisorActor {
             let stream = streams.telemetry.endpoint.stream_id().clone();
             let catalog = streams.telemetry.endpoint.catalog_snapshot();
             for frame in streams.telemetry.endpoint.mux().drain() {
-                let channel = catalog
+                let (channel, content) = catalog
                     .channels
                     .get(&telemetry::frame::ChannelRef {
                         stream: stream.clone(),
                         channel: frame.channel,
                     })
-                    .map(|descriptor| descriptor.name.clone())
-                    .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
+                    .map(|descriptor| (descriptor.name.clone(), descriptor.content.clone()))
+                    .unwrap_or_else(|| {
+                        (
+                            format!("channel#{}", frame.channel.0),
+                            telemetry::ChannelContent::Bytes,
+                        )
+                    });
                 publish_frame(
                     &self.dashboard,
                     &stream,
                     &channel,
+                    &content,
                     &frame,
                     streams.telemetry.origin,
                     &streams.telemetry.label,
@@ -990,6 +1012,7 @@ fn publish_frame(
     dashboard: &dashboard::DashboardHandle,
     stream: &telemetry::frame::StreamId,
     channel: &str,
+    content: &telemetry::ChannelContent,
     frame: &telemetry::frame::Frame,
     origin: &str,
     label: &str,
@@ -1004,6 +1027,7 @@ fn publish_frame(
         channel: channel.to_owned(),
         position: frame.position.0,
         payload: frame.payload.clone(),
+        content: content.clone(),
     });
 }
 
@@ -1493,6 +1517,7 @@ mod properties {
 
     fn provision_spec(attempt: u64) -> NodeProvisionSpec {
         NodeProvisionSpec {
+            deployment: None,
             run_id: 1,
             node_id: attempt,
             attempt_id: attempt,

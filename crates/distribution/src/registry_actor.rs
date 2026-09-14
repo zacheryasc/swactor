@@ -10,13 +10,13 @@
 //! node returns.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 
-use crate::messages::RegistryGossip;
-use crate::registry::{ClusterRegistry, RegistryConfig, RegistrySnapshot};
+use crate::messages::{RegistryDelivery, RegistryGossip};
+use crate::registry::{ClusterRegistry, RegistryConfig, RegistryEntry, RegistrySnapshot};
 use crate::swim::actor::{MembershipChanged, PeerDirectory};
 use crate::types::{MemberState, NodeId};
 
@@ -38,12 +38,43 @@ pub enum RegistryIn {
         name: String,
         actor_addr: ActorAddress,
     },
+    /// Local: register with a caller-supplied logical timestamp. Used by a
+    /// recovered service whose fresh logical clock would otherwise lose to the
+    /// binding it disseminated before restarting.
+    RegisterNameAt {
+        name: String,
+        actor_addr: ActorAddress,
+        timestamp: u64,
+    },
+    /// Local: push this registry's current live entry for `name` directly to
+    /// `peers` now, bypassing SWIM-gated dissemination. Recovery re-bind: a
+    /// restarted authority must replace the dead binding workers still serve
+    /// without waiting for membership rounds to re-form (observed stall: a
+    /// dead directory binding served for the full namespace request deadline
+    /// while membership re-converged).
+    DisseminateNameTo {
+        name: String,
+        peers: Vec<NodeId>,
+        reply_to: ActorAddress,
+    },
+    /// Local: a peer installed this exact live name/binding/generation.
+    /// Delivered only while it remains the origin registry's current winner.
+    NameAcknowledged { entry: RegistryEntry, peer: NodeId },
     /// Local: unregister a name (writes a tombstone).
     UnregisterName { name: String },
     /// Local request: resolve `name`; the result is sent to `reply`.
     ResolveName { name: String, reply: ActorAddress },
     /// Gossip from a peer: a batch of CRDT entries to merge.
     Gossip(RegistryGossip),
+    /// Local: send all current winners, including tombstones, directly over a
+    /// newly established peer connection, even if membership never changed.
+    SyncTo { peer: NodeId },
+    /// Local observer, retained only while its owner keeps the callback alive.
+    /// Runs after publication and once on registration to close the check/subscribe race.
+    WatchName {
+        name: String,
+        changed: Weak<dyn Fn() + Send + Sync>,
+    },
     /// Clock: run GC and disseminate a pending batch to one peer.
     Tick,
 }
@@ -68,6 +99,7 @@ pub struct RegistryActor {
     /// Optional read-mirror the node's telemetry tick observes. Republished
     /// after each registry change. `None` when no one is observing.
     view: Option<RegistryView>,
+    watchers: Vec<(String, Option<RegistryEntry>, Weak<dyn Fn() + Send + Sync>)>,
 }
 
 impl RegistryActor {
@@ -83,6 +115,7 @@ impl RegistryActor {
             alive: BTreeSet::new(),
             fanout_cursor: 0,
             view: None,
+            watchers: Vec::new(),
         }
     }
 
@@ -96,10 +129,21 @@ impl RegistryActor {
     }
 
     /// Republish the registry snapshot to the read-mirror, if one is installed.
-    fn publish(&self) {
+    fn publish(&mut self) {
         if let Some(view) = &self.view {
             *view.write().expect("registry view poisoned") = self.registry.snapshot();
         }
+        self.watchers.retain_mut(|(name, previous, changed)| {
+            let Some(changed) = changed.upgrade() else {
+                return false;
+            };
+            let current = self.registry.entries().find(|entry| entry.name == *name);
+            if current != previous.as_ref() {
+                *previous = current.cloned();
+                changed();
+            }
+            true
+        });
     }
 
     fn cluster_size(&self) -> usize {
@@ -122,7 +166,33 @@ impl RegistryActor {
         let peer = peers[self.fanout_cursor % peers.len()];
         self.fanout_cursor = self.fanout_cursor.wrapping_add(1);
         if let Some(addr) = self.peer_directory.resolve(&peer) {
-            let _ = ctx.send(addr, RegistryIn::Gossip(RegistryGossip { entries }));
+            let _ = ctx.send(
+                addr,
+                RegistryIn::Gossip(RegistryGossip {
+                    entries,
+                    delivery: None,
+                }),
+            );
+        }
+    }
+
+    fn sync_to(&self, ctx: &Ctx, peer: NodeId) {
+        let Some(addr) = self.peer_directory.resolve(&peer) else {
+            return;
+        };
+        let mut entries = self.registry.entries();
+        loop {
+            let batch: Vec<_> = entries.by_ref().take(8).cloned().collect();
+            if batch.is_empty() {
+                break;
+            }
+            let _ = ctx.send(
+                addr,
+                RegistryIn::Gossip(RegistryGossip {
+                    entries: batch,
+                    delivery: None,
+                }),
+            );
         }
     }
 }
@@ -155,10 +225,59 @@ impl ActorInterface for RegistryActor {
                 self.registry.register(name, actor_addr, self.self_id, size);
                 self.publish();
             }
+            RegistryIn::RegisterNameAt {
+                name,
+                actor_addr,
+                timestamp,
+            } => {
+                let size = self.cluster_size();
+                self.registry
+                    .register_at(name, actor_addr, self.self_id, timestamp, size);
+                self.publish();
+            }
+            RegistryIn::DisseminateNameTo {
+                name,
+                peers,
+                reply_to,
+            } => {
+                let Some(entry) = self
+                    .registry
+                    .entries()
+                    .find(|entry| {
+                        entry.name == name && !entry.tombstone && entry.node_id == self.self_id
+                    })
+                    .cloned()
+                else {
+                    return;
+                };
+                for peer in peers {
+                    if let Some(addr) = self.peer_directory.resolve(&peer) {
+                        let _ = ctx.send(
+                            addr,
+                            RegistryIn::Gossip(RegistryGossip {
+                                entries: vec![entry.clone()],
+                                delivery: Some(RegistryDelivery::Request { reply_to }),
+                            }),
+                        );
+                    }
+                }
+            }
             RegistryIn::UnregisterName { name } => {
                 let size = self.cluster_size();
                 self.registry.unregister(&name, self.self_id, size);
                 self.publish();
+            }
+            RegistryIn::SyncTo { peer } => self.sync_to(ctx, peer),
+            RegistryIn::WatchName { name, changed } => {
+                let current = self
+                    .registry
+                    .entries()
+                    .find(|entry| entry.name == name)
+                    .cloned();
+                if let Some(notify) = changed.upgrade() {
+                    notify();
+                    self.watchers.push((name, current, changed));
+                }
             }
             RegistryIn::ResolveName { name, reply } => {
                 let binding = self.registry.resolve(&name);
@@ -166,9 +285,46 @@ impl ActorInterface for RegistryActor {
             }
             RegistryIn::Gossip(g) => {
                 let size = self.cluster_size();
-                self.registry.merge_batch(g.entries, size);
-                self.publish();
+                match g.delivery {
+                    Some(RegistryDelivery::Acknowledged { reply_to, peer }) => {
+                        for entry in g.entries {
+                            if !entry.tombstone
+                                && entry.node_id == self.self_id
+                                && self.registry.entries().any(|current| current == &entry)
+                            {
+                                let _ = ctx
+                                    .send(reply_to, RegistryIn::NameAcknowledged { entry, peer });
+                            }
+                        }
+                    }
+                    Some(RegistryDelivery::Request { reply_to }) => {
+                        self.registry.merge_batch(g.entries.iter().cloned(), size);
+                        self.publish();
+                        for entry in g.entries {
+                            if !entry.tombstone
+                                && self.registry.entries().any(|current| current == &entry)
+                                && let Some(addr) = self.peer_directory.resolve(&entry.node_id)
+                            {
+                                let _ = ctx.send(
+                                    addr,
+                                    RegistryIn::Gossip(RegistryGossip {
+                                        entries: vec![entry],
+                                        delivery: Some(RegistryDelivery::Acknowledged {
+                                            reply_to,
+                                            peer: self.self_id,
+                                        }),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        self.registry.merge_batch(g.entries, size);
+                        self.publish();
+                    }
+                }
             }
+            RegistryIn::NameAcknowledged { .. } => {}
             RegistryIn::Tick => {
                 self.registry.gc_tick();
                 self.disseminate(ctx);

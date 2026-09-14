@@ -1,13 +1,13 @@
+use distribution::directory_actor::DirectoryIn;
 use iroh::EndpointAddr;
+use iroh_driver::PeerConnector;
+use myelin_control_contract::{ContextualProcessEvent, ContextualProcessEventKind};
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
-use crate::contextual_process::{
-    ContextualNodeCommand, ContextualProcessControllerIn, ContextualProcessEventKindWire,
-    ContextualProcessEventWire,
-};
+use crate::contextual_process::{ContextualNodeCommand, ContextualProcessControllerIn};
 use crate::gguf_shard::StageShardPlan;
 use crate::run_plan;
 use crate::staging as stage;
@@ -146,7 +146,15 @@ pub(crate) enum NodeAgentMsg {
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
         readiness_id: u64,
+        #[serde(default)]
+        artifact_digest: Option<String>,
+        #[serde(default)]
+        deployment_generation: Option<String>,
     },
+    JoinPeers {
+        endpoints: Vec<EndpointAddr>,
+    },
+    ResyncRoutes,
     RuntimeReadyAck {
         run_id: u64,
         node_id: u64,
@@ -346,6 +354,8 @@ pub(crate) struct NodeAgentActor {
     orchestrator: ActorAddress,
     report_to: Option<ActorAddress>,
     contextual_controller: Option<ActorAddress>,
+    peer_connector: Option<PeerConnector>,
+    directory: Option<ActorAddress>,
     control_generation: u64,
     inbound_edge: Option<StageInboundEdgeWire>,
     outbound_edge: Option<StageOutboundEdgeWire>,
@@ -366,6 +376,8 @@ impl NodeAgentActor {
             orchestrator,
             report_to,
             contextual_controller: None,
+            peer_connector: None,
+            directory: None,
             control_generation: 0,
             inbound_edge: None,
             outbound_edge: None,
@@ -377,6 +389,16 @@ impl NodeAgentActor {
 
     pub(crate) fn with_contextual_controller(mut self, controller: ActorAddress) -> Self {
         self.contextual_controller = Some(controller);
+        self
+    }
+
+    pub(crate) fn with_peer_connector(mut self, connector: PeerConnector) -> Self {
+        self.peer_connector = Some(connector);
+        self
+    }
+
+    pub(crate) fn with_directory_actor(mut self, directory: ActorAddress) -> Self {
+        self.directory = Some(directory);
         self
     }
 
@@ -461,7 +483,7 @@ impl NodeAgentActor {
                         } => (
                             request_id,
                             reply_to,
-                            ContextualProcessEventKindWire::SpawnRejected {
+                            ContextualProcessEventKind::SpawnRejected {
                                 error: CONTROL_UNAVAILABLE.to_owned(),
                             },
                         ),
@@ -472,7 +494,7 @@ impl NodeAgentActor {
                         } => (
                             request_id,
                             reply_to,
-                            ContextualProcessEventKindWire::StopRejected {
+                            ContextualProcessEventKind::StopRejected {
                                 error: CONTROL_UNAVAILABLE.to_owned(),
                             },
                         ),
@@ -482,14 +504,14 @@ impl NodeAgentActor {
                         } => (
                             request_id,
                             reply_to,
-                            ContextualProcessEventKindWire::ControlUnavailable {
+                            ContextualProcessEventKind::ControlUnavailable {
                                 error: CONTROL_UNAVAILABLE.to_owned(),
                             },
                         ),
                     };
                     let _ = ctx.send(
                         reply_to,
-                        OrchestratorMsg::ContextualEvent(ContextualProcessEventWire {
+                        OrchestratorMsg::ContextualEvent(ContextualProcessEvent {
                             request_id,
                             logical_node_id: self.logical_node_id,
                             event,
@@ -518,6 +540,18 @@ impl NodeAgentActor {
             return;
         };
         match msg {
+            NodeAgentMsg::JoinPeers { endpoints } => {
+                if let Some(connector) = &self.peer_connector {
+                    for endpoint in endpoints {
+                        connector.connect(endpoint);
+                    }
+                }
+            }
+            NodeAgentMsg::ResyncRoutes => {
+                if let Some(directory) = self.directory {
+                    let _ = ctx.send(directory, DirectoryIn::Resync);
+                }
+            }
             NodeAgentMsg::ProvisionStage(provision) => {
                 self.core.observe(stage::StageEvent::ProvisionStage {
                     from: stage::NodeId(provision.authorized_orchestrator),
@@ -534,6 +568,8 @@ impl NodeAgentActor {
                 endpoint,
                 node_actor,
                 readiness_id,
+                artifact_digest,
+                deployment_generation,
             } => {
                 self.core.observe(stage::StageEvent::WorkerReady);
                 let _ = ctx.send(
@@ -545,6 +581,8 @@ impl NodeAgentActor {
                         endpoint,
                         node_actor,
                         readiness_id,
+                        artifact_digest,
+                        deployment_generation,
                     },
                 );
             }

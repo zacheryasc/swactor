@@ -50,6 +50,35 @@ mod registry_crdt {
         assert_eq!(reg.resolve("svc"), Some((addr_new, node_id)));
     }
 
+    #[test]
+    fn recovered_authoritative_registration_wins_over_older_disseminated_clock() {
+        let mut restarted = ClusterRegistry::new(RegistryConfig::default());
+        let old_address = ActorAddress::new_random();
+        let recovered_address = ActorAddress::new_random();
+        let node_id = NodeId([7; 32]);
+
+        restarted.merge(RegistryEntry {
+            name: "data-directory".into(),
+            actor_addr: old_address,
+            node_id,
+            timestamp: 10_000,
+            generation: 7,
+            tombstone: false,
+        });
+        restarted.register_at(
+            "data-directory".into(),
+            recovered_address,
+            node_id,
+            1_u64 << 63,
+            2,
+        );
+
+        assert_eq!(
+            restarted.resolve("data-directory"),
+            Some((recovered_address, node_id))
+        );
+    }
+
     // ─── LWW tiebreak — generation then node_id ────────────────────────────────
 
     #[test]
@@ -517,6 +546,212 @@ mod standalone_gossip_transport {
             propagated,
             "registered name did not propagate over the transport"
         );
+    }
+    #[test]
+    fn directed_rebind_replaces_a_stale_binding_without_gossip_rounds() {
+        use distribution::messages::RegistryGossip;
+        use distribution::registry::RegistryEntry;
+
+        let c = GossipCluster::new(2);
+        let acknowledgements = c.nodes[0].rt.new_inbox::<RegistryIn>().unwrap();
+        let name = "swactor.data-directory".to_owned();
+        let dead = ActorAddress([0xDD; 32]);
+        let fresh = ActorAddress([0xF3; 32]);
+
+        // The peer still serves the authority's pre-crash binding.
+        c.nodes[1]
+            .rt
+            .send_to(
+                c.nodes[1].registry,
+                RegistryIn::Gossip(RegistryGossip {
+                    entries: vec![RegistryEntry {
+                        name: name.clone(),
+                        actor_addr: dead,
+                        node_id: c.ids[0],
+                        timestamp: (1 << 63) + 4,
+                        generation: 1,
+                        tombstone: false,
+                    }],
+                    delivery: None,
+                }),
+            )
+            .unwrap();
+        c.pump(2);
+        assert_eq!(c.resolve_name(1, &name), Some((dead, c.ids[0])));
+
+        // The restarted authority registers its recovered binding and pushes
+        // it directly to the persisted peer — no Tick, no gossip round, no
+        // membership convergence in between.
+        c.nodes[0]
+            .rt
+            .send_to(
+                c.nodes[0].registry,
+                RegistryIn::RegisterNameAt {
+                    name: name.clone(),
+                    actor_addr: fresh,
+                    timestamp: (1 << 63) + 5,
+                },
+            )
+            .unwrap();
+        c.nodes[0].backend.step();
+        c.nodes[0]
+            .rt
+            .send_to(
+                c.nodes[0].registry,
+                RegistryIn::DisseminateNameTo {
+                    name,
+                    peers: vec![c.ids[1]],
+                    reply_to: *acknowledgements.addr(),
+                },
+            )
+            .unwrap();
+        c.pump(4);
+
+        assert_eq!(
+            c.resolve_name(1, "swactor.data-directory"),
+            Some((fresh, c.ids[0])),
+            "directed re-bind must replace the dead binding without gossip rounds"
+        );
+        assert!(matches!(
+            acknowledgements.try_recv(),
+            Some(RegistryIn::NameAcknowledged { entry, peer })
+                if entry.name == "swactor.data-directory"
+                    && entry.actor_addr == fresh
+                    && entry.node_id == c.ids[0]
+                    && entry.timestamp == (1 << 63) + 5
+                    && entry.generation == 1
+                    && !entry.tombstone
+                    && peer == c.ids[1]
+        ));
+
+        // Losing an ACK must not strand recovery: an unchanged duplicate
+        // publication still acknowledges the installed winner.
+        c.nodes[0]
+            .rt
+            .send_to(
+                c.nodes[0].registry,
+                RegistryIn::DisseminateNameTo {
+                    name: "swactor.data-directory".to_owned(),
+                    peers: vec![c.ids[1]],
+                    reply_to: *acknowledgements.addr(),
+                },
+            )
+            .unwrap();
+        c.pump(4);
+        assert!(matches!(acknowledgements.try_recv(),
+            Some(RegistryIn::NameAcknowledged { entry, peer })
+                if entry.actor_addr == fresh && peer == c.ids[1]
+        ));
+
+        // A peer that has a newer winning binding must not ACK mere receipt
+        // of the stale directed request.
+        c.nodes[1]
+            .rt
+            .send_to(
+                c.nodes[1].registry,
+                RegistryIn::RegisterNameAt {
+                    name: "swactor.data-directory".to_owned(),
+                    actor_addr: ActorAddress([0xF4; 32]),
+                    timestamp: (1 << 63) + 20,
+                },
+            )
+            .unwrap();
+        c.nodes[1].backend.step();
+        c.nodes[0]
+            .rt
+            .send_to(
+                c.nodes[0].registry,
+                RegistryIn::DisseminateNameTo {
+                    name: "swactor.data-directory".to_owned(),
+                    peers: vec![c.ids[1]],
+                    reply_to: *acknowledgements.addr(),
+                },
+            )
+            .unwrap();
+        c.pump(4);
+        assert!(acknowledgements.try_recv().is_none());
+    }
+
+    #[test]
+    fn directed_acknowledgement_rejects_superseded_generation() {
+        use distribution::messages::{RegistryDelivery, RegistryGossip};
+
+        let c = GossipCluster::new(2);
+        let replies = c.nodes[0].rt.new_inbox::<RegistryIn>().unwrap();
+        let name = "swactor.data-directory".to_owned();
+        let actor_addr = ActorAddress([0xF3; 32]);
+        for timestamp in [100, 101] {
+            c.nodes[0]
+                .rt
+                .send_to(
+                    c.nodes[0].registry,
+                    RegistryIn::RegisterNameAt {
+                        name: name.clone(),
+                        actor_addr,
+                        timestamp,
+                    },
+                )
+                .unwrap();
+        }
+        c.nodes[0].backend.step();
+        // Observe the actual publication; the registry advances its logical
+        // clock while merging, so requested timestamps are not clock snapshots.
+        c.nodes[0].dir.bind(c.ids[1], *replies.addr(), 1);
+        c.nodes[0]
+            .rt
+            .send_to(c.nodes[0].registry, RegistryIn::SyncTo { peer: c.ids[1] })
+            .unwrap();
+        c.nodes[0].backend.step();
+        let Some(RegistryIn::Gossip(publication)) = replies.try_recv() else {
+            panic!("registry did not publish its current binding");
+        };
+        let current = publication
+            .entries
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap();
+        let acknowledge = |entry| {
+            c.nodes[0]
+                .rt
+                .send_to(
+                    c.nodes[0].registry,
+                    RegistryIn::Gossip(RegistryGossip {
+                        entries: vec![entry],
+                        delivery: Some(RegistryDelivery::Acknowledged {
+                            reply_to: *replies.addr(),
+                            peer: c.ids[1],
+                        }),
+                    }),
+                )
+                .unwrap();
+            c.nodes[0].backend.step();
+        };
+        let mut stale = current.clone();
+        stale.generation -= 1;
+        acknowledge(stale);
+        assert!(
+            replies.try_recv().is_none(),
+            "same binding is not the same generation"
+        );
+        let mut stale = current.clone();
+        stale.timestamp -= 1;
+        acknowledge(stale);
+        assert!(
+            replies.try_recv().is_none(),
+            "stale publication cannot finish recovery"
+        );
+        let mut future = current.clone();
+        future.timestamp += 1;
+        acknowledge(future);
+        assert!(
+            replies.try_recv().is_none(),
+            "ACKs cannot publish unseen future entries"
+        );
+        acknowledge(current.clone());
+        assert!(matches!(replies.try_recv(),
+            Some(RegistryIn::NameAcknowledged { entry, peer })
+                if entry == current && peer == c.ids[1]
+        ));
     }
 
     #[test]

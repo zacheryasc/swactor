@@ -74,6 +74,8 @@ pub struct RegistryEntrySnapshot {
     pub name: String,
     pub actor_addr: ActorAddress,
     pub node_id: NodeId,
+    pub timestamp: u64,
+    pub generation: u64,
     pub tombstone: bool,
 }
 
@@ -150,6 +152,31 @@ impl ClusterRegistry {
         self.merge_and_enqueue(entry, cluster_size);
     }
 
+    /// Register with a caller-supplied logical timestamp. A restarted node's
+    /// fresh CRDT clock starts below entries it previously disseminated; an
+    /// epoch-derived high timestamp makes the recovered binding win without
+    /// reading ambient time inside the actor.
+    pub fn register_at(
+        &mut self,
+        name: String,
+        actor_addr: ActorAddress,
+        node_id: NodeId,
+        timestamp: u64,
+        cluster_size: usize,
+    ) {
+        self.clock = self.clock.saturating_add(1).max(timestamp);
+        let generation = self.next_generation(&name);
+        let entry = RegistryEntry {
+            name,
+            actor_addr,
+            node_id,
+            timestamp: self.clock,
+            generation,
+            tombstone: false,
+        };
+        self.merge_and_enqueue(entry, cluster_size);
+    }
+
     /// Unregister a name (create a tombstone).
     pub fn unregister(&mut self, name: &str, node_id: NodeId, cluster_size: usize) {
         self.clock += 1;
@@ -210,7 +237,11 @@ impl ClusterRegistry {
 
     /// Merge a batch of entries received from gossip.
     /// Changed entries are re-enqueued for further dissemination.
-    pub fn merge_batch(&mut self, entries: Vec<RegistryEntry>, cluster_size: usize) {
+    pub fn merge_batch(
+        &mut self,
+        entries: impl IntoIterator<Item = RegistryEntry>,
+        cluster_size: usize,
+    ) {
         for entry in entries {
             if self.merge(entry.clone()) {
                 self.enqueue(entry, cluster_size);
@@ -334,6 +365,8 @@ impl ClusterRegistry {
                 name: e.name.clone(),
                 actor_addr: e.actor_addr,
                 node_id: e.node_id,
+                timestamp: e.timestamp,
+                generation: e.generation,
                 tombstone: e.tombstone,
             })
             .collect();

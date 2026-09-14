@@ -5,6 +5,7 @@
 //! sequence while draining accepted payloads.
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::frame::{ChannelId, Frame, Position, StreamId};
@@ -19,6 +20,7 @@ pub struct Mux {
     stream: StreamId,
     next: AtomicU64,
     dropped: AtomicU64,
+    drain_lock: Mutex<()>,
     tx: Sender<PendingFrame>,
     rx: Receiver<PendingFrame>,
 }
@@ -32,6 +34,7 @@ impl Mux {
             stream,
             next: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            drain_lock: Mutex::new(()),
             tx,
             rx,
         }
@@ -60,16 +63,18 @@ impl Mux {
 
     /// Pull all currently queued frames in mux queue order.
     pub fn drain(&self) -> Vec<Frame> {
-        let mut frames = Vec::new();
+        let _drain = self.drain_lock.lock().expect("telemetry mux poisoned");
+        let mut frames = Vec::with_capacity(self.rx.len());
         while let Ok(pending) = self.rx.try_recv() {
-            // Position is consumed only after a pending frame has left
-            // the queue; failed submit never reaches this point.
-            let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
             frames.push(Frame {
                 channel: pending.channel,
-                position,
+                position: Position(0),
                 payload: pending.payload,
             });
+        }
+        let start = self.next.fetch_add(frames.len() as u64, Ordering::Relaxed);
+        for (offset, frame) in frames.iter_mut().enumerate() {
+            frame.position = Position(start + offset as u64);
         }
         frames
     }

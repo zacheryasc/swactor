@@ -4,16 +4,17 @@ use std::time::{Duration, Instant};
 
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh_driver::{
-    PullCollectorConfig, TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection,
-    spawn_pull_collector, write_available_subscription,
+    PullCollectorConfig, TELEMETRY_ALPN, TelemetryQuicHeader, decode_event_records,
+    encode_event_batch, read_next_uni_from_connection, spawn_pull_collector, spawn_pull_server,
+    write_available_subscription,
 };
 use swactor::config::RuntimeConfig;
 use swactor::runtime::RuntimeParts;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
-use telemetry::frame::TelemetryEvent;
+use telemetry::frame::{ChannelRef, FrameDelivery, StreamOrigin, TelemetryEvent};
 use telemetry::{
-    ChannelContent, DeliveryFanout, Lifetime, NodeId, Position, StreamId, SubscriptionRequest,
-    TelemetryEndpoint,
+    ChannelContent, ChannelId, DeliveryFanout, Lifetime, NodeId, Position, StreamDescriptor,
+    StreamId, SubscriptionRequest, TelemetryEndpoint, TelemetrySnapshot, TelemetrySubscription,
 };
 
 /// Telemetry transport test scheduled through `EngineHandle`, not an ambient
@@ -118,6 +119,41 @@ fn iroh_telemetry_alpn_carries_catalog_and_numeric_frames() {
 }
 
 #[test]
+fn zstd_batch_preserves_exact_frames_and_rejects_truncation() {
+    let stream = StreamId::new(NodeId::new("zstd-source"), Lifetime(4));
+    let descriptor = StreamDescriptor {
+        stream: stream.clone(),
+        label: Some("compression test".to_owned()),
+        origin: StreamOrigin::RemoteNode,
+    };
+    let events = (0..128)
+        .map(|position| {
+            TelemetryEvent::Frame(FrameDelivery {
+                channel: ChannelRef {
+                    stream: stream.clone(),
+                    channel: ChannelId(7),
+                },
+                position: Position(position),
+                payload: vec![position as u8; 2048],
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut encoded = Vec::new();
+    let stats = encode_event_batch(&events, &mut encoded).expect("encode zstd telemetry batch");
+    assert_eq!(stats.events, events.len());
+    assert_eq!(encoded.first().copied(), Some(0x05));
+    assert!(encoded.len() < events.len() * 2048 / 16);
+    assert_eq!(
+        decode_event_records(&encoded, &descriptor).expect("decode zstd telemetry batch"),
+        events
+    );
+
+    encoded.pop();
+    assert!(decode_event_records(&encoded, &descriptor).is_err());
+}
+
+#[test]
 fn pull_collector_cancellation_interrupts_inflight_io() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let engine = Engine::new(
@@ -168,6 +204,136 @@ fn pull_collector_cancellation_interrupts_inflight_io() {
         "cancelled collector remained blocked in network I/O"
     );
     drop((collector_endpoint, silent_peer));
+}
+
+#[test]
+fn pull_replays_startup_and_disconnect_frames_without_duplicates() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        TokioBackend::new(TokioConfig::default()).expect("test backend"),
+    )
+    .expect("test engine");
+    let handle = engine.handle();
+    let task_handle = handle.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    handle.spawn(async move {
+        let timeout_handle = task_handle.clone();
+        let result = timeout_handle
+            .timeout(Duration::from_secs(15), async move {
+                let source = test_endpoint().await;
+                let sink = test_endpoint().await;
+                let endpoint = Arc::new(
+                    TelemetryEndpoint::with_capacity(
+                        StreamId::new(NodeId::new("retained-node"), Lifetime(9)),
+                        8,
+                        8,
+                    )
+                    .with_retention(32, 4096),
+                );
+                let producer = endpoint.producer();
+                let channel = producer.register_channel("runtime.log", ChannelContent::TextStream);
+                producer.submit_text(channel, "before-ready");
+                endpoint.tick();
+
+                let fanout = Arc::new(DeliveryFanout::new(8));
+                let subscription = fanout.subscribe_all(
+                    "archive",
+                    TelemetrySnapshot {
+                        streams: Vec::new(),
+                        channels: Vec::new(),
+                    },
+                );
+                let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+                {
+                    let source = source.clone();
+                    let endpoint = Arc::clone(&endpoint);
+                    let server_handle = task_handle.clone();
+                    task_handle.spawn(async move {
+                        let mut first_tx = Some(first_tx);
+                        for _ in 0..2 {
+                            let conn = source
+                                .accept()
+                                .await
+                                .expect("incoming pull")
+                                .await
+                                .expect("accepted pull");
+                            if let Some(first_tx) = first_tx.take() {
+                                let _ = first_tx.send(conn.clone());
+                            }
+                            spawn_pull_server(
+                                &server_handle,
+                                conn,
+                                Arc::clone(&endpoint),
+                                Duration::from_millis(1),
+                            );
+                        }
+                    });
+                }
+                let (header_tx, _header_rx) = std::sync::mpsc::channel();
+                let collector = spawn_pull_collector(
+                    &task_handle,
+                    PullCollectorConfig {
+                        endpoint: sink.clone(),
+                        peer: endpoint_addr(&source),
+                        flow_id: [9; 16],
+                        token: Vec::new(),
+                        request: SubscriptionRequest::all(),
+                        fanout,
+                    },
+                    header_tx,
+                );
+                let first = next_pulled_frame(&task_handle, &subscription).await;
+                assert_eq!(
+                    (first.position, first.payload),
+                    (Position(0), b"before-ready".to_vec())
+                );
+                producer.submit_text(channel, "before-disconnect");
+                endpoint.tick();
+                let second = next_pulled_frame(&task_handle, &subscription).await;
+                assert_eq!(
+                    (second.position, second.payload),
+                    (Position(1), b"before-disconnect".to_vec())
+                );
+
+                first_rx
+                    .await
+                    .expect("first server connection")
+                    .close(0u32.into(), b"test disconnect");
+                producer.submit_text(channel, "while-disconnected");
+                endpoint.tick();
+                let third = next_pulled_frame(&task_handle, &subscription).await;
+                assert_eq!(
+                    (third.position, third.payload),
+                    (Position(2), b"while-disconnected".to_vec())
+                );
+                assert_eq!(
+                    endpoint.subscriber_count(),
+                    1,
+                    "closed pull kept a source subscription"
+                );
+                collector.cancel();
+                source.close().await;
+                sink.close().await;
+            })
+            .await;
+        done_tx.send(result).expect("test completion");
+    });
+    done_rx
+        .recv()
+        .expect("pull replay task completed")
+        .expect("pull replay deadline");
+}
+
+async fn next_pulled_frame(
+    engine: &swactor_engine::EngineHandle,
+    subscription: &TelemetrySubscription,
+) -> FrameDelivery {
+    loop {
+        if let Ok(TelemetryEvent::Frame(frame)) = subscription.try_recv() {
+            return frame;
+        }
+        engine.timer(Duration::from_millis(1)).await;
+    }
 }
 
 async fn test_endpoint() -> Endpoint {

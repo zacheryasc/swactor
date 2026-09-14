@@ -125,7 +125,10 @@ mod codec_contract {
     fn registry_and_metadata_gossip_round_trip() {
         let codecs = distribution_codec_registry();
 
-        let rg = RegistryGossip { entries: vec![] };
+        let rg = RegistryGossip {
+            entries: vec![],
+            delivery: None,
+        };
         let (tag, bytes) = codecs
             .encode(TypeId::of::<RegistryGossip>(), Box::new(rg))
             .unwrap();
@@ -148,7 +151,7 @@ mod route_view_egress {
     use distribution::transport_bridge::{Outbox, RouteView, RouteViewTransport, peer_addr};
     use distribution::types::NodeId;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, RwLock};
     use swactor::actor::ActorAddress;
     use swactor_transport::{Transport, WireEnvelope};
 
@@ -173,7 +176,7 @@ mod route_view_egress {
         let first_host = id(1);
         let second_host = id(2);
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
-        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         let transport = RouteViewTransport::new(route_view.clone(), outbox.clone());
 
         transport

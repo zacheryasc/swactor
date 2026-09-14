@@ -165,9 +165,10 @@ impl DashboardView for ControlPlaneView {
 
     fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
         let now = Instant::now();
+        let decoded_payload = event.decoded_payload();
         let mut state = self.state.write();
 
-        if let Some(routed) = provisioning_output(event) {
+        if let Some(routed) = provisioning_output(event, decoded_payload.as_ref()) {
             let key = stream_key(&routed.stream);
             if routed.stream.origin.as_deref() == Some("bootstrap") {
                 let terminal = matches!(routed.phase.as_str(), "failed" | "stopped");
@@ -219,8 +220,9 @@ impl DashboardView for ControlPlaneView {
             if let Some(output) = joined_output {
                 node.output = output;
             }
-            node.hardware.update(&event.channel, &event.payload, now);
-            node.actors.update(&event.channel, &event.payload, now);
+            node.hardware.update(event, decoded_payload.as_ref(), now);
+            node.actors
+                .update(&event.channel, decoded_payload.as_ref(), now);
             if let Some((source, phase)) = process_output_channel(&event.channel) {
                 node.output.push_chunk(source, &phase, &event.payload, now);
             }
@@ -347,8 +349,11 @@ fn ensure_node<'a>(
         })
 }
 
-fn provisioning_output(event: &FrameEvent) -> Option<RoutedProvisionOutput> {
-    let value = serde_json::from_slice::<Value>(&event.payload).ok()?;
+fn provisioning_output(
+    event: &FrameEvent,
+    decoded_payload: Option<&Value>,
+) -> Option<RoutedProvisionOutput> {
+    let value = decoded_payload?;
     if event.channel == ORCHESTRATOR_LOGS {
         return Some(RoutedProvisionOutput {
             stream: event.stream.clone(),
@@ -824,7 +829,7 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use telemetry::frame::{ChannelId, Lifetime, NodeId, Position};
+    use telemetry::frame::{ChannelContent, ChannelId, Lifetime, NodeId, Position};
 
     fn ingest_json(
         view: &ControlPlaneView,
@@ -844,6 +849,31 @@ mod tests {
             channel: channel.to_string(),
             position,
             payload: frame.payload.clone(),
+            content: ChannelContent::JsonRecord { schema: None },
+        };
+        view.ingest(stream, &frame, &event);
+    }
+
+    fn ingest_messagepack(
+        view: &ControlPlaneView,
+        stream: &StreamId,
+        position: u64,
+        channel: &str,
+        payload: &Value,
+    ) {
+        let payload = telemetry::encode_record(payload).expect("MessagePack payload");
+        let frame = Frame::new(ChannelId(1), Position(position), payload);
+        let event = FrameEvent {
+            stream: crate::StreamEvent {
+                node: stream.node.as_str().to_string(),
+                life: stream.life.0,
+                origin: None,
+                label: None,
+            },
+            channel: channel.to_string(),
+            position,
+            payload: frame.payload.clone(),
+            content: ChannelContent::MessagePackRecord { schema: None },
         };
         view.ingest(stream, &frame, &event);
     }
@@ -863,6 +893,7 @@ mod tests {
             channel: "runtime.actors".to_owned(),
             position: 0,
             payload: frame.payload.clone(),
+            content: ChannelContent::JsonRecord { schema: None },
         };
         view.ingest(&stream, &frame, &event);
 
@@ -967,9 +998,11 @@ mod tests {
                 "line": "SSH identity registered"
             }))
             .unwrap(),
+            content: ChannelContent::JsonRecord { schema: None },
         };
 
-        let routed = provisioning_output(&event).expect("orchestrator log route");
+        let decoded = event.decoded_payload();
+        let routed = provisioning_output(&event, decoded.as_ref()).expect("orchestrator log route");
 
         assert_eq!(routed.stream.node, "myelin-orchestrator");
         assert_eq!(routed.stream.origin.as_deref(), Some("orchestrator"));
@@ -1106,6 +1139,7 @@ mod tests {
                 channel: "runtime.actors".to_owned(),
                 position: 0,
                 payload: frame.payload.clone(),
+                content: ChannelContent::JsonRecord { schema: None },
             };
             view.ingest(stream, &frame, &event);
         }
@@ -1268,13 +1302,7 @@ mod tests {
             (4, "host.net", net_sample(1, 2_000, 2_000, 3_500)),
             (5, "host.storage", storage),
         ] {
-            ingest_json(
-                &view,
-                &stream,
-                position,
-                channel,
-                serde_json::to_vec(&payload).expect("hardware payload"),
-            );
+            ingest_messagepack(&view, &stream, position, channel, &payload);
         }
 
         let snapshot = view.snapshot_json();
@@ -1289,6 +1317,12 @@ mod tests {
             node["storage"]["filesystems"][0]["used_percent"],
             json!(80.0)
         );
+        for section in ["cpu", "gpu", "memory", "net", "storage"] {
+            assert!(
+                node[section].get("error").is_none(),
+                "{section} emitted a null error field"
+            );
+        }
         assert_eq!(node["history"][0]["cpu_cores_percent"], json!([25.0, 60.0]));
         assert_eq!(
             node["history"][0]["memory_pressure_some_avg10"],

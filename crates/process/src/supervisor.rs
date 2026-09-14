@@ -1,6 +1,10 @@
 use std::io::{self, Read};
 use std::mem;
-use std::os::fd::RawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -152,21 +156,32 @@ impl Drop for WakeFdInner {
     }
 }
 
-fn poll_command_wake(wake: &WakeFd, timeout: Duration) -> io::Result<bool> {
+fn poll_command_wake(
+    wake: &WakeFd,
+    child_exit: Option<RawFd>,
+    timeout: Duration,
+) -> io::Result<bool> {
     let timeout_ms = poll_timeout_ms(timeout);
-    let mut pollfd = libc::pollfd {
-        fd: wake.fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut pollfds = [
+        libc::pollfd {
+            fd: wake.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: child_exit.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
 
     loop {
-        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
         if result == 0 {
             return Ok(false);
         }
         if result > 0 {
-            let revents = pollfd.revents;
+            let revents = pollfds[0].revents;
             if revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
                 return Err(io::Error::other(format!(
                     "process supervisor wake fd poll failed: revents={revents}"
@@ -296,6 +311,21 @@ impl Drop for ProcessThreadHandle {
 
 const WAITPID_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// A pidfd is tied to this exact child, including an exit before poll starts.
+/// Kernels/platforms without pidfds retain the existing waitpid reconciliation.
+fn child_exit_fd(pid: u32) -> Option<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd >= 0 {
+            return Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupervisorState {
     Spawning,
@@ -336,6 +366,8 @@ fn supervisor_thread_main(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     #[cfg(unix)]
     resources.configure_command(&mut cmd);
 
@@ -381,9 +413,16 @@ fn supervisor_thread_main(
     }
 
     let child_pid = pid.expect("supervisor pid stored after successful spawn");
+    let child_exit = child_exit_fd(child_pid);
     loop {
-        let timeout = command_poll_timeout(kill_deadline);
-        match poll_command_wake(&wake, timeout) {
+        let timeout = if child_exit.is_some() {
+            kill_deadline.map_or(Duration::from_millis(i32::MAX as u64), |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            })
+        } else {
+            command_poll_timeout(kill_deadline)
+        };
+        match poll_command_wake(&wake, child_exit.as_ref().map(AsRawFd::as_raw_fd), timeout) {
             Ok(true) => {
                 if let Err(err) = wake.drain() {
                     finish_with_error(
@@ -646,14 +685,16 @@ fn signal_to_libc(signal: Signal) -> libc::c_int {
 
 fn send_signal(pid: u32, signal: Signal) -> Result<(), String> {
     let sig = signal_to_libc(signal);
-    let ret = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    // The supervised child leads a private process group. Signalling the group
+    // prevents descendants from retaining its output pipes after the leader
+    // exits, which would otherwise indefinitely delay terminal observation.
+    let target = -(pid as libc::pid_t);
+    let ret = unsafe { libc::kill(target, sig) };
     if ret == 0 {
         Ok(())
     } else {
         Err(format!(
-            "kill({}, {}) failed: {}",
-            pid,
-            sig,
+            "kill({target}, {sig}) failed: {}",
             std::io::Error::last_os_error()
         ))
     }
@@ -885,7 +926,7 @@ mod tests {
             .expect("shutdown command should queue");
 
         assert!(
-            poll_command_wake(&wake, Duration::ZERO).expect("wake poll should succeed"),
+            poll_command_wake(&wake, None, Duration::ZERO).expect("wake poll should succeed"),
             "wake fd should be readable after queued commands"
         );
         wake.drain().expect("wake fd should drain");
@@ -995,7 +1036,7 @@ mod tests {
     fn supervisor_stop_escalates_to_kill_after_deadline() {
         let (sink, receiver) = thread_event_channel(|| {});
         let mut handle = ProcessSupervisorThread::start(
-            shell_spec("trap '' TERM; while true; do sleep 1; done"),
+            shell_spec("trap '' TERM; printf 'ready\\n'; while true; do sleep 1; done"),
             ProcessSpawnResources::new(),
             sink,
         )
@@ -1007,9 +1048,9 @@ mod tests {
         while Instant::now() < deadline {
             events.extend(receiver.drain());
             if !stop_sent
-                && events
-                    .iter()
-                    .any(|event| matches!(event, ThreadEvent::Started { pid } if *pid > 0))
+                && events.iter().any(
+                    |event| matches!(event, ThreadEvent::Output { stderr: false, bytes } if bytes == b"ready\n"),
+                )
             {
                 handle
                     .stop(Some(Duration::from_millis(20)))
@@ -1030,7 +1071,7 @@ mod tests {
 
         assert!(
             stop_sent,
-            "supervisor did not report Started before timeout"
+            "supervisor process did not report readiness before timeout"
         );
         assert_eq!(events.last(), Some(&ThreadEvent::ThreadFinished));
         assert!(events.iter().any(|event| {

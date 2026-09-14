@@ -15,9 +15,11 @@ use crate::blob::{
     WritableViewObserver,
 };
 use crate::byte_ring::{
-    Endpoint, FlowError, RecordCursor, RecordKind, RingHandle, Role, attach_mapped,
+    Endpoint, FlowError, HeaderError, PeerTermination, RecordCursor, RecordKind, RingHandle, Role,
+    attach_mapped,
 };
 use crate::mapped_arena::MappedArena;
+use crate::namespace::StreamIncarnation;
 use crate::path::DataPath;
 pub use crate::protocol::{
     AccessMode, BlobAllocation, DataPlaneError, DescriptorCapabilities, DescriptorKind, Errno,
@@ -105,6 +107,8 @@ impl DataPlaneBootstrap {
                 stream_operations: HashMap::new(),
                 pending_blob_releases: 0,
                 deferred_blob_opens: VecDeque::new(),
+                close_replies: Vec::new(),
+                close_result: None,
             })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
 
@@ -176,8 +180,10 @@ enum DescriptorOpenGrant {
         cancellation: Arc<DescriptorGrantCancellation>,
     },
     Stream {
+        path: DataPath,
         operation: ActorAddress,
         host_binding: ActorAddress,
+        incarnation: StreamIncarnation,
         ring: RingHandle,
         role: Role,
         cancellation: Arc<DescriptorGrantCancellation>,
@@ -882,8 +888,10 @@ impl DataPlane {
                 Ok(Descriptor::write_blob(writer, access))
             }
             DescriptorOpenGrant::Stream {
+                path,
                 operation,
                 host_binding,
+                incarnation,
                 ring,
                 role,
                 cancellation,
@@ -897,15 +905,19 @@ impl DataPlane {
                         child_session: self.child_session,
                         operation,
                         host_binding,
+                        incarnation,
                         endpoint,
                         terminal: None,
                         pending_record: None,
+                        path,
                     }),
                     Role::Producer => Descriptor::write_stream(StreamWriter {
                         runtime: self.runtime.clone(),
                         child_session: self.child_session,
+                        path,
                         operation,
                         host_binding,
+                        incarnation,
                         endpoint,
                         closed: false,
                     }),
@@ -1042,8 +1054,27 @@ impl DataPlane {
 
     pub fn close(&self) -> Result<(), DataPlaneError> {
         self.runtime
-            .send_to(self.child_session, ChildSessionIn::Close)
+            .send_to(self.child_session, ChildSessionIn::Close { reply_to: None })
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))
+    }
+
+    /// Closes the child and host session and waits for the host to finish
+    /// revoking its resources. This future has no internal timeout; callers
+    /// that require a bound must apply one.
+    pub async fn close_acknowledged(&self) -> Result<(), DataPlaneError> {
+        let inbox = self
+            .runtime
+            .new_inbox::<Result<(), DataPlaneError>>()
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        self.runtime
+            .send_to(
+                self.child_session,
+                ChildSessionIn::Close {
+                    reply_to: Some(*inbox.addr()),
+                },
+            )
+            .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))?;
+        inbox.recv().await
     }
 }
 
@@ -1280,16 +1311,34 @@ pub(crate) enum ChildStreamIn {
     Wake(Result<(), DataPlaneError>),
 }
 
+fn stream_flow_error(path: &DataPath, action: &str, error: FlowError) -> DataPlaneError {
+    match error {
+        FlowError::Corrupt(HeaderError::GenerationMismatch { .. }) => {
+            DataPlaneError::PathReplaced(path.clone())
+        }
+        error => DataPlaneError::StreamFault(format!("{action}: {error:?}")),
+    }
+}
+
 pub struct StreamWriter {
     runtime: Runtime,
     child_session: ActorAddress,
     operation: ActorAddress,
+    path: DataPath,
     host_binding: ActorAddress,
+    incarnation: StreamIncarnation,
     endpoint: Endpoint,
     closed: bool,
 }
 
 impl StreamWriter {
+    /// The authoritative namespace identity of this attached stream.
+    ///
+    /// This identity remains unchanged after close or namespace replacement.
+    pub fn incarnation(&self) -> StreamIncarnation {
+        self.incarnation
+    }
+
     pub fn capacity(&self) -> u64 {
         self.endpoint.capacity()
     }
@@ -1439,15 +1488,17 @@ impl StreamWriter {
             return Ok(0);
         }
         loop {
-            if self.endpoint.peer_terminated().map_err(|error| {
-                DataPlaneError::StreamFault(format!(
-                    "observe stream peer terminal state: {error:?}"
-                ))
+            match self.endpoint.peer_termination().map_err(|error| {
+                stream_flow_error(&self.path, "observe stream peer terminal state", error)
             })? {
-                return Err(DataPlaneError::BrokenPipe);
+                None => {}
+                Some(PeerTermination::Closed) => return Err(DataPlaneError::BrokenPipe),
+                Some(PeerTermination::PathReplaced) => {
+                    return Err(DataPlaneError::PathReplaced(self.path.clone()));
+                }
             }
             let available = self.endpoint.writable_payload_capacity().map_err(|error| {
-                DataPlaneError::StreamFault(format!("observe writable stream capacity: {error:?}"))
+                stream_flow_error(&self.path, "observe writable stream capacity", error)
             })?;
             if available != 0 {
                 let count = bytes
@@ -1457,9 +1508,7 @@ impl StreamWriter {
                     .endpoint
                     .reserve_record(RecordKind::Data, count as u64)
                     .map_err(|error| {
-                        DataPlaneError::StreamFault(format!(
-                            "reserve partial stream record: {error:?}"
-                        ))
+                        stream_flow_error(&self.path, "reserve partial stream record", error)
                     })?;
                 let (first, second) = record.spans_mut();
                 first.copy_from_slice(&bytes[..first.len()]);
@@ -1479,7 +1528,7 @@ impl StreamWriter {
                 reply_to: *inbox.addr(),
             })?;
             if self.endpoint.writable_payload_capacity().map_err(|error| {
-                DataPlaneError::StreamFault(format!("recheck writable stream capacity: {error:?}"))
+                stream_flow_error(&self.path, "recheck writable stream capacity", error)
             })? != 0
             {
                 continue;
@@ -1592,12 +1641,21 @@ pub struct StreamReader {
     child_session: ActorAddress,
     operation: ActorAddress,
     host_binding: ActorAddress,
+    incarnation: StreamIncarnation,
+    path: DataPath,
     endpoint: Endpoint,
     terminal: Option<StreamReadTerminal>,
     pending_record: Option<(RecordCursor, u64)>,
 }
 
 impl StreamReader {
+    /// The authoritative namespace identity of this attached stream.
+    ///
+    /// This identity remains unchanged after EOF or namespace replacement.
+    pub fn incarnation(&self) -> StreamIncarnation {
+        self.incarnation
+    }
+
     pub fn capacity(&self) -> u64 {
         self.endpoint.capacity()
     }
@@ -1640,9 +1698,7 @@ impl StreamReader {
     fn release_record(&mut self, cursor: RecordCursor) -> Result<(), DataPlaneError> {
         self.endpoint
             .release_record_cursor(cursor)
-            .map_err(|error| {
-                DataPlaneError::StreamFault(format!("consume stream ring: {error:?}"))
-            })?;
+            .map_err(|error| stream_flow_error(&self.path, "consume stream ring", error))?;
         self.send_control(HostStreamIn::CapacityAvailable)
     }
 
@@ -1655,9 +1711,10 @@ impl StreamReader {
         }
         loop {
             if self.pending_record.is_none()
-                && let Some(cursor) = self.endpoint.record_cursor().map_err(|error| {
-                    DataPlaneError::StreamFault(format!("read stream ring: {error:?}"))
-                })?
+                && let Some(cursor) = self
+                    .endpoint
+                    .record_cursor()
+                    .map_err(|error| stream_flow_error(&self.path, "read stream ring", error))?
             {
                 match cursor.kind() {
                     RecordKind::Data if cursor.is_empty() => {
@@ -1724,6 +1781,17 @@ impl StreamReader {
                 return Ok(count);
             }
 
+            let peer_termination = self.endpoint.peer_termination().map_err(|error| {
+                stream_flow_error(&self.path, "observe stream peer terminal state", error)
+            })?;
+            match peer_termination {
+                None => {}
+                Some(PeerTermination::Closed) => return Err(DataPlaneError::PeerLost),
+                Some(PeerTermination::PathReplaced) => {
+                    return Err(DataPlaneError::PathReplaced(self.path.clone()));
+                }
+            }
+
             let inbox = self
                 .runtime
                 .new_inbox::<ChildStreamIn>()
@@ -1734,9 +1802,7 @@ impl StreamReader {
             if self
                 .endpoint
                 .record_cursor()
-                .map_err(|error| {
-                    DataPlaneError::StreamFault(format!("recheck stream ring: {error:?}"))
-                })?
+                .map_err(|error| stream_flow_error(&self.path, "recheck stream ring", error))?
                 .is_some()
             {
                 continue;
@@ -2083,11 +2149,81 @@ pub struct ChildDataPlaneSessionActor {
     stream_operations: HashMap<ActorAddress, ActorAddress>,
     pending_blob_releases: usize,
     deferred_blob_opens: VecDeque<ChildSessionIn>,
+    close_replies: Vec<ActorAddress>,
+    close_result: Option<Result<(), DataPlaneError>>,
 }
 
 impl ChildDataPlaneSessionActor {
     pub fn state(&self) -> ChildSessionState {
         self.state
+    }
+
+    fn complete_close(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        self.state = ChildSessionState::Closed;
+        self.close_result = Some(result.clone());
+        for reply_to in self.close_replies.drain(..) {
+            let _ = ctx.send(reply_to, result.clone());
+        }
+    }
+
+    fn begin_close(&mut self, ctx: &Ctx<'_>, reply_to: Option<ActorAddress>) {
+        if self.state == ChildSessionState::Closed {
+            if let Some(reply_to) = reply_to {
+                let result = self.close_result.clone().unwrap_or(Ok(()));
+                let _ = ctx.send(reply_to, result);
+            }
+            return;
+        }
+        if let Some(reply_to) = reply_to {
+            self.close_replies.push(reply_to);
+        }
+        if self.state == ChildSessionState::Closing {
+            return;
+        }
+
+        self.state = ChildSessionState::Closing;
+        if let Some(reply_to) = self.attach_reply.take() {
+            let _ = ctx.send(reply_to, Err::<u64, _>(DataPlaneError::SessionNotRunning));
+        }
+        for operation in self.operations.drain() {
+            let _ = ctx.stop_actor(operation);
+        }
+        self.open_operations.clear();
+        self.stream_operations.clear();
+        for reply_to in self.namespace_operations.drain() {
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::CancelNamespace {
+                    operation: reply_to,
+                },
+            );
+            let _ = ctx.send(
+                reply_to,
+                Err::<NamespaceOperationResult, _>(DataPlaneError::SessionNotRunning),
+            );
+        }
+        for deferred in self.deferred_blob_opens.drain(..) {
+            if let ChildSessionIn::Open { reply_to, .. } = deferred {
+                let _ = ctx.send(
+                    reply_to,
+                    Err::<DescriptorOpenGrant, _>(DataPlaneError::OperationCancelled),
+                );
+            }
+        }
+
+        if let Err(error) = ctx.send(
+            self.host_session,
+            HostSessionIn::CloseChild {
+                child_session: ctx.self_addr(),
+            },
+        ) {
+            self.complete_close(
+                ctx,
+                Err(DataPlaneError::SessionFailed(format!(
+                    "close host data-plane session: {error}"
+                ))),
+            );
+        }
     }
 
     fn start_stream_open(
@@ -2359,6 +2495,7 @@ impl ActorInterface for ChildDataPlaneSessionActor {
             ChildSessionIn::StreamOpened {
                 operation,
                 host_binding,
+                incarnation,
                 ring,
                 role,
             } => {
@@ -2367,6 +2504,7 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                         operation,
                         ChildOperationIn::StreamOpened {
                             host_binding,
+                            incarnation,
                             ring,
                             role,
                         },
@@ -2395,33 +2533,11 @@ impl ActorInterface for ChildDataPlaneSessionActor {
                 self.stream_operations
                     .retain(|_, stream_operation| *stream_operation != operation);
             }
-            ChildSessionIn::Close => {
-                if matches!(
-                    self.state,
-                    ChildSessionState::Closing | ChildSessionState::Closed
-                ) {
-                    return;
+            ChildSessionIn::Close { reply_to } => self.begin_close(ctx, reply_to),
+            ChildSessionIn::CloseCompleted { result } => {
+                if self.state == ChildSessionState::Closing {
+                    self.complete_close(ctx, result);
                 }
-                self.state = ChildSessionState::Closing;
-                for operation in self.operations.iter().copied() {
-                    let _ = ctx.stop_actor(operation);
-                }
-                self.open_operations.clear();
-                self.stream_operations.clear();
-                for reply_to in self.namespace_operations.drain() {
-                    let _ = ctx.send(
-                        self.host_session,
-                        HostSessionIn::CancelNamespace {
-                            operation: reply_to,
-                        },
-                    );
-                    let _ = ctx.send(
-                        reply_to,
-                        Err::<NamespaceOperationResult, _>(DataPlaneError::SessionNotRunning),
-                    );
-                }
-                let _ = ctx.send(self.host_session, HostSessionIn::Revoke);
-                self.state = ChildSessionState::Closed;
             }
             _ => {}
         }
@@ -2442,6 +2558,7 @@ enum ChildOperationIn {
     },
     StreamOpened {
         host_binding: ActorAddress,
+        incarnation: StreamIncarnation,
         ring: RingHandle,
         role: Role,
     },
@@ -2513,6 +2630,7 @@ impl ActorInterface for StreamOpenOperationActor {
         match message {
             ChildOperationIn::StreamOpened {
                 host_binding,
+                incarnation: _,
                 ring,
                 role,
             } if role == self.role => self.finish(
@@ -2717,6 +2835,7 @@ impl ActorInterface for DescriptorOpenOperationActor {
             }
             ChildOperationIn::StreamOpened {
                 host_binding,
+                incarnation,
                 ring,
                 role,
             } if self.state == WriteOperationState::Opening => {
@@ -2753,8 +2872,10 @@ impl ActorInterface for DescriptorOpenOperationActor {
                 self.finish_open(
                     ctx,
                     Ok(DescriptorOpenGrant::Stream {
+                        path: self.path.clone(),
                         operation: ctx.self_addr(),
                         host_binding,
+                        incarnation,
                         ring,
                         role,
                         cancellation,

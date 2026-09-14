@@ -177,6 +177,7 @@ pub fn null_sink() -> PluginSink {
 /// A `NodeProvisionSpec` for a concrete attempt, for direct plugin calls.
 pub fn plugin_spec(attempt: u64) -> NodeProvisionSpec {
     NodeProvisionSpec {
+        deployment: None,
         run_id: 7,
         node_id: attempt,
         attempt_id: attempt,
@@ -408,6 +409,7 @@ impl<P: TestablePlugin + 'static> EffectBackend for PluginBackendAdapter<P> {
                     ))));
                 }
                 let spec = NodeProvisionSpec {
+                    deployment: None,
                     run_id: request.spec.run_id.0,
                     node_id: attempt,
                     attempt_id: attempt,

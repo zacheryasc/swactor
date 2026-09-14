@@ -16,7 +16,7 @@ dashboard = { path = "../crates/dashboard", features = ["demo-control"] }
 data-plane = { path = "../crates/data-plane" }
 iroh-driver = { path = "../crates/iroh-driver" }
 distribution = { path = "../crates/distribution" }
-iroh = "0.98"
+iroh.workspace = true
 serde = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
 

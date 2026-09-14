@@ -23,18 +23,26 @@ use crate::orchestration::daemon;
 use crate::orchestration::manual_control::{
     CONTROL_REGISTRY_NAME, ConfigValidator, ManualActorControl, ManualActorControlConfig,
     ManualControl, ManualControlMsg, ManualControlReply, NodePhase, OfferDto, OfferSearchRequest,
-    OfferSearcher, ProviderConfigurationRequest, ProviderFactory, ProviderReadiness, SpecBuilder,
+    OfferSearchRequestExt, OfferSearcher, ProviderConfigurationRequest, ProviderFactory,
+    ProviderReadiness, SpecBuilder,
 };
 
+use crate::node_actor::NodeAgentMsg;
 use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
 use crate::orchestration::provider_adapters::relay::{
     MYELIN_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV,
     relay_mode_env_value, relay_runtime_config_from_settings,
 };
+use crate::orchestration::provider_adapters::ssh_bootstrap::{
+    BootstrapEnvSource, SshArtifactBootstrapLauncher, SshCommandBootstrapLauncher,
+    read_bundle_identity,
+};
+use crate::orchestration::provider_adapters::static_ssh::{
+    StaticFleetManifest, StaticSshFleetPlugin, StaticSshRuntimeConfig, WORKER_BIN_PATH,
+};
 use crate::orchestration::provider_adapters::vastai::{
-    BootstrapEnvSource, SshCommandBootstrapLauncher, ToolsVastAiLeaseClient,
-    VastAiProvisioningConfig, VastAiProvisioningPlugin,
+    ToolsVastAiLeaseClient, VastAiProvisioningConfig, VastAiProvisioningPlugin,
 };
 use crate::provisioning::{
     LocalDockerPlugin, LocalProcessPlugin, MockVastAiPlugin, NodeProvisionSpec, PluginObservation,
@@ -46,6 +54,7 @@ use crate::run_plan::{GgufSource, TokenizerSource};
 use distribution::node::DistributedNodeConfig;
 use distribution::registry_actor::RegistryIn;
 use distribution::swim::telemetry::ObservedTransition;
+use distribution::transport_bridge::RouteBinder;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN};
@@ -217,6 +226,54 @@ mod hardware_telemetry_tests {
         }
     }
 }
+fn reconcile_active_deployment_intent(
+    snapshot: &mut daemon::ClusterSnapshot,
+    active: Option<&crate::provisioning::DeploymentIdentity>,
+) -> Vec<u64> {
+    let Some(active) = active else {
+        return Vec::new();
+    };
+    let mut stale_nodes = Vec::new();
+    for node in &mut snapshot.nodes {
+        if matches!(node.phase, NodePhase::Stopped | NodePhase::Orphan) {
+            continue;
+        }
+        let Some(spec) = node.spec.as_mut() else {
+            continue;
+        };
+        let intent_matches = spec.deployment.as_ref() == Some(active);
+        let runtime_matches = node
+            .runtime
+            .as_ref()
+            .and_then(daemon::RuntimeFacts::deployment_identity)
+            .as_ref()
+            == Some(active);
+        if intent_matches && runtime_matches {
+            continue;
+        }
+        spec.deployment = Some(active.clone());
+        spec.env.retain(|(key, _)| {
+            key != "MYELIN_ARTIFACT_DIGEST" && key != "MYELIN_DEPLOYMENT_GENERATION"
+        });
+        spec.env.push((
+            "MYELIN_ARTIFACT_DIGEST".to_owned(),
+            active.artifact_digest.clone(),
+        ));
+        spec.env.push((
+            "MYELIN_DEPLOYMENT_GENERATION".to_owned(),
+            active.deployment_generation.clone(),
+        ));
+        node.runtime = None;
+        if matches!(
+            node.phase,
+            NodePhase::Joining | NodePhase::Acknowledging | NodePhase::Running
+        ) {
+            node.phase = NodePhase::Bootstrapping;
+        }
+        stale_nodes.push(node.logical_node_id);
+    }
+    stale_nodes
+}
 
 pub(crate) fn run_with_options<I>(
     args: I,
@@ -249,6 +306,10 @@ where
         // persisted run owns them so adoption addresses the same resources.
         config.run_id = snapshot.run_id;
     }
+    let deployment_refresh_nodes = reconcile_active_deployment_intent(
+        &mut snapshot,
+        config.deployment.as_ref().map(|bundle| &bundle.identity),
+    );
     if let Some(url) = DashboardSupport::configured_url(config.dashboard)? {
         println!("Myelin dashboard: {url}");
         std::io::stdout()
@@ -290,6 +351,7 @@ where
             "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
             "pipeline_stages":config.pipeline_stages,
             "provider_config":config.provider_telemetry_detail(),
+            "deployment_refresh_nodes":&deployment_refresh_nodes,
         }),
     );
     bootstrap(
@@ -381,6 +443,7 @@ where
         IrohDriverConfig {
             secret_key: Some(identity),
             relay_mode: config.relay.mode.clone(),
+            bind_port: config.endpoint_bind_port,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
@@ -478,8 +541,18 @@ where
         route_view: stack.route_view.clone(),
         outbox: stack.outbox.clone(),
     });
-    let data_namespace =
-        crate::data_namespace::DataNamespaceAuthority::start(&stack, &driver, data_namespace_path)?;
+    let recovery_swim_peers = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !matches!(node.phase, NodePhase::Stopped))
+        .filter_map(|node| node.runtime.as_ref().map(|runtime| runtime.swim_node_id))
+        .collect::<Vec<_>>();
+    let data_namespace = crate::data_namespace::DataNamespaceAuthority::start(
+        &stack,
+        &driver,
+        data_namespace_path,
+        recovery_swim_peers,
+    )?;
     let tiny_linear_weights = std::env::var_os("MYELIN_TINY_LINEAR_WEIGHTS")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("apps/myelin/testdata/tiny_linear.weights"));
@@ -502,17 +575,51 @@ where
         })
         .map(|(node_id, runtime)| {
             serde_json::from_str::<EndpointAddr>(&runtime.endpoint)
-                .map(|endpoint| (node_id, endpoint))
+                .map(|endpoint| (node_id, endpoint, runtime))
                 .map_err(|error| format!("parse persisted endpoint for node {node_id}: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    for (_, _endpoint, runtime) in &recovery_nodes {
+        if let Ok(mut pinned) = stack.pinned_routes.write() {
+            pinned.insert(runtime.node_actor, runtime.swim_node_id);
+        }
+        if let Ok(mut routes) = stack.route_view.write() {
+            routes.insert(runtime.node_actor, runtime.swim_node_id);
+        }
+        stack.route_binder.ensure_routable(runtime.node_actor);
+    }
     if !recovery_nodes.is_empty() {
         driver.join(
             &recovery_nodes
                 .iter()
-                .map(|(_, endpoint)| endpoint.clone())
+                .map(|(_, endpoint, _)| endpoint.clone())
                 .collect::<Vec<_>>(),
         );
+        for (node_id, _, runtime) in &recovery_nodes {
+            // Dial each worker directly (fresh endpoint) in addition to the
+            // join above: a restarted orchestrator has new direct addresses,
+            // while every worker still caches the pre-restart endpoint for
+            // redials. Without this push, worker egress to the orchestrator
+            // black-holes until endpoint gossip rediscovers the fresh
+            // addresses, which stranded namespace clients for the whole
+            // request deadline in recovery campaigns.
+            let mut dial_targets = vec![coordinator_endpoint.clone()];
+            dial_targets.extend(
+                recovery_nodes
+                    .iter()
+                    .filter(|(peer_id, _, _)| peer_id != node_id)
+                    .map(|(_, endpoint, _)| endpoint.clone()),
+            );
+            let _ = stack.runtime.send_to(
+                runtime.node_actor,
+                NodeAgentMsg::JoinPeers {
+                    endpoints: dial_targets,
+                },
+            );
+            let _ = stack
+                .runtime
+                .send_to(runtime.node_actor, NodeAgentMsg::ResyncRoutes);
+        }
     }
     // Engine owns protocol tick injection and core progression; the application
     // loop only drains integration-owned queues (ENGINE_SPEC.md).
@@ -527,7 +634,8 @@ where
     );
 
     let collector = FrameCollector::new();
-    for (node_id, endpoint) in &recovery_nodes {
+    collector.restore_archive(config.telemetry_frame_log.as_deref())?;
+    for (node_id, endpoint, _) in &recovery_nodes {
         collector.subscribe_node(
             &engine.handle(),
             driver.endpoint(),
@@ -626,6 +734,7 @@ where
             .as_mut()
             .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
         if let Some(api_key) = request.api_key {
+            vastai.client = Some(swactor_vastai::VastClient::new(&api_key));
             vastai.api_key = Some(api_key);
         }
         if let Some(path) = request.ssh_identity {
@@ -752,6 +861,10 @@ where
         Err(error) => return Err(format!("spawn orchestrator actor: {error}")),
     };
     stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
+    // The live actor handle is a static fact from spawn time; recovery
+    // tooling (the control endpoint route) needs it before any SSH
+    // bootstrap has driven the spec builder.
+    *live_orchestrator_actor.lock() = Some(orchestrator_actor);
     stack
         .runtime
         .send_to(
@@ -781,6 +894,7 @@ where
         orchestrator_actor,
         data_namespace.control(),
         contextual_upload_root,
+        Arc::clone(&bootstrap_env_source),
     );
     dashboard = DashboardSupport::start_with_plugins(
         config.dashboard,
@@ -825,6 +939,10 @@ where
             engine: engine.handle(),
             sender: runtime.create_sender(),
             lifecycle: ServeClusterLifecycle::new(),
+            ready_peers: BTreeMap::new(),
+            dispatched_deployments: BTreeMap::new(),
+            requires_deployment_receipt: config.deployment.is_some(),
+            pending_undispatched_readies: BTreeMap::new(),
             flush_reply_actor: None,
             completion: completion.clone(),
         })
@@ -868,6 +986,7 @@ impl VastAiProvisioningMode {
 #[derive(Clone)]
 struct VastAiRuntimeConfig {
     api_key: Option<String>,
+    client: Option<swactor_vastai::VastClient>,
     provisioning_mode: VastAiProvisioningMode,
     provisioning: VastAiProvisioningConfig,
     bootstrap_command: Option<String>,
@@ -975,6 +1094,10 @@ impl VastAiRuntimeConfig {
             .transpose()?;
         Ok(Self {
             api_key: builder.vastai_api_key.clone(),
+            client: builder
+                .vastai_api_key
+                .as_ref()
+                .map(swactor_vastai::VastClient::new),
             provisioning_mode: builder.vastai_provisioning_mode,
             provisioning,
             bootstrap_command: builder.vastai_bootstrap_command.clone(),
@@ -1108,8 +1231,11 @@ struct Config {
     state_dir: PathBuf,
     reset_state: bool,
     relay: RelayRuntimeConfig,
+    endpoint_bind_port: Option<u16>,
     endpoint_addr_mask: EndpointAddrMask,
     vastai: Option<VastAiRuntimeConfig>,
+    static_ssh: Option<StaticSshRuntimeConfig>,
+    deployment: Option<DeploymentBundle>,
     cached_model: Option<CachedModelConfig>,
     telemetry_frame_log: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
@@ -1138,6 +1264,7 @@ struct ConfigBuilder {
     max_context: Option<u32>,
     relay_mode: Option<String>,
     relay_url: Option<String>,
+    endpoint_bind_port: Option<u16>,
     endpoint_addr_mask: Option<String>,
     vastai_api_key: Option<String>,
     vastai_provisioning_mode: VastAiProvisioningMode,
@@ -1149,6 +1276,9 @@ struct ConfigBuilder {
     vastai_confirm_lease_raw: Option<String>,
     vastai_onstart: Option<String>,
     vastai_ssh_identity_raw: Option<String>,
+    static_ssh_manifest_raw: Option<String>,
+    static_ssh_identity_raw: Option<String>,
+    deployment_bundle_raw: Option<String>,
     vastai_gpu_name: Option<String>,
     vastai_min_gpu_ram_mb: Option<u64>,
     vastai_min_gpu_ram_mb_raw: Option<String>,
@@ -1198,6 +1328,7 @@ impl ConfigBuilder {
             max_context: None,
             relay_mode: None,
             relay_url: None,
+            endpoint_bind_port: None,
             endpoint_addr_mask: None,
             vastai_api_key: None,
             vastai_provisioning_mode: VastAiProvisioningMode::Real,
@@ -1209,6 +1340,9 @@ impl ConfigBuilder {
             vastai_confirm_lease_raw: None,
             vastai_onstart: None,
             vastai_ssh_identity_raw: None,
+            static_ssh_manifest_raw: None,
+            static_ssh_identity_raw: None,
+            deployment_bundle_raw: None,
             vastai_gpu_name: None,
             vastai_min_gpu_ram_mb: None,
             vastai_min_gpu_ram_mb_raw: None,
@@ -1444,6 +1578,9 @@ impl ConfigBuilder {
                 self.relay_url = Some(url);
             }
         );
+        env_parse!("MYELIN_IROH_BIND_PORT", |port| {
+            self.endpoint_bind_port = Some(port)
+        });
         env_apply!(MVP_IROH_ENDPOINT_ADDR_MASK_ENV, |mask| {
             self.endpoint_addr_mask = Some(mask)
         });
@@ -1463,6 +1600,15 @@ impl ConfigBuilder {
         });
         env_apply!("MYELIN_VASTAI_SSH_IDENTITY", |identity| {
             self.vastai_ssh_identity_raw = Some(identity)
+        });
+        env_apply!("MYELIN_STATIC_SSH_MANIFEST", |manifest| {
+            self.static_ssh_manifest_raw = Some(manifest)
+        });
+        env_apply!("MYELIN_STATIC_SSH_IDENTITY", |identity| {
+            self.static_ssh_identity_raw = Some(identity)
+        });
+        env_apply!("MYELIN_DEPLOYMENT_BUNDLE", |bundle| {
+            self.deployment_bundle_raw = Some(bundle)
         });
         env_apply!("MYELIN_VASTAI_DISK_GB", |disk_gb| {
             self.vastai_disk_gb_raw = Some(disk_gb)
@@ -1637,6 +1783,16 @@ impl ConfigBuilder {
                     self.vastai_ssh_identity_raw =
                         Some(next_arg(&mut args, "--vastai-ssh-identity")?);
                 }
+                "--static-ssh-manifest" => {
+                    self.static_ssh_manifest_raw =
+                        Some(next_arg(&mut args, "--static-ssh-manifest")?);
+                }
+                "--ssh-identity" => {
+                    self.static_ssh_identity_raw = Some(next_arg(&mut args, "--ssh-identity")?);
+                }
+                "--deployment-bundle" => {
+                    self.deployment_bundle_raw = Some(next_arg(&mut args, "--deployment-bundle")?);
+                }
                 "--vastai-ssh-user" => {
                     self.vastai_ssh_user = Some(next_arg(&mut args, "--vastai-ssh-user")?)
                 }
@@ -1724,6 +1880,50 @@ impl ConfigBuilder {
         let vastai = (provider_name == "vastai")
             .then(|| VastAiRuntimeConfig::from_builder(&self))
             .transpose()?;
+        let static_ssh = if provider_name == "static-ssh" {
+            Some(resolve_static_ssh_config(
+                self.static_ssh_manifest_raw.as_deref(),
+                self.static_ssh_identity_raw.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let deployment = match self.deployment_bundle_raw.as_deref() {
+            Some(bundle_raw) => {
+                if provider_name == "vastai"
+                    && self
+                        .vastai_provisioning_mode
+                        .eq(&VastAiProvisioningMode::Mock)
+                {
+                    return Err("mock VastAI provisioning does not deploy bundles".to_owned());
+                }
+                if !matches!(provider_name, "vastai" | "static-ssh") {
+                    return Err(format!(
+                        "--deployment-bundle is not applicable to provider {provider_name}"
+                    ));
+                }
+                if provider_name == "static-ssh" && static_ssh.is_none() {
+                    return Err(
+                        "--deployment-bundle is required when --provider static-ssh".to_owned()
+                    );
+                }
+                let path = PathBuf::from(bundle_raw);
+                Some(DeploymentBundle {
+                    path: path.clone(),
+                    identity: read_bundle_identity(&path)?,
+                })
+            }
+            None => {
+                if provider_name == "static-ssh" {
+                    return Err(
+                        "--deployment-bundle (or MYELIN_DEPLOYMENT_BUNDLE) is required when \
+                         --provider static-ssh"
+                            .to_owned(),
+                    );
+                }
+                None
+            }
+        };
         Ok(Config {
             config_profile: self.config_profile,
             image,
@@ -1743,8 +1943,11 @@ impl ConfigBuilder {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
             reset_state: self.reset_state,
             relay,
+            endpoint_bind_port: self.endpoint_bind_port,
             endpoint_addr_mask,
             vastai,
+            static_ssh,
+            deployment,
             cached_model,
             worker_bin: self.worker_bin,
             telemetry_frame_log: self.telemetry_frame_log,
@@ -1812,6 +2015,35 @@ impl ConfigBuilder {
             )),
         }
     }
+}
+
+/// A verified deployment bundle: live host-local path plus the identity it
+/// carries. The path never enters durable state; only the identity does.
+#[derive(Clone, Debug)]
+struct DeploymentBundle {
+    path: PathBuf,
+    identity: crate::provisioning::DeploymentIdentity,
+}
+
+fn resolve_static_ssh_config(
+    manifest_raw: Option<&str>,
+    identity_raw: Option<&str>,
+) -> Result<StaticSshRuntimeConfig, String> {
+    let manifest_raw = manifest_raw.ok_or(
+        "--static-ssh-manifest (or MYELIN_STATIC_SSH_MANIFEST) is required when \
+         --provider static-ssh",
+    )?;
+    let identity_raw = identity_raw.ok_or(
+        "--ssh-identity (or MYELIN_STATIC_SSH_IDENTITY) is required when \
+         --provider static-ssh",
+    )?;
+    let manifest_path = PathBuf::from(manifest_raw);
+    let identity_path = expand_home_path(identity_raw)?;
+    let manifest = StaticFleetManifest::load(&manifest_path)?;
+    Ok(StaticSshRuntimeConfig {
+        manifest,
+        identity_path,
+    })
 }
 
 impl Config {
@@ -1936,7 +2168,7 @@ impl Config {
                             .to_owned(),
                     );
                 }
-                let api_key = vastai.api_key.clone().ok_or_else(|| {
+                let client = vastai.client.clone().ok_or_else(|| {
                     "VAST_API_KEY, MYELIN_VASTAI_API_KEY, or VASTAI_API_KEY is required when MYELIN_NODE_PROVIDER=vastai"
                         .to_owned()
                 })?;
@@ -1944,8 +2176,22 @@ impl Config {
                     .ssh_identity
                     .clone()
                     .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
+                if let Some(deployment) = self.deployment.as_ref() {
+                    return Ok(Box::new(VastAiProvisioningPlugin::new(
+                        ToolsVastAiLeaseClient::new(client)?
+                            .with_actor_host(bootstrap_runtime.clone(), bootstrap_engine.clone()),
+                        SshArtifactBootstrapLauncher::new(
+                            ssh_identity,
+                            deployment.path.clone(),
+                            bootstrap_runtime,
+                            bootstrap_env,
+                            bootstrap_engine,
+                        ),
+                        vastai.provisioning.clone(),
+                    )));
+                }
                 Ok(Box::new(VastAiProvisioningPlugin::new(
-                    ToolsVastAiLeaseClient::from_api_key(api_key)?
+                    ToolsVastAiLeaseClient::new(client)?
                         .with_actor_host(bootstrap_runtime.clone(), bootstrap_engine.clone()),
                     SshCommandBootstrapLauncher::new(
                         Some(ssh_identity),
@@ -1954,6 +2200,24 @@ impl Config {
                         bootstrap_engine,
                     ),
                     vastai.provisioning.clone(),
+                )))
+            }
+            "static-ssh" => {
+                let static_ssh = self.static_ssh.as_ref().ok_or_else(|| {
+                    "static-ssh configuration was not resolved for provider static-ssh".to_owned()
+                })?;
+                let deployment = self.deployment.as_ref().ok_or_else(|| {
+                    "static-ssh provisioning requires a deployment bundle".to_owned()
+                })?;
+                Ok(Box::new(StaticSshFleetPlugin::new(
+                    static_ssh.manifest.clone(),
+                    SshArtifactBootstrapLauncher::new(
+                        static_ssh.identity_path.clone(),
+                        deployment.path.clone(),
+                        bootstrap_runtime,
+                        bootstrap_env,
+                        bootstrap_engine,
+                    ),
                 )))
             }
             _ => Err("mock provider cannot build a runtime provisioner".to_owned()),
@@ -2019,6 +2283,7 @@ impl Config {
                 .vastai
                 .as_ref()
                 .is_some_and(|vastai| vastai.provisioning_mode == VastAiProvisioningMode::Real)
+            || provider_name == "static-ssh"
         {
             env.retain(|(key, _)| {
                 key != "MYELIN_COORDINATOR_ENDPOINT" && key != "MYELIN_ORCHESTRATOR_ACTOR"
@@ -2037,19 +2302,36 @@ impl Config {
                     .into_iter()
                     .collect()
             }
+            "vastai" if self.deployment.is_some() => vec![format!("exec {WORKER_BIN_PATH}")],
             "vastai" => self
                 .vastai
                 .as_ref()
                 .and_then(|vastai| vastai.bootstrap_command.clone())
                 .into_iter()
                 .collect(),
+            "static-ssh" => vec![format!("exec {WORKER_BIN_PATH}")],
             "process" if self.worker_bin.is_none() => {
                 vec![crate::ORCHESTRATOR_WORKER_MODE_ARG.to_owned()]
             }
             "process" | "docker" => Vec::new(),
             _ => return Err("myelin-orchestrator does not support mock provider".to_owned()),
         };
+        if let Some(deployment) = &self.deployment {
+            env.push((
+                "MYELIN_ARTIFACT_DIGEST".to_owned(),
+                deployment.identity.artifact_digest.clone(),
+            ));
+            env.push((
+                "MYELIN_DEPLOYMENT_GENERATION".to_owned(),
+                deployment.identity.deployment_generation.clone(),
+            ));
+        }
+        let deployment = self
+            .deployment
+            .as_ref()
+            .map(|bundle| bundle.identity.clone());
         Ok(NodeProvisionSpec {
+            deployment,
             run_id: self.run_id,
             node_id: logical_node_id,
             attempt_id: 0,
@@ -2065,13 +2347,68 @@ impl Config {
 
 #[derive(Clone)]
 struct RuntimeReady {
+    endpoint: EndpointAddr,
     node_actor: ActorAddress,
     swim_node_id: DistNodeId,
+    facts: daemon::RuntimeFacts,
 }
 
 fn runtime_ready_barrier_met(stack: &DistributionRuntimeStack, ready: &RuntimeReady) -> bool {
     stack.member_state(ready.swim_node_id) == Some(MemberState::Alive)
         && stack.route_owner(ready.node_actor) == Some(ready.swim_node_id)
+}
+
+fn deployment_dispatch_identity(line: &str, node_id: u64) -> Option<(String, String, u64)> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.pointer("/type")?.as_str()? != "MyelinBootstrapDispatched"
+        || value.pointer("/node_id")?.as_u64()? != node_id
+    {
+        return None;
+    }
+    let artifact = value.pointer("/artifact_digest")?.as_str()?;
+    let generation = value.pointer("/deployment_generation")?.as_str()?;
+    let receipt = value.pointer("/receipt")?;
+    let executable = receipt.pointer("/executable_digest")?.as_str()?;
+    if receipt.pointer("/type")?.as_str()? != "MyelinBootstrapReceipt"
+        || receipt.pointer("/artifact_digest")?.as_str()? != artifact
+        || receipt.pointer("/deployment_generation")?.as_str()? != generation
+        || !executable.starts_with("sha256:")
+        || receipt.pointer("/pid")?.as_u64()? <= 1
+        || receipt.pointer("/process_start_ticks")?.as_u64()? == 0
+        || receipt.pointer("/worker_count")?.as_u64()? != 1
+        || receipt.pointer("/incarnation")?.as_str()?.is_empty()
+    {
+        return None;
+    }
+    let incarnation = format!(
+        "{}:{}:{generation}",
+        receipt.pointer("/pid")?.as_u64()?,
+        receipt.pointer("/process_start_ticks")?.as_u64()?
+    );
+    if receipt.pointer("/incarnation")?.as_str()? != incarnation {
+        return None;
+    }
+    Some((
+        artifact.to_owned(),
+        generation.to_owned(),
+        daemon::deployment_readiness_id(&incarnation),
+    ))
+}
+
+fn runtime_ready_matches_dispatch(
+    dispatches: &BTreeMap<u64, (String, String, u64)>,
+    node_id: u64,
+    readiness_id: u64,
+    artifact_digest: &Option<String>,
+    deployment_generation: &Option<String>,
+) -> bool {
+    match (artifact_digest, deployment_generation) {
+        (None, None) => true,
+        (Some(artifact), Some(generation)) => dispatches.get(&node_id).is_some_and(|identity| {
+            &identity.0 == artifact && &identity.1 == generation && identity.2 == readiness_id
+        }),
+        _ => false,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2342,6 +2679,32 @@ impl<T> ServeClusterLifecycle<T> {
     }
 }
 
+impl ServeClusterLifecycle<RuntimeReady> {
+    fn advance_join_barriers(
+        &self,
+        stack: &DistributionRuntimeStack,
+        orchestrator_actor: ActorAddress,
+    ) {
+        for (node_id, pending) in &self.pending_readies {
+            if !runtime_ready_barrier_met(stack, &pending.ready) {
+                continue;
+            }
+            // Enqueueing admission is not completion: the manual actor may not
+            // yet be Joining, and the worker's final ACK can be lost after it
+            // stops announcing readiness. Keep this retry owner until that ACK
+            // returns with the matching identity. Manual control coalesces
+            // duplicate admission behind its durable ACK barrier.
+            let _ = stack.runtime.send_to(
+                orchestrator_actor,
+                OrchestratorMsg::Manual(ManualControlMsg::JoinBarrierSatisfied {
+                    node_id: *node_id,
+                    facts: pending.ready.facts.clone(),
+                }),
+            );
+        }
+    }
+}
+
 struct StopSignalActor {
     sender: ExternalSender,
     serve_actor: ActorAddress,
@@ -2430,6 +2793,11 @@ struct ServeClusterActor {
     sender: ExternalSender,
     lifecycle: ServeClusterLifecycle<RuntimeReady>,
     flush_reply_actor: Option<ActorAddress>,
+    ready_peers: BTreeMap<u64, RuntimeReady>,
+    dispatched_deployments: BTreeMap<u64, (String, String, u64)>,
+    requires_deployment_receipt: bool,
+    pending_undispatched_readies:
+        BTreeMap<(u64, Option<String>, Option<String>, u64), OrchestratorReport>,
     completion: ActorCompletion<Result<(), String>>,
 }
 
@@ -2448,25 +2816,98 @@ fn daemon_label(config: &Config) -> String {
 
 impl ServeClusterActor {
     fn observe_report(&mut self, report: OrchestratorReport) {
+        let deferred_report = report.clone();
         match report {
             OrchestratorReport::NodeRuntimeReady {
                 run_id,
                 node_id,
+                stage_index,
                 endpoint,
                 node_actor,
                 readiness_id,
+                artifact_digest,
+                deployment_generation,
                 ..
             } if run_id == self.run_id => {
-                let tracked = self.lifecycle.track_runtime_ready(
+                if self.requires_deployment_receipt
+                    && (artifact_digest.is_none() || deployment_generation.is_none())
+                {
+                    return;
+                }
+                if artifact_digest.is_some()
+                    && deployment_generation.is_some()
+                    && !self.dispatched_deployments.contains_key(&node_id)
+                {
+                    self.pending_undispatched_readies.insert(
+                        (
+                            node_id,
+                            artifact_digest.clone(),
+                            deployment_generation.clone(),
+                            readiness_id,
+                        ),
+                        deferred_report,
+                    );
+                    self.orch_telemetry.emit_bootstrap(
+                        self.dashboard.as_ref(),
+                        self.run_id,
+                        node_id,
+                        "runtime_ready",
+                        "deferred",
+                        json!({"reason":"awaiting matching validated deployment receipt"}),
+                    );
+                    return;
+                }
+                if !runtime_ready_matches_dispatch(
+                    &self.dispatched_deployments,
                     node_id,
                     readiness_id,
-                    RuntimeReady {
+                    &artifact_digest,
+                    &deployment_generation,
+                ) {
+                    self.orch_telemetry.emit_bootstrap(
+                        self.dashboard.as_ref(),
+                        self.run_id,
+                        node_id,
+                        "runtime_ready",
+                        "rejected",
+                        json!({"reason":"runtime identity does not match validated deployment receipt"}),
+                    );
+                    return;
+                }
+                let ready = RuntimeReady {
+                    endpoint: endpoint.clone(),
+                    node_actor,
+                    swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                    facts: daemon::RuntimeFacts {
+                        run_id,
+                        attempt_id: 0,
+                        endpoint: serde_json::to_string(&endpoint).expect("serialize endpoint"),
                         node_actor,
                         swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                        stage_index,
+                        readiness_id,
+                        artifact_digest,
+                        deployment_generation,
                     },
-                );
+                };
+                if !self.lifecycle.pending_readies.contains_key(&node_id)
+                    && self
+                        .ready_peers
+                        .get(&node_id)
+                        .is_some_and(|accepted| accepted.facts == ready.facts)
+                {
+                    // The matching final ACK retired admission. A readiness
+                    // announcement already in transit must not re-arm it.
+                    // Deployment/terminal transitions clear both peer and
+                    // pending state before admitting a replacement.
+                    return;
+                }
+                let tracked =
+                    self.lifecycle
+                        .track_runtime_ready(node_id, readiness_id, ready.clone());
                 if tracked {
                     self.driver.join(std::slice::from_ref(&endpoint));
+                    self.connect_ready_peer_mesh(node_id, &ready);
                     self.collector.subscribe_node(
                         &self.engine,
                         self.driver.endpoint(),
@@ -2479,37 +2920,58 @@ impl ServeClusterActor {
             OrchestratorReport::NodeRuntimeReadyAck {
                 run_id,
                 node_id,
+                stage_index,
                 readiness_id,
                 ..
             } if run_id == self.run_id => {
-                self.lifecycle
-                    .acknowledge_runtime_ready(node_id, readiness_id);
+                if self
+                    .lifecycle
+                    .pending_readies
+                    .get(&node_id)
+                    .is_some_and(|pending| pending.ready.facts.stage_index == stage_index)
+                {
+                    self.lifecycle
+                        .acknowledge_runtime_ready(node_id, readiness_id);
+                }
             }
             _ => {}
         }
     }
 
-    fn advance_join_barriers(&mut self) {
-        let ready = self
-            .lifecycle
-            .pending_readies
-            .iter()
-            .filter(|(_, pending)| runtime_ready_barrier_met(&self.stack, &pending.ready))
-            .map(|(node_id, _)| *node_id)
-            .collect::<Vec<_>>();
-        for node_id in ready {
-            if self
-                .stack
-                .runtime
-                .send_to(
-                    self.orchestrator_actor,
-                    OrchestratorMsg::Manual(ManualControlMsg::JoinBarrierSatisfied { node_id }),
-                )
-                .is_ok()
-            {
-                self.lifecycle.remove_runtime_ready(node_id);
+    /// Connect every ready worker directly to its peers.
+    ///
+    /// Workers initially know only the orchestrator endpoint. Actor routing
+    /// maps a source address to its worker node, but a direct-only deployment
+    /// cannot dial that node from a bare public key; without the explicit peer
+    /// addresses the first cross-worker transfer can exhaust its bounded route
+    /// budget while a background dial has nothing to dial.
+    fn connect_ready_peer_mesh(&mut self, node_id: u64, ready: &RuntimeReady) {
+        let existing = self.ready_peers.clone();
+        for (peer_id, peer) in existing.iter() {
+            if *peer_id == node_id {
+                continue;
             }
+            let _ = self.stack.runtime.send_to(
+                peer.node_actor,
+                NodeAgentMsg::JoinPeers {
+                    endpoints: vec![ready.endpoint.clone()],
+                },
+            );
         }
+        let peer_endpoints = existing
+            .iter()
+            .filter(|(peer_id, _)| **peer_id != node_id)
+            .map(|(_, peer)| peer.endpoint.clone())
+            .collect::<Vec<_>>();
+        if !peer_endpoints.is_empty() {
+            let _ = self.stack.runtime.send_to(
+                ready.node_actor,
+                NodeAgentMsg::JoinPeers {
+                    endpoints: peer_endpoints,
+                },
+            );
+        }
+        self.ready_peers.insert(node_id, ready.clone());
     }
 
     fn drain_observations(&mut self) {
@@ -2522,6 +2984,7 @@ impl ServeClusterActor {
                     break;
                 }
             };
+            let mut deferred_ready = None;
             match &observation {
                 PluginObservation::Exited {
                     run_id, node_id, ..
@@ -2530,6 +2993,32 @@ impl ServeClusterActor {
                     run_id, node_id, ..
                 } if *run_id == self.run_id => {
                     self.collector.unsubscribe_node(*run_id, *node_id);
+                    self.lifecycle.remove_runtime_ready(*node_id);
+                    self.ready_peers.remove(node_id);
+                    self.dispatched_deployments.remove(node_id);
+                    self.pending_undispatched_readies
+                        .retain(|(pending_node, _, _, _), _| pending_node != node_id);
+                }
+                PluginObservation::ProviderLine {
+                    run_id,
+                    node_id,
+                    line,
+                } if *run_id == self.run_id => {
+                    if let Some(identity) = deployment_dispatch_identity(line, *node_id) {
+                        let key = (
+                            *node_id,
+                            Some(identity.0.clone()),
+                            Some(identity.1.clone()),
+                            identity.2,
+                        );
+                        self.lifecycle.remove_runtime_ready(*node_id);
+                        self.ready_peers.remove(node_id);
+                        self.collector.unsubscribe_node(*run_id, *node_id);
+                        self.dispatched_deployments.insert(*node_id, identity);
+                        deferred_ready = self.pending_undispatched_readies.remove(&key);
+                        self.pending_undispatched_readies
+                            .retain(|(pending_node, _, _, _), _| pending_node != node_id);
+                    }
                 }
                 _ => {}
             }
@@ -2562,6 +3051,9 @@ impl ServeClusterActor {
                     }),
                 );
             }
+            if let Some(report) = deferred_ready {
+                self.observe_report(report);
+            }
         }
     }
 
@@ -2569,19 +3061,21 @@ impl ServeClusterActor {
         self.collector.pump(&self.driver);
         let dashboard = self.dashboard.as_ref();
         let telemetry = &mut self.orch_telemetry;
-        self.collector.drain(|stream, descriptor, channel, frame| {
-            if let Some(dashboard) = dashboard {
-                dashboard.publish_frame(stream, descriptor, channel, frame);
-            }
-            telemetry.archive_frame("node", stream, channel, frame);
-        });
+        self.collector
+            .drain(|stream, descriptor, channel, content, frame| {
+                if let Some(dashboard) = dashboard {
+                    dashboard.publish_frame(stream, descriptor, channel, content, frame);
+                }
+                telemetry.archive_frame("node", stream, channel, content, frame);
+            });
         self.orch_telemetry
             .flush(self.dashboard.as_ref(), "orchestrator");
         self.drain_observations();
         while let Some(report) = self.orchestrator_reports.try_recv() {
             self.observe_report(report);
         }
-        self.advance_join_barriers();
+        self.lifecycle
+            .advance_join_barriers(&self.stack, self.orchestrator_actor);
         emit_swim_transitions(
             &mut self.orch_telemetry,
             self.dashboard.as_ref(),
@@ -2928,50 +3422,17 @@ pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
         .unwrap_or_else(|| UNAVAILABLE.to_owned())
 }
 
-fn vastai_account_has_ssh_key(api_key: &str, public_key: &str) -> Result<bool, String> {
-    let output = swactor_process::command_output(Command::new("vastai").args([
-        "show",
-        "ssh-keys",
-        "--raw",
-        "--api-key",
-        api_key,
-    ]))
-    .map_err(vastai_cli_error)?;
-    if !output.status.success() {
-        return Err(format!(
-            "vastai show ssh-keys failed: {}",
-            command_output_failure_detail(&output, Some(api_key))
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(account_ssh_keys_output_contains_public_key(
-        &stdout, public_key,
-    ))
-}
-
 pub(crate) fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), String> {
-    if vastai_account_has_ssh_key(api_key, public_key)? {
+    let client = swactor_vastai::BlockingVastClient::new(swactor_vastai::VastClient::new(api_key))?;
+    if account_ssh_keys_output_contains_public_key(&client.account_ssh_keys()?, public_key) {
         return Ok(());
     }
 
-    let output = swactor_process::command_output(
-        Command::new("vastai")
-            .args(["create", "ssh-key"])
-            .arg(public_key)
-            .args(["-y", "--api-key", api_key]),
-    )
-    .map_err(vastai_cli_error)?;
-    if !output.status.success() {
-        return Err(format!(
-            "vastai create ssh-key failed: {}",
-            command_output_failure_detail(&output, Some(api_key))
-        ));
-    }
-
-    if vastai_account_has_ssh_key(api_key, public_key)? {
+    client.register_account_ssh_key(public_key)?;
+    if account_ssh_keys_output_contains_public_key(&client.account_ssh_keys()?, public_key) {
         Ok(())
     } else {
-        Err("VastAI SSH key registration did not make the selected key visible in vastai show ssh-keys".to_owned())
+        Err("VastAI SSH key registration did not make the selected key visible in the account listing".to_owned())
     }
 }
 
@@ -2983,14 +3444,6 @@ fn account_ssh_keys_output_contains_public_key(output: &str, public_key: &str) -
                 .split_whitespace()
                 .nth(1)
                 .is_some_and(|body| !body.is_empty() && output.contains(body)))
-}
-
-fn vastai_cli_error(error: std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        "vastai CLI is required to verify/register MYELIN_VASTAI_SSH_IDENTITY; install with pip install vastai".to_owned()
-    } else {
-        format!("run vastai CLI: {error}")
-    }
 }
 
 fn command_output_failure_detail(output: &std::process::Output, secret: Option<&str>) -> String {
@@ -3034,6 +3487,210 @@ mod serve_cluster_properties {
     const READY_NODE_DOMAIN: u8 = 8;
     const STEPS_PER_ACTION: usize = 16;
     const FINAL_STEPS: usize = 32;
+
+    #[test]
+    fn admission_retries_lost_final_ack_without_duplicate_provider_completion() {
+        use crate::node_actor::{NodeAgentActor, NodeAgentReport};
+        use crate::orchestration::manual_control::{EffectKind, EffectOutcome, ManualAction};
+
+        fn settle_persistence(core: &mut ManualControl) -> Vec<ManualAction> {
+            let mut effects = Vec::new();
+            loop {
+                let actions = core.take_actions().collect::<Vec<_>>();
+                if actions.is_empty() {
+                    return effects;
+                }
+                for action in actions {
+                    match action {
+                        ManualAction::Persist { generation, .. } => {
+                            core.persisted(generation, Ok(())).unwrap();
+                        }
+                        effect => effects.push(effect),
+                    }
+                }
+            }
+        }
+
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let stack = DistributionRuntimeStack::new_from_runtime(
+            runtime.clone(),
+            Arc::new(distribution::messages::actor_codec_registry()),
+            Arc::new(swactor_transport::TransportRouter::new()),
+            DistNodeId([1; 32]),
+            DistributedNodeConfig::default(),
+            engine.handle(),
+        );
+        let messages = runtime.new_inbox::<OrchestratorMsg>().unwrap();
+        let reports = runtime.new_inbox::<NodeAgentReport>().unwrap();
+        let node_actor = runtime
+            .spawn(NodeAgentActor::new(
+                myelin::staging::NodeId(2),
+                *messages.addr(),
+                Some(*reports.addr()),
+            ))
+            .unwrap();
+        let endpoint = EndpointAddr::new(iroh::SecretKey::from_bytes(&[2; 32]).public());
+        let worker = DistNodeId(*endpoint.id.as_bytes());
+        let facts = daemon::RuntimeFacts {
+            run_id: 4_611_686_018_447_648_814,
+            attempt_id: 0,
+            endpoint: serde_json::to_string(&endpoint).unwrap(),
+            node_actor,
+            swim_node_id: worker,
+            stage_index: 3,
+            readiness_id: 684_671_332_900_197_836,
+            artifact_digest: Some("sha256:current".to_owned()),
+            deployment_generation: Some("current-deployment".to_owned()),
+        };
+        let mut snapshot = daemon::ClusterSnapshot::fresh(facts.run_id, "ack-loss");
+        snapshot.upsert_node(daemon::SnapshotNode {
+            logical_node_id: 2,
+            spec: Some(NodeProvisionSpec {
+                run_id: facts.run_id,
+                node_id: 2,
+                attempt_id: facts.attempt_id,
+                stage_index: Some(facts.stage_index),
+                deployment: facts.deployment_identity(),
+                image: "worker".to_owned(),
+                env: Vec::new(),
+                args: Vec::new(),
+                offer_criteria_json: None,
+                mounts: Vec::new(),
+            }),
+            selected_offer_id: None,
+            provider_ref: Some("retained-worker".to_owned()),
+            phase: NodePhase::Joining,
+            runtime: None,
+            last_error: None,
+            last_seen_unix_ms: 0,
+        });
+        let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
+        let mut lifecycle = ServeClusterLifecycle::new();
+        assert!(lifecycle.track_runtime_ready(
+            2,
+            facts.readiness_id,
+            RuntimeReady {
+                endpoint,
+                node_actor,
+                swim_node_id: worker,
+                facts: facts.clone(),
+            },
+        ));
+        drive_steps(&backend, STEPS_PER_ACTION);
+
+        // Neither membership alone nor a missing route grants admission.
+        lifecycle.advance_join_barriers(&stack, *messages.addr());
+        drive_steps(&backend, STEPS_PER_ACTION);
+        assert!(messages.try_recv().is_none());
+        stack
+            .membership_mirror
+            .lock()
+            .unwrap()
+            .apply(worker, MemberState::Alive, 1);
+        lifecycle.advance_join_barriers(&stack, *messages.addr());
+        drive_steps(&backend, STEPS_PER_ACTION);
+        assert!(messages.try_recv().is_none());
+        stack.route_view.write().unwrap().insert(node_actor, worker);
+
+        // The worker accepts the first grant and stops announcing readiness.
+        // Lose only its final reply; the orchestrator must still own recovery.
+        for round in 0..2 {
+            for _ in 0..2 {
+                lifecycle.advance_join_barriers(&stack, *messages.addr());
+                drive_steps(&backend, STEPS_PER_ACTION);
+                let Some(OrchestratorMsg::Manual(ManualControlMsg::JoinBarrierSatisfied {
+                    node_id,
+                    facts: admitted,
+                })) = messages.try_recv()
+                else {
+                    panic!("admission was abandoned before the worker's final ACK");
+                };
+                assert_eq!(admitted, facts);
+                core.runtime_ready(node_id, admitted).unwrap();
+                if round == 0 && core.snapshot().node(2).unwrap().phase == NodePhase::Joining {
+                    core.join_barrier_satisfied(node_id).unwrap();
+                }
+            }
+            assert_eq!(
+                core.snapshot().node(2).unwrap().phase,
+                NodePhase::Acknowledging
+            );
+            let effects = settle_persistence(&mut core);
+            let [
+                ManualAction::SendRuntimeReadyAck {
+                    node_id,
+                    facts: grant,
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("one durable grant must coalesce repeated admission: {effects:?}");
+            };
+            runtime
+                .send_to(
+                    grant.node_actor,
+                    NodeAgentMsg::RuntimeReadyAck {
+                        run_id: grant.run_id,
+                        node_id: *node_id,
+                        stage_index: grant.stage_index,
+                        readiness_id: grant.readiness_id,
+                    },
+                )
+                .unwrap();
+            drive_steps(&backend, STEPS_PER_ACTION);
+            assert!(matches!(
+                reports.try_recv(),
+                Some(NodeAgentReport::RuntimeReadyAck { readiness_id, .. })
+                    if readiness_id == facts.readiness_id
+            ));
+            let Some(OrchestratorMsg::ObserveNodeRuntimeReadyAck { readiness_id, .. }) =
+                messages.try_recv()
+            else {
+                panic!("worker did not reply to the durable readiness grant");
+            };
+            if round == 0 {
+                let mut stale = facts.clone();
+                stale.node_actor = ActorAddress::default();
+                assert!(core.runtime_ready(2, stale).is_err());
+                assert!(!lifecycle.acknowledge_runtime_ready(2, readiness_id + 1));
+                continue;
+            }
+            assert!(core.node_ack(2, readiness_id + 1).is_err());
+            core.node_ack(2, readiness_id).unwrap();
+            core.node_ack(2, readiness_id).unwrap();
+            assert!(lifecycle.acknowledge_runtime_ready(2, readiness_id));
+        }
+        assert_eq!(
+            core.snapshot().node(2).unwrap().phase,
+            NodePhase::Acknowledging
+        );
+        assert!(matches!(
+            settle_persistence(&mut core).as_slice(),
+            [ManualAction::CompleteBootstrap { node_id: 2 }]
+        ));
+        core.node_ack(2, facts.readiness_id).unwrap();
+        assert!(settle_persistence(&mut core).is_empty());
+        core.effect_finished(
+            2,
+            EffectKind::CompleteBootstrap,
+            Ok(EffectOutcome::BootstrapCompleted),
+        )
+        .unwrap();
+        assert!(settle_persistence(&mut core).is_empty());
+        assert_eq!(core.snapshot().node(2).unwrap().phase, NodePhase::Running);
+        assert_eq!(
+            core.snapshot().node(2).unwrap().runtime.as_ref(),
+            Some(&facts)
+        );
+        lifecycle.advance_join_barriers(&stack, *messages.addr());
+        drive_steps(&backend, STEPS_PER_ACTION);
+        assert!(messages.try_recv().is_none());
+    }
 
     #[derive(Clone, Debug)]
     enum LifecycleAction {
@@ -3674,7 +4331,62 @@ mod serve_cluster_properties {
 
 #[cfg(test)]
 mod lifecycle_policy_tests {
-    use super::{ActorAddress, ConfigBuilder, EndpointAddr, VastAiProvisioningMode};
+    use super::{
+        ActorAddress, ConfigBuilder, EndpointAddr, VastAiProvisioningMode,
+        reconcile_active_deployment_intent,
+    };
+    use crate::orchestration::daemon::{ClusterSnapshot, RuntimeFacts, SnapshotNode};
+    use crate::orchestration::manual_control::NodePhase;
+    use crate::provisioning::DeploymentIdentity;
+    use distribution::types::NodeId as DistNodeId;
+
+    #[test]
+    fn deployment_receipt_rejects_readiness_from_an_earlier_launch() {
+        let artifact = Some("sha256:payload".to_owned());
+        let generation = Some("same-deployment".to_owned());
+        let current = "123:456:same-deployment";
+        let receipt = serde_json::json!({
+            "type": "MyelinBootstrapDispatched",
+            "node_id": 1,
+            "artifact_digest": artifact,
+            "deployment_generation": generation,
+            "receipt": {
+                "type": "MyelinBootstrapReceipt",
+                "artifact_digest": artifact,
+                "deployment_generation": generation,
+                "executable_digest": "sha256:executable",
+                "pid": 123,
+                "process_start_ticks": 456,
+                "incarnation": current,
+                "worker_count": 1
+            }
+        });
+        let dispatch = super::deployment_dispatch_identity(&receipt.to_string(), 1).unwrap();
+        let dispatches = std::collections::BTreeMap::from([(1, dispatch)]);
+        assert!(super::runtime_ready_matches_dispatch(
+            &dispatches,
+            1,
+            super::daemon::deployment_readiness_id(current),
+            &artifact,
+            &generation,
+        ));
+        // Reusing the provision attempt and deployment does not make a dead
+        // launch's readiness eligible for the replacement's receipt.
+        assert!(!super::runtime_ready_matches_dispatch(
+            &dispatches,
+            1,
+            super::daemon::deployment_readiness_id("122:455:same-deployment"),
+            &artifact,
+            &generation,
+        ));
+        assert!(!super::runtime_ready_matches_dispatch(
+            &dispatches,
+            1,
+            0,
+            &artifact,
+            &generation,
+        ));
+    }
     #[test]
     fn vastai_mock_mode_needs_no_ssh_or_bootstrap_configuration() {
         let mut config = ConfigBuilder::hardcoded_defaults()
@@ -3778,5 +4490,78 @@ mod lifecycle_policy_tests {
             .unwrap();
         assert!(error.contains("imaginary"));
         assert!(error.contains("mock"));
+    }
+
+    #[test]
+    fn active_bundle_replaces_stale_recovery_intent_and_runtime() {
+        let config = ConfigBuilder::hardcoded_defaults().finalize().unwrap();
+        let endpoint = EndpointAddr::new(iroh::SecretKey::from_bytes(&[6; 32]).public());
+        let mut spec = config
+            .node_spec_for_stage(endpoint, ActorAddress::default(), 1, 0)
+            .unwrap();
+        let stale = DeploymentIdentity {
+            artifact_digest: "sha256:stale".to_owned(),
+            deployment_generation: "deploy-a".to_owned(),
+        };
+        spec.deployment = Some(stale.clone());
+        spec.env.push((
+            "MYELIN_ARTIFACT_DIGEST".to_owned(),
+            stale.artifact_digest.clone(),
+        ));
+        spec.env.push((
+            "MYELIN_DEPLOYMENT_GENERATION".to_owned(),
+            stale.deployment_generation.clone(),
+        ));
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.nodes.push(SnapshotNode {
+            logical_node_id: 1,
+            spec: Some(spec),
+            selected_offer_id: None,
+            provider_ref: Some("static-ssh:slot-0".to_owned()),
+            phase: NodePhase::Running,
+            runtime: Some(RuntimeFacts {
+                run_id: 7,
+                attempt_id: 0,
+                endpoint: "endpoint".to_owned(),
+                node_actor: ActorAddress::default(),
+                swim_node_id: DistNodeId([1; 32]),
+                stage_index: 0,
+                readiness_id: 0,
+                artifact_digest: Some(stale.artifact_digest),
+                deployment_generation: Some(stale.deployment_generation),
+            }),
+            last_error: None,
+            last_seen_unix_ms: 0,
+        });
+        let active = DeploymentIdentity {
+            artifact_digest: "sha256:active".to_owned(),
+            deployment_generation: "deploy-b".to_owned(),
+        };
+
+        assert_eq!(
+            reconcile_active_deployment_intent(&mut snapshot, Some(&active)),
+            [1]
+        );
+        let node = &snapshot.nodes[0];
+        assert_eq!(
+            node.spec.as_ref().unwrap().deployment.as_ref(),
+            Some(&active)
+        );
+        assert!(node.runtime.is_none());
+        assert_eq!(node.phase, NodePhase::Bootstrapping);
+        assert_eq!(
+            node.spec
+                .as_ref()
+                .unwrap()
+                .env
+                .iter()
+                .filter(|(key, value)| {
+                    (key == "MYELIN_ARTIFACT_DIGEST" && value == &active.artifact_digest)
+                        || (key == "MYELIN_DEPLOYMENT_GENERATION"
+                            && value == &active.deployment_generation)
+                })
+                .count(),
+            2
+        );
     }
 }

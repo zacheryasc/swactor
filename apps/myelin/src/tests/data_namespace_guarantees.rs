@@ -44,7 +44,12 @@ impl DataNode {
             driver.endpoint_addr(),
             driver.edge_events_handle(),
         ));
-        receiver.install_pump(&engine.handle(), stack.runtime.clone(), POLL);
+        receiver.install_pump(
+            &engine.handle(),
+            stack.runtime.clone(),
+            POLL,
+            driver.edge_events_changed(),
+        );
         let receiver: Arc<dyn BlobTransferReceiver> = receiver;
         let sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
             driver.edge_connector(),
@@ -105,6 +110,9 @@ impl DataNode {
                         self.stack.route_view.clone(),
                         self.stack.pinned_routes.clone(),
                         self.stack.route_binder.clone(),
+                        self.stack.runtime.clone(),
+                        self.stack.actors.directory,
+                        self.driver.connection_observer(),
                     ))),
                     stream_transport: None,
                 })
@@ -133,6 +141,7 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
         &node_a.stack,
         &node_a.driver,
         state.path().join("namespace.json"),
+        Vec::new(),
     )
     .expect("namespace authority");
 

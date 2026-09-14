@@ -3,7 +3,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use telemetry::frame::{Frame, StreamId};
+use telemetry::decode_record_value;
+use telemetry::frame::{ChannelContent, Frame, StreamId};
 
 use crate::observability::benchmark;
 
@@ -49,11 +50,21 @@ impl FrameArchive {
         source: &str,
         stream: &StreamId,
         channel: &str,
+        content: &ChannelContent,
         frame: &Frame,
     ) -> Result<(), String> {
-        let payload = match std::str::from_utf8(&frame.payload) {
-            Ok(text) => json!({"encoding": "utf8", "value": text}),
-            Err(_) => json!({"encoding": "bytes", "value": frame.payload}),
+        let payload = match content {
+            ChannelContent::MessagePackRecord { .. } => decode_record_value(&frame.payload)
+                .map(|value| json!({"encoding": "messagepack", "value": value}))
+                .unwrap_or_else(|_| json!({"encoding": "bytes", "value": frame.payload})),
+            ChannelContent::JsonRecord { .. } => serde_json::from_slice(&frame.payload)
+                .map(|value: serde_json::Value| json!({"encoding": "json", "value": value}))
+                .unwrap_or_else(|_| json!({"encoding": "bytes", "value": frame.payload})),
+            ChannelContent::TextStream => match std::str::from_utf8(&frame.payload) {
+                Ok(text) => json!({"encoding": "utf8", "value": text}),
+                Err(_) => json!({"encoding": "bytes", "value": frame.payload}),
+            },
+            ChannelContent::Bytes => json!({"encoding": "bytes", "value": frame.payload}),
         };
         let record = json!({
             "arrival_seq": self.next_seq,

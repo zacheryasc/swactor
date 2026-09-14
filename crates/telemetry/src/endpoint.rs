@@ -4,9 +4,9 @@
 //! stream/channel metadata, orders producer frames through the mux, and fans
 //! catalog-aware events to subscribers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use crossbeam_channel::{
@@ -23,7 +23,7 @@ use crate::frame::{
     SourceFilter, StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest, TelemetryEvent,
 };
 use crate::mux::Mux;
-use crate::record::Record;
+use crate::record::{Record, encode_record};
 use crate::transport::Delivery;
 
 const DEFAULT_MUX_CAPACITY: usize = 4096;
@@ -76,7 +76,9 @@ pub struct TelemetrySubscription {
     name: String,
     request: SubscriptionRequest,
     snapshot: TelemetrySnapshot,
+    replay: Option<Mutex<VecDeque<Arc<TelemetryEvent>>>>,
     rx: Receiver<TelemetryEvent>,
+    fanout: Weak<Mutex<FanoutState>>,
 }
 
 impl TelemetrySubscription {
@@ -96,27 +98,63 @@ impl TelemetrySubscription {
         &self.snapshot
     }
 
+    pub fn dropped(&self) -> u64 {
+        self.fanout
+            .upgrade()
+            .and_then(|state| {
+                state
+                    .lock()
+                    .expect("telemetry fanout poisoned")
+                    .subscribers
+                    .get(&self.id)
+                    .map(|slot| slot.dropped)
+            })
+            .unwrap_or(0)
+    }
+
+    fn pop_replay(&self) -> Option<TelemetryEvent> {
+        self.replay
+            .as_ref()?
+            .lock()
+            .expect("telemetry replay poisoned")
+            .pop_front()
+            .map(|event| (*event).clone())
+    }
+
     pub fn try_recv(&self) -> Result<TelemetryEvent, TryRecvError> {
-        self.rx.try_recv()
+        self.pop_replay().map_or_else(|| self.rx.try_recv(), Ok)
     }
 
     pub fn recv(&self) -> Result<TelemetryEvent, RecvError> {
-        self.rx.recv()
+        self.pop_replay().map_or_else(|| self.rx.recv(), Ok)
     }
 
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
     ) -> Result<TelemetryEvent, RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
+        self.pop_replay()
+            .map_or_else(|| self.rx.recv_timeout(timeout), Ok)
     }
 
     pub fn drain_available(&self) -> Vec<TelemetryEvent> {
         let mut out = Vec::with_capacity(self.rx.len());
-        while let Ok(event) = self.rx.try_recv() {
+        while let Ok(event) = self.try_recv() {
             out.push(event);
         }
         out
+    }
+}
+
+impl Drop for TelemetrySubscription {
+    fn drop(&mut self) {
+        if let Some(fanout) = self.fanout.upgrade() {
+            fanout
+                .lock()
+                .expect("telemetry fanout poisoned")
+                .subscribers
+                .remove(&self.id);
+        }
     }
 }
 
@@ -170,17 +208,17 @@ struct FanoutState {
 /// Local fanout; future events are broadcast to every subscriber without request filtering.
 pub struct DeliveryFanout {
     default_capacity: usize,
-    state: Mutex<FanoutState>,
+    state: Arc<Mutex<FanoutState>>,
 }
 
 impl DeliveryFanout {
     pub fn new(default_capacity: usize) -> Self {
         Self {
             default_capacity: default_capacity.max(1),
-            state: Mutex::new(FanoutState {
+            state: Arc::new(Mutex::new(FanoutState {
                 next_id: 1,
                 subscribers: BTreeMap::new(),
-            }),
+            })),
         }
     }
 
@@ -226,7 +264,9 @@ impl DeliveryFanout {
             name,
             request,
             snapshot,
+            replay: None,
             rx,
+            fanout: Arc::downgrade(&self.state),
         }
     }
 
@@ -438,12 +478,51 @@ impl ChannelCatalogState {
     }
 }
 
+#[derive(Default)]
+struct EndpointDelivery {
+    frame_capacity: usize,
+    byte_capacity: usize,
+    retained_bytes: usize,
+    retained: VecDeque<Arc<TelemetryEvent>>,
+}
+
+impl EndpointDelivery {
+    fn retain(&mut self, events: &[TelemetryEvent]) {
+        if self.frame_capacity == 0 || self.byte_capacity == 0 {
+            return;
+        }
+        for event in events {
+            let TelemetryEvent::Frame(frame) = event else {
+                continue;
+            };
+            let bytes = frame.payload.len();
+            while !self.retained.is_empty()
+                && (self.retained.len() >= self.frame_capacity
+                    || bytes > self.byte_capacity.saturating_sub(self.retained_bytes))
+            {
+                if let Some(event) = self.retained.pop_front()
+                    && let TelemetryEvent::Frame(frame) = event.as_ref()
+                {
+                    self.retained_bytes -= frame.payload.len();
+                }
+            }
+            // An oversize frame cannot fit. Keep its original missing position,
+            // rather than renumbering or fabricating an event during replay.
+            if bytes <= self.byte_capacity {
+                self.retained_bytes += bytes;
+                self.retained.push_back(Arc::new(event.clone()));
+            }
+        }
+    }
+}
+
 /// Process-local telemetry endpoint.
 pub struct TelemetryEndpoint {
     stream: StreamId,
     mux: Arc<Mux>,
     catalog: Arc<Mutex<ChannelCatalogState>>,
     fanout: Arc<DeliveryFanout>,
+    delivery: Arc<Mutex<EndpointDelivery>>,
     drained: AtomicU64,
     bitbucketed: AtomicU64,
 }
@@ -481,9 +560,23 @@ impl TelemetryEndpoint {
             mux,
             catalog: Arc::new(Mutex::new(ChannelCatalogState::new(descriptor))),
             fanout: Arc::new(DeliveryFanout::new(subscriber_capacity)),
+            delivery: Arc::new(Mutex::new(EndpointDelivery::default())),
             drained: AtomicU64::new(0),
             bitbucketed: AtomicU64::new(0),
         }
+    }
+
+    /// Retain a bounded suffix for explicitly replaying subscriptions.
+    ///
+    /// Configure this before creating producers. Evicted frames and rejected
+    /// mux submissions are not reconstructed; their original gaps remain visible.
+    pub fn with_retention(self, frame_capacity: usize, byte_capacity: usize) -> Self {
+        {
+            let mut delivery = self.delivery.lock().expect("telemetry delivery poisoned");
+            delivery.frame_capacity = frame_capacity;
+            delivery.byte_capacity = byte_capacity;
+        }
+        self
     }
 
     pub fn stream_id(&self) -> &StreamId {
@@ -506,6 +599,7 @@ impl TelemetryEndpoint {
             mux: Arc::clone(&self.mux),
             catalog: Arc::clone(&self.catalog),
             fanout: Arc::clone(&self.fanout),
+            delivery: Arc::clone(&self.delivery),
         }
     }
 
@@ -514,7 +608,13 @@ impl TelemetryEndpoint {
         name: impl Into<String>,
         content: ChannelContent,
     ) -> Result<ChannelId, ChannelRegistrationError> {
-        register_channel(&self.catalog, &self.fanout, name.into(), content)
+        register_channel(
+            &self.catalog,
+            &self.fanout,
+            &self.delivery,
+            name.into(),
+            content,
+        )
     }
 
     pub fn register_channel(&self, name: impl Into<String>, content: ChannelContent) -> ChannelId {
@@ -529,7 +629,7 @@ impl TelemetryEndpoint {
     pub fn register_record<R: Record>(&self) -> ChannelId {
         self.register_channel(
             R::CHANNEL,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(R::CHANNEL.to_owned()),
             },
         )
@@ -540,6 +640,7 @@ impl TelemetryEndpoint {
         name: impl Into<String>,
         request: SubscriptionRequest,
     ) -> TelemetrySubscription {
+        let _delivery = self.delivery.lock().expect("telemetry delivery poisoned");
         let snapshot = self.catalog_snapshot().telemetry_snapshot(&request);
         self.fanout.subscribe(name, request, snapshot)
     }
@@ -548,11 +649,31 @@ impl TelemetryEndpoint {
         self.subscribe(name, SubscriptionRequest::all())
     }
 
+    /// Replay retained frames in position order, then receive live events.
+    ///
+    /// Replay has its own bounded snapshot, so it cannot fill the live queue
+    /// before the subscription is returned. The delivery lock makes the
+    /// retained/live boundary atomic with ticks and channel declarations.
+    pub fn subscribe_retained(
+        &self,
+        name: impl Into<String>,
+        request: SubscriptionRequest,
+    ) -> TelemetrySubscription {
+        let delivery = self.delivery.lock().expect("telemetry delivery poisoned");
+        let snapshot = self.catalog_snapshot().telemetry_snapshot(&request);
+        let mut subscription = self.fanout.subscribe(name, request, snapshot);
+        if !delivery.retained.is_empty() {
+            subscription.replay = Some(Mutex::new(delivery.retained.clone()));
+        }
+        subscription
+    }
+
     pub fn subscribe_all_with_capacity(
         &self,
         name: impl Into<String>,
         capacity: usize,
     ) -> TelemetrySubscription {
+        let _delivery = self.delivery.lock().expect("telemetry delivery poisoned");
         let request = SubscriptionRequest::all();
         let snapshot = self.catalog_snapshot().telemetry_snapshot(&request);
         self.fanout
@@ -567,13 +688,16 @@ impl TelemetryEndpoint {
         self.fanout.subscriber_snapshots()
     }
 
-    /// Drain the mux once and broadcast future frame events; with no subscribers, drained frames are bitbucketed.
+    /// Drain the mux, retain the configured suffix, and broadcast live events.
     pub fn tick(&self) -> EndpointTick {
+        let mut delivery = self.delivery.lock().expect("telemetry delivery poisoned");
         let events = self.drain_events();
         if events.is_empty() {
             return EndpointTick::default();
         }
-        self.publish_events(events)
+        delivery.retain(&events);
+        let retained = delivery.retained.len().min(events.len());
+        self.publish_events(events, retained)
     }
 
     fn drain_events(&self) -> Vec<TelemetryEvent> {
@@ -593,13 +717,13 @@ impl TelemetryEndpoint {
             .collect()
     }
 
-    fn publish_events(&self, events: Vec<TelemetryEvent>) -> EndpointTick {
+    fn publish_events(&self, events: Vec<TelemetryEvent>, retained: usize) -> EndpointTick {
         let drained = events.len();
         self.drained.fetch_add(drained as u64, Ordering::Relaxed);
         let tick = self.fanout.publish_batch(events);
         if tick.subscribers == 0 {
             self.bitbucketed
-                .fetch_add(drained as u64, Ordering::Relaxed);
+                .fetch_add((drained - retained) as u64, Ordering::Relaxed);
         }
         tick
     }
@@ -627,6 +751,7 @@ pub struct TelemetryProducer {
     mux: Arc<Mux>,
     catalog: Arc<Mutex<ChannelCatalogState>>,
     fanout: Arc<DeliveryFanout>,
+    delivery: Arc<Mutex<EndpointDelivery>>,
 }
 
 impl TelemetryProducer {
@@ -639,7 +764,13 @@ impl TelemetryProducer {
         name: impl Into<String>,
         content: ChannelContent,
     ) -> Result<ChannelId, ChannelRegistrationError> {
-        register_channel(&self.catalog, &self.fanout, name.into(), content)
+        register_channel(
+            &self.catalog,
+            &self.fanout,
+            &self.delivery,
+            name.into(),
+            content,
+        )
     }
 
     pub fn register_channel(&self, name: impl Into<String>, content: ChannelContent) -> ChannelId {
@@ -654,7 +785,7 @@ impl TelemetryProducer {
     pub fn register_record<R: Record>(&self) -> ChannelId {
         self.register_channel(
             R::CHANNEL,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(R::CHANNEL.to_owned()),
             },
         )
@@ -696,7 +827,7 @@ impl TelemetryProducer {
     pub fn stats_hook(&self) -> Arc<dyn StatsHook> {
         let channel = self.register_channel(
             DEFAULT_STATS_CHANNEL,
-            ChannelContent::JsonRecord {
+            ChannelContent::MessagePackRecord {
                 schema: Some(DEFAULT_STATS_CHANNEL.to_owned()),
             },
         );
@@ -715,9 +846,11 @@ impl TelemetryProducer {
 fn register_channel(
     catalog: &Arc<Mutex<ChannelCatalogState>>,
     fanout: &Arc<DeliveryFanout>,
+    delivery: &Arc<Mutex<EndpointDelivery>>,
     name: String,
     content: ChannelContent,
 ) -> Result<ChannelId, ChannelRegistrationError> {
+    let _delivery = delivery.lock().expect("telemetry delivery poisoned");
     // New channel declarations publish a future event immediately; existing-name
     // reuse only returns the prior id.
     let (id, event) = {
@@ -980,7 +1113,7 @@ impl StatsHook for TelemetryStatsHook {
                 .expect("actor telemetry record is an object");
             object.insert("generation".to_owned(), generation.into());
             object.insert("sequence".to_owned(), state.sequence.into());
-            let bytes = serde_json::to_vec(&payload).expect("actor telemetry record serializes");
+            let bytes = encode_record(&payload).expect("actor telemetry record serializes");
             self.producer.submit_bytes(self.channel, bytes);
         }
     }

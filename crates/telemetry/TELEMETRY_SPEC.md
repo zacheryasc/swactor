@@ -1,7 +1,7 @@
 # The Telemetry — Specification
 
 Id: 7
-Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
+Last modified: 74ba89c0cedae04b05a4b8b4af9a3856adfd5875
 Last reviewed:
 > Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
@@ -162,12 +162,18 @@ The human-readable channel name and display/routing metadata live in a channel
 descriptor:
 
 ```rust
-pub enum ChannelContentKind { Bytes, TextStream, JsonRecord }
+pub enum ChannelContentKind {
+    Bytes,
+    TextStream,
+    JsonRecord,
+    MessagePackRecord,
+}
 
 pub enum ChannelContent {
     Bytes,
     TextStream,
     JsonRecord { schema: Option<String> },
+    MessagePackRecord { schema: Option<String> },
 }
 
 pub struct ChannelDescriptor {
@@ -335,7 +341,7 @@ Examples:
 | `{ sources: All, channels: Prefix("proc.") }` | all process-output channels with descriptors visible to the subscriber |
 | `{ sources: Node(X), channels: Prefix("proc.trainer.") }` | trainer process output from every life of node `X` |
 | `{ sources: Stream(S), channels: Name("host.cpu") }` | exact host CPU channel in one stream |
-| `{ sources: Origin(Bootstrap), channels: Content(JsonRecord) }` | JSON-record channels from bootstrap streams |
+| `{ sources: Origin(Bootstrap), channels: Content(MessagePackRecord) }` | named-field MessagePack record channels from bootstrap streams |
 
 ---
 
@@ -516,6 +522,7 @@ pub enum ChannelContent {
     Bytes,
     TextStream,
     JsonRecord { schema: Option<String> },
+    MessagePackRecord { schema: Option<String> },
 }
 ```
 
@@ -525,17 +532,17 @@ transport catalog. It is not payload inspection.
 View classification remains caller-owned:
 
 ```rust
-pub enum ChannelKind { Typed, Text, Opaque }
+pub enum ChannelKind { MessagePackRecord, JsonRecord, Text, Opaque }
 
 pub trait ChannelClassifier {
     fn classify(&self, channel_name: &str) -> ChannelKind;
 }
 ```
 
-A `ChannelRegistry` can classify exact typed/text names and text prefixes, but
-unknown names default to `Opaque`. The pipe may route by `ChannelContentKind`; a
-view decides how far to decode a payload by `ChannelKind` and the caller's
-registry.
+A `ChannelRegistry` can classify exact MessagePack/JSON/text names and text
+prefixes, but unknown names default to `Opaque`. The pipe may route by
+`ChannelContentKind`; a view decides how far to decode a payload by
+`ChannelKind` and the caller's registry.
 
 ### 5.3 Static channels and dynamic families
 
@@ -554,19 +561,24 @@ A caller-owned classifier can know a family shape without knowing every concrete
 instance: for example, `proc.` may classify as text while
 `proc.trainer.stdout` first appears only when the trainer emits and registers.
 
-### 5.4 Bytes / TextStream / JsonRecord, and the raw fallback
+### 5.4 Bytes / TextStream / structured records, and the raw fallback
 
 Catalog content classes are:
 
 - **Bytes** — arbitrary bytes. Display as raw unless a view knows more.
 - **TextStream** — UTF-8-ish stream chunks. A view may render valid UTF-8 as
   text and invalid bytes as raw.
-- **JsonRecord** — payloads encoded with serde JSON for a record type. The
-  optional `schema` string is catalog metadata, not a versioned wire envelope.
+- **JsonRecord** — payloads encoded with serde JSON.
+- **MessagePackRecord** — payloads encoded as named-field MessagePack. This is
+  the default for [`Record`] and preserves field names so generic views can
+  decode records without knowing their Rust type.
+
+The optional `schema` string on either record class is catalog metadata, not a
+versioned wire envelope.
 
 View decode results are:
 
-- **Record** — a typed/JSON channel decoded to a structured JSON value.
+- **Record** — a JSON or MessagePack channel decoded to a structured JSON value.
 - **Text** — a text channel decoded as UTF-8.
 - **Raw** — unknown, invalid, or intentionally opaque bytes.
 
@@ -584,8 +596,8 @@ pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
     const CHANNEL: &'static str;
 
     fn channel_name() -> &'static str { Self::CHANNEL }
-    fn encode(&self) -> Vec<u8> { serde_json::to_vec(self).unwrap() }
-    fn decode(payload: &[u8]) -> Result<Self, serde_json::Error>;
+    fn encode(&self) -> Vec<u8> { rmp_serde::to_vec_named(self).unwrap() }
+    fn decode(payload: &[u8]) -> Result<Self, rmp_serde::decode::Error>;
 }
 ```
 
@@ -601,15 +613,17 @@ Schema evolution is still serde discipline:
 - **Add fields freely.** New fields are emitted by new producers.
 - **Tolerate missing.** `#[serde(default)]` fills fields an older producer did
   not send.
+- **Omit absent optionals.** Optional failure context such as hardware
+  `error` fields is absent on success rather than encoded as an explicit null.
 - **Ignore unknown.** A consumer drops fields it does not recognize.
 - **Never remove or repurpose.** Retire a field by leaving it unused; introduce
   new meaning as a new field.
 
-Current `JsonRecord` descriptors carry `schema: Option<String>`. In the current
-implementation, `register_record<R>()` uses `Some(R::CHANNEL.to_owned())` as the
-schema string. Treat this as catalog metadata for display/subscription tooling,
-not as a frame-level schema version. There is still no schema version field in
-`Frame` itself.
+Current `JsonRecord` and `MessagePackRecord` descriptors carry
+`schema: Option<String>`. `register_record<R>()` uses
+`MessagePackRecord { schema: Some(R::CHANNEL.to_owned()) }`. Treat this as
+catalog metadata for display/subscription tooling, not as a frame-level schema
+version. There is still no schema version field in `Frame` itself.
 
 ### 5.7 Lifecycle and liveness
 

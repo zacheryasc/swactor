@@ -6,6 +6,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use myelin_control_contract::MAX_PROVISION_COUNT;
+pub(crate) use myelin_control_contract::{
+    CommandKind, CommandRecord, CommandState, KillRequest, NodePhase, Offer as OfferDto,
+    OfferSearchRequest, OfferSearchResults, ProviderConfigurationRequest, ProviderReadiness,
+    ProviderReadinessKind, ProvisionRequest,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -24,114 +30,10 @@ use crate::provisioning::{
     ProvisionPlugin,
 };
 
-pub(crate) const MAX_PROVISION_COUNT: u32 = 8;
 pub(crate) const CONTROL_REGISTRY_NAME: &str = "myelin.manual-control";
 pub(crate) const SELECTED_OFFER_ID_ENV: &str = "MYELIN_SELECTED_OFFER_ID";
 pub(crate) const READ_MODEL_COMMAND_LIMIT: usize = 256;
 const OFFER_SEARCH_RECEIPT_TTL_MS: u64 = 5 * 60 * 1_000;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderReadinessKind {
-    Unconfigured,
-    Validating,
-    Ready,
-    ConfigurationError,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ProviderReadiness {
-    pub name: String,
-    pub provisioning_mode: String,
-    pub runtime_image: String,
-    pub kind: ProviderReadinessKind,
-    pub error: Option<String>,
-}
-
-impl ProviderReadiness {
-    #[cfg(test)]
-    pub(crate) fn ready() -> Self {
-        Self::ready_for("test", "test-image")
-    }
-
-    pub(crate) fn ready_for(name: impl Into<String>, runtime_image: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            provisioning_mode: "real".to_owned(),
-            runtime_image: runtime_image.into(),
-            kind: ProviderReadinessKind::Ready,
-            error: None,
-        }
-    }
-
-    pub(crate) fn unconfigured_for(
-        name: impl Into<String>,
-        runtime_image: impl Into<String>,
-        error: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            provisioning_mode: "real".to_owned(),
-            runtime_image: runtime_image.into(),
-            kind: ProviderReadinessKind::Unconfigured,
-            error: Some(error.into()),
-        }
-    }
-
-    pub(crate) fn with_provisioning_mode(mut self, mode: impl Into<String>) -> Self {
-        self.provisioning_mode = mode.into();
-        self
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CommandKind {
-    Provision,
-    Kill,
-    /// Schema-v1 accepted-command IDs had no durable kind or result.
-    Migrated,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CommandState {
-    Persisting,
-    Running,
-    Succeeded,
-    Failed,
-}
-
-impl CommandState {
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CommandRecord {
-    pub command_id: String,
-    pub kind: CommandKind,
-    pub state: CommandState,
-    pub node_ids: Vec<u64>,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum NodePhase {
-    Requested,
-    Creating,
-    Bootstrapping,
-    Joining,
-    Acknowledging,
-    Running,
-    KillRequested,
-    Stopping,
-    StopFailed,
-    Stopped,
-    Orphan,
-}
 
 fn provision_event_kind_for_phase(phase: NodePhase) -> Option<ProvisionEventKind> {
     match phase {
@@ -149,43 +51,12 @@ fn provision_event_kind_for_phase(phase: NodePhase) -> Option<ProvisionEventKind
     }
 }
 
-/// Runtime correction input. `api_key` is intentionally absent from Debug and
-/// never enters durable state or a response DTO.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ProviderConfigurationRequest {
-    pub api_key: Option<String>,
-    pub ssh_identity: Option<String>,
-    pub bootstrap_command: Option<String>,
+pub(crate) trait OfferSearchRequestExt {
+    fn browse_criteria(&self) -> OfferBrowseCriteria;
 }
 
-impl std::fmt::Debug for ProviderConfigurationRequest {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ProviderConfigurationRequest")
-            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
-            .field("ssh_identity", &self.ssh_identity)
-            .field("bootstrap_command", &self.bootstrap_command)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct OfferSearchRequest {
-    pub gpu_model: Option<String>,
-    pub min_gpu_ram_mb: Option<u64>,
-    pub min_compute_cap: Option<u64>,
-    pub min_reliability: Option<f64>,
-    pub require_verified: Option<bool>,
-    pub min_download_mbps: Option<f64>,
-    pub min_upload_mbps: Option<f64>,
-    pub max_hourly_price: Option<f64>,
-    #[serde(default)]
-    pub blacklist_hosts: Vec<u64>,
-    pub count: Option<u32>,
-}
-
-impl OfferSearchRequest {
-    pub(crate) fn browse_criteria(&self) -> OfferBrowseCriteria {
+impl OfferSearchRequestExt for OfferSearchRequest {
+    fn browse_criteria(&self) -> OfferBrowseCriteria {
         OfferBrowseCriteria {
             gpu_name_contains: self.gpu_model.clone(),
             min_gpu_ram_mb: self.min_gpu_ram_mb,
@@ -198,88 +69,22 @@ impl OfferSearchRequest {
             blacklist_hosts: self.blacklist_hosts.clone(),
         }
     }
-
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        let finite_non_negative = [
-            ("min_reliability", self.min_reliability),
-            ("min_download_mbps", self.min_download_mbps),
-            ("min_upload_mbps", self.min_upload_mbps),
-            ("max_hourly_price", self.max_hourly_price),
-        ];
-        for (name, value) in finite_non_negative {
-            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
-                return Err(format!("{name} must be finite and non-negative"));
-            }
-        }
-        if self.min_reliability.is_some_and(|value| value > 1.0) {
-            return Err("min_reliability must not exceed 1".to_owned());
-        }
-        let count = self.count.unwrap_or(1);
-        if count == 0 || count > MAX_PROVISION_COUNT {
-            return Err(format!(
-                "offer count must be between 1 and {MAX_PROVISION_COUNT}"
-            ));
-        }
-        Ok(())
-    }
 }
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct OfferDto {
-    pub offer_id: u64,
-    pub host_id: Option<u64>,
-    pub gpu_model: String,
-    pub gpu_ram_mb: Option<f64>,
-    pub compute_cap: u64,
-    pub verification: Option<String>,
-    pub reliability: Option<f64>,
-    pub download_mbps: Option<f64>,
-    pub upload_mbps: Option<f64>,
-    pub location: Option<String>,
-    pub hourly_price: f64,
-    pub download_cost_per_tb: f64,
-    pub upload_cost_per_tb: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct OfferSearchResults {
-    pub search_id: u64,
-    pub offers: Vec<OfferDto>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ProvisionRequest {
-    pub command_id: String,
-    #[serde(default = "default_one")]
-    pub count: u32,
-    #[serde(default)]
-    pub selected_offer_ids: Vec<u64>,
-    #[serde(default)]
-    pub search_id: Option<u64>,
-    #[serde(default)]
-    pub image: Option<String>,
-}
-
-const fn default_one() -> u32 {
-    1
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct KillRequest {
-    pub command_id: String,
-    pub logical_node_id: u64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RejoinHello {
     pub run_id: u64,
     pub logical_node_id: u64,
     pub attempt_id: u64,
+    pub readiness_id: u64,
     pub selected_offer_id: Option<u64>,
     pub endpoint: String,
     pub swim_node_id: distribution::types::NodeId,
     pub stage_index: u32,
     pub node_actor: ActorAddress,
+    #[serde(default)]
+    pub artifact_digest: Option<String>,
+    #[serde(default)]
+    pub deployment_generation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -701,6 +506,24 @@ impl ManualControl {
             .snapshot
             .node_mut(node_id)
             .ok_or_else(|| format!("runtime-ready for unknown node {node_id}"))?;
+        if node.phase == NodePhase::Acknowledging && node.runtime.as_ref() == Some(&facts) {
+            // A lost ACK (including the worker's reply) must not strand an
+            // accepted runtime. Coalesce replay while the durable grant or
+            // completion is already pending; never bypass persistence.
+            if self.in_flight.get(&node_id) == Some(&EffectKind::CompleteBootstrap)
+                || self.pending_persists.iter().any(|pending| {
+                    matches!(
+                        pending.after,
+                        AfterPersist::SendRuntimeReadyAck(id)
+                            | AfterPersist::CompleteBootstrap(id) if id == node_id
+                    )
+                })
+            {
+                return Ok(());
+            }
+            self.queue_persist(AfterPersist::SendRuntimeReadyAck(node_id));
+            return Ok(());
+        }
         if node.phase != NodePhase::Joining {
             return Err(format!(
                 "runtime-ready is invalid for node {node_id} in {:?}",
@@ -711,10 +534,24 @@ impl ManualControl {
             .spec
             .as_ref()
             .ok_or_else(|| format!("node {node_id} has no provision intent"))?;
+        if spec
+            .stage_index
+            .is_some_and(|stage| stage != facts.stage_index)
+        {
+            return Err(format!("runtime-ready stage mismatch for node {node_id}"));
+        }
         if facts.run_id != spec.run_id || facts.attempt_id != spec.attempt_id {
             return Err(format!(
                 "runtime-ready identity mismatch for node {node_id}: expected run/attempt {}/{}, got {}/{}",
                 spec.run_id, spec.attempt_id, facts.run_id, facts.attempt_id
+            ));
+        }
+        if let Some(expected) = &spec.deployment
+            && facts.deployment_identity().as_ref() != Some(expected)
+        {
+            return Err(format!(
+                "runtime-ready deployment identity mismatch for node {node_id}: expected {expected:?}, worker runs {:?}",
+                facts.deployment_identity(),
             ));
         }
         node.runtime = Some(facts);
@@ -751,6 +588,15 @@ impl ManualControl {
             return Err(format!(
                 "node ACK does not match node {node_id} acknowledging attempt"
             ));
+        }
+        // Replayed durable grants can produce multiple final ACKs before the
+        // provider completes. They represent one admission, not new effects.
+        if self.in_flight.get(&node_id) == Some(&EffectKind::CompleteBootstrap)
+            || self.pending_persists.iter().any(|pending| {
+                matches!(pending.after, AfterPersist::CompleteBootstrap(id) if id == node_id)
+            })
+        {
+            return Ok(());
         }
         self.queue_persist(AfterPersist::CompleteBootstrap(node_id));
         Ok(())
@@ -799,6 +645,40 @@ impl ManualControl {
                 hello.logical_node_id
             ));
         }
+        if let Some(expected) = &spec.deployment {
+            if node.phase != NodePhase::Running
+                || !node.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.readiness_id == hello.readiness_id
+                        && runtime.node_actor == hello.node_actor
+                        && runtime.swim_node_id == hello.swim_node_id
+                        && runtime.stage_index == hello.stage_index
+                })
+            {
+                return Err(format!(
+                    "rejoin cannot replace receipt-validated readiness for node {}",
+                    hello.logical_node_id
+                ));
+            }
+            let reported = crate::orchestration::daemon::RuntimeFacts {
+                run_id: hello.run_id,
+                attempt_id: hello.attempt_id,
+                endpoint: hello.endpoint.clone(),
+                node_actor: hello.node_actor,
+                swim_node_id: hello.swim_node_id,
+                stage_index: hello.stage_index,
+                readiness_id: hello.readiness_id,
+                artifact_digest: hello.artifact_digest.clone(),
+                deployment_generation: hello.deployment_generation.clone(),
+            };
+            if reported.deployment_identity().as_ref() != Some(expected) {
+                return Err(format!(
+                    "rejoin deployment identity mismatch for node {}: expected {:?}, worker runs {:?}",
+                    hello.logical_node_id,
+                    expected,
+                    reported.deployment_identity(),
+                ));
+            }
+        }
         if matches!(
             node.phase,
             NodePhase::KillRequested
@@ -818,7 +698,9 @@ impl ManualControl {
             node_actor: hello.node_actor,
             swim_node_id: hello.swim_node_id,
             stage_index: hello.stage_index,
-            readiness_id: hello.attempt_id,
+            readiness_id: hello.readiness_id,
+            artifact_digest: hello.artifact_digest.clone(),
+            deployment_generation: hello.deployment_generation.clone(),
         });
         node.phase = NodePhase::Running;
         node.last_error = None;
@@ -1152,6 +1034,17 @@ impl ManualControl {
                 let node = self.snapshot.node_mut(node_id).expect("effect node exists");
                 node.provider_ref = Some(provider_ref);
                 node.last_seen_unix_ms = unix_ms_now();
+                let deployment_stale = node
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.deployment.clone())
+                    .is_some_and(|expected| {
+                        node.runtime
+                            .as_ref()
+                            .and_then(|facts| facts.deployment_identity())
+                            .as_ref()
+                            != Some(&expected)
+                    });
                 let after = match node.phase {
                     NodePhase::Requested | NodePhase::Creating | NodePhase::Bootstrapping => {
                         node.phase = NodePhase::Bootstrapping;
@@ -1160,6 +1053,16 @@ impl ManualControl {
                     NodePhase::KillRequested | NodePhase::Stopping | NodePhase::StopFailed => {
                         node.phase = NodePhase::KillRequested;
                         AfterPersist::Stop(node_id)
+                    }
+                    NodePhase::Joining | NodePhase::Acknowledging | NodePhase::Running
+                        if deployment_stale =>
+                    {
+                        // The retained resource runs a stale deployment.
+                        // Keep the resource, refresh its mutable state, and
+                        // require a fresh join before it may run again.
+                        node.phase = NodePhase::Bootstrapping;
+                        node.runtime = None;
+                        AfterPersist::StartBootstrap(node_id)
                     }
                     NodePhase::Joining
                     | NodePhase::Acknowledging
@@ -1373,6 +1276,7 @@ pub(crate) enum ManualControlMsg {
     },
     JoinBarrierSatisfied {
         node_id: u64,
+        facts: RuntimeFacts,
     },
     Rejoin {
         hello: RejoinHello,
@@ -1427,6 +1331,7 @@ fn refresh_recovery_routing(
             .filter(|(key, _)| ROUTING_KEYS.contains(&key.as_str())),
     );
     persisted.args = current.args;
+    persisted.deployment = current.deployment;
     persisted
 }
 
@@ -1591,9 +1496,6 @@ impl ManualActorControl {
         }
     }
 
-    pub(crate) fn read_model(&self) -> ManualReadModel {
-        self.core.read_model()
-    }
     pub(crate) fn running_node_actor(&self, logical_node_id: u64) -> Result<ActorAddress, String> {
         let node = self
             .core
@@ -1963,8 +1865,18 @@ impl ManualActorControl {
                     self.lanes.remove(&node_id);
                 }
             }
-            ManualControlMsg::JoinBarrierSatisfied { node_id } => {
-                let _ = self.core.join_barrier_satisfied(node_id);
+            ManualControlMsg::JoinBarrierSatisfied { node_id, mut facts } => {
+                if let Some(spec) = self
+                    .core
+                    .snapshot()
+                    .node(node_id)
+                    .and_then(|node| node.spec.as_ref())
+                {
+                    facts.attempt_id = spec.attempt_id;
+                }
+                if self.core.runtime_ready(node_id, facts).is_ok() {
+                    let _ = self.core.join_barrier_satisfied(node_id);
+                }
             }
             ManualControlMsg::Rejoin { hello, reply_to } => {
                 if let Err(error) =
@@ -1985,22 +1897,23 @@ impl ManualActorControl {
         self.finish_flush_waiters(ctx);
     }
 
-    pub(crate) fn observe_runtime_ready(
-        &mut self,
-        actor: ActorAddress,
-        node_id: u64,
-        facts: RuntimeFacts,
-    ) {
-        let _ = self.core.runtime_ready(node_id, facts);
-        self.dispatch_actions(actor);
-    }
-
     pub(crate) fn observe_node_ack(
         &mut self,
         actor: ActorAddress,
+        run_id: u64,
+        stage_index: u32,
         node_id: u64,
         readiness_id: u64,
     ) {
+        if !self
+            .core
+            .snapshot()
+            .node(node_id)
+            .and_then(|node| node.runtime.as_ref())
+            .is_some_and(|facts| facts.run_id == run_id && facts.stage_index == stage_index)
+        {
+            return;
+        }
         let _ = self.core.node_ack(node_id, readiness_id);
         self.dispatch_actions(actor);
     }
@@ -2388,6 +2301,7 @@ mod tests {
 
     fn spec(node_id: u64) -> NodeProvisionSpec {
         NodeProvisionSpec {
+            deployment: None,
             run_id: 7,
             node_id,
             attempt_id: 0,
@@ -2463,6 +2377,8 @@ mod tests {
 
     fn facts(node_id: u64, readiness_id: u64) -> RuntimeFacts {
         RuntimeFacts {
+            artifact_digest: None,
+            deployment_generation: None,
             run_id: 7,
             attempt_id: 0,
             endpoint: format!("endpoint-{node_id}"),
@@ -2575,6 +2491,14 @@ mod tests {
             settle_persistence(&mut core).as_slice(),
             [ManualAction::SendRuntimeReadyAck { node_id: 1, .. }]
         ));
+        // Lose the first acknowledgement. Only a replay of the exact accepted
+        // runtime may recover it, and recovery still waits for persistence.
+        assert!(core.runtime_ready(1, facts(1, 54)).is_err());
+        core.runtime_ready(1, facts(1, 55)).unwrap();
+        assert!(matches!(
+            settle_persistence(&mut core).as_slice(),
+            [ManualAction::SendRuntimeReadyAck { node_id: 1, .. }]
+        ));
         core.node_ack(1, 55).unwrap();
         assert!(matches!(
             settle_persistence(&mut core).as_slice(),
@@ -2591,6 +2515,23 @@ mod tests {
         assert_eq!(
             core.snapshot().commands["provision"].state,
             CommandState::Succeeded
+        );
+        let wire =
+            serde_json::to_value(ManualControlReply::FleetStatus(core.fleet_read_model())).unwrap();
+        let myelin_control_contract::ControlReply::FleetStatus(fleet) =
+            serde_json::from_value(wire).expect("shared client must decode the native fleet reply")
+        else {
+            panic!("expected fleet reply");
+        };
+        let runtime = fleet.nodes[0].runtime.as_ref().unwrap();
+        assert_eq!(runtime.readiness_id, 55);
+        assert_eq!(
+            serde_json::to_value(&runtime.swim_node_id).unwrap(),
+            serde_json::to_value([1u8; 32]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&runtime.node_actor).unwrap(),
+            serde_json::to_value(ActorAddress::default()).unwrap()
         );
     }
 
@@ -2838,9 +2779,12 @@ mod tests {
         let binding = core
             .rejoin(
                 &RejoinHello {
+                    artifact_digest: None,
+                    deployment_generation: None,
                     run_id: 7,
                     logical_node_id: 1,
                     attempt_id: 0,
+                    readiness_id: 0,
                     selected_offer_id: None,
                     endpoint: "endpoint".to_owned(),
                     swim_node_id: DistNodeId([7; 32]),
@@ -2879,9 +2823,12 @@ mod tests {
         assert!(
             core.rejoin(
                 &RejoinHello {
+                    artifact_digest: None,
+                    deployment_generation: None,
                     run_id: 7,
                     logical_node_id: 1,
                     attempt_id: 1,
+                    readiness_id: 0,
                     selected_offer_id: None,
                     endpoint: "endpoint".to_owned(),
                     swim_node_id: DistNodeId([7; 32]),
@@ -4021,9 +3968,12 @@ mod tests {
                             actor,
                             ManualControlMsg::Rejoin {
                                 hello: RejoinHello {
+                                    artifact_digest: None,
+                                    deployment_generation: None,
                                     run_id: 7,
                                     logical_node_id: u64::from(selector) + 10_000,
                                     attempt_id: 0,
+                                    readiness_id: 0,
                                     selected_offer_id: None,
                                     endpoint: "generated-rejoin".to_owned(),
                                     swim_node_id: DistNodeId([selector; 32]),
@@ -4348,5 +4298,169 @@ mod tests {
         assert_no_poison(&runtime);
         assert_eq!(runtime.stats().actors.len(), baseline);
         assert_mailboxes_drained(&runtime);
+    }
+
+    #[test]
+    fn runtime_ready_rejects_stale_deployment_identity() {
+        let mut expected_spec = spec(1);
+        expected_spec.deployment = Some(crate::provisioning::DeploymentIdentity {
+            artifact_digest: "sha256:expected".to_owned(),
+            deployment_generation: "deploy-gen-2".to_owned(),
+        });
+        // The persisted provision intent already demands generation two.
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.upsert_node(crate::orchestration::daemon::SnapshotNode {
+            logical_node_id: 1,
+            spec: Some(expected_spec),
+            selected_offer_id: None,
+            provider_ref: None,
+            phase: NodePhase::Joining,
+            runtime: None,
+            last_error: None,
+            last_seen_unix_ms: 0,
+        });
+        let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
+
+        let mut stale = facts(1, 55);
+        stale.artifact_digest = Some("sha256:stale".to_owned());
+        stale.deployment_generation = Some("deploy-gen-1".to_owned());
+        let rejected = core.runtime_ready(1, stale).unwrap_err();
+        assert!(rejected.contains("deployment identity mismatch"));
+
+        let mut fresh = facts(1, 55);
+        fresh.artifact_digest = Some("sha256:expected".to_owned());
+        fresh.deployment_generation = Some("deploy-gen-2".to_owned());
+        core.runtime_ready(1, fresh).unwrap();
+    }
+
+    #[test]
+    fn rejoin_rejects_stale_deployment_identity() {
+        let mut node_spec = spec(1);
+        node_spec.deployment = Some(crate::provisioning::DeploymentIdentity {
+            artifact_digest: "sha256:expected".to_owned(),
+            deployment_generation: "deploy-gen-2".to_owned(),
+        });
+        let mut node = crate::orchestration::daemon::SnapshotNode {
+            logical_node_id: 1,
+            spec: Some(node_spec.clone()),
+            selected_offer_id: None,
+            provider_ref: Some("static-ssh:node".to_owned()),
+            phase: NodePhase::Running,
+            runtime: None,
+            last_error: None,
+            last_seen_unix_ms: 0,
+        };
+        node.runtime = Some({
+            let mut facts = facts(1, 0);
+            facts.artifact_digest = Some("sha256:expected".to_owned());
+            facts.deployment_generation = Some("deploy-gen-2".to_owned());
+            facts
+        });
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.upsert_node(node);
+        let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
+
+        let mut stale_hello = rejoin_hello(1);
+        stale_hello.artifact_digest = Some("sha256:expected".to_owned());
+        stale_hello.deployment_generation = Some("deploy-gen-1".to_owned());
+        let rejected = core
+            .rejoin(
+                &stale_hello,
+                ActorAddress::default(),
+                0,
+                ActorAddress::default(),
+            )
+            .unwrap_err();
+        assert!(rejected.contains("deployment identity mismatch"));
+
+        let mut fresh_hello = rejoin_hello(1);
+        fresh_hello.artifact_digest = Some("sha256:expected".to_owned());
+        fresh_hello.deployment_generation = Some("deploy-gen-2".to_owned());
+        fresh_hello.readiness_id = 99;
+        assert!(
+            core.rejoin(
+                &fresh_hello,
+                ActorAddress::default(),
+                0,
+                ActorAddress::default(),
+            )
+            .is_err()
+        );
+        fresh_hello.readiness_id = 0;
+        core.rejoin(
+            &fresh_hello,
+            ActorAddress::default(),
+            0,
+            ActorAddress::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recovery_rebootstraps_nodes_running_a_stale_deployment() {
+        let mut node_spec = spec(1);
+        node_spec.deployment = Some(crate::provisioning::DeploymentIdentity {
+            artifact_digest: "sha256:expected".to_owned(),
+            deployment_generation: "deploy-gen-2".to_owned(),
+        });
+        let mut node = crate::orchestration::daemon::SnapshotNode {
+            logical_node_id: 1,
+            spec: Some(node_spec),
+            selected_offer_id: None,
+            provider_ref: Some("static-ssh:node".to_owned()),
+            phase: NodePhase::Running,
+            runtime: None,
+            last_error: None,
+            last_seen_unix_ms: 0,
+        };
+        // The persisted worker still runs generation one.
+        node.runtime = Some({
+            let mut facts = facts(1, 0);
+            facts.artifact_digest = Some("sha256:expected".to_owned());
+            facts.deployment_generation = Some("deploy-gen-1".to_owned());
+            facts
+        });
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.upsert_node(node);
+        let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
+        core.begin_recovery();
+        assert!(matches!(
+            core.take_actions().collect::<Vec<_>>().as_slice(),
+            [ManualAction::Recover { node_id: 1, .. }]
+        ));
+        core.effect_finished(
+            1,
+            EffectKind::Recover,
+            Ok(EffectOutcome::Recovered {
+                provider_ref: Some("static-ssh:node".to_owned()),
+            }),
+        )
+        .unwrap();
+        let effects = settle_persistence(&mut core);
+        assert!(matches!(
+            effects.as_slice(),
+            [ManualAction::StartBootstrap { node_id: 1 }]
+        ));
+        assert_eq!(
+            core.snapshot().node(1).unwrap().phase,
+            NodePhase::Bootstrapping
+        );
+        assert!(core.snapshot().node(1).unwrap().runtime.is_none());
+    }
+
+    fn rejoin_hello(node_id: u64) -> RejoinHello {
+        RejoinHello {
+            run_id: 7,
+            logical_node_id: node_id,
+            attempt_id: 0,
+            readiness_id: 0,
+            selected_offer_id: None,
+            endpoint: "\"endpoint\"".to_owned(),
+            swim_node_id: distribution::types::NodeId([1; 32]),
+            stage_index: 0,
+            node_actor: ActorAddress::default(),
+            artifact_digest: None,
+            deployment_generation: None,
+        }
     }
 }

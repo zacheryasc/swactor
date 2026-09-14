@@ -10,6 +10,7 @@ use swactor_engine::EngineHandle;
 
 use crate::blob::FileRegistration;
 use crate::blob_transfer::BlobTransferSender;
+use crate::host::HostRouteRegistrar;
 use crate::namespace::{
     DataDirectoryActor, DirectoryClient, NamespaceError, OperationId, RetirementRetry,
 };
@@ -25,6 +26,7 @@ const RETIREMENT_RETRY_PERIOD: Duration = Duration::from_millis(250);
 pub struct DataNamespaceService {
     directory: ActorAddress,
     control: DataPlaneControl,
+    authority_epoch: u64,
 }
 
 impl DataNamespaceService {
@@ -34,12 +36,17 @@ impl DataNamespaceService {
         store_path: impl AsRef<Path>,
         source_sender: Arc<dyn BlobTransferSender>,
         source_publisher: Arc<dyn BlobSourcePublisher>,
+        routes: Option<Arc<dyn HostRouteRegistrar>>,
     ) -> Result<Self, NamespaceError> {
         let recovery_runtime = runtime.clone();
         let recovery_sender = Arc::clone(&source_sender);
         let recovery_publisher = Arc::clone(&source_publisher);
-        let retire_retry =
-            RetirementRetry::new(engine, runtime.create_sender(), RETIREMENT_RETRY_PERIOD);
+        let retire_retry = RetirementRetry::new(
+            engine,
+            runtime.create_sender(),
+            RETIREMENT_RETRY_PERIOD,
+            routes,
+        );
         let directory = DataDirectoryActor::recover(
             store_path,
             Some(retire_retry),
@@ -57,16 +64,20 @@ impl DataNamespaceService {
                             path.display()
                         ))
                     })?;
-                    if let Err(error) = recovery_publisher.publish_source(source) {
-                        let _ = recovery_runtime
-                            .send_to(source, BlobSourceIn::Retire { reply_to: None });
-                        return Err(NamespaceError::SourceRecovery(error));
-                    }
-                    Ok(source)
+                    let node = match recovery_publisher.publish_source(source) {
+                        Ok(node) => node,
+                        Err(error) => {
+                            let _ = recovery_runtime
+                                .send_to(source, BlobSourceIn::Retire { reply_to: None });
+                            return Err(NamespaceError::SourceRecovery(error));
+                        }
+                    };
+                    Ok((source, node))
                 }
-                SourceRecovery::Actor { actor } => Ok(*actor),
+                SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
             },
         )?;
+        let authority_epoch = directory.authority_epoch();
         let directory = runtime.spawn(directory).map_err(|error| {
             NamespaceError::SourceRecovery(format!("spawn data directory: {error}"))
         })?;
@@ -76,7 +87,11 @@ impl DataNamespaceService {
             source_sender,
             source_publisher,
         };
-        Ok(Self { directory, control })
+        Ok(Self {
+            directory,
+            authority_epoch,
+            control,
+        })
     }
 
     pub fn directory(&self) -> ActorAddress {
@@ -85,6 +100,10 @@ impl DataNamespaceService {
 
     pub fn control(&self) -> DataPlaneControl {
         self.control.clone()
+    }
+
+    pub fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
     }
 }
 
@@ -96,7 +115,50 @@ pub struct DataPlaneControl {
     source_publisher: Arc<dyn BlobSourcePublisher>,
 }
 
+pub enum RetainedNamespaceResources {
+    Absent,
+    QuiescentStream { revision: u64 },
+    Blob(crate::namespace::BlobBinding),
+}
+
+pub enum NamespaceCleanupStatus {
+    Absent,
+    ActiveStream,
+    Removed {
+        quiescent_stream_revision: Option<u64>,
+    },
+}
+
 impl DataPlaneControl {
+    pub async fn retained_blob_resources(
+        &self,
+        path: DataPath,
+    ) -> Result<RetainedNamespaceResources, NamespaceError> {
+        let node = match self.directory.lookup(path.clone()).await {
+            Ok(node) => node,
+            Err(NamespaceError::PathNotFound(_)) => return Ok(RetainedNamespaceResources::Absent),
+            Err(error) => return Err(error),
+        };
+        if node.kind == crate::namespace::EntryKind::Stream {
+            return if node.active {
+                Err(NamespaceError::Protocol(
+                    "retained stream is still active".to_owned(),
+                ))
+            } else {
+                Ok(RetainedNamespaceResources::QuiescentStream {
+                    revision: node.revision,
+                })
+            };
+        }
+        let binding = self.directory.resolve(path).await?;
+        if binding.revision != node.revision {
+            return Err(NamespaceError::Protocol(
+                "retained blob changed during ownership lookup".to_owned(),
+            ));
+        }
+        Ok(RetainedNamespaceResources::Blob(binding))
+    }
+
     pub async fn ensure(
         &self,
         path: DataPath,
@@ -132,11 +194,19 @@ impl DataPlaneControl {
             source,
             armed: true,
         };
-        self.source_publisher
+        let source_node = self
+            .source_publisher
             .publish_source(source)
             .map_err(NamespaceError::SourceRecovery)?;
         self.directory
-            .register(path, source, length, recovery, random_operation_id())
+            .register(
+                path,
+                source,
+                source_node,
+                length,
+                recovery,
+                random_operation_id(),
+            )
             .await?;
         cleanup.armed = false;
         Ok(())
@@ -147,6 +217,36 @@ impl DataPlaneControl {
             .unregister(path, random_operation_id())
             .await?;
         Ok(())
+    }
+
+    /// Remove one namespace entry only after any stream writer has quiesced,
+    /// then prove the committed directory state no longer contains the path.
+    pub async fn try_unregister_quiescent(
+        &self,
+        path: DataPath,
+    ) -> Result<NamespaceCleanupStatus, NamespaceError> {
+        let node = match self.directory.lookup(path.clone()).await {
+            Ok(node) => node,
+            Err(NamespaceError::PathNotFound(_)) => return Ok(NamespaceCleanupStatus::Absent),
+            Err(error) => return Err(error),
+        };
+        if node.kind == crate::namespace::EntryKind::Stream && node.active {
+            return Ok(NamespaceCleanupStatus::ActiveStream);
+        }
+        let quiescent_stream_revision =
+            (node.kind == crate::namespace::EntryKind::Stream).then_some(node.revision);
+        self.directory
+            .unregister(path.clone(), random_operation_id())
+            .await?;
+        match self.directory.lookup(path).await {
+            Err(NamespaceError::PathNotFound(_)) => Ok(NamespaceCleanupStatus::Removed {
+                quiescent_stream_revision,
+            }),
+            Ok(_) => Err(NamespaceError::Protocol(
+                "namespace entry remained after unregister acknowledgement".to_owned(),
+            )),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn rename(

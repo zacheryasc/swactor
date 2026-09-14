@@ -518,7 +518,7 @@ fn stop_before_spawn_success_reports_started_then_exited() {
         &rt,
         spawner,
         &sender,
-        shell_spec("sh", vec!["-c", "sleep 60"], Some("stop-before-start")),
+        shell_spec("sleep", vec!["60"], Some("stop-before-start")),
         ProcessOutputConfig::disabled(*upstream.addr()),
         &reply,
     );

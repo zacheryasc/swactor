@@ -120,8 +120,8 @@ impl BlobTransferReceiver for DirectReceiver {
 struct NoopSourceRegistrar;
 
 impl BlobSourcePublisher for NoopSourceRegistrar {
-    fn publish_source(&self, _source: ActorAddress) -> Result<(), String> {
-        Ok(())
+    fn publish_source(&self, _source: ActorAddress) -> Result<[u8; 32], String> {
+        Ok([9; 32])
     }
 }
 
@@ -231,6 +231,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         &store_path,
         Arc::clone(&sender),
         Arc::clone(&source_publisher),
+        None,
     )
     .unwrap();
     let directory = service.directory();
@@ -333,6 +334,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         future::block_on(direct.register(
             fault_path.clone(),
             source,
+            [9; 32],
             length,
             recovery,
             OperationId::from_u128(10 + u128::from(mode)),

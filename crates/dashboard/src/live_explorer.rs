@@ -156,7 +156,7 @@ impl DashboardView for LiveTelemetryExplorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use telemetry::frame::{ChannelId, Lifetime, NodeId, Position};
+    use telemetry::frame::{ChannelContent, ChannelId, Lifetime, NodeId, Position};
 
     #[test]
     fn retains_quiet_channels_and_bounds_each_channel_independently() {
@@ -252,6 +252,7 @@ mod tests {
                 channel: channel.to_owned(),
                 position: position as u64,
                 payload: payload.clone(),
+                content: ChannelContent::Bytes,
             };
             view.ingest_at(&event, Instant::now());
         }
@@ -286,6 +287,7 @@ mod tests {
             channel: channel.to_owned(),
             position,
             payload: frame.payload.clone(),
+            content: ChannelContent::Bytes,
         }
     }
 

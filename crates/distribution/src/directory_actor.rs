@@ -24,7 +24,9 @@
 //! [`MetadataActor`]: crate::node_metadata_actor::MetadataActor
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+use parking_lot::RwLock;
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
@@ -65,6 +67,20 @@ pub enum DirectoryIn {
         actor: ActorAddress,
         reply: ActorAddress,
     },
+    /// Local: re-arm every cached claim for dissemination. A restarted peer
+    /// keeps the same node id, so membership never transitions and ordinary
+    /// gossip has no rejoin edge to tell it that the peer lost its map.
+    Resync,
+    /// Local: send the cached signed claims directly over a newly established
+    /// peer connection. A stable-id restart need not produce a membership delta,
+    /// and the peer may have lost every application reply route.
+    SyncTo { peer: NodeId },
+    /// Local, lifetime-bound wakeup after routes or verified claims change.
+    /// The subscriber retains the callback; dropping it ends observations.
+    /// A wakeup is not a location claim: callbacks must re-read the views.
+    WatchRoutes {
+        changed: Weak<dyn Fn() + Send + Sync>,
+    },
     /// Clock: disseminate one batch to one peer.
     Tick,
 }
@@ -76,10 +92,26 @@ pub struct Located {
     pub host: Option<NodeId>,
 }
 
+/// Read-only access to the directory's verified winning claims. A cached claim
+/// authenticates its host and generation, not the host's current reachability.
+#[derive(Clone, Default)]
+pub struct DirectoryClaims {
+    entries: Arc<RwLock<HashMap<ActorAddress, DirectoryEntry>>>,
+}
+
+impl DirectoryClaims {
+    pub fn location(&self, actor: &ActorAddress) -> Option<(NodeId, u64)> {
+        self.entries
+            .read()
+            .get(actor)
+            .map(|claim| (claim.node_id, claim.generation))
+    }
+}
+
 pub struct DirectoryActor {
     self_id: NodeId,
     /// The location map: one signed claim per actor. The only writer is [`Self::merge_one`].
-    map: HashMap<ActorAddress, DirectoryEntry>,
+    map: DirectoryClaims,
     /// Alive peers (excludes self), folded from the membership stream — the
     /// dissemination fan-out set and the `cluster_size` budget basis.
     alive: BTreeSet<NodeId>,
@@ -103,6 +135,7 @@ pub struct DirectoryActor {
     /// runtime attached to this host). Directory republishing always preserves
     /// these entries.
     pinned_routes: RouteView,
+    watchers: Vec<Weak<dyn Fn() + Send + Sync>>,
 }
 
 impl DirectoryActor {
@@ -130,7 +163,7 @@ impl DirectoryActor {
     ) -> Self {
         Self {
             self_id,
-            map: HashMap::new(),
+            map: DirectoryClaims::default(),
             alive: BTreeSet::new(),
             hot: HashMap::new(),
             cursor: 0,
@@ -139,7 +172,12 @@ impl DirectoryActor {
             route_binder,
             bound_remote: HashSet::new(),
             pinned_routes,
+            watchers: Vec::new(),
         }
+    }
+
+    pub fn claims(&self) -> DirectoryClaims {
+        self.map.clone()
     }
 
     /// Merge one claim under the supersession rule — the only writer of `map`.
@@ -150,11 +188,12 @@ impl DirectoryActor {
     /// stale, equal, or forged claim is ignored. Merging the same claim twice is a
     /// no-op — it does not re-arm dissemination, which is what lets the cluster go
     /// quiet. Idempotent and commutative.
-    fn merge_one(&mut self, claim: DirectoryEntry) {
+    fn merge_one(&mut self, claim: DirectoryEntry) -> bool {
         if !verify_directory_entry(&claim) {
-            return; // not signed by the host it names — drop it
+            return false; // not signed by the host it names — drop it
         }
-        let supersedes = match self.map.get(&claim.actor_addr) {
+        let mut map = self.map.entries.write();
+        let supersedes = match map.get(&claim.actor_addr) {
             None => true,
             Some(cur) => {
                 claim.generation > cur.generation
@@ -164,20 +203,22 @@ impl DirectoryActor {
         if supersedes {
             let budget = self.budget();
             self.hot.insert(claim.actor_addr, budget); // arm for dissemination
-            self.map.insert(claim.actor_addr, claim);
+            map.insert(claim.actor_addr, claim);
         }
+        supersedes
     }
 
     fn register(&mut self, claim: DirectoryEntry) {
-        self.merge_one(claim);
-        self.republish();
+        let changed = self.merge_one(claim);
+        self.republish(changed);
     }
 
     fn merge_batch(&mut self, claims: Vec<DirectoryEntry>) {
+        let mut changed = false;
         for c in claims {
-            self.merge_one(c);
+            changed |= self.merge_one(c);
         }
-        self.republish();
+        self.republish(changed);
     }
 
     fn on_membership(&mut self, change: MembershipChanged) {
@@ -188,7 +229,8 @@ impl DirectoryActor {
                     // peer is caught up — without a full-cluster reflood (only the
                     // actors we hold, and only via the lazy push).
                     let budget = self.budget();
-                    let actors: Vec<ActorAddress> = self.map.keys().copied().collect();
+                    let actors: Vec<ActorAddress> =
+                        self.map.entries.read().keys().copied().collect();
                     for actor in actors {
                         self.hot.insert(actor, budget);
                     }
@@ -202,7 +244,7 @@ impl DirectoryActor {
             }
             _ => {} // Suspect, or self: ignore (suspicion is SWIM's transient state)
         }
-        self.republish();
+        self.republish(false);
     }
 
     fn tick(&mut self, ctx: &Ctx) {
@@ -228,12 +270,27 @@ impl DirectoryActor {
         }
     }
 
+    fn sync_to(&self, ctx: &Ctx, peer: NodeId) {
+        let Some(addr) = self.peer_directory.resolve(&peer) else {
+            return;
+        };
+        let map = self.map.entries.read();
+        let mut claims = map.values();
+        loop {
+            let batch: Vec<_> = claims.by_ref().take(BATCH).cloned().collect();
+            if batch.is_empty() {
+                break;
+            }
+            let _ = ctx.send(addr, DirectoryIn::Gossip(DirectoryGossip { claims: batch }));
+        }
+    }
+
     /// Republish the §5 route view: every actor whose host is reachable right now
     /// (self, or an alive peer). A dead host's actors are omitted, so the egress
     /// never routes to a host SWIM has buried; the claim remains cached for
     /// recovery. Actors that left the remotely-routed set are unbound so the
     /// binder and transport router do not grow without bound.
-    fn republish(&mut self) {
+    fn republish(&mut self, claims_changed: bool) {
         let pinned = self
             .pinned_routes
             .read()
@@ -244,7 +301,8 @@ impl DirectoryActor {
             .filter_map(|(actor, node)| (*node != self.self_id).then_some(*actor))
             .collect::<HashSet<_>>();
         drop(pinned);
-        for (actor, claim) in &self.map {
+        let map = self.map.entries.read();
+        for (actor, claim) in map.iter() {
             if view.contains_key(actor) {
                 continue;
             }
@@ -255,7 +313,13 @@ impl DirectoryActor {
                 remote.insert(*actor);
             }
         }
-        *self.route_view.write().expect("route view poisoned") = view;
+        drop(map);
+        let changed = {
+            let mut published = self.route_view.write().expect("route view poisoned");
+            let changed = *published != view;
+            *published = view;
+            changed
+        };
         // Unbind actors that fell out of the remotely-routed set (host left
         // the cluster or claim superseded): without this diff the binder and
         // router retain every ever-seen actor forever.
@@ -268,6 +332,16 @@ impl DirectoryActor {
             self.route_binder.ensure_routable(actor);
         }
         self.bound_remote = remote;
+        if changed || claims_changed {
+            self.watchers.retain(|watcher| {
+                if let Some(watcher) = watcher.upgrade() {
+                    watcher();
+                    true
+                } else {
+                    false
+                }
+            });
+        }
     }
 
     /// Take up to `limit` armed claims for this tick's batch, spending one unit of
@@ -275,8 +349,9 @@ impl DirectoryActor {
     fn take_hot(&mut self, limit: usize) -> Vec<DirectoryEntry> {
         let actors: Vec<ActorAddress> = self.hot.keys().copied().take(limit).collect();
         let mut claims = Vec::with_capacity(actors.len());
+        let map = self.map.entries.read();
         for actor in actors {
-            if let Some(c) = self.map.get(&actor) {
+            if let Some(c) = map.get(&actor) {
                 claims.push(c.clone());
             }
             if let Some(left) = self.hot.get_mut(&actor) {
@@ -308,6 +383,22 @@ impl ActorInterface for DirectoryActor {
             DirectoryIn::Register(claim) => self.register(claim),
             DirectoryIn::Gossip(batch) => self.merge_batch(batch.claims),
             DirectoryIn::Membership(change) => self.on_membership(change),
+            DirectoryIn::SyncTo { peer } => self.sync_to(ctx, peer),
+            DirectoryIn::WatchRoutes { changed } => {
+                self.watchers.retain(|watcher| watcher.strong_count() != 0);
+                if let Some(watcher) = changed.upgrade() {
+                    watcher();
+                    self.watchers.push(changed);
+                }
+            }
+            DirectoryIn::Resync => {
+                let budget = self.budget();
+                let actors: Vec<ActorAddress> = self.map.entries.read().keys().copied().collect();
+                for actor in actors {
+                    self.hot.insert(actor, budget);
+                }
+                self.republish(false);
+            }
             DirectoryIn::Tick => self.tick(ctx),
             DirectoryIn::Resolve { actor, reply } => {
                 let host = self

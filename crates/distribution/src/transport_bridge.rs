@@ -17,7 +17,7 @@
 //! only the distribution-side routing and outbound queue.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, RwLock};
 
 use parking_lot::Mutex as ParkingMutex;
 
@@ -70,7 +70,33 @@ pub struct OutFrame {
 
 /// Shared queue of outbound frames, written by worker threads (via
 /// [`OutboxPeerTransport`]) and drained by the concrete network driver.
-pub type Outbox = Arc<Mutex<Vec<OutFrame>>>;
+pub type Outbox = Arc<OutboxQueue>;
+
+#[derive(Default)]
+pub struct OutboxQueue {
+    frames: Mutex<Vec<OutFrame>>,
+    wake: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl OutboxQueue {
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, Vec<OutFrame>>> {
+        self.frames.lock()
+    }
+
+    /// Install the owning driver's wakeup and reconcile anything queued
+    /// before installation. Notifications never substitute for draining.
+    pub fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self.wake.write().expect("outbox wake poisoned") = Some(wake.clone());
+        wake();
+    }
+
+    fn push(&self, frame: OutFrame) {
+        self.frames.lock().expect("outbox poisoned").push(frame);
+        if let Some(wake) = self.wake.read().expect("outbox wake poisoned").as_ref() {
+            wake();
+        }
+    }
+}
 
 /// Per-peer egress transport. The runtime hands it an already-encoded
 /// [`WireEnvelope`] bound for this peer; it just records the frame on the shared
@@ -83,7 +109,7 @@ struct OutboxPeerTransport {
 
 impl Transport for OutboxPeerTransport {
     fn send(&self, envelope: WireEnvelope) -> Result<(), Error> {
-        self.outbox.lock().expect("outbox poisoned").push(OutFrame {
+        self.outbox.push(OutFrame {
             to: self.node_id,
             dest: envelope.dest,
             type_tag: envelope.type_tag,
@@ -161,7 +187,7 @@ impl Transport for RouteViewTransport {
             .get(&envelope.dest)
             .copied();
         if let Some(node) = host {
-            self.outbox.lock().expect("outbox poisoned").push(OutFrame {
+            self.outbox.push(OutFrame {
                 to: node,
                 dest: envelope.dest,
                 type_tag: envelope.type_tag,
@@ -254,7 +280,7 @@ mod tests {
     fn an_encoded_frame_is_enqueued_for_the_peer_it_targets() {
         // The egress contract: a routed WireEnvelope becomes an OutFrame the
         // driver can write, preserving the target peer, wire tag, and bytes.
-        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         let peer = id(7);
         let transport = OutboxPeerTransport {
             node_id: peer,
@@ -278,7 +304,7 @@ mod tests {
     #[test]
     fn route_view_transport_drops_missing_route_without_error() {
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
-        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         let transport = RouteViewTransport::new(route_view, outbox.clone());
 
         let result = transport.send(WireEnvelope {
@@ -300,7 +326,7 @@ mod tests {
             .write()
             .expect("route view poisoned")
             .insert(actor, node);
-        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         let transport = RouteViewTransport::new(route_view, outbox.clone());
 
         let result = transport.send(WireEnvelope {

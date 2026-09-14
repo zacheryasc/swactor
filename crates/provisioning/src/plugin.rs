@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use myelin_control_contract::DeploymentIdentity;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeProvisionSpec {
     pub run_id: u64,
@@ -17,6 +18,10 @@ pub struct NodeProvisionSpec {
     /// explicitly selected marketplace offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offer_criteria_json: Option<String>,
+    /// Desired deployment identity for this attempt. Providers that ship
+    /// artifacts must install exactly this identity before runtime ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<DeploymentIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<ProviderMount>,
 }
@@ -233,6 +238,7 @@ mod tests {
     #[test]
     fn mounted_node_specs_round_trip_without_losing_readonly_intent() {
         let spec = NodeProvisionSpec {
+            deployment: None,
             run_id: 17,
             node_id: 23,
             attempt_id: 7,

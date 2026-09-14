@@ -136,6 +136,18 @@ def test_run_attaches_before_main_and_maps_blob_buffer_directly(host):
         os.fstat(inherited)
 
 
+def test_python_handle_cannot_retain_native_session_teardown(host):
+    install_bootstrap(host)
+    retained = []
+
+    async def main(ctx):
+        retained.append(ctx.data)
+
+    swactor.run(main)
+    with pytest.raises(RuntimeError, match="data-plane context is closed"):
+        retained[0].lookup("/models/tiny-linear/weights")
+
+
 def test_write_blob_seals_cleanly_and_exception_aborts(host):
     install_bootstrap(host)
 

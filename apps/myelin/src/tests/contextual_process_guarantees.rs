@@ -2,19 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use data_plane::host::HostRouteRegistrar;
 use data_plane::path::SessionAccess;
-use swactor::actor::{ActorInterface, Ctx};
+use distribution::directory_actor::{DirectoryIn, Located};
+use distribution::types::NodeId;
+use myelin_control_contract::{ContextualProcessEventKind, ContextualProcessSpec};
+use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
 use swactor_process::{ProcessOutput, ProcessSpec};
 use swactor_process_context::{
     ContextualProcessOutput, ContextualProcessOutputConfig, ContextualProcessSpawner,
-    ContextualProcessSpec,
+    ContextualProcessSpec as RuntimeContextualProcessSpec,
 };
 
 use crate::contextual_process::{
     ContextualNodeCommand, ContextualProcessController, ContextualProcessControllerIn,
-    ContextualProcessEventKindWire, ContextualProcessSpecWire, MyelinContextualProcessConfig,
-    build_contextual_process_spawner,
+    MyelinChildRouteRegistrar, MyelinContextualProcessConfig, build_contextual_process_spawner,
 };
 use crate::orchestration::actor::OrchestratorMsg;
 use crate::tests::harness::build_iroh_composition;
@@ -22,7 +25,7 @@ use crate::tests::harness::build_iroh_composition;
 struct Launch {
     spawner: Arc<ContextualProcessSpawner>,
     sender: ExternalSender,
-    spec: Option<ContextualProcessSpec>,
+    spec: Option<RuntimeContextualProcessSpec>,
     output: Option<ContextualProcessOutputConfig>,
 }
 
@@ -46,6 +49,69 @@ impl ActorInterface for Launch {
 }
 
 #[test]
+fn shared_source_route_survives_one_owner_release_and_cleans_up_after_last() {
+    let (_engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
+    let host_reader: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
+        stack.route_view.clone(),
+        stack.pinned_routes.clone(),
+        stack.route_binder.clone(),
+        stack.runtime.clone(),
+        stack.actors.directory,
+        driver.connection_observer(),
+    ));
+    let program_transfer = Arc::clone(&host_reader);
+    let source = ActorAddress([23; 32]);
+    let source_node = NodeId([17; 32]);
+    let replies = stack.runtime.new_inbox::<Located>().unwrap();
+    let resolve_after_republish = || {
+        // Rebuild from the directory's own claims and live pins. Merely reading
+        // the old route view would hide an incorrectly removed shared pin.
+        stack
+            .runtime
+            .send_to(stack.actors.directory, DirectoryIn::Resync)
+            .unwrap();
+        stack
+            .runtime
+            .send_to(
+                stack.actors.directory,
+                DirectoryIn::Resolve {
+                    actor: source,
+                    reply: *replies.addr(),
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(located) = replies.try_recv() {
+                assert_eq!(located.actor, source);
+                break located.host;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "directory did not resolve source"
+            );
+            std::thread::yield_now();
+        }
+    };
+
+    host_reader.retain_source(source, source_node.0).unwrap();
+    program_transfer
+        .retain_source(source, source_node.0)
+        .unwrap();
+    assert_eq!(resolve_after_republish(), Some(source_node));
+
+    host_reader.release_source(source);
+    drop(host_reader);
+    assert_eq!(resolve_after_republish(), Some(source_node));
+    assert!(program_transfer.is_routable(source));
+
+    program_transfer.release_source(source);
+    assert_eq!(resolve_after_republish(), None);
+    assert!(!program_transfer.is_routable(source));
+    driver.shutdown();
+}
+
+#[test]
 fn unaware_native_child_fails_bootstrap_before_terminal_output() {
     let (engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
     let spawner = Arc::new(
@@ -58,9 +124,14 @@ fn unaware_native_child_fails_bootstrap_before_terminal_output() {
             transfer_receiver: None,
             source_sender: None,
             source_publisher: None,
-            route_view: stack.route_view.clone(),
-            pinned_routes: stack.pinned_routes.clone(),
-            route_binder: stack.route_binder.clone(),
+            route_registrar: Arc::new(MyelinChildRouteRegistrar::new(
+                stack.route_view.clone(),
+                stack.pinned_routes.clone(),
+                stack.route_binder.clone(),
+                stack.runtime.clone(),
+                stack.actors.directory,
+                driver.connection_observer(),
+            )),
             stream_transport: Some(driver.stream_transport()),
             host_endpoint: driver.endpoint_addr(),
         })
@@ -75,7 +146,7 @@ fn unaware_native_child_fails_bootstrap_before_terminal_output() {
         .spawn(Launch {
             spawner,
             sender: stack.runtime.create_sender(),
-            spec: Some(ContextualProcessSpec {
+            spec: Some(RuntimeContextualProcessSpec {
                 process: ProcessSpec {
                     command: "/bin/true".to_owned(),
                     args: Vec::new(),
@@ -147,9 +218,14 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
             transfer_receiver: None,
             source_sender: None,
             source_publisher: None,
-            route_view: stack.route_view.clone(),
-            pinned_routes: stack.pinned_routes.clone(),
-            route_binder: stack.route_binder.clone(),
+            route_registrar: Arc::new(MyelinChildRouteRegistrar::new(
+                stack.route_view.clone(),
+                stack.pinned_routes.clone(),
+                stack.route_binder.clone(),
+                stack.runtime.clone(),
+                stack.actors.directory,
+                driver.connection_observer(),
+            )),
             stream_transport: Some(driver.stream_transport()),
             host_endpoint: driver.endpoint_addr(),
         })
@@ -170,7 +246,7 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
             controller,
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Spawn {
                 request_id: "execution".to_owned(),
-                spec: ContextualProcessSpecWire {
+                spec: ContextualProcessSpec {
                     command: "/bin/sh".to_owned(),
                     args: vec!["-c".to_owned(), "sleep 30".to_owned()],
                     env: Default::default(),
@@ -198,8 +274,8 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
             && event.request_id == "execution"
         {
             match event.event {
-                ContextualProcessEventKindWire::Spawned { process, .. } => break process,
-                ContextualProcessEventKindWire::SpawnRejected { error } => {
+                ContextualProcessEventKind::Spawned { process, .. } => break process,
+                ContextualProcessEventKind::SpawnRejected { error } => {
                     panic!("contextual spawn rejected: {error}")
                 }
                 _ => {}
@@ -221,7 +297,7 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
         assert!(Instant::now() < spawn_deadline, "live query timed out");
         if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
             && event.request_id == "query-live"
-            && let ContextualProcessEventKindWire::LiveExecutions { executions } = event.event
+            && let ContextualProcessEventKind::LiveExecutions { executions, .. } = event.event
         {
             assert_eq!(executions.len(), 1);
             assert_eq!(executions[0].process, process);
@@ -236,26 +312,26 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
             controller,
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Stop {
                 request_id: "stop".to_owned(),
-                process,
-                kill_after_ms: None,
+                target_request_id: "execution".to_owned(),
+                kill_after_ms: Some(100),
                 reply_to: *events.addr(),
             }),
         )
         .unwrap();
     let mut stop_accepted = false;
+    let mut stop_events = Vec::new();
     let stop_deadline = Instant::now() + Duration::from_secs(20);
     let mut terminal = false;
     while !terminal {
         assert!(
             Instant::now() < stop_deadline,
-            "stopped process did not terminate"
+            "stopped process did not terminate; stop_accepted={stop_accepted}; events={stop_events:?}"
         );
         if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv() {
+            stop_events.push((event.request_id.clone(), format!("{:?}", event.event)));
             if event.request_id == "stop" {
-                stop_accepted |= matches!(
-                    event.event,
-                    ContextualProcessEventKindWire::StopAccepted { .. }
-                );
+                stop_accepted |=
+                    matches!(event.event, ContextualProcessEventKind::StopAccepted { .. });
             } else if event.request_id == "execution" {
                 terminal = event.event.is_terminal();
             }
@@ -279,7 +355,7 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
         assert!(Instant::now() < query_deadline, "empty query timed out");
         if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
             && event.request_id == "query-empty"
-            && let ContextualProcessEventKindWire::LiveExecutions { executions } = event.event
+            && let ContextualProcessEventKind::LiveExecutions { executions, .. } = event.event
         {
             assert!(executions.is_empty());
             break;
@@ -290,7 +366,7 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
 }
 
 #[test]
-fn bootstrap_failure_is_terminal_and_reclaims_execution() {
+fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
     let (engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
     let spawner = Arc::new(
         build_contextual_process_spawner(MyelinContextualProcessConfig {
@@ -302,9 +378,14 @@ fn bootstrap_failure_is_terminal_and_reclaims_execution() {
             transfer_receiver: None,
             source_sender: None,
             source_publisher: None,
-            route_view: stack.route_view.clone(),
-            pinned_routes: stack.pinned_routes.clone(),
-            route_binder: stack.route_binder.clone(),
+            route_registrar: Arc::new(MyelinChildRouteRegistrar::new(
+                stack.route_view.clone(),
+                stack.pinned_routes.clone(),
+                stack.route_binder.clone(),
+                stack.runtime.clone(),
+                stack.actors.directory,
+                driver.connection_observer(),
+            )),
             stream_transport: Some(driver.stream_transport()),
             host_endpoint: driver.endpoint_addr(),
         })
@@ -327,7 +408,7 @@ fn bootstrap_failure_is_terminal_and_reclaims_execution() {
             controller,
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Spawn {
                 request_id: "bootstrap-failure".to_owned(),
-                spec: ContextualProcessSpecWire {
+                spec: ContextualProcessSpec {
                     command: "/bin/sh".to_owned(),
                     args: vec!["-c".to_owned(), "exit 0".to_owned()],
                     env: Default::default(),
@@ -345,6 +426,7 @@ fn bootstrap_failure_is_terminal_and_reclaims_execution() {
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_bootstrap_failure = false;
     let mut reclaimed = false;
     while !reclaimed {
         assert!(
@@ -355,18 +437,35 @@ fn bootstrap_failure_is_terminal_and_reclaims_execution() {
         if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
             && event.request_id == "bootstrap-failure"
         {
-            if let ContextualProcessEventKindWire::BootstrapFailed { .. } = event.event {
-                assert!(
-                    event.event.is_terminal(),
-                    "BootstrapFailed must be terminal, saw {:?}",
-                    event.event
-                );
-                reclaimed = true;
-            } else if event.event.is_terminal() {
-                panic!(
-                    "unexpected terminal outcome before bootstrap failure: {:?}",
-                    event.event
-                );
+            match event.event {
+                ContextualProcessEventKind::BootstrapFailed { .. } => {
+                    assert!(
+                        !event.event.is_terminal(),
+                        "BootstrapFailed must stay non-terminal until the native process is reaped, saw {:?}",
+                        event.event
+                    );
+                    saw_bootstrap_failure = true;
+                }
+                ContextualProcessEventKind::Exited { .. } => {
+                    assert!(
+                        saw_bootstrap_failure,
+                        "bootstrap failure exited without reporting why: {:?}",
+                        event.event
+                    );
+                    assert!(
+                        event.event.is_terminal(),
+                        "Exited must be terminal, saw {:?}",
+                        event.event
+                    );
+                    reclaimed = true;
+                }
+                other if other.is_terminal() => {
+                    panic!(
+                        "unexpected terminal outcome before bootstrap failure: {:?}",
+                        other
+                    );
+                }
+                _ => {}
             }
         }
         std::thread::yield_now();
@@ -390,7 +489,7 @@ fn bootstrap_failure_is_terminal_and_reclaims_execution() {
         );
         if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
             && event.request_id == "query-after-failure"
-            && let ContextualProcessEventKindWire::LiveExecutions { executions } = event.event
+            && let ContextualProcessEventKind::LiveExecutions { executions, .. } = event.event
         {
             assert!(
                 executions.is_empty(),

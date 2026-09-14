@@ -469,6 +469,7 @@ impl EffectBackend for DemoBackend {
         match &effect.command {
             NodeManagerCommand::CreateLease(request) => {
                 let spec = NodeProvisionSpec {
+                    deployment: None,
                     run_id: request.spec.run_id.0,
                     node_id: attempt,
                     attempt_id: attempt,

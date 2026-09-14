@@ -39,6 +39,7 @@ pub enum BlobTransferEvent {
     Released(Result<(), DataPlaneError>),
     Cancel,
     RouteRetry,
+    RouteChanged,
 }
 
 impl NetworkMessage for BlobTransferEvent {

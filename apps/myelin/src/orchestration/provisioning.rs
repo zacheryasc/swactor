@@ -6,11 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
@@ -21,10 +23,12 @@ pub use ::provisioning::plugin::{
     ProvisionLogStream, ProvisionPlugin,
 };
 use iroh::EndpointAddr;
+pub use myelin_control_contract::DeploymentIdentity;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, Runtime};
+use swactor_process::ProcessWatch;
 
-use crate::node::worker_node_runtime::request_debug_join;
+use crate::node::worker_node_runtime::{DEBUG_JOIN_TIMEOUT, request_debug_join};
 use crate::observability::provisioning_logs::BootstrapTelemetryBridge;
 use crate::orchestration::manual_control::SELECTED_OFFER_ID_ENV;
 
@@ -51,6 +55,7 @@ trait DockerLifecycleBackend: Send + Sync {
         prefix: &str,
         spec: &NodeProvisionSpec,
     ) -> Result<Option<(String, bool)>, String>;
+    fn rejoin(&self, node: &LocalDockerNode) -> Result<(), String>;
     fn observe(&self, runtime: &Runtime, node: &LocalDockerNode, tail: &str) -> Result<(), String>;
     fn list_managed(&self, prefix: &str) -> Result<Vec<String>, String>;
 }
@@ -88,12 +93,165 @@ struct LocalProcessNode {
     sink: PluginSink,
     pid: Option<u32>,
     runtime: Option<LocalProcessRuntime>,
+    observer: Option<ProcessWatch>,
+    output: Option<ProcessOutput>,
 }
 
 struct LocalProcessRuntime {
     stdin: ChildStdin,
     child: Arc<Mutex<Option<Child>>>,
     exit_actor: Option<ActorAddress>,
+}
+
+fn process_exit_fd(pid: u32) -> Option<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn file_change_fd(path: &Path) -> Option<OwnedFd> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if raw < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mask = libc::IN_MODIFY
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_CREATE
+        | libc::IN_MOVED_TO
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF;
+    (unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) } >= 0).then_some(fd)
+}
+
+fn drain_change(fd: &OwnedFd) {
+    let mut bytes = [0_u8; 4096];
+    while unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) } > 0 {}
+}
+
+fn wait_fds<const N: usize>(
+    fds: &[Option<&OwnedFd>; N],
+    timeout: Duration,
+) -> std::io::Result<[bool; N]> {
+    let mut descriptors: [libc::pollfd; N] = std::array::from_fn(|index| libc::pollfd {
+        fd: fds[index].map_or(-1, AsRawFd::as_raw_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let result = unsafe {
+        libc::poll(
+            descriptors.as_mut_ptr(),
+            descriptors.len() as libc::nfds_t,
+            millis,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(std::array::from_fn(|index| descriptors[index].revents != 0))
+}
+
+fn cancellation_fd() -> Result<Arc<OwnedFd>, String> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(format!(
+            "create process observer cancellation: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+fn cancel_observer(fd: &OwnedFd) {
+    let value = 1_u64;
+    unsafe {
+        libc::write(
+            fd.as_raw_fd(),
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        );
+    }
+}
+
+struct FollowLocalFile {
+    file: File,
+    identity: swactor_process::ProcessIdentity,
+    changed: Option<OwnedFd>,
+    exited: Option<OwnedFd>,
+    cancel: Arc<OwnedFd>,
+}
+
+impl FollowLocalFile {
+    fn new(file: File, identity: swactor_process::ProcessIdentity, cancel: Arc<OwnedFd>) -> Self {
+        // Watch the actual open inode, not a path that may be replaced.
+        let changed = file_change_fd(Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())));
+        let exited = process_exit_fd(identity.pid);
+        Self {
+            file,
+            identity,
+            changed,
+            exited,
+            cancel,
+        }
+    }
+}
+
+impl Read for FollowLocalFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if wait_fds(&[Some(&self.cancel)], Duration::ZERO)?[0] {
+                return Ok(0);
+            }
+            let count = self.file.read(buffer)?;
+            if count != 0 || !self.identity.matches() {
+                return Ok(count);
+            }
+            let ready = wait_fds(
+                &[
+                    self.changed.as_ref(),
+                    self.exited.as_ref(),
+                    Some(&self.cancel),
+                ],
+                if self.changed.is_some() {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_millis(50)
+                },
+            )?;
+            if ready[2] {
+                return Ok(0);
+            }
+            if ready[1] {
+                return self.file.read(buffer);
+            }
+            if ready[0] {
+                if let Some(changed) = &self.changed {
+                    drain_change(changed);
+                }
+            }
+        }
+    }
+}
+
+struct ProcessOutput {
+    cancel: Arc<OwnedFd>,
+    readers: Vec<swactor_process::LineReaderHandle>,
+    actor: ActorAddress,
+    runtime: Runtime,
+}
+
+impl Drop for ProcessOutput {
+    fn drop(&mut self) {
+        cancel_observer(&self.cancel);
+        for reader in self.readers.drain(..) {
+            reader.join();
+        }
+        let _ = self.runtime.stop_actor(self.actor);
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -414,6 +572,9 @@ fn discover_process_record(
             spec.node_id.to_string(),
         ),
     ];
+    // Linux /proc does not provide reliable inotify creation/exec events.
+    // Retain bounded discovery reconciliation; socket and child waits below
+    // use kernel notifications once an exact identity has been discovered.
     let mut matches = swactor_process::find_process_identities_with_retry(
         &environment,
         true,
@@ -467,32 +628,89 @@ fn remove_debug_join_socket(spec: &NodeProvisionSpec) -> Result<(), String> {
     }
 }
 
-fn request_process_rejoin(spec: &NodeProvisionSpec) -> Result<(), String> {
+pub(crate) const EXECUTION_OWNER_DEADLINE_ENV: &str = "MYELIN_E2E_EXECUTION_DEADLINE_MONOTONIC_MS";
+
+pub(crate) fn execution_owner_deadline() -> Result<Option<Instant>, String> {
+    let Some(value) = std::env::var_os(EXECUTION_OWNER_DEADLINE_ENV) else {
+        return Ok(None);
+    };
+    let deadline = value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "invalid execution owner monotonic deadline".to_owned())?;
+    let started = Instant::now();
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return Err(format!(
+            "read execution owner clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let now = Duration::from_secs(now.tv_sec as u64) + Duration::from_nanos(now.tv_nsec as u64);
+    let remaining = Duration::from_millis(deadline).saturating_sub(now);
+    if remaining.is_zero() {
+        Err("execution budget expired; pending owned operation/child exit".to_owned())
+    } else {
+        Ok(Some(started + remaining))
+    }
+}
+
+fn recovery_route_env(spec: &NodeProvisionSpec) -> Result<Option<(&str, &str)>, String> {
     let Some(endpoint_json) = spec
         .env
         .iter()
         .find_map(|(key, value)| (key == "MYELIN_COORDINATOR_ENDPOINT").then_some(value.as_str()))
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let endpoint = serde_json::from_str::<EndpointAddr>(endpoint_json)
-        .map_err(|error| format!("parse recovery coordinator endpoint: {error}"))?;
     let actor_json = spec
         .env
         .iter()
         .find_map(|(key, value)| (key == "MYELIN_ORCHESTRATOR_ACTOR").then_some(value.as_str()))
         .ok_or_else(|| "recovery spec has no orchestrator actor".to_owned())?;
+    Ok(Some((endpoint_json, actor_json)))
+}
+
+fn request_process_rejoin(spec: &NodeProvisionSpec) -> Result<(), String> {
+    let Some((endpoint_json, actor_json)) = recovery_route_env(spec)? else {
+        return Ok(());
+    };
+    let endpoint = serde_json::from_str::<EndpointAddr>(endpoint_json)
+        .map_err(|error| format!("parse recovery coordinator endpoint: {error}"))?;
     let orchestrator_actor = serde_json::from_str::<ActorAddress>(actor_json)
         .map_err(|error| format!("parse recovery orchestrator actor: {error}"))?;
     let socket = debug_join_socket_path(spec);
-    if !swactor_process::wait_for_path(&socket, 40, Duration::from_millis(50)) {
+    let change = socket.parent().and_then(file_change_fd);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !socket.exists() && Instant::now() < deadline {
+        wait_fds(
+            &[change.as_ref()],
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(if change.is_some() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(50)
+                }),
+        )
+        .map_err(|error| format!("wait rejoin socket {}: {error}", socket.display()))?;
+        if let Some(change) = &change {
+            drain_change(change);
+        }
+    }
+    if !socket.exists() {
         return Err(format!(
             "rejoin socket {} did not become ready",
             socket.display()
         ));
     }
-    request_debug_join(&socket, endpoint, orchestrator_actor)
-        .map_err(|error| format!("rejoin local worker through {}: {error}", socket.display()))
+    request_debug_join(
+        &socket,
+        endpoint,
+        orchestrator_actor,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .map_err(|error| format!("rejoin local worker through {}: {error}", socket.display()))
 }
 
 fn observe_process_files(
@@ -500,7 +718,7 @@ fn observe_process_files(
     spec: NodeProvisionSpec,
     sink: PluginSink,
     record: LocalProcessRecord,
-) -> Result<(), String> {
+) -> Result<ProcessOutput, String> {
     let stdout = File::open(&record.stdout_path).map_err(|error| {
         format!(
             "open local process stdout {}: {error}",
@@ -513,21 +731,34 @@ fn observe_process_files(
             record.stderr_path.display()
         )
     })?;
-    observe_output_streams(
-        runtime,
-        spec,
-        sink,
-        swactor_process::FollowProcessFile::new(
-            stdout,
-            record.identity(),
-            Duration::from_millis(50),
+    let cancel = cancellation_fd()?;
+    let actor = runtime
+        .spawn(BootstrapOutputActor {
+            bridge: BootstrapTelemetryBridge::new(spec, sink, None),
+            closed: 0,
+        })
+        .map_err(|error| format!("spawn local process output actor: {error}"))?;
+    let sender = runtime.create_sender();
+    let readers = vec![
+        swactor_process::spawn_line_reader(
+            swactor_process::ProcessStream::Stdout,
+            FollowLocalFile::new(stdout, record.identity(), Arc::clone(&cancel)),
+            sender.clone(),
+            actor,
         ),
-        swactor_process::FollowProcessFile::new(
-            stderr,
-            record.identity(),
-            Duration::from_millis(50),
+        swactor_process::spawn_line_reader(
+            swactor_process::ProcessStream::Stderr,
+            FollowLocalFile::new(stderr, record.identity(), Arc::clone(&cancel)),
+            sender,
+            actor,
         ),
-    )
+    ];
+    Ok(ProcessOutput {
+        cancel,
+        readers,
+        actor,
+        runtime: runtime.clone(),
+    })
 }
 
 fn observe_output_streams(
@@ -607,7 +838,7 @@ fn docker_inspect_error_is_absent(stderr: &str) -> bool {
     stderr.contains("no such object") || stderr.contains("no such container")
 }
 
-fn docker_container_is_absent(name: &str) -> Result<bool, String> {
+pub(crate) fn docker_container_is_absent(name: &str) -> Result<bool, String> {
     let output = swactor_process::command_output(Command::new("docker").arg("inspect").arg(name))
         .map_err(|error| format!("inspect Docker container {name}: {error}"))?;
     if output.status.success() {
@@ -625,7 +856,7 @@ fn docker_container_is_absent(name: &str) -> Result<bool, String> {
     }
 }
 
-fn docker_container_is_running(name: &str) -> Result<bool, String> {
+pub(crate) fn docker_container_is_running(name: &str) -> Result<bool, String> {
     let output = swactor_process::command_output(
         Command::new("docker")
             .args(["inspect", "-f", "{{.State.Running}}"])
@@ -884,29 +1115,23 @@ fn docker_status_vec(args: Vec<String>, label: &str) -> Result<(), String> {
 }
 
 fn stop_owned_process(runtime: &mut LocalProcessRuntime) -> Result<Option<i32>, String> {
-    let _ = runtime.stdin.write_all(b"shutdown\n");
-    let _ = runtime.stdin.flush();
-    swactor_process::wait_shared_child_or_kill(
+    swactor_process::stop_shared_child_with_input(
         &runtime.child,
-        Duration::from_secs(2),
-        true,
-        Duration::from_millis(50),
+        &mut runtime.stdin,
+        b"shutdown\n",
+        Instant::now() + Duration::from_secs(2),
     )
     .map(|status| status.and_then(|status| status.code()))
-    .map_err(|error| format!("stop local process node: {error}"))
+    .map_err(|error| format!("stop local process: {error}"))
 }
 
 fn stop_adopted_process(record: &LocalProcessRecord) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        swactor_process::terminate_process_group(
-            &record.identity(),
-            Duration::from_secs(2),
-            Duration::from_millis(50),
-        )
-    }
-    #[cfg(not(target_os = "linux"))]
-    Ok(())
+    swactor_process::terminate_process_group(
+        &record.identity(),
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .map_err(|error| format!("stop adopted node {}: {error}", record.pid))
 }
 
 fn observe_adopted_process(
@@ -916,7 +1141,7 @@ fn observe_adopted_process(
     registry_path: PathBuf,
     provider_ref: String,
     record: LocalProcessRecord,
-) -> Result<(), String> {
+) -> Result<ProcessWatch, String> {
     let actor = runtime
         .spawn(ProcessExitActor {
             spec,
@@ -924,13 +1149,8 @@ fn observe_adopted_process(
             registry: Some((registry_path, provider_ref)),
         })
         .map_err(|error| format!("spawn adopted process observer actor: {error}"))?;
-    swactor_process::spawn_identity_exit_wait(
-        record.identity(),
-        Duration::from_millis(100),
-        runtime.create_sender(),
-        actor,
-    );
-    Ok(())
+    swactor_process::watch_process(record.identity(), None, runtime.create_sender(), actor)
+        .map_err(|error| format!("watch adopted process: {error}"))
 }
 
 impl ProvisionPlugin for LocalProcessPlugin {
@@ -951,6 +1171,8 @@ impl ProvisionPlugin for LocalProcessPlugin {
                 sink,
                 pid: None,
                 runtime: None,
+                observer: None,
+                output: None,
             },
         );
         Ok(handle)
@@ -1068,7 +1290,12 @@ impl ProvisionPlugin for LocalProcessPlugin {
             child: Arc::clone(&child),
             exit_actor: None,
         });
-        observe_process_files(&self.runtime, spec.clone(), sink.clone(), record)?;
+        node.output = Some(observe_process_files(
+            &self.runtime,
+            spec.clone(),
+            sink.clone(),
+            record.clone(),
+        )?);
         let exit_actor = self
             .runtime
             .spawn(ProcessExitActor {
@@ -1081,11 +1308,14 @@ impl ProvisionPlugin for LocalProcessPlugin {
             .as_mut()
             .expect("local process runtime was installed before its exit observer")
             .exit_actor = Some(exit_actor);
-        swactor_process::spawn_shared_child_wait(
-            child,
-            Duration::from_millis(100),
-            self.runtime.create_sender(),
-            exit_actor,
+        node.observer = Some(
+            swactor_process::watch_process(
+                record.identity(),
+                Some(child),
+                self.runtime.create_sender(),
+                exit_actor,
+            )
+            .map_err(|error| format!("watch local process: {error}"))?,
         );
         Ok(())
     }
@@ -1197,8 +1427,9 @@ impl ProvisionPlugin for LocalProcessPlugin {
             return Ok(None);
         };
         request_process_rejoin(spec)?;
-        observe_process_files(&self.runtime, spec.clone(), sink.clone(), record.clone())?;
-        observe_adopted_process(
+        let output =
+            observe_process_files(&self.runtime, spec.clone(), sink.clone(), record.clone())?;
+        let observer = observe_adopted_process(
             &self.runtime,
             spec.clone(),
             sink.clone(),
@@ -1218,6 +1449,8 @@ impl ProvisionPlugin for LocalProcessPlugin {
                 sink,
                 pid: Some(record.pid),
                 runtime: None,
+                observer: Some(observer),
+                output: Some(output),
             },
         );
         Ok(Some(AdoptedNode {
@@ -1462,6 +1695,44 @@ impl DockerLifecycleBackend for SystemDockerLifecycle {
         Ok(Some((name, running)))
     }
 
+    fn rejoin(&self, node: &LocalDockerNode) -> Result<(), String> {
+        let Some((endpoint_json, actor_json)) = recovery_route_env(&node.spec)? else {
+            return Ok(());
+        };
+        // Docker keeps the original worker environment on adoption. Send the
+        // live endpoint and control actor through its existing debug socket;
+        // replaying old readiness logs cannot reconnect either control route.
+        let deadline = Instant::now() + DEBUG_JOIN_TIMEOUT;
+        let deadline = execution_owner_deadline()?.map_or(deadline, |owner| owner.min(deadline));
+        let mut command = Command::new("docker");
+        command.arg("exec");
+        if std::env::var_os(EXECUTION_OWNER_DEADLINE_ENV).is_some() {
+            // The container shares the host monotonic clock, but docker exec
+            // otherwise inherits the old container environment, not this owner.
+            command.arg("--env").arg(EXECUTION_OWNER_DEADLINE_ENV);
+        }
+        command
+            .arg(&node.container_name)
+            .args(["/usr/local/bin/myelin-node", "debug-join", "--socket"])
+            .arg(debug_join_socket_path(&node.spec))
+            .arg("--endpoint-json")
+            .arg(endpoint_json)
+            .arg("--orchestrator-actor-json")
+            .arg(actor_json);
+        let output = swactor_process::command_output_until(&mut command, deadline)
+            .map_err(|error| format!("rejoin Docker worker {}: {error}", node.container_name))?;
+        if !output.status.success() {
+            return Err(format!(
+                "rejoin Docker worker {} exited with {}: stdout={}, stderr={}",
+                node.container_name,
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
     fn observe(&self, runtime: &Runtime, node: &LocalDockerNode, tail: &str) -> Result<(), String> {
         observe_docker_container(
             runtime,
@@ -1617,6 +1888,10 @@ impl ProvisionPlugin for LocalDockerPlugin {
             node.container_name == docker_container_name(&self.container_name_prefix, spec)
         }) {
             node.sink = sink;
+            node.spec = spec.clone();
+            if self.backend.container_state(&node.container_name)? == Some(true) {
+                self.backend.rejoin(node)?;
+            }
             return Ok(Some(AdoptedNode {
                 handle: PluginNodeHandle {
                     id,
@@ -1641,6 +1916,7 @@ impl ProvisionPlugin for LocalDockerPlugin {
             container_name: container_name.clone(),
         };
         if running {
+            self.backend.rejoin(&node)?;
             // Replay this container's bootstrap log into the fresh daemon,
             // then follow new output. The replay supplies runtime facts when
             // the prior daemon died before persisting readiness.
@@ -1799,6 +2075,7 @@ mod tests {
 
     fn test_spec() -> NodeProvisionSpec {
         NodeProvisionSpec {
+            deployment: None,
             run_id: 5,
             node_id: 7,
             attempt_id: 11,
@@ -1933,6 +2210,29 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn local_process_stop_releases_all_observer_actors() {
+        // /proc/self/fd is process-wide; sibling tests must not contribute
+        // descriptors to this resource-ownership assertion.
+        const CHILD_ENV: &str = "MYELIN_LOCAL_PROCESS_FD_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = swactor_process::command_output_until(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "provisioning::tests::local_process_stop_releases_all_observer_actors",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_ENV, "1"),
+                std::time::Instant::now() + Duration::from_secs(15),
+            )
+            .expect("complete isolated local-process resource check");
+            assert!(
+                output.status.success(),
+                "isolated local-process resource check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
         let (_engine, runtime) = test_runtime();
         let baseline_actors = runtime.stats().actors.len();
         let baseline_fds = fs::read_dir("/proc/self/fd").unwrap().count();
@@ -2163,6 +2463,7 @@ mod tests {
         next_resource_id: u64,
         fail_next_start: bool,
         fail_next_remove: bool,
+        fail_next_rejoin: bool,
         started_specs: Vec<NodeProvisionSpec>,
     }
 
@@ -2389,6 +2690,13 @@ mod tests {
             Ok(self.container_state(&name)?.map(|running| (name, running)))
         }
 
+        fn rejoin(&self, _node: &LocalDockerNode) -> Result<(), String> {
+            if std::mem::take(&mut self.state.lock().fail_next_rejoin) {
+                return Err("scripted Docker worker rejected rejoin".to_owned());
+            }
+            Ok(())
+        }
+
         fn observe(
             &self,
             runtime: &Runtime,
@@ -2424,6 +2732,59 @@ mod tests {
         fn observe(&self, observation: PluginObservation) {
             self.observations.lock().push(observation);
         }
+    }
+
+    #[test]
+    fn docker_adoption_requires_rejoin_without_replacing_retained_resource() {
+        let parts = RuntimeParts::new(swactor::config::RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let stepping = SteppingBackend::new();
+        let _engine = Engine::new(parts, stepping.clone()).expect("stepping engine");
+        let baseline_actors = runtime.stats().actors.len();
+        let sink = PluginSink::new(Arc::new(RecordingDockerSink::default()));
+        let backend = Arc::new(ScriptedDockerBackend::default());
+        let mut plugin =
+            LocalDockerPlugin::with_backend("myelin", runtime.clone(), backend.clone());
+        let spec = test_spec();
+        let name = docker_container_name("myelin", &spec);
+        backend.seed_orphan(&name, true).unwrap();
+        let retained_id = backend.state.lock().resources[0].id;
+        backend.state.lock().fail_next_rejoin = true;
+
+        // Existing bootstrap logs are not proof of a current control binding.
+        // A rejected rejoin must not report a successful adoption or dispose
+        // of the live worker, so recovery can retry the same external resource.
+        assert!(plugin.adopt_by_spec(&spec, sink.clone()).is_err());
+        assert!(plugin.nodes.is_empty());
+        assert_eq!(plugin.list_managed_refs().unwrap(), [name.clone()]);
+        assert_eq!(backend.container_state(&name).unwrap(), Some(true));
+        assert_eq!(backend.state.lock().resources[0].id, retained_id);
+        assert_eq!(runtime.stats().actors.len(), baseline_actors);
+
+        let adopted = plugin
+            .adopt_by_spec(&spec, sink.clone())
+            .unwrap()
+            .expect("retained container adopted after rejoin");
+        assert_eq!(adopted.provider_ref, name);
+        assert_eq!(backend.state.lock().resources[0].id, retained_id);
+
+        // An already registered handle also has to reconnect on recovery;
+        // failure retains its ownership rather than silently accepting it.
+        backend.state.lock().fail_next_rejoin = true;
+        assert!(plugin.adopt_by_spec(&spec, sink.clone()).is_err());
+        let retried = plugin
+            .adopt_by_spec(&spec, sink)
+            .unwrap()
+            .expect("registered container rejoined");
+        assert_eq!(retried.handle.id, adopted.handle.id);
+        assert_eq!(plugin.list_managed_refs().unwrap(), [name.clone()]);
+        assert_eq!(backend.state.lock().resources[0].id, retained_id);
+
+        plugin.stop_node(&retried.handle).unwrap();
+        backend.finish_all(&runtime).unwrap();
+        settle_docker_actors(&stepping);
+        assert!(plugin.list_managed_refs().unwrap().is_empty());
+        assert_eq!(runtime.stats().actors.len(), baseline_actors);
     }
 
     #[test]

@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use iroh::{EndpointAddr, PublicKey, RelayMode};
@@ -132,7 +132,7 @@ impl IrohNode {
         let metadata_lambda = node_config.metadata_lambda;
 
         // Shared egress state.
-        let outbox: Outbox = Arc::new(StdMutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(Default::default());
         let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
         let peer_directory = Arc::new(OutboxPeerDirectory::new(
@@ -309,6 +309,7 @@ pub fn make_driver() -> IrohNode {
     IrohNode::from_config(IrohDriverConfig {
         secret_key: None,
         relay_mode: RelayMode::Disabled,
+        bind_port: None,
         node: test_config(),
         peer_auth: None,
         additional_alpns: vec![],
@@ -319,6 +320,7 @@ pub fn make_driver_with_auth(auth: Arc<Mutex<PeerAllowList>>) -> IrohNode {
     IrohNode::from_config(IrohDriverConfig {
         secret_key: None,
         relay_mode: RelayMode::Disabled,
+        bind_port: None,
         node: test_config(),
         peer_auth: Some(auth),
         additional_alpns: vec![],
@@ -329,6 +331,7 @@ pub fn make_driver_with_relay(relay_url: iroh::RelayUrl) -> IrohNode {
     IrohNode::from_config(IrohDriverConfig {
         secret_key: None,
         relay_mode: RelayMode::Custom(relay_url.into()),
+        bind_port: None,
         node: test_config(),
         peer_auth: None,
         additional_alpns: vec![],
@@ -419,18 +422,12 @@ pub fn spawn_test_relay() -> (iroh::RelayUrl, RelayGuard) {
         .unwrap();
     let server = rt
         .block_on(async {
-            iroh_relay::server::Server::spawn(iroh_relay::server::ServerConfig::<(), ()> {
-                relay: Some(iroh_relay::server::RelayConfig {
-                    http_bind_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-                    tls: None,
-                    limits: Default::default(),
-                    key_cache_capacity: Some(256),
-                    access: iroh_relay::server::AccessConfig::Everyone,
-                }),
-                quic: None,
-                metrics_addr: None,
-            })
-            .await
+            let mut relay =
+                iroh_relay::server::RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
+            relay.key_cache_capacity = Some(256);
+            let mut config = iroh_relay::server::ServerConfig::default();
+            config.relay = Some(relay);
+            iroh_relay::server::Server::spawn(config).await
         })
         .unwrap();
     let url = server.http_url().expect("relay has no HTTP URL");

@@ -5,6 +5,10 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
+[features]
+# Diagnostic tracing of the namespace directory actor's request lifecycle.
+directory-trace = []
+
 [dependencies]
 telemetry = { path = "../telemetry" }
 serde = { version = "1", features = ["derive"] }

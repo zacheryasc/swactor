@@ -10,6 +10,8 @@ mod types;
 
 pub use lifecycle::{ProcessLifecycleObservability, ProcessOutputConfig};
 pub use message::{ProcessCommand, ProcessOutput};
+#[cfg(target_os = "linux")]
+pub use operations::command_output_until;
 #[cfg(unix)]
 pub use operations::request_child_termination;
 #[cfg(target_os = "linux")]
@@ -20,14 +22,16 @@ pub use operations::spawn_unix_stream_listener;
 pub use operations::terminate_process_group;
 pub use operations::{
     CommandOutputObservation, FollowProcessFile, LineReaderHandle, ProcessExitObservation,
-    ProcessIdentity, ProcessStopSignal, ProcessStream, ProcessStreamObservation, child_kill,
-    child_try_wait, child_wait, child_wait_with_output, command_output, command_spawn,
-    command_status, find_process_identities_by_environment, find_process_identities_with_retry,
-    spawn_child_wait, spawn_command_output, spawn_detached_command_status,
-    spawn_identity_exit_wait, spawn_line_channel, spawn_line_reader, spawn_mapped_line_channel,
-    spawn_mapped_line_reader, spawn_shared_child_wait, spawn_stdin_command_wait,
-    spawn_stop_channel_wait, wait_for_path, wait_shared_child_or_kill,
+    ProcessIdentity, ProcessStopSignal, ProcessStream, ProcessStreamObservation,
+    SupervisedProcessObservation, child_kill, child_try_wait, child_wait, child_wait_with_output,
+    command_output, command_spawn, command_status, find_process_identities_by_environment,
+    find_process_identities_with_retry, spawn_child_wait, spawn_command_output,
+    spawn_detached_command_status, spawn_identity_exit_wait, spawn_line_channel, spawn_line_reader,
+    spawn_mapped_line_channel, spawn_mapped_line_reader, spawn_shared_child_wait,
+    spawn_stdin_command_wait, spawn_stop_channel_wait, wait_for_path,
 };
+#[cfg(target_os = "linux")]
+pub use operations::{ProcessWatch, SupervisedChild, stop_shared_child_with_input, watch_process};
 #[cfg(unix)]
 pub use resources::{ProcessResourceError, ProcessSpawnResources};
 #[cfg(unix)]

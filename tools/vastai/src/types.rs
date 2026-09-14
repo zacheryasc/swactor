@@ -22,11 +22,11 @@ pub struct Offer {
     pub compute_cap: u64,
     #[serde(default)]
     pub geolocation: Option<String>,
-    /// Inbound bandwidth price ($/TB). vast.ai bills Docker image pulls here.
-    #[serde(default, rename = "internet_down_cost_per_tb")]
+    /// Inbound bandwidth price ($/TB). Missing pricing is not evidence of zero cost.
+    #[serde(rename = "internet_down_cost_per_tb")]
     pub inet_down_cost_per_tb: f64,
     /// Outbound bandwidth price ($/TB), surfaced so callers can account for it.
-    #[serde(default, rename = "internet_up_cost_per_tb")]
+    #[serde(rename = "internet_up_cost_per_tb")]
     pub inet_up_cost_per_tb: f64,
     /// Marketplace host that owns the machine. Used for host-level blacklist and
     /// distinct-host provisioning.
@@ -82,6 +82,8 @@ impl ProviderInstanceStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabeledInstance {
     pub contract_id: u64,
+    /// Exact provider host association; absent is unknown, never a guessed host.
+    pub host_id: Option<u64>,
     /// vast.ai SSH proxy host (e.g. `ssh5.vast.ai`); empty if not yet assigned.
     pub ssh_host: String,
     pub ssh_port: u16,
@@ -258,6 +260,20 @@ mod failure_class_tests {
     use super::*;
 
     #[test]
+    fn missing_bandwidth_pricing_is_not_zero_cost_evidence() {
+        let offer = serde_json::json!({
+            "id": 1, "gpu_name": "test", "dph_total": 0.1,
+            "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+        });
+        assert!(serde_json::from_value::<Offer>(offer.clone()).is_ok());
+        for field in ["internet_down_cost_per_tb", "internet_up_cost_per_tb"] {
+            let mut unknown = offer.clone();
+            unknown.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Offer>(unknown).is_err());
+        }
+    }
+
+    #[test]
     fn representative_vastai_errors_classify_to_stable_failure_classes() {
         for (raw, class) in [
             (
@@ -359,6 +375,10 @@ pub(crate) struct InstanceListResponse {
 pub(crate) struct InstanceListEntry {
     pub id: u64,
     #[serde(default)]
+    pub host_id: Option<u64>,
+    #[serde(default)]
+    pub machine_id: Option<u64>,
+    #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
     pub actual_status: Option<String>,
@@ -374,10 +394,35 @@ impl From<InstanceListEntry> for LabeledInstance {
     fn from(e: InstanceListEntry) -> Self {
         Self {
             contract_id: e.id,
+            host_id: match (e.host_id, e.machine_id) {
+                (Some(host), Some(machine)) if host != machine => None,
+                (host, machine) => host.or(machine),
+            },
             ssh_host: e.ssh_host.unwrap_or_default(),
             ssh_port: e.ssh_port.unwrap_or(0),
             public_ipaddr: e.public_ipaddr.unwrap_or_default(),
             actual_status: e.actual_status.unwrap_or_else(|| "unknown".to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn conflicting_provider_host_fields_are_unknown_not_arbitrarily_selected() {
+        let entry: InstanceListEntry = serde_json::from_value(serde_json::json!({
+            "id": 1, "host_id": 2, "machine_id": 3
+        }))
+        .unwrap();
+        let instance = LabeledInstance::from(entry);
+        assert_eq!(instance.contract_id, 1);
+        assert_eq!(instance.host_id, None);
+        let matching: InstanceListEntry = serde_json::from_value(serde_json::json!({
+            "id": 1, "host_id": 2, "machine_id": 2
+        }))
+        .unwrap();
+        assert_eq!(LabeledInstance::from(matching).host_id, Some(2));
     }
 }

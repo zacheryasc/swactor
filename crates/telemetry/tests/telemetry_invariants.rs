@@ -183,10 +183,13 @@ impl Harness {
     }
 
     fn content(kind: u8, suffix: &str) -> ChannelContent {
-        match kind % 3 {
+        match kind % 4 {
             0 => ChannelContent::Bytes,
             1 => ChannelContent::TextStream,
-            _ => ChannelContent::JsonRecord {
+            2 => ChannelContent::JsonRecord {
+                schema: Some(suffix.to_owned()),
+            },
+            _ => ChannelContent::MessagePackRecord {
                 schema: Some(suffix.to_owned()),
             },
         }
@@ -759,6 +762,8 @@ fn full_and_disconnected_subscribers_do_not_affect_others() {
         .collect();
     assert_eq!(dropped[&slow_id], 1);
     assert_eq!(dropped[&fast_id], 0);
+    assert_eq!(slow.dropped(), 1);
+    assert_eq!(fast.dropped(), 0);
 
     drop(slow);
     assert!(

@@ -2,8 +2,7 @@ use crate::actor::{ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Me
 use crate::runtime::{Inbox, Runtime, SingleThreadRuntime};
 use parking_lot::Mutex;
 use std::any::Any;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Weak};
 
 pub type AdminResult<T> = Result<T, AdminError>;
 
@@ -31,6 +30,7 @@ pub struct RuntimeAdmin<'a> {
 
 pub struct Admin<T: Message> {
     pub(crate) inbox: Inbox<AdminResult<T>>,
+    pub(crate) list_actors_request: Option<ListActorsRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,11 +95,20 @@ impl<A: ActorInterface> ActorStateSnapshot<A> {
 
 impl<T: Message> Admin<T> {
     pub(crate) fn new(inbox: Inbox<AdminResult<T>>) -> Self {
-        Self { inbox }
+        Self {
+            inbox,
+            list_actors_request: None,
+        }
     }
 
     pub fn try_recv(&self) -> Option<AdminResult<T>> {
         self.inbox.try_recv()
+    }
+
+    /// Wait for the worker-owned reply without polling its inbox. Dropping
+    /// this future releases the caller's wait; workers retain their own work.
+    pub async fn recv(&self) -> AdminResult<T> {
+        self.inbox.recv().await
     }
 
     pub fn recv_ticking(&self, host: &mut SingleThreadRuntime, max_ticks: usize) -> AdminResult<T> {
@@ -125,7 +134,7 @@ pub(crate) type AdminReplaceState =
 
 pub(crate) enum AdminCommand {
     ListActors {
-        acc: Arc<ListActorsAccumulator>,
+        acc: Weak<ListActorsAccumulator>,
     },
     InspectActor {
         actor: ActorAddress,
@@ -156,8 +165,34 @@ pub(crate) enum AdminCommand {
     },
 }
 
+/// Owns a fresh worker census until its reply is delivered or the request is
+/// dropped. Dropping releases partial summaries and cancels workers that have
+/// not sampled yet; no task or temporary reply actor is created.
+#[must_use = "retain the request until its reply arrives; dropping cancels the census"]
+pub struct ListActorsRequest {
+    pub(crate) acc: Arc<ListActorsAccumulator>,
+}
+impl ListActorsRequest {
+    /// Cancel collection and release partial snapshots. A reply already queued
+    /// to the recipient may still arrive and must be correlated by that actor.
+    pub fn cancel(&self) {
+        self.acc.state.lock().take();
+    }
+}
+
+impl Drop for ListActorsRequest {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 pub(crate) struct ListActorsAccumulator {
-    pub(crate) remaining: AtomicUsize,
-    pub(crate) summaries: Mutex<Vec<ActorSummary>>,
+    pub(crate) state: Mutex<Option<ListActorsState>>,
+}
+
+pub(crate) struct ListActorsState {
+    pub(crate) remaining: usize,
+    pub(crate) summaries: Vec<ActorSummary>,
     pub(crate) reply_to: ActorAddress,
+    pub(crate) reply: Box<dyn FnOnce(ListActorsResponse) -> AdminBoxedReply + Send>,
 }

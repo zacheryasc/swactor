@@ -32,11 +32,30 @@ pub enum BlobSourceIn {
     Retire {
         reply_to: Option<ActorAddress>,
     },
+    InspectResources {
+        request_id: String,
+        reply_to: ActorAddress,
+    },
 }
 
 impl NetworkMessage for BlobSourceIn {
     fn type_tag() -> &'static str {
         "data-plane.blob-source.in.v1"
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlobSourceResources {
+    pub request_id: String,
+    pub source: ActorAddress,
+    pub binding: Option<ActorAddress>,
+    pub active_transfers: usize,
+    pub retiring: bool,
+}
+
+impl NetworkMessage for BlobSourceResources {
+    fn type_tag() -> &'static str {
+        "data-plane.blob-source.resources.v1"
     }
 }
 
@@ -63,11 +82,12 @@ impl BlobTransferCompletion for ActorTransferCompletion {
 }
 
 pub trait BlobSourcePublisher: Send + Sync + 'static {
-    fn publish_source(&self, source: ActorAddress) -> Result<(), String>;
+    fn publish_source(&self, source: ActorAddress) -> Result<[u8; 32], String>;
 }
 
 pub trait BlobSourceRetirement: Send + Sync + 'static {
     fn retired(&self);
+    fn binding(&self) -> ActorAddress;
 }
 
 pub struct FileBlobSourceActor {
@@ -248,6 +268,24 @@ impl ActorInterface for FileBlobSourceActor {
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: BlobSourceIn) {
         match message {
+            BlobSourceIn::InspectResources {
+                request_id,
+                reply_to,
+            } => {
+                let _ = ctx.send(
+                    reply_to,
+                    BlobSourceResources {
+                        request_id,
+                        source: ctx.self_addr(),
+                        binding: self
+                            .retirement
+                            .as_ref()
+                            .map(|retirement| retirement.binding()),
+                        active_transfers: self.active.len(),
+                        retiring: self.retiring,
+                    },
+                );
+            }
             BlobSourceIn::BeginTransfer { offer } => {
                 if self.retiring {
                     self.fail_destination(ctx, &offer, "blob source is retired".to_owned());
@@ -329,5 +367,8 @@ impl ActorInterface for FileBlobSourceActor {
 pub fn register_blob_source_codecs(registry: &mut CodecRegistry) {
     registry
         .register::<BlobSourceIn, _>(JsonCodec::default())
+        .expect("unique codec registration");
+    registry
+        .register::<BlobSourceResources, _>(JsonCodec::default())
         .expect("unique codec registration");
 }

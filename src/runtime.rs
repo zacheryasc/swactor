@@ -11,7 +11,8 @@ use crate::actor::{
 };
 use crate::admin::{
     ActorStateSnapshot, Admin, AdminCommand, AdminError, AdminResult, GetActorStateResponse,
-    InspectActorResponse, ListActorsAccumulator, ListActorsResponse, OperationResult, RuntimeAdmin,
+    InspectActorResponse, ListActorsAccumulator, ListActorsRequest, ListActorsResponse,
+    ListActorsState, OperationResult, RuntimeAdmin,
 };
 use crate::channel::{AsyncReceiver, Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
@@ -603,20 +604,51 @@ impl RuntimeAdmin<'_> {
     }
 
     pub fn list_actors(&self) -> Result<Admin<ListActorsResponse>, Error> {
-        let (admin, reply_to) = self.new_admin::<ListActorsResponse>()?;
-        let n = self.runtime.shared.worker_count();
-        let acc = Arc::new(ListActorsAccumulator {
-            remaining: AtomicUsize::new(n),
-            summaries: parking_lot::Mutex::new(Vec::new()),
-            reply_to,
-        });
-
-        // Broadcast to every worker; the last to finish aggregates and replies.
-        for tx in &self.runtime.shared.admin_txs {
-            tx.send(AdminCommand::ListActors { acc: acc.clone() });
-        }
-
+        let (mut admin, reply_to) = self.new_admin::<ListActorsResponse>()?;
+        admin.list_actors_request = Some(
+            self.start_actor_census(reply_to, |response| Box::new(Ok::<_, AdminError>(response))),
+        );
         Ok(admin)
+    }
+
+    /// Request a current census from every worker and deliver it as a typed
+    /// message to a local actor. The mapper only constructs the observation;
+    /// the receiving actor owns correlation, deadlines, and subsequent work.
+    ///
+    /// Retain the returned request in that actor until completion. Dropping it
+    /// cancels outstanding collection and releases partial worker snapshots.
+    pub fn list_actors_to<M: Message>(
+        &self,
+        reply_to: ActorAddress,
+        reply: impl FnOnce(ListActorsResponse) -> M + Send + 'static,
+    ) -> Result<ListActorsRequest, Error> {
+        if !self.runtime.is_local_actor(reply_to) {
+            return Err(Error::from("Actor not found"));
+        }
+        Ok(self.start_actor_census(reply_to, move |response| Box::new(reply(response))))
+    }
+
+    fn start_actor_census(
+        &self,
+        reply_to: ActorAddress,
+        reply: impl FnOnce(ListActorsResponse) -> crate::admin::AdminBoxedReply + Send + 'static,
+    ) -> ListActorsRequest {
+        let acc = Arc::new(ListActorsAccumulator {
+            state: parking_lot::Mutex::new(Some(ListActorsState {
+                remaining: self.runtime.shared.worker_count(),
+                summaries: Vec::new(),
+                reply_to,
+                reply: Box::new(reply),
+            })),
+        });
+        // Worker queues do not own the request. Withheld workers cannot retain
+        // its accumulated snapshots or callback after its caller disappears.
+        for tx in &self.runtime.shared.admin_txs {
+            tx.send(AdminCommand::ListActors {
+                acc: Arc::downgrade(&acc),
+            });
+        }
+        ListActorsRequest { acc }
     }
 
     pub fn inspect_actor(&self, actor: ActorAddress) -> Result<Admin<InspectActorResponse>, Error> {

@@ -1,3 +1,6 @@
+[unstable]
+profile-hint-mostly-unused = true
+
 [build]
 rustc-workspace-wrapper = "tools/actor-control-flow-lint/rustc-wrapper.py"
 

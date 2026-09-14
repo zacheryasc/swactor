@@ -10,6 +10,7 @@ members = [
     "crates/distribution",
     "crates/iroh-driver",
     "crates/dashboard",
+    "crates/myelin-control-contract",
     "apps/myelin",
     "xtask",
     "tools/vastai",
@@ -37,6 +38,11 @@ exclude = ["crates/bindings/wasm-crypto", "examples"]
 # Without this, members declared tokio with different features, so building
 # one member vs another (or `run` vs `test`) recompiled tokio each time.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "signal"] }
+iroh = { version = "1.1", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh-base = { version = "1.1", default-features = false, features = ["key"] }
+iroh-relay = { version = "1.1", default-features = false, features = ["test-utils"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [package]
 name = "swactor"
@@ -48,6 +54,48 @@ autobenches = false
 [profile.bench]
 debug = true
 strip = false
+
+# Development builds omit debug information; the diagnostic profile restores
+# full debugger support without changing release artifacts.
+[profile.dev]
+debug = 0
+
+[profile.dev.package.iroh]
+hint-mostly-unused = true
+
+[profile.dev.package."noq-proto"]
+hint-mostly-unused = true
+
+[profile.dev.package.reqwest]
+hint-mostly-unused = true
+
+[profile.dev.package.rustls]
+hint-mostly-unused = true
+
+[profile.dev.package.tokio]
+hint-mostly-unused = true
+
+[profile.test]
+debug = 0
+
+[profile.test.package.iroh]
+hint-mostly-unused = true
+
+[profile.test.package."noq-proto"]
+hint-mostly-unused = true
+
+[profile.test.package.reqwest]
+hint-mostly-unused = true
+
+[profile.test.package.rustls]
+hint-mostly-unused = true
+
+[profile.test.package.tokio]
+hint-mostly-unused = true
+
+[profile.diagnostic]
+inherits = "dev"
+debug = 2
 
 [lib]
 crate-type = ["rlib"]

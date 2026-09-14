@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use swactor::Error;
+use swactor::actor::ActorAddress;
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
 use crate::node_metadata::NodeMetadataEntry;
@@ -127,12 +128,27 @@ pub struct MembershipUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryGossip {
     pub entries: Vec<RegistryEntry>,
+    /// Directed recovery delivery uses the same gossip route as ordinary
+    /// replication. Acknowledgements never merge entries back into the CRDT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<RegistryDelivery>,
 }
 
 impl NetworkMessage for RegistryGossip {
     fn type_tag() -> &'static str {
         "swactor_dist::RegistryGossip"
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RegistryDelivery {
+    /// Acknowledge only entries that are exact live winners after merging.
+    Request { reply_to: ActorAddress },
+    /// `entries` contains the exact winners installed by this peer.
+    Acknowledged {
+        reply_to: ActorAddress,
+        peer: NodeId,
+    },
 }
 
 /// Node-metadata gossip — a batch of per-node metadata entries (relay URL,

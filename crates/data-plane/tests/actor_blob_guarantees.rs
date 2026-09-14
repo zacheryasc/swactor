@@ -565,6 +565,67 @@ fn peer_replacement_requires_and_supports_a_fresh_incarnation() {
 }
 
 #[test]
+fn active_stream_replacement_fences_both_old_endpoints() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/active-replacement");
+
+    future::block_on(async {
+        let mut first_reader_open = Box::pin(data_plane.read_stream(&logical));
+        assert!(
+            future::poll_once(first_reader_open.as_mut())
+                .await
+                .is_none()
+        );
+        let mut first_writer = data_plane
+            .write_stream(&logical)
+            .await
+            .expect("first writer");
+        let mut first_reader = first_reader_open.await.expect("first reader");
+        first_writer.write(b"old").await.expect("old write");
+        assert_eq!(
+            first_reader.read().await.expect("old read"),
+            Some(b"old".to_vec())
+        );
+
+        let mut replacement_writer_open = Box::pin(data_plane.write_stream_replacing(&logical));
+        assert!(
+            future::poll_once(replacement_writer_open.as_mut())
+                .await
+                .is_none()
+        );
+        let mut replacement_reader = loop {
+            match data_plane.read_stream(&logical).await {
+                Ok(reader) => break reader,
+                Err(DataPlaneError::SessionFailed(reason))
+                    if reason.contains("already has a Sink") => {}
+                Err(error) => panic!("replacement reader: {error}"),
+            }
+        };
+        let mut replacement_writer = replacement_writer_open.await.expect("replacement writer");
+
+        assert!(matches!(
+            first_writer.write(b"stale").await,
+            Err(DataPlaneError::PathReplaced(path)) if path == logical
+        ));
+        let stale_read = first_reader.read().await;
+        assert!(
+            matches!(
+                &stale_read,
+                Err(DataPlaneError::PathReplaced(path)) if path == &logical
+            ),
+            "old reader remained usable after replacement: {stale_read:?}"
+        );
+        replacement_writer.write(b"new").await.expect("new write");
+        assert_eq!(
+            replacement_reader.read().await.expect("new read"),
+            Some(b"new".to_vec())
+        );
+    });
+}
+
+#[test]
 fn actor_stream_consumer_registers_before_writer_and_collects_to_eof() {
     let _stream_test = STREAM_TEST_LOCK.lock();
     let harness = harness(2 << 20);

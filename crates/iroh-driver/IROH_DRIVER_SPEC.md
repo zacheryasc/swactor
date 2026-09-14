@@ -1,7 +1,7 @@
 # Iroh Driver Fixed Specification
 
 Id: 5
-Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
+Last modified: 74ba89c0cedae04b05a4b8b4af9a3856adfd5875
 Last reviewed:
 > Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
@@ -451,7 +451,7 @@ Target wire record:
 Telemetry records use:
 
 ```text
-swactor/telemetry/0
+swactor/telemetry/1
 ```
 
 The telemetry transport opens unidirectional streams over a connection negotiated with this ALPN.
@@ -461,42 +461,51 @@ The telemetry transport opens unidirectional streams over a connection negotiate
 A telemetry unidirectional stream begins with a header:
 
 ```text
-magic = "DSQ1"
+magic = "DSQ2"
 flow_id: [u8; 16]
 token_len: u16 LE
 token bytes
-stream descriptor JSON
-channel descriptors JSON
+stream descriptor: unsigned-varint length + Postcard bytes
+channel descriptors: unsigned-varint length + Postcard bytes
 ```
 
-Then zero or more length-prefixed records follow:
-
-```text
-record_len: u32 LE
-record bytes
-```
-
-Record tags:
+Compact event records follow directly, without an outer fixed-width length:
 
 ```text
 0x01 = channel declared
-0x02 = frame
+       unsigned-varint descriptor length + Postcard descriptor bytes
+0x02 = raw frame batch
+       unsigned-varint batch length + frame entries
 0x03 = stream ended
+0x04 = LZ4 frame batch (accepted from older senders)
+       unsigned-varint raw length
+       unsigned-varint compressed length
+       compressed frame entries
+0x05 = Zstandard frame batch
+       unsigned-varint raw length
+       unsigned-varint compressed length
+       compressed frame entries
 ```
 
-A frame record contains:
+Each frame entry contains:
 
 ```text
-tag
-channel_id: u32 LE
-position: u64 LE
-payload_len: u32 LE
+channel_id: unsigned varint
+position: unsigned varint (absolute for the first entry, then delta within the batch)
+payload_len: unsigned varint
 payload bytes
 ```
 
-Each telemetry record is bounded by `16 * 1024 * 1024` bytes.
+The writer drains available events without waiting, limits one batch to 256 KiB
+or 1024 events, and uses Zstandard level 1 only when the complete compressed
+record is smaller than the raw record. Readers continue to accept LZ4 batches
+from older senders. Compression is byte-preserving: the reader reconstructs the
+same channel id, absolute position, and opaque payload bytes.
 
-`StreamDeclared` events are represented in the stream header and are not emitted as individual records by the current writer.
+Each decoded record or batch is bounded by `16 * 1024 * 1024` bytes.
+
+`StreamDeclared` events are represented in the stream header and are not
+emitted as individual records by the current writer.
 
 ### 4.6 Node Identity and Endpoint Addressing
 

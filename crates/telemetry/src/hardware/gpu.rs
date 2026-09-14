@@ -26,6 +26,7 @@ pub struct HostGpuSample {
     pub query_elapsed_ms: Option<u64>,
     pub gpus: Vec<GpuDeviceSample>,
     pub processes: Vec<GpuProcessSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -297,5 +298,29 @@ mod tests {
         assert_eq!(sample.schema, "host.gpu.v1");
         assert_eq!(sample.seq, 9);
         assert_eq!(sample.error, Some("no gpu".to_string()));
+    }
+
+    #[test]
+    fn successful_sample_omits_error_but_failure_preserves_it() {
+        let sample = HostGpuSample {
+            schema: SCHEMA.to_owned(),
+            seq: 1,
+            sample_unix_ms: 2,
+            query_elapsed_ms: Some(3),
+            gpus: Vec::new(),
+            processes: Vec::new(),
+            error: None,
+        };
+        let value = crate::record::decode_record_value(&sample.encode()).expect("decode sample");
+        assert!(
+            !value
+                .as_object()
+                .expect("sample object")
+                .contains_key("error")
+        );
+
+        let failure = HostGpuSample::error(2, "nvidia-smi unavailable");
+        let value = crate::record::decode_record_value(&failure.encode()).expect("decode failure");
+        assert_eq!(value["error"], "nvidia-smi unavailable");
     }
 }

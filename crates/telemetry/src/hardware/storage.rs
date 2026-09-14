@@ -19,6 +19,7 @@ pub struct HostStorageSample {
     pub query_elapsed_ms: Option<u64>,
     pub filesystems: Vec<FilesystemSample>,
     pub pressure: Option<PressureSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

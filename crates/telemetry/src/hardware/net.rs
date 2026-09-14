@@ -16,6 +16,7 @@ pub struct HostNetSample {
     pub seq: u64,
     pub sample_unix_ms: u64,
     pub interfaces: Vec<NetInterfaceSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

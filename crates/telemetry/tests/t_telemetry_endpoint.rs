@@ -6,7 +6,7 @@ use swactor::stats::{ActorSnapshot, StatsSnapshotKind};
 use telemetry::frame::{FrameDelivery, TelemetryEvent};
 use telemetry::{
     ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, Lifetime, NodeId, Record,
-    SourceFilter, StreamId, SubscriptionRequest, TelemetryEndpoint,
+    SourceFilter, StreamId, SubscriptionRequest, TelemetryEndpoint, decode_record_value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -68,11 +68,14 @@ fn subscription_snapshot_contains_stream_and_channel_metadata() {
             .iter()
             .any(|descriptor| descriptor.id == stdout && descriptor.name == "stdout")
     );
-    assert!(subscription
-        .snapshot()
-        .channels
-        .iter()
-        .any(|descriptor| descriptor.id == runtime && descriptor.name == RuntimeRecord::CHANNEL));
+    assert!(subscription.snapshot().channels.iter().any(|descriptor| {
+        descriptor.id == runtime
+            && descriptor.name == RuntimeRecord::CHANNEL
+            && descriptor.content
+                == ChannelContent::MessagePackRecord {
+                    schema: Some(RuntimeRecord::CHANNEL.to_owned()),
+                }
+    }));
 }
 
 #[test]
@@ -124,6 +127,15 @@ fn subscription_snapshot_filters_but_future_fanout_broadcasts() {
         .map(|event| frame_event(event).channel.channel)
         .collect();
     assert_eq!(channels, vec![stdout, json]);
+    let record = events
+        .iter()
+        .map(frame_event)
+        .find(|delivery| delivery.channel.channel == json)
+        .expect("record frame");
+    assert_eq!(
+        RuntimeRecord::decode(&record.payload).unwrap(),
+        RuntimeRecord { value: 5 }
+    );
 }
 
 #[test]
@@ -222,12 +234,12 @@ fn process_observer_adapter_submits_configured_channels() {
 }
 
 #[test]
-fn stats_hook_adapter_submits_worker_snapshot_json() {
+fn stats_hook_adapter_submits_worker_snapshot_messagepack() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
     let runtime = producer.register_channel(
         "runtime.actors",
-        ChannelContent::JsonRecord {
+        ChannelContent::MessagePackRecord {
             schema: Some("runtime.actors".to_owned()),
         },
     );
@@ -255,12 +267,11 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
         .iter()
         .map(frame_event)
         .find(|delivery| {
-            serde_json::from_slice::<Value>(&delivery.payload)
-                .is_ok_and(|json| json["kind"] == "census")
+            decode_record_value(&delivery.payload).is_ok_and(|value| value["kind"] == "census")
         })
         .expect("census frame");
     assert_eq!(delivery.channel.channel, runtime);
-    let json: Value = serde_json::from_slice(&delivery.payload).unwrap();
+    let json: Value = decode_record_value(&delivery.payload).unwrap();
     assert_eq!(json["worker_id"], 2);
     assert_eq!(json["generation"], 7);
     assert_eq!(json["actors"][0]["address"], actor.to_full_hex());
@@ -270,6 +281,96 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
     assert_eq!(json["actors"][0]["message_type_counts"][0]["ty"], "Ping");
     assert_eq!(json["actors"][0]["actor_type"], "TestActor");
     assert_eq!(json["actors"][0]["message_type"], "Ping");
+}
+
+#[test]
+fn retained_subscription_recovers_actor_startup_before_live_activity() {
+    let endpoint =
+        TelemetryEndpoint::with_capacity(stream(), 64, 1).with_retention(32, 1024 * 1024);
+    let producer = endpoint.producer();
+    let hook = producer.stats_hook();
+    let mut snapshots = (1..=13)
+        .map(|index| ActorSnapshot {
+            address: ActorAddress([index; 32]),
+            mailbox_depth: 0,
+            mailbox_max_depth: 0,
+            last_msg_type: Some("Ping"),
+            actor_type: Some("StartupActor"),
+            message_type: Some("Ping"),
+            messages_processed: 1,
+            poisoned: false,
+            message_type_counts: vec![("Ping", 1)],
+        })
+        .collect::<Vec<_>>();
+    hook.on_snapshot(0, &snapshots, StatsSnapshotKind::CENSUS);
+    endpoint.tick();
+
+    // The node has already ticked before runtimeReady makes it discoverable.
+    // Fourteen startup records must not compete with the single live queue slot.
+    let subscription = endpoint.subscribe_retained("late-supervisor", SubscriptionRequest::all());
+    for snapshot in &mut snapshots {
+        snapshot.messages_processed += 1;
+    }
+    hook.on_snapshot(0, &snapshots, StatsSnapshotKind::ACTIVITY);
+    endpoint.tick();
+
+    let events = subscription.drain_available();
+    let records = events
+        .iter()
+        .map(frame_event)
+        .map(|frame| decode_record_value(&frame.payload).expect("actor record"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["sequence"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        (1..=15).collect::<Vec<_>>()
+    );
+    assert!(records.iter().all(|record| record["generation"] == 7));
+    assert_eq!(records[0]["event"], "started");
+    assert_eq!(records[13]["kind"], "census");
+    assert_eq!(records[14]["kind"], "activity");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| frame_event(event).position.0)
+            .collect::<Vec<_>>(),
+        (0..15).collect::<Vec<_>>()
+    );
+    assert_eq!(endpoint.bitbucketed(), 0);
+    drop(subscription);
+    assert_eq!(endpoint.subscriber_count(), 0);
+}
+
+#[test]
+fn retained_subscription_bounds_leave_original_positions_visible() {
+    let endpoint = TelemetryEndpoint::with_capacity(stream(), 8, 1).with_retention(2, 5);
+    let producer = endpoint.producer();
+    let channel = producer.register_channel("bounded", ChannelContent::Bytes);
+    for value in ["a", "b", "c"] {
+        producer.submit_text(channel, value);
+    }
+    endpoint.tick();
+    let first = endpoint.subscribe_retained("frame-bound", SubscriptionRequest::all());
+    assert_eq!(positions(&first.drain_available()), vec![1, 2]);
+    drop(first);
+
+    producer.submit_text(channel, "12345");
+    endpoint.tick();
+    let second = endpoint.subscribe_retained("byte-bound", SubscriptionRequest::all());
+    let events = second.drain_available();
+    assert_eq!(positions(&events), vec![3]);
+    assert_eq!(frame_event(&events[0]).payload, b"12345");
+    drop(second);
+
+    producer.submit_text(channel, "oversize");
+    producer.submit_text(channel, "d");
+    endpoint.tick();
+    let third = endpoint.subscribe_retained("after-overflow", SubscriptionRequest::all());
+    let events = third.drain_available();
+    assert_eq!(positions(&events), vec![5]);
+    assert_eq!(frame_event(&events[0]).payload, b"d");
 }
 
 fn positions(events: &[TelemetryEvent]) -> Vec<u64> {
