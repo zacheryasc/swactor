@@ -8,7 +8,14 @@ autobenches = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+rmp-serde = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+zstd = { version = "0.13", default-features = false }
+iroh-driver = { path = "../../crates/iroh-driver" }
 swactor = { path = "../.." }
+swactor-engine = { path = "../../crates/engine" }
 swactor-transport = { path = "../../crates/transport" }
 telemetry = { path = "../../crates/telemetry" }
 
