@@ -12,6 +12,7 @@ members = [
     "crates/dashboard",
     "crates/myelin-control-contract",
     "apps/myelin",
+    "apps/switchboard",
     "xtask",
     "tools/vastai",
     "tools/actor-control-flow-lint",
@@ -28,6 +29,7 @@ default-members = [
     "crates/distribution",
     "crates/dashboard",
     "apps/myelin",
+    "apps/switchboard",
     "tools/vastai",
 ]
 # The language bindings (python, wasm) and xtask are built on demand

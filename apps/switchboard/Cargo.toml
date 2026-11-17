@@ -1,0 +1,31 @@
+[package]
+name = "switchboard"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+anyhow = "1"
+dashboard = { path = "../../crates/dashboard" }
+distribution = { path = "../../crates/distribution" }
+iroh-driver = { path = "../../crates/iroh-driver", default-features = false }
+iroh.workspace = true
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+swactor = { path = "../..", features = ["serde", "transport"] }
+swactor-engine = { path = "../../crates/engine" }
+swactor-process = { path = "../../crates/process" }
+telemetry = { path = "../../crates/telemetry" }
+swactor-transport = { path = "../../crates/transport" }
+tokio = { workspace = true, features = ["io-std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Pipes", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[lints]
+workspace = true
