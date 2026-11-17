@@ -39,11 +39,56 @@ ALLOWANCES = (
         "cpu sampler poll interval",
     ),
     Allowance(
-        "crates/bindings/python/tests/test_bootstrap.py",
-        "test_real_exec_attachment_and_blob_mapping",
-        "subprocess.run",
-        1,
-        "child-process test completion fuse",
+        "tools/myelin-e2e-fuzz/ordered_acceptance.py", "probe",
+        "subprocess.run", 1, "bounded external image metadata probe",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "Handler.parse_request",
+        "self.state.create_release.wait", 1, "scripted withheld SSH banner",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "Handler.do_GET",
+        "state.offer_release.wait", 1, "scripted withheld offer response",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "Handler.do_PUT",
+        "state.create_release.wait", 2, "scripted withheld create acceptance and response",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "Handler.do_DELETE",
+        "state.delete_release.wait", 1, "scripted withheld delete response",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "Handler.do_DELETE",
+        "time.sleep", 1, "scripted slow external delete response",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "run_process",
+        "process.wait", 3, "test process completion and owned terminate/kill/reap",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "retained_owner_loss",
+        "time.sleep", 1, "bounded external cleanup ownership observation",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "retained_cleanup_gate.request",
+        "urllib.request.urlopen", 1, "loopback fixture request deadline",
+    ),
+    Allowance(
+        "tools/myelin-e2e-fuzz/scripted_provider.py", "retained_cleanup_gate",
+        "provider.wait", 2, "owned fixture terminate/kill/reap",
+    ),
+    Allowance(
+        "tools/omp_guard.py", "wait_exit", "time.sleep", 1,
+        "external terminal child exit observation",
+    ),
+    Allowance(
+        "tools/omp_guard.py", "main", "time.sleep", 4,
+        "external terminal startup and input pacing",
+    ),
+    Allowance(
+        "tools/omp_guard.py", "main.maybe_fire", "time.sleep", 1,
+        "external terminal input pacing",
     ),
 )
 
@@ -158,20 +203,20 @@ def self_test() -> None:
         "probe.py:3: unapproved timing primitive `time.sleep` in `work`"
     ]
 
-    overage = TimingVisitor("crates/bindings/python/tests/test_bootstrap.py")
+    overage = TimingVisitor("apps/myelin/node-image/tinygrad_worker.py")
     overage.visit(
         ast.parse(
-            "import subprocess\n"
-            "def test_real_exec_attachment_and_blob_mapping():\n"
-            "    subprocess.run([], timeout=1)\n"
-            "    subprocess.run([], timeout=1)\n"
+            "import urllib.request\n"
+            "def fetch_whole():\n"
+            "    urllib.request.urlopen('https://example.invalid', timeout=1)\n"
+            "    urllib.request.urlopen('https://example.invalid', timeout=1)\n"
         )
     )
     assert overage.violations == [
-        "crates/bindings/python/tests/test_bootstrap.py:4: timing occurrence 2 "
+        "apps/myelin/node-image/tinygrad_worker.py:4: timing occurrence 2 "
         "exceeds the 1 audited call(s) in "
-        "`test_real_exec_attachment_and_blob_mapping` "
-        "(`child-process test completion fuse`)"
+        "`fetch_whole` "
+        "(`model download request deadline`)"
     ]
 
 

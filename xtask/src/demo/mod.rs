@@ -39,9 +39,14 @@ use std::time::Duration;
 
 use iroh::RelayMode;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+#[cfg(test)]
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{ExternalSender, Runtime, RuntimeParts};
-use swactor_engine::{ActorCompletion, Engine, TokioBackend, TokioConfig};
+#[cfg(test)]
+use swactor::runtime::RuntimeParts;
+use swactor::runtime::{ExternalSender, Runtime};
+use swactor_engine::{ActorCompletion, Engine, EngineHandle, TaskSpawner};
+#[cfg(test)]
+use swactor_engine::{TokioBackend, TokioConfig};
 
 use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
@@ -63,38 +68,6 @@ pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(2);
 pub const DEFAULT_PORT: u16 = 9871;
 /// Default initial cluster size.
 pub const DEFAULT_NODES: u64 = 3;
-
-#[cfg(test)]
-pub(super) fn shared_test_driver() -> Arc<IrohDriver> {
-    thread_local! {
-        static DRIVER: (Arc<IrohDriver>, Engine) = {
-            let parts = RuntimeParts::new(RuntimeConfig {
-                worker_count: 1,
-                ..RuntimeConfig::default()
-            });
-            let backend = TokioBackend::new(TokioConfig::default())
-                .expect("create shared demo test backend");
-            let engine =
-                Engine::new(parts, backend).expect("create shared demo test I/O engine");
-            let driver = Arc::new(
-                IrohDriver::with_engine(
-                    engine.handle(),
-                    IrohDriverConfig {
-                        secret_key: None,
-                        relay_mode: RelayMode::Disabled,
-                        bind_port: None,
-                        node: DistributedNodeConfig::default(),
-                        peer_auth: None,
-                        additional_alpns: vec![],
-                    },
-                )
-                .expect("create shared demo test driver"),
-            );
-            (driver, engine)
-        };
-    }
-    DRIVER.with(|(driver, _)| Arc::clone(driver))
-}
 
 /// Resolve the executable path for node-role re-execs. `current_exe()`
 /// returns a "(deleted)" path or fails once the binary file has been
@@ -129,18 +102,56 @@ fn resolve_exe() -> std::path::PathBuf {
     std::path::PathBuf::from("xtask")
 }
 
-/// Shared iroh driver handle: the supervisor's endpoint address (handed to
-/// node roles) and the endpoint for outbound telemetry pulls.
-pub struct DemoDriverHandle {
-    pub supervisor_addr_json: String,
-    pub(crate) driver: std::sync::Arc<IrohDriver>,
+/// Actor-facing control-plane command port. The driver remains in an
+/// engine-owned execution owner, outside every actor and actor message.
+#[derive(Clone)]
+pub struct GossipSender {
+    commands: tokio::sync::mpsc::UnboundedSender<GossipCommand>,
 }
 
-impl DemoDriverHandle {
-    /// Clone the iroh endpoint for outbound telemetry pulls.
-    pub fn endpoint(&self) -> iroh::Endpoint {
-        self.driver.endpoint()
+struct GossipCommand {
+    peer: iroh::EndpointAddr,
+    tag: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+impl GossipSender {
+    fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<GossipCommand>) {
+        let (commands, requests) = tokio::sync::mpsc::unbounded_channel();
+        (Self { commands }, requests)
     }
+
+    fn serve(
+        tasks: &TaskSpawner,
+        driver: Arc<IrohDriver>,
+        mut requests: tokio::sync::mpsc::UnboundedReceiver<GossipCommand>,
+    ) {
+        tasks.spawn(async move {
+            while let Some(command) = requests.recv().await {
+                driver.send_tagged_gossip(command.peer, &command.tag, command.payload);
+            }
+        });
+    }
+
+    fn start(tasks: &TaskSpawner, driver: Arc<IrohDriver>) -> Self {
+        let (sender, requests) = Self::channel();
+        Self::serve(tasks, driver, requests);
+        sender
+    }
+
+    pub fn send_tagged_gossip(&self, peer: iroh::EndpointAddr, tag: &[u8], payload: Vec<u8>) {
+        let _ = self.commands.send(GossipCommand {
+            peer,
+            tag: tag.to_vec(),
+            payload,
+        });
+    }
+}
+
+/// Supervisor address and command port; neither grants task authority.
+pub struct DemoDriverHandle {
+    pub supervisor_addr_json: String,
+    pub(crate) gossip: GossipSender,
 }
 
 /// Pull collector fired by bootstrap actors: dials the freshly-bootstrapped
@@ -148,7 +159,19 @@ impl DemoDriverHandle {
 /// telemetry into the supervisor's remote-stream fanout. The header lands in
 /// the supervisor actor so frames can be classified before publishing.
 struct DemoTelemetryCollector {
-    engine: swactor_engine::EngineHandle,
+    commands: tokio::sync::mpsc::UnboundedSender<provisioning::NodeIdentity>,
+}
+
+impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
+    fn collect(&self, identity: &provisioning::NodeIdentity) {
+        let _ = self.commands.send(identity.clone());
+    }
+}
+
+/// External pull execution owner; actors retain only its command sender.
+struct DemoTelemetryCollectorOwner {
+    tasks: TaskSpawner,
+    engine: EngineHandle,
     runtime: Runtime,
     endpoint: iroh::Endpoint,
     fanout: Arc<telemetry::DeliveryFanout>,
@@ -156,7 +179,18 @@ struct DemoTelemetryCollector {
     supervisor_slot: Arc<std::sync::OnceLock<ActorAddress>>,
 }
 
-impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
+impl DemoTelemetryCollectorOwner {
+    fn start(self) -> DemoTelemetryCollector {
+        let (commands, mut requests) =
+            tokio::sync::mpsc::unbounded_channel::<provisioning::NodeIdentity>();
+        self.tasks.clone().spawn(async move {
+            while let Some(identity) = requests.recv().await {
+                self.collect(&identity);
+            }
+        });
+        DemoTelemetryCollector { commands }
+    }
+
     fn collect(&self, identity: &provisioning::NodeIdentity) {
         let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(&identity.transport_addr) else {
             eprintln!(
@@ -190,6 +224,7 @@ impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
             }
         };
         iroh_driver::spawn_pull_collector_to_actor(
+            &self.tasks,
             &self.engine,
             iroh_driver::PullCollectorConfig {
                 endpoint: self.endpoint.clone(),
@@ -231,7 +266,7 @@ impl ActorInterface for PullHeaderActor {
 /// Entry point: `demo [--port N] [--nodes N]
 /// [--docker]` for the supervisor, or `--demo-node <supervisor-addr-json>
 /// --demo-attempt <n>` for node children.
-pub fn run(args: &[String]) -> ExitCode {
+pub fn run(args: &[String], runtime: Runtime, engine: Engine, tasks: TaskSpawner) -> ExitCode {
     if let Some(index) = args.iter().position(|arg| arg == "--demo-node") {
         let addr = args.get(index + 1).map(String::as_str).unwrap_or_default();
         let attempt = arg_value(args, "--demo-attempt").and_then(|value| value.parse::<u64>().ok());
@@ -239,7 +274,7 @@ pub fn run(args: &[String]) -> ExitCode {
             eprintln!("demo node: --demo-attempt <n> is required");
             return ExitCode::FAILURE;
         };
-        return match node::run_node_role(addr, attempt) {
+        return match node::run_node_role(addr, attempt, runtime, engine, tasks) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("demo node: {error}");
@@ -247,7 +282,7 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         };
     }
-    match run_supervisor(args) {
+    match run_supervisor(args, runtime, engine, tasks) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("demo: {error}");
@@ -261,7 +296,12 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
         .position(|arg| arg == name)
         .and_then(|index| args.get(index + 1).cloned())
 }
-fn run_supervisor(args: &[String]) -> Result<(), String> {
+fn run_supervisor(
+    args: &[String],
+    runtime: Runtime,
+    engine: Engine,
+    tasks: TaskSpawner,
+) -> Result<(), String> {
     let port: u16 = arg_value(args, "--port")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -274,27 +314,17 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     // the supervisor actor once it is installed below.
     let manager = NodeManager::new();
 
-    // Telemetry endpoint with the runtime stats hook attached before the
-    // engine takes the parts.
-    let mut telemetry = SupervisorTelemetry::new("supervisor");
-    let actors_channel = telemetry.register("runtime.actors");
-    let stats_hook = telemetry.producer.stats_hook_on(actors_channel);
-
-    let mut parts = RuntimeParts::new(RuntimeConfig::default());
-    parts = parts.with_stats_hook(stats_hook);
-    let runtime = parts.runtime().clone();
+    let telemetry = SupervisorTelemetry::new("supervisor");
+    runtime.set_stats_hook(telemetry.producer.stats_hook());
     let sender = runtime.create_sender();
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig::default()).map_err(|e| format!("backend: {e}"))?,
-    )
-    .map_err(|e| format!("engine: {e}"))?;
+    let blocking = engine.handle().blocking_work_sender();
 
     // iroh: accept joins from node-role children. The minimal actor bridge
     // exists so the production adapter pump folds accepted connections into
     // the driver cache — `has_active_connection` is our real join signal.
     // Frames that decode against the (empty) codec registry drop harmlessly.
     let mut driver = IrohDriver::with_engine(
+        tasks.clone(),
         engine.handle(),
         IrohDriverConfig {
             secret_key: None,
@@ -365,12 +395,13 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
             route_view,
             outbox,
         });
-        driver.install_actor_bridge_pump(Duration::from_millis(250));
+        driver.install_actor_bridge();
     }
 
+    let driver = Arc::new(driver);
     let driver_handle = Arc::new(DemoDriverHandle {
         supervisor_addr_json: supervisor_addr_json.clone(),
-        driver: Arc::new(driver),
+        gossip: GossipSender::start(&tasks, Arc::clone(&driver)),
     });
 
     // Dashboard.
@@ -379,11 +410,11 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         ..dashboard::DashboardConfig::default()
     });
     dashboard.register_view(Arc::new(view::ReconcilerDashboardView::default()));
-    dashboard.spawn(&engine.handle());
+    dashboard.spawn(&tasks);
 
     // Provisioning: driver + plugin + executor.
     let launch = if docker_mode {
-        let addrs = driver_handle.driver.direct_addresses();
+        let addrs = driver.direct_addresses();
         let port = addrs
             .iter()
             .find(|addr| addr.is_ipv4())
@@ -394,7 +425,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
             .parent()
             .expect("xtask manifest dir has a parent")
             .to_path_buf();
-        let launch = docker::preflight(&root, driver_handle.driver.endpoint().id(), port)?;
+        let launch = docker::preflight(&root, driver.endpoint().id(), port)?;
         LaunchStyle::Docker(launch)
     } else {
         LaunchStyle::Process { exe: resolve_exe() }
@@ -433,8 +464,10 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     let mut bootstrap_registry = provisioning::BootstrapRegistry::new();
     bootstrap_registry.register("process", {
         let manager = manager.clone();
+        let blocking = blocking.clone();
         Arc::new(move |spec| {
             Ok(Box::new(bootstrap::LocalProcessLogic::new(
+                blocking.clone(),
                 spec.clone(),
                 manager.clone(),
             )) as Box<dyn provisioning::BootstrapLogic>)
@@ -442,28 +475,33 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     });
     bootstrap_registry.register("docker", {
         let manager = manager.clone();
+        let blocking = blocking.clone();
         Arc::new(move |spec| {
             Ok(Box::new(docker::DockerProcessLogic::new(
+                blocking.clone(),
                 spec.clone(),
                 manager.clone(),
             )) as Box<dyn provisioning::BootstrapLogic>)
         })
     });
-    let edge_driver = std::sync::Arc::clone(&driver_handle.driver);
-    let collector: Arc<dyn provisioning::NodeTelemetryCollector> =
-        Arc::new(DemoTelemetryCollector {
+    let collector: Arc<dyn provisioning::NodeTelemetryCollector> = Arc::new(
+        DemoTelemetryCollectorOwner {
+            tasks: tasks.clone(),
             engine: engine.handle(),
             runtime: runtime.clone(),
-            endpoint: driver_handle.endpoint(),
+            endpoint: driver.endpoint(),
             fanout: Arc::clone(&fanout),
             sender: sender.clone(),
             supervisor_slot: supervisor_slot.clone(),
-        });
+        }
+        .start(),
+    );
 
     let edge_actor = edge::start_edge_pump(
         &runtime,
         engine.handle(),
-        edge_driver,
+        driver.edge_port(),
+        driver_handle.gossip.clone(),
         sender.clone(),
         supervisor_slot.clone(),
     )?;
@@ -486,7 +524,8 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     });
 
     // Control plane: dashboard → supervisor.
-    control::install(&runtime, supervisor_slot.clone());
+    let _control_sink = control::install(&blocking, &runtime, supervisor_slot.clone())
+        .map_err(|error| format!("install dashboard control: {error}"))?;
 
     let supervisor_addr = runtime
         .spawn(supervisor)
@@ -505,7 +544,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         })
         .map_err(|error| format!("spawn supervisor stop actor: {error}"))?;
     #[cfg(target_os = "linux")]
-    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor)
+    swactor_process::spawn_os_stop_signal_wait(&blocking, runtime.create_sender(), stop_actor)
         .map_err(|error| format!("install supervisor stop signal handler: {error}"))?;
     println!("demo: dashboard on http://localhost:{port}");
     println!("  /view/fleet        — per-node cards (pid, lifecycle)");
@@ -636,12 +675,25 @@ mod properties {
     #[test]
     #[ignore = "subprocess entrypoint for direct_binary_signal_smoke_has_a_hard_timeout"]
     fn direct_binary_signal_smoke_child() {
-        run_supervisor(&[
-            "--nodes".to_owned(),
-            "0".to_owned(),
-            "--port".to_owned(),
-            "0".to_owned(),
-        ])
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let engine = Engine::new(
+            parts,
+            TokioBackend::new(TokioConfig::default()).expect("create child backend"),
+        )
+        .expect("create child engine");
+        let tasks = engine.task_spawner();
+        run_supervisor(
+            &[
+                "--nodes".to_owned(),
+                "0".to_owned(),
+                "--port".to_owned(),
+                "0".to_owned(),
+            ],
+            runtime,
+            engine,
+            tasks,
+        )
         .expect("empty demo supervisor exits after its OS stop signal");
     }
 
@@ -686,6 +738,7 @@ mod properties {
             .expect("spawn exit observer");
 
         swactor_process::spawn_mapped_line_reader(
+            &engine.handle().blocking_work_sender(),
             stdout,
             sender.clone(),
             readiness,
@@ -693,7 +746,16 @@ mod properties {
             ReadinessObservation::Error,
             ReadinessObservation::Closed,
         );
-        swactor_process::spawn_child_wait(child, sender.clone(), exit);
+        if let Err(mut child) = swactor_process::spawn_child_wait(
+            &engine.handle().blocking_work_sender(),
+            child,
+            sender.clone(),
+            exit,
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("engine rejected direct demo child observation");
+        }
         let _readiness_timeout = engine.handle().send_after(
             HARD_TIMEOUT,
             sender.clone(),

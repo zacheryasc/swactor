@@ -5,8 +5,8 @@
 # parallelism OS scheduling delays blow through those deadlines — different
 # timing tests fail on every loaded run — and the namespace reference-model
 # guarantee test (~25s unloaded) stretches past the default 60s slow-timeout.
-# Bounded threads plus a 180s slow period trades wall time for determinism
-# without masking true hangs.
+# Bounded threads plus a 180s per-test termination deadline trade wall time for
+# determinism without leaving true hangs running indefinitely.
 [profile.default]
 test-threads = 4
-slow-timeout = { period = "180s" }
+slow-timeout = { period = "180s", terminate-after = 1 }

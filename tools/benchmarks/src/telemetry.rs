@@ -1,15 +1,12 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Barrier, mpsc};
-use std::thread::{self, JoinHandle};
 
 use serde::{Deserialize, Serialize};
 
 use iroh_driver::telemetry_transport::{
     decode_event_records, encode_event_batch, encode_event_record,
 };
-use swactor::config::RuntimeConfig;
-use swactor::runtime::RuntimeParts;
-use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor_engine::{BlockingWorkHandle, BlockingWorkSender, TaskSpawner};
 
 use telemetry::frame::{ChannelRef, Frame, FrameDelivery, TelemetryEvent};
 use telemetry::ingest::Consumer;
@@ -27,7 +24,6 @@ const BATCH_SIZES: [usize; 3] = [1, 64, 1024];
 const STORE_BATCH: usize = 1024;
 const CONCURRENT_TOTAL: usize = 4096;
 const CONCURRENT_PAYLOAD_SIZE: usize = 32;
-const ENGINE_WORKERS: usize = 4;
 const ENGINE_PRODUCERS: usize = 8;
 const ENGINE_CHANNELS: usize = 256;
 const ENGINE_TOTAL: usize = 16_384;
@@ -117,7 +113,7 @@ impl CompressionCodec {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub enum TelemetryWorkload {
     Mux {
         payload_size: usize,
@@ -138,8 +134,11 @@ pub enum TelemetryWorkload {
     WireBatch,
     Concurrent {
         producers: usize,
+        blocking_work: BlockingWorkSender,
     },
-    EngineConcurrent,
+    EngineConcurrent {
+        tasks: TaskSpawner,
+    },
     PayloadCodec {
         codec: PayloadCodec,
         operation: PayloadCodecOperation,
@@ -185,13 +184,11 @@ pub struct WireBatchState {
 pub struct ConcurrentState {
     endpoint: TelemetryEndpoint,
     start: Arc<Barrier>,
-    handles: Vec<JoinHandle<usize>>,
+    handles: Vec<BlockingWorkHandle<usize>>,
     total: usize,
 }
 
 pub struct EngineConcurrentState {
-    _engine: Engine,
-    handle: EngineHandle,
     endpoint: Arc<TelemetryEndpoint>,
     subscriptions: Vec<TelemetrySubscription>,
     submissions: Vec<Vec<(ChannelId, Vec<u8>)>>,
@@ -451,7 +448,7 @@ fn setup_wire(payload_size: usize) -> WireState {
     }
 }
 
-fn setup_concurrent(producers: usize) -> ConcurrentState {
+fn setup_concurrent(producers: usize, blocking_work: &BlockingWorkSender) -> ConcurrentState {
     let endpoint = TelemetryEndpoint::with_capacity(
         StreamId::new("bench-concurrent", Lifetime(1)),
         CONCURRENT_TOTAL,
@@ -471,13 +468,17 @@ fn setup_concurrent(producers: usize) -> ConcurrentState {
                 )
             })
             .collect();
-        handles.push(thread::spawn(move || {
-            start.wait();
-            payloads
-                .into_iter()
-                .map(|payload| usize::from(producer.submit_bytes(ChannelId(1), payload)))
-                .sum()
-        }));
+        handles.push(
+            blocking_work
+                .submit_joinable(move || {
+                    start.wait();
+                    payloads
+                        .into_iter()
+                        .map(|payload| usize::from(producer.submit_bytes(ChannelId(1), payload)))
+                        .sum()
+                })
+                .expect("submit benchmark producer"),
+        );
     }
     ConcurrentState {
         endpoint,
@@ -536,23 +537,7 @@ fn setup_engine_concurrent() -> EngineConcurrentState {
                 .collect()
         })
         .collect();
-    let parts = RuntimeParts::new(RuntimeConfig {
-        worker_count: ENGINE_WORKERS,
-        ..RuntimeConfig::default()
-    });
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig {
-            worker_threads: ENGINE_WORKERS,
-            ..TokioConfig::default()
-        })
-        .expect("benchmark Tokio backend"),
-    )
-    .expect("benchmark engine");
-    let handle = engine.handle();
     EngineConcurrentState {
-        _engine: engine,
-        handle,
         endpoint,
         subscriptions,
         submissions,
@@ -747,12 +732,15 @@ fn execute_concurrent(state: &mut ConcurrentState) -> TelemetryOutput {
     }
 }
 
-fn execute_engine_concurrent(state: &mut EngineConcurrentState) -> TelemetryOutput {
+fn execute_engine_concurrent(
+    tasks: &TaskSpawner,
+    state: &mut EngineConcurrentState,
+) -> TelemetryOutput {
     let (done_tx, done_rx) = mpsc::channel();
     for submissions in std::mem::take(&mut state.submissions) {
         let done_tx = done_tx.clone();
         let producer = state.endpoint.producer();
-        state.handle.spawn(async move {
+        tasks.spawn(async move {
             let accepted: usize = submissions
                 .into_iter()
                 .map(|(channel, payload)| usize::from(producer.submit_bytes(channel, payload)))
@@ -928,10 +916,10 @@ impl Workload for TelemetryWorkload {
             Self::WireBatch => format!(
                 "telemetry/wire/subscription-batch/channels-{ENGINE_CHANNELS}/frames-{ENGINE_TOTAL}"
             ),
-            Self::Concurrent { producers } => {
+            Self::Concurrent { producers, .. } => {
                 format!("telemetry/mux/concurrent/producers-{producers}/total-{CONCURRENT_TOTAL}")
             }
-            Self::EngineConcurrent => format!(
+            Self::EngineConcurrent { .. } => format!(
                 "telemetry/engine/multithread/channels-{ENGINE_CHANNELS}/producers-{ENGINE_PRODUCERS}/total-{ENGINE_TOTAL}"
             ),
             Self::PayloadCodec { codec, operation } => format!(
@@ -967,10 +955,13 @@ impl Workload for TelemetryWorkload {
             Self::Store(kind) => TelemetryState::Store(setup_store(*kind)),
             Self::Wire { payload_size, .. } => TelemetryState::Wire(setup_wire(*payload_size)),
             Self::WireBatch => TelemetryState::WireBatch(setup_wire_batch()),
-            Self::Concurrent { producers } => {
-                TelemetryState::Concurrent(setup_concurrent(*producers))
+            Self::Concurrent {
+                producers,
+                blocking_work,
+            } => TelemetryState::Concurrent(setup_concurrent(*producers, blocking_work)),
+            Self::EngineConcurrent { .. } => {
+                TelemetryState::EngineConcurrent(setup_engine_concurrent())
             }
-            Self::EngineConcurrent => TelemetryState::EngineConcurrent(setup_engine_concurrent()),
             Self::PayloadCodec { codec, .. } => {
                 TelemetryState::PayloadCodec(setup_payload_codec(*codec))
             }
@@ -990,8 +981,8 @@ impl Workload for TelemetryWorkload {
             (Self::Concurrent { .. }, TelemetryState::Concurrent(state)) => {
                 execute_concurrent(state)
             }
-            (Self::EngineConcurrent, TelemetryState::EngineConcurrent(state)) => {
-                execute_engine_concurrent(state)
+            (Self::EngineConcurrent { tasks }, TelemetryState::EngineConcurrent(state)) => {
+                execute_engine_concurrent(tasks, state)
             }
             (Self::PayloadCodec { codec, operation }, TelemetryState::PayloadCodec(state)) => {
                 execute_payload_codec(state, *codec, *operation)
@@ -1260,7 +1251,7 @@ impl Workload for TelemetryWorkload {
             Self::Wire { payload_size, .. } => WorkUnits::Bytes(*payload_size as u64),
             Self::WireBatch => WorkUnits::Frames(ENGINE_TOTAL as u64),
             Self::Concurrent { .. } => WorkUnits::Operations(CONCURRENT_TOTAL as u64),
-            Self::EngineConcurrent => WorkUnits::Frames(ENGINE_TOTAL as u64),
+            Self::EngineConcurrent { .. } => WorkUnits::Frames(ENGINE_TOTAL as u64),
             Self::PayloadCodec { .. } => WorkUnits::Frames(PAYLOAD_CODEC_TOTAL as u64),
             Self::Compression(_) => {
                 WorkUnits::Bytes(setup_compression(CompressionCodec::Lz4).raw_bytes as u64)
@@ -1269,7 +1260,10 @@ impl Workload for TelemetryWorkload {
     }
 
     fn setup_policy(&self) -> SetupPolicy {
-        if matches!(self, Self::Concurrent { .. } | Self::EngineConcurrent) {
+        if matches!(
+            self,
+            Self::Concurrent { .. } | Self::EngineConcurrent { .. }
+        ) {
             SetupPolicy::PerExecution
         } else {
             SetupPolicy::Batched
@@ -1277,7 +1271,7 @@ impl Workload for TelemetryWorkload {
     }
 }
 
-pub fn workloads() -> Vec<TelemetryWorkload> {
+pub fn workloads(tasks: TaskSpawner, blocking_work: BlockingWorkSender) -> Vec<TelemetryWorkload> {
     let mut workloads = Vec::new();
     for payload_size in PAYLOAD_SIZES {
         for batch in BATCH_SIZES {
@@ -1342,8 +1336,11 @@ pub fn workloads() -> Vec<TelemetryWorkload> {
     workloads.push(TelemetryWorkload::Compression(CompressionCodec::Zstd));
 
     for producers in [1, 2, 4, 8] {
-        workloads.push(TelemetryWorkload::Concurrent { producers });
+        workloads.push(TelemetryWorkload::Concurrent {
+            producers,
+            blocking_work: blocking_work.clone(),
+        });
     }
-    workloads.push(TelemetryWorkload::EngineConcurrent);
+    workloads.push(TelemetryWorkload::EngineConcurrent { tasks });
     workloads
 }

@@ -13,6 +13,7 @@ use std::time::SystemTime;
 
 use swactor::actor::{ActorAddress, Ctx};
 use swactor::runtime::ExternalSender;
+use swactor_engine::BlockingWorkSender;
 use swactor_process::{ProcessOutputConfig, ProcessSpec, spawn_local_process};
 
 use provisioning::bootstrap::{BootstrapLogic, LogicProbe, NodeLaunchSpec};
@@ -24,14 +25,16 @@ use crate::demo::provider::{NodeManager, NodeRelayActor, NodeRuntime};
 /// [`NodeRelayActor`]; probes read that registry only — readiness is the
 /// wire announce, not a probe observation.
 pub struct LocalProcessLogic {
+    blocking: BlockingWorkSender,
     spec: NodeLaunchSpec,
     manager: NodeManager,
     process_actor: Option<ActorAddress>,
 }
 
 impl LocalProcessLogic {
-    pub fn new(spec: NodeLaunchSpec, manager: NodeManager) -> Self {
+    pub fn new(blocking: BlockingWorkSender, spec: NodeLaunchSpec, manager: NodeManager) -> Self {
         Self {
+            blocking,
             spec,
             manager,
             process_actor: None,
@@ -65,7 +68,7 @@ impl BootstrapLogic for LocalProcessLogic {
             label: self.spec.label.clone(),
         };
         let output = ProcessOutputConfig::disabled(relay);
-        let process_actor = spawn_local_process(ctx, sender, spec, output)
+        let process_actor = spawn_local_process(&self.blocking, ctx, sender, spec, output)
             .map_err(|error| format!("spawn process actor: {error}"))?;
         self.process_actor = Some(process_actor);
 

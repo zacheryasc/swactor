@@ -25,6 +25,8 @@ def main() -> None:
     root = Path(__file__).resolve().parents[2]
     source = Path(__file__).with_name("driver.rs")
     policy = Path(__file__).with_name("timing_policy.rs")
+    execution_policy = Path(__file__).with_name("execution_policy.rs")
+    myelin_time_policy = Path(__file__).with_name("myelin_time_policy.rs")
     target_root = Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
     if not target_root.is_absolute():
         target_root = root / target_root
@@ -52,7 +54,9 @@ def main() -> None:
         fail(f"cannot inspect pinned rustc: {error}")
 
     digest = hashlib.sha256(
-        source.read_bytes() + b"\0" + policy.read_bytes() + b"\0" + version.encode()
+        source.read_bytes() + b"\0" + policy.read_bytes() + b"\0"
+        + execution_policy.read_bytes() + b"\0" + myelin_time_policy.read_bytes()
+        + b"\0" + version.encode()
     ).hexdigest()[:20]
     driver = cache / f"driver-{digest}"
     lock_path = cache / "build.lock"

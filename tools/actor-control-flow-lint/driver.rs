@@ -6,20 +6,22 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_span;
 
+use std::collections::HashSet;
 use std::env;
 use std::process::ExitCode;
 
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir as hir;
-use rustc_hir::def::Res;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_interface::interface::Compiler;
-use rustc_middle::ty::{TyCtxt, TypeckResults};
-use rustc_span::{Span, symbol::Symbol};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeckResults};
+use rustc_span::{Span, symbol::{Symbol, sym}};
 
-/// Crates whose purpose is to run the actor engine or turn external I/O,
-/// process, telemetry, and provider API streams into actor observations.
-/// Adding an entry changes the architecture.
+/// Existing timer, process-I/O, and runtime-driving boundaries. These roles
+/// never authorize task/thread creation or task-capability minting. Their
+/// dependency direction remains an independent architectural restriction.
 const EXECUTION_OWNERS: &[&str] = &[
     "dashboard",
     "iroh-driver",
@@ -32,18 +34,6 @@ const EXECUTION_OWNERS: &[&str] = &[
     "telemetry",
 ];
 
-/// Test and benchmark harness packages that must not be workspace dependencies.
-const TEST_SUPPORT_OWNERS: &[&str] = &[
-    "actor-control-flow-lint-tests",
-    "myelin-e2e-fuzz",
-    "swactor-benchmarks",
-];
-
-/// Packages whose integration tests coordinate real child processes and file
-/// locks to prove cross-process admission safety. Unit builds stay governed;
-/// only `cargo test` builds of these packages use this exemption.
-const TEST_COORDINATION_OWNERS: &[&str] = &["provisioning"];
-
 /// Policy-bearing crates that must never enter an execution owner's dependency
 /// closure.
 const DOMAIN_CONTROL_CRATES: &[&str] = &["myelin", "provisioning", "xtask"];
@@ -53,11 +43,12 @@ struct Capability {
     label: &'static str,
     resolution: &'static str,
     test_wait: bool,
+    substrate: bool,
     paths: &'static [&'static str],
 }
 
-const MOVE_TO_OWNER: &str =
-    "move stream mechanics into an approved execution owner or move the decision into an actor";
+const USE_TASK_CAPABILITY: &str =
+    "receive TaskSpawner explicitly from a binary entrypoint or test composition root; raw scheduling belongs only to the engine substrate";
 const USE_ACTOR_TIMER: &str = "schedule a typed actor message through the engine; the receiving actor owns the deadline decision";
 
 /// Stable resolved item paths. These are deliberately compiler identities, not
@@ -66,46 +57,111 @@ const USE_ACTOR_TIMER: &str = "schedule a typed actor message through the engine
 const CAPABILITIES: &[Capability] = &[
     Capability {
         label: "asynchronous task spawning",
-        resolution: MOVE_TO_OWNER,
+        resolution: USE_TASK_CAPABILITY,
         test_wait: false,
+        substrate: true,
         paths: &[
             "tokio::runtime::Handle::spawn",
             "tokio::runtime::Runtime::spawn",
             "tokio::spawn",
             "tokio::task::spawn",
             "tokio::task::spawn_local",
+            "tokio::task::JoinSet::spawn",
+            "tokio::task::JoinSet::spawn_on",
+            "tokio::task::JoinSet::spawn_local",
+            "tokio::task::JoinSet::spawn_local_on",
+            "tokio::task::LocalSet::spawn_local",
+            "tokio::task::Builder::spawn",
+            "tokio::task::Builder::spawn_on",
+            "tokio::task::Builder::spawn_local",
+            "tokio::task::Builder::spawn_local_on",
         ],
     },
     Capability {
         label: "blocking task spawning",
-        resolution: MOVE_TO_OWNER,
+        resolution: USE_TASK_CAPABILITY,
         test_wait: false,
+        substrate: true,
         paths: &[
             "tokio::runtime::Handle::spawn_blocking",
             "tokio::runtime::Runtime::spawn_blocking",
             "tokio::task::spawn_blocking",
+            "tokio::task::JoinSet::spawn_blocking",
+            "tokio::task::JoinSet::spawn_blocking_on",
+        ],
+    },
+    // These helpers hide runtime spawning (including stream backpressure) or
+    // expose/install its global authority. Context-only helpers and the local
+    // TaskSpawner-based bridge do not mint execution capability.
+    Capability {
+        label: "implicit Python runtime task scheduling",
+        resolution: USE_TASK_CAPABILITY,
+        test_wait: false,
+        substrate: true,
+        paths: &[
+            "pyo3_async_runtimes::tokio::future_into_py",
+            "pyo3_async_runtimes::tokio::future_into_py_with_locals",
+            "pyo3_async_runtimes::tokio::local_future_into_py",
+            "pyo3_async_runtimes::tokio::local_future_into_py_with_locals",
+            "pyo3_async_runtimes::tokio::get_runtime",
+            "pyo3_async_runtimes::tokio::init",
+            "pyo3_async_runtimes::tokio::init_with_runtime",
+            "pyo3_async_runtimes::tokio::run",
+            "pyo3_async_runtimes::tokio::run_until_complete",
+            "pyo3_async_runtimes::tokio::into_stream_v1",
+            "pyo3_async_runtimes::tokio::into_stream_with_locals_v1",
+            "pyo3_async_runtimes::tokio::into_stream_v2",
+            "pyo3_async_runtimes::tokio::into_stream_with_locals_v2",
+            "pyo3_async_runtimes::async_std::future_into_py",
+            "pyo3_async_runtimes::async_std::future_into_py_with_locals",
+            "pyo3_async_runtimes::async_std::local_future_into_py",
+            "pyo3_async_runtimes::async_std::local_future_into_py_with_locals",
+            "pyo3_async_runtimes::async_std::run",
+            "pyo3_async_runtimes::async_std::run_until_complete",
+            "pyo3_async_runtimes::async_std::into_stream_v1",
+            "pyo3_async_runtimes::async_std::into_stream_with_locals_v1",
+            "pyo3_async_runtimes::async_std::into_stream_v2",
+            "pyo3_async_runtimes::async_std::into_stream_with_locals_v2",
+            "pyo3_async_runtimes::generic::future_into_py",
+            "pyo3_async_runtimes::generic::future_into_py_with_locals",
+            "pyo3_async_runtimes::generic::local_future_into_py",
+            "pyo3_async_runtimes::generic::local_future_into_py_with_locals",
+            "pyo3_async_runtimes::generic::run",
+            "pyo3_async_runtimes::generic::run_until_complete",
+            "pyo3_async_runtimes::generic::into_stream_v1",
+            "pyo3_async_runtimes::generic::into_stream_with_locals_v1",
+            "pyo3_async_runtimes::generic::into_stream_v2",
+            "pyo3_async_runtimes::generic::into_stream_with_locals_v2",
         ],
     },
     Capability {
         label: "engine task scheduling",
-        resolution: MOVE_TO_OWNER,
+        resolution: USE_TASK_CAPABILITY,
         test_wait: false,
-        paths: &["swactor_engine::EngineHandle::spawn"],
+        substrate: true,
+        paths: &[
+            "swactor_engine::ExecutionBackend::spawn",
+            "swactor_engine::ExecutionBackend::spawn_blocking",
+        ],
     },
     Capability {
         label: "OS thread creation",
-        resolution: MOVE_TO_OWNER,
+        resolution: USE_TASK_CAPABILITY,
         test_wait: false,
+        substrate: true,
         paths: &[
             "std::thread::Builder::spawn",
             "std::thread::Builder::spawn_unchecked",
             "std::thread::spawn",
+            "std::thread::Scope::spawn",
+            "std::thread::Builder::spawn_scoped",
         ],
     },
     Capability {
         label: "thread sleeping",
         resolution: USE_ACTOR_TIMER,
         test_wait: true,
+        substrate: false,
         paths: &[
             "std::thread::park",
             "std::thread::park_timeout",
@@ -116,6 +172,7 @@ const CAPABILITIES: &[Capability] = &[
         label: "direct timer driving",
         resolution: USE_ACTOR_TIMER,
         test_wait: false,
+        substrate: false,
         paths: &[
             "swactor_engine::EngineHandle::interval",
             "swactor_engine::EngineHandle::timer",
@@ -132,6 +189,7 @@ const CAPABILITIES: &[Capability] = &[
         label: "runtime construction or driving",
         resolution: "the actor engine owns runtime construction and progression",
         test_wait: false,
+        substrate: false,
         paths: &[
             "swactor::runtime::SingleThreadRuntime::tick",
             "swactor::runtime::SingleThreadRuntime::try_tick",
@@ -147,6 +205,7 @@ const CAPABILITIES: &[Capability] = &[
         label: "blocking receive used as a controller",
         resolution: "receive observations in an actor; tests may use a bounded observation wait",
         test_wait: true,
+        substrate: false,
         paths: &[
             "crossbeam_channel::channel::Receiver::recv",
             "crossbeam_channel::channel::Receiver::recv_deadline",
@@ -162,6 +221,7 @@ const CAPABILITIES: &[Capability] = &[
         label: "process creation",
         resolution: "send a command to the process I/O owner and return exit/output observations to an actor",
         test_wait: false,
+        substrate: false,
         paths: &[
             "std::process::Child::kill",
             "std::process::Child::try_wait",
@@ -183,6 +243,8 @@ const CAPABILITIES: &[Capability] = &[
 ];
 
 include!("timing_policy.rs");
+include!("execution_policy.rs");
+include!("myelin_time_policy.rs");
 struct ActorControlFlowCallbacks {
     package: String,
     test_build: bool,
@@ -191,9 +253,10 @@ struct ActorControlFlowCallbacks {
 
 impl Callbacks for ActorControlFlowCallbacks {
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let role_exempt = TEST_SUPPORT_OWNERS.contains(&self.package.as_str())
-            || EXECUTION_OWNERS.contains(&self.package.as_str())
-            || (self.test_build && TEST_COORDINATION_OWNERS.contains(&self.package.as_str()));
+        if self.package == "myelin" {
+            check_myelin_time_declarations(tcx);
+        }
+        let execution_policy = ExecutionPolicy::collect(tcx, self.test_build);
         if EXECUTION_OWNERS.contains(&self.package.as_str()) {
             check_owner_dependencies(tcx, &self.package);
         }
@@ -206,8 +269,13 @@ impl Callbacks for ActorControlFlowCallbacks {
                 typeck,
                 package: &self.package,
                 caller: tcx.def_path_str(owner.to_def_id()),
-                role_exempt,
-                test_build: self.test_build,
+                owner,
+                nonexecution_owner: EXECUTION_OWNERS.contains(&self.package.as_str()),
+                test_root: execution_policy.is_test_root(tcx, owner),
+                minting_root: execution_policy.is_composition_root(tcx, owner),
+                actor_handler: execution_policy.is_actor_handler(tcx, owner),
+                execution_policy: &execution_policy,
+                reported_actor_capability: false,
                 trace: self.trace,
                 timing_counts: Vec::new(),
             };
@@ -235,14 +303,34 @@ struct CapabilityVisitor<'a, 'tcx> {
     typeck: &'tcx TypeckResults<'tcx>,
     package: &'a str,
     caller: String,
-    role_exempt: bool,
-    test_build: bool,
+    owner: LocalDefId,
+    nonexecution_owner: bool,
+    test_root: bool,
+    minting_root: bool,
+    actor_handler: bool,
+    execution_policy: &'a ExecutionPolicy,
+    reported_actor_capability: bool,
     trace: bool,
     timing_counts: Vec<(String, usize)>,
 }
 
 impl<'tcx> Visitor<'tcx> for CapabilityVisitor<'_, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        if let Some(ty) = self.typeck.expr_ty_opt(expr) {
+            if self.package == "myelin" {
+                check_myelin_time_type(self.tcx, ty, expr.span);
+            }
+            if self.actor_handler && !self.reported_actor_capability
+                && contains_task_spawner(self.tcx, self.owner, ty)
+            {
+                self.reported_actor_capability = true;
+                self.tcx.dcx().span_err(
+                    expr.span,
+                    "actor task-capability violation: TaskSpawner must not be introduced inside an actor handler",
+                );
+            }
+            self.execution_policy.check_actor_instance(self.tcx, self.owner, ty, expr.span);
+        }
         match &expr.kind {
             hir::ExprKind::MethodCall(..) => {
                 if let Some(def_id) = self.typeck.type_dependent_def_id(expr.hir_id) {
@@ -251,6 +339,19 @@ impl<'tcx> Visitor<'tcx> for CapabilityVisitor<'_, 'tcx> {
             }
             hir::ExprKind::Path(qpath) => {
                 if let Res::Def(_, def_id) = self.typeck.qpath_res(qpath, expr.hir_id) {
+                    if is_engine_method(self.tcx, def_id, "Engine", "task_spawner")
+                        && !matches!(
+                            self.tcx.parent_hir_node(expr.hir_id),
+                            hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Call(callee, _), .. })
+                                if callee.hir_id == expr.hir_id
+                        )
+                    {
+                        self.tcx.dcx().span_err(
+                            expr.span,
+                            "task-capability minting violation: Engine::task_spawner must be called directly at a composition root, not exported as a function value",
+                        );
+                        return;
+                    }
                     self.check(def_id, expr.span);
                 }
             }
@@ -265,6 +366,11 @@ impl CapabilityVisitor<'_, '_> {
         let path = self.tcx.def_path_str(def_id);
         let normalized_path = normalize_def_path(&path);
         let item_name = self.tcx.item_name(def_id);
+        if self.package == "myelin" && myelin_timing_api(&normalized_path) {
+            self.tcx.dcx().span_err(span, format!(
+                "Myelin no-time policy: timing API `{normalized_path}` is forbidden; consume readiness/completion events or explicit cancellation instead"));
+            return;
+        }
         if self.trace && is_candidate_name(item_name) {
             eprintln!(
                 "actor-control-flow trace: package=`{}` caller=`{}` callee=`{path}`",
@@ -272,6 +378,15 @@ impl CapabilityVisitor<'_, '_> {
             );
         }
 
+        if is_engine_method(self.tcx, def_id, "Engine", "task_spawner")
+            && !self.minting_root
+        {
+            self.tcx.dcx().span_err(
+                span,
+                "task-capability minting violation: Engine::task_spawner is restricted to a compiler-identified binary entrypoint or test composition root; pass TaskSpawner explicitly to helpers",
+            );
+            return;
+        }
         if GUARDED_TIMING_ITEMS.contains(&item_name.as_str()) {
             let occurrence = self.next_timing_occurrence(&normalized_path);
             let allowance = TIMING_ALLOWANCES.iter().find(|allowance| {
@@ -303,14 +418,27 @@ impl CapabilityVisitor<'_, '_> {
             return;
         }
 
+        let backend_scheduling = is_backend_scheduling(self.tcx, def_id);
+        let python_runtime_scheduling = is_python_runtime_scheduling(self.tcx, def_id);
         let Some(capability) = CAPABILITIES
             .iter()
-            .find(|capability| capability.paths.contains(&normalized_path.as_str()))
+            .find(|capability| {
+                capability.paths.contains(&normalized_path.as_str())
+                    || (backend_scheduling && capability.label == "engine task scheduling")
+                    || (python_runtime_scheduling
+                        && capability.label == "implicit Python runtime task scheduling")
+            })
         else {
             return;
         };
 
-        if self.role_exempt || (self.test_build && capability.test_wait) {
+        if capability.substrate {
+            if trusted_substrate_call(self.tcx, self.owner, def_id, &normalized_path) {
+                return;
+            }
+        } else if self.nonexecution_owner
+            || (self.test_root && (capability.test_wait || capability.label == "process creation"))
+        {
             return;
         }
 
@@ -371,6 +499,19 @@ fn is_candidate_name(name: Symbol) -> bool {
             name.as_str(),
             "block_on"
                 | "blocking_recv"
+                | "future_into_py"
+                | "future_into_py_with_locals"
+                | "local_future_into_py"
+                | "local_future_into_py_with_locals"
+                | "get_runtime"
+                | "init"
+                | "init_with_runtime"
+                | "run"
+                | "run_until_complete"
+                | "into_stream_v1"
+                | "into_stream_with_locals_v1"
+                | "into_stream_v2"
+                | "into_stream_with_locals_v2"
                 | "has_work"
                 | "interval"
                 | "interval_at"
@@ -380,6 +521,7 @@ fn is_candidate_name(name: Symbol) -> bool {
                 | "spawn"
                 | "spawn_blocking"
                 | "spawn_local"
+                | "task_spawner"
                 | "tick"
                 | "timer"
                 | "try_tick"

@@ -1,0 +1,18 @@
+[package]
+name = "fail-python-runtime"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+direct = []
+aliased-helper = []
+with-locals = []
+runtime-access = []
+runtime-spawn = []
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py312"] }
+runtime-api = { package = "pyo3-async-runtimes", version = "0.23", features = ["tokio-runtime"] }
+
+[workspace]

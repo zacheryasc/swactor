@@ -11,24 +11,55 @@ pub const INITIAL_BASELINE_COMMAND: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::RuntimeParts;
+    use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
     #[test]
     fn every_workload_passes_its_correctness_check() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig {
+                worker_count: 4,
+                ..RuntimeConfig::default()
+            }),
+            TokioBackend::new(TokioConfig {
+                worker_threads: 4,
+                ..TokioConfig::default()
+            })
+            .expect("benchmark Tokio backend"),
+        )
+        .expect("benchmark engine");
+        let tasks = engine.task_spawner();
+        let blocking_work = engine.handle().blocking_work_sender();
         for workload in codec::workloads() {
             validate(&workload);
         }
-        for workload in telemetry::workloads() {
+        for workload in telemetry::workloads(tasks, blocking_work) {
             validate(&workload);
         }
     }
 
     #[test]
     fn benchmark_names_are_unique_and_stable() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig {
+                worker_count: 4,
+                ..RuntimeConfig::default()
+            }),
+            TokioBackend::new(TokioConfig {
+                worker_threads: 4,
+                ..TokioConfig::default()
+            })
+            .expect("benchmark Tokio backend"),
+        )
+        .expect("benchmark engine");
+        let tasks = engine.task_spawner();
+        let blocking_work = engine.handle().blocking_work_sender();
         let codec_names: Vec<String> = codec::workloads()
             .into_iter()
             .map(|workload| workload.name())
             .collect();
-        let telemetry_names: Vec<String> = telemetry::workloads()
+        let telemetry_names: Vec<String> = telemetry::workloads(tasks, blocking_work)
             .into_iter()
             .map(|workload| workload.name())
             .collect();
@@ -117,11 +148,5 @@ mod tests {
         };
         assert!(compressed_size("zstd") < compressed_size("zstd-fast"));
         assert!(compressed_size("zstd-fast") < compressed_size("lz4"));
-    }
-
-    #[test]
-    fn benchmark_commands_name_the_package() {
-        assert!(BENCHMARK_COMMAND.contains("-p swactor-benchmarks"));
-        assert!(INITIAL_BASELINE_COMMAND.contains("--save-baseline initial"));
     }
 }

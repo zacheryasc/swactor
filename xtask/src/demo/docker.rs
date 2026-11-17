@@ -23,6 +23,7 @@ use std::time::SystemTime;
 
 use swactor::actor::{ActorAddress, Ctx};
 use swactor::runtime::ExternalSender;
+use swactor_engine::BlockingWorkSender;
 use swactor_process::{ProcessOutputConfig, ProcessSpec, spawn_local_process};
 
 use provisioning::bootstrap::{BootstrapLogic, LogicProbe, NodeLaunchSpec};
@@ -65,6 +66,7 @@ pub fn container_name(attempt: u64) -> String {
 /// container is force-removed on every terminal path (terminate, exit,
 /// spawn failure, deregistration) so it can never outlive the attempt.
 pub struct DockerProcessLogic {
+    blocking: BlockingWorkSender,
     spec: NodeLaunchSpec,
     manager: NodeManager,
     process_actor: Option<ActorAddress>,
@@ -74,8 +76,9 @@ pub struct DockerProcessLogic {
 }
 
 impl DockerProcessLogic {
-    pub fn new(spec: NodeLaunchSpec, manager: NodeManager) -> Self {
+    pub fn new(blocking: BlockingWorkSender, spec: NodeLaunchSpec, manager: NodeManager) -> Self {
         Self {
+            blocking,
             spec,
             manager,
             process_actor: None,
@@ -98,6 +101,7 @@ impl DockerProcessLogic {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         swactor_process::spawn_detached_command_status(
+            &self.blocking,
             command,
             format!("demo: docker rm -f {name} failed"),
         );
@@ -130,7 +134,7 @@ impl BootstrapLogic for DockerProcessLogic {
             label: self.spec.label.clone(),
         };
         let output = ProcessOutputConfig::disabled(relay);
-        let process_actor = spawn_local_process(ctx, sender, spec, output)
+        let process_actor = spawn_local_process(&self.blocking, ctx, sender, spec, output)
             .map_err(|error| format!("spawn docker process actor: {error}"))?;
         self.process_actor = Some(process_actor);
 
@@ -323,7 +327,10 @@ pub fn sweep_run(launch: &DockerLaunch) {
 
 /// Build the scratch image: stage the static binary + Dockerfile in a temp
 /// dir (keeps the build context to one file), then `docker build`.
+/// Compiler policy contracts qualify every image build, including when the
+/// static binary is reused from a previous build.
 fn build_image(root: &Path, image: &str) -> Result<(), String> {
+    crate::run_compiler_contracts(root)?;
     println!("demo --docker: building static node binary…");
     let bin = root
         .join("target")

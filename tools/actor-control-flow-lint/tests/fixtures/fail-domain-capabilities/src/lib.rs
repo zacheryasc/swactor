@@ -1,14 +1,14 @@
 
 use std::thread::sleep as renamed_sleep;
 use std::time::Duration;
-use swactor_engine::EngineHandle;
+use swactor_engine::{EngineHandle, ExecutionBackend};
 
 fn local_sleep_wrapper() {
     renamed_sleep(Duration::from_millis(1));
 }
 
-fn forbidden_engine_controls(handle: &EngineHandle) {
-    handle.spawn(async {});
+fn forbidden_engine_controls(handle: &EngineHandle, backend: &dyn ExecutionBackend) {
+    backend.spawn(Box::pin(async {}));
     handle.timer(Duration::from_millis(1));
 }
 

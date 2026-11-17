@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, Runtime};
+use swactor_engine::BlockingWorkSender;
 
 use crate::demo::feed::SupervisorMsg;
 
@@ -23,11 +24,15 @@ impl ActorInterface for ControlForwarder {
 }
 
 /// Wire the dashboard control channel to a typed actor relay.
-pub fn install(runtime: &Runtime, supervisor: Arc<OnceLock<ActorAddress>>) {
+pub fn install(
+    blocking: &BlockingWorkSender,
+    runtime: &Runtime,
+    supervisor: Arc<OnceLock<ActorAddress>>,
+) -> std::io::Result<dashboard::control::ActorSinkGuard> {
     let actor = runtime
         .spawn(ControlForwarder { supervisor })
         .expect("spawn dashboard control forwarder actor");
-    dashboard::control::install_actor_sink(runtime.create_sender(), actor);
+    dashboard::control::install_actor_sink(blocking, runtime.create_sender(), actor)
 }
 
 #[cfg(test)]

@@ -18,6 +18,28 @@ impl ActorInterface for Child {
     fn handle(&mut self, _ctx: &Ctx, _message: Tick) {}
 }
 
+#[derive(Clone)]
+struct ClockActor {
+    clock: EngineHandle,
+    sender: ExternalSender,
+    next: ActorAddress,
+}
+
+impl ActorInterface for ClockActor {
+    type Incoming = Tick;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, message: Tick) {
+        let _now = self.clock.now();
+        self.clock.send_after(
+            Duration::from_millis(1),
+            self.sender.clone(),
+            self.next,
+            message,
+        );
+    }
+}
+
 pub struct Parent;
 
 impl Parent {

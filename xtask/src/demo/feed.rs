@@ -413,6 +413,9 @@ impl SupervisorActor {
             reporter,
             sender: self.sender.clone(),
             collector: Some(std::sync::Arc::clone(&self.collector)),
+            transitions: Some(protocol_telemetry::TransitionEmitter::register(
+                &self.telemetry.producer,
+            )),
             probe_period: provisioning::DEFAULT_PROBE_PERIOD,
             spec: spec.clone(),
         };
@@ -1227,7 +1230,7 @@ impl SupervisorActor {
             return;
         }
         if let Ok(bytes) = serde_json::to_vec(&provision) {
-            self.driver_handle.driver.send_tagged_gossip(
+            self.driver_handle.gossip.send_tagged_gossip(
                 peer,
                 edge::EDGE_PROVISION_TAG.as_bytes(),
                 bytes,
@@ -1655,11 +1658,14 @@ mod properties {
                     channels: Vec::new(),
                 },
             );
-            let io_driver = crate::demo::shared_test_driver();
+            let (gossip, _gossip_requests) = crate::demo::GossipSender::channel();
+            let endpoint_addr = iroh::EndpointAddr::new(
+                iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            );
             let driver_handle = Arc::new(crate::demo::DemoDriverHandle {
-                supervisor_addr_json: serde_json::to_string(&io_driver.endpoint_addr())
+                supervisor_addr_json: serde_json::to_string(&endpoint_addr)
                     .expect("serialize generated supervisor endpoint"),
-                driver: io_driver,
+                gossip,
             });
             let shape = ClusterShape {
                 run_id: RunId(1),
@@ -1842,7 +1848,7 @@ mod properties {
                                 logical_node: format!("node-{attempt}"),
                                 key_hex: format!("{attempt:016x}"),
                                 endpoint_addr_json: serde_json::to_string(
-                                    &crate::demo::shared_test_driver().endpoint_addr(),
+                                    &endpoint_addr,
                                 )
                                 .expect("serialize generated announce endpoint"),
                                 at_ms: index as u64 + 1,

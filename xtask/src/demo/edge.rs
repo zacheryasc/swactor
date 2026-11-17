@@ -2,7 +2,7 @@
 //!
 //! Supervisor side: one [`EdgeSession`] per established edge — an
 //! `EdgeRuntime` (outbound) with its own arena and a recorder worker,
-//! polled on the supervisor tick. Node side: [`NodeEdgeAgent`] — the actor
+//! polled by the edge actor. Node side: [`NodeEdgeAgent`] — the actor
 //! the node's actor bridge routes `EdgeProvision` gossip to; it provisions
 //! the node's (single) inbound edge, polls it, mirrors observations onto
 //! the `node.edge` telemetry channel, and answers control-plane
@@ -23,10 +23,10 @@ use data_plane::edge_lifecycle::{
 };
 pub use data_plane::edge_runtime::Observation;
 use data_plane::edge_runtime::{EdgeRuntime, LoadedObject, WorkerPort};
-use data_plane::edge_wire::EdgeTransport;
 use data_plane::ids::{EdgeId, ExecutionId};
 use data_plane::object_record::{self, ObjectRecord};
 use iroh::EndpointAddr;
+use iroh_driver::IrohEdgePort;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
 use swactor_engine::EngineHandle;
@@ -41,8 +41,6 @@ pub const EDGE_ACK_TAG: &str = "xtask_demo/EdgeAck/1";
 pub const NODE_EDGE_CHANNEL: &str = "node.edge";
 /// How long a supervisor session waits for an ack before faulting.
 pub const PROVISION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
-/// Upper bound on one edge connect handshake before the session faults.
-pub const EDGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Provision gossip retry period.
 pub const PROVISION_RETRY_PERIOD: Duration = Duration::from_secs(1);
@@ -106,33 +104,6 @@ pub fn unix_ms(now: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-// ─── Shared transport ───────────────────────────────────────────────────────
-
-/// `EdgeTransport` over a shared driver: outbound writers are driver-owned
-/// send pumps (`&self` through the Arc); inbound events drain the shared
-/// edge-event queue. Supervisor sessions (all outbound) and the node agent
-/// (single inbound) both use this — outbound-only pollers never race on
-/// `drain_events` because inbound events only exist where edges are
-/// accepted.
-pub struct DriverTransport(pub Arc<iroh_driver::IrohDriver>);
-impl EdgeTransport for DriverTransport {
-    type Writer = iroh_driver::EdgeSendHandle;
-    type PeerAddr = EndpointAddr;
-
-    fn open_writer(
-        &mut self,
-        edge_id: EdgeId,
-        peer: &EndpointAddr,
-    ) -> Result<Self::Writer, String> {
-        self.0
-            .spawn_edge_send_pump_timeout(peer.clone(), edge_id.0, EDGE_CONNECT_TIMEOUT)
-    }
-
-    fn drain_events(&mut self) -> Vec<data_plane::edge_wire::WireEvent> {
-        self.0.drain_edge_events()
-    }
-}
-
 // ─── Recorder worker ────────────────────────────────────────────────────────
 
 /// A `WorkerPort` that records effects instead of touching a GPU: the demo
@@ -182,7 +153,7 @@ pub struct EdgeSession {
     pub attempt: u64,
     pub logical_node: String,
     pub peer: EndpointAddr,
-    runtime: EdgeRuntime<DriverTransport>,
+    runtime: EdgeRuntime<IrohEdgePort>,
     arena: ArenaManager,
     worker: DemoWorkerPort,
     /// Node ack outcome, once its gossip landed.
@@ -226,14 +197,10 @@ impl EdgeSession {
     }
 
     /// One poll: drive the lifecycle; return new observations.
-    pub fn poll(
-        &mut self,
-        driver: &Arc<iroh_driver::IrohDriver>,
-    ) -> (Vec<Observation>, Option<String>) {
-        let mut transport = DriverTransport(Arc::clone(driver));
+    pub fn poll(&mut self, transport: &mut IrohEdgePort) -> (Vec<Observation>, Option<String>) {
         let result = self
             .runtime
-            .poll(&mut transport, &mut self.arena, &mut self.worker);
+            .poll(transport, &mut self.arena, &mut self.worker);
         let observations = self.runtime.take_observations();
         for observation in &observations {
             if matches!(observation, Observation::EdgeReady { .. }) {
@@ -302,7 +269,8 @@ pub struct EdgePumpUpdate {
 struct EdgePumpActor {
     engine: EngineHandle,
     sender: ExternalSender,
-    driver: Arc<iroh_driver::IrohDriver>,
+    transport: IrohEdgePort,
+    gossip: super::GossipSender,
     supervisor: Arc<std::sync::OnceLock<ActorAddress>>,
     sessions: Vec<EdgeSession>,
 }
@@ -365,7 +333,7 @@ impl ActorInterface for EdgePumpActor {
             EdgePumpCmd::Tick => {
                 let mut update = EdgePumpUpdate::default();
                 for session in &mut self.sessions {
-                    pump_one(session, &self.driver, &mut update);
+                    pump_one(session, &mut self.transport, &self.gossip, &mut update);
                 }
                 update.states = self.sessions.iter().map(session_state_json).collect();
                 if let Some(supervisor) = self.supervisor.get() {
@@ -383,7 +351,8 @@ impl ActorInterface for EdgePumpActor {
 pub fn start_edge_pump(
     runtime: &Runtime,
     engine: EngineHandle,
-    driver: Arc<iroh_driver::IrohDriver>,
+    transport: IrohEdgePort,
+    gossip: super::GossipSender,
     sender: ExternalSender,
     supervisor: Arc<std::sync::OnceLock<ActorAddress>>,
 ) -> Result<ActorAddress, String> {
@@ -391,7 +360,8 @@ pub fn start_edge_pump(
         .spawn(EdgePumpActor {
             engine,
             sender,
-            driver,
+            transport,
+            gossip,
             supervisor,
             sessions: Vec::new(),
         })
@@ -410,7 +380,8 @@ fn session_state_json(session: &EdgeSession) -> serde_json::Value {
 
 fn pump_one(
     session: &mut EdgeSession,
-    driver: &Arc<iroh_driver::IrohDriver>,
+    transport: &mut IrohEdgePort,
+    gossip: &super::GossipSender,
     update: &mut EdgePumpUpdate,
 ) {
     // Retry the provision gossip until the node acks (the node re-acks
@@ -437,7 +408,7 @@ fn pump_one(
             ));
         } else if since_send >= PROVISION_RETRY_PERIOD.as_millis() as u64 {
             if let Ok(bytes) = serde_json::to_vec(&session.provision()) {
-                driver.send_tagged_gossip(
+                gossip.send_tagged_gossip(
                     session.peer.clone(),
                     EDGE_PROVISION_TAG.as_bytes(),
                     bytes,
@@ -446,7 +417,7 @@ fn pump_one(
             session.last_send = SystemTime::now();
         }
     }
-    let (observations, error) = session.poll(driver);
+    let (observations, error) = session.poll(transport);
     for observation in &observations {
         match observation {
             Observation::EdgeReady { .. } => update.feed.push((
@@ -489,13 +460,11 @@ pub struct NodeEdgeAgent {
     attempt: u64,
     logical_node: String,
     supervisor_addr: EndpointAddr,
-    /// Filled right after the driver is Arc-wrapped (the bridge setup
-    /// needs `&mut` on the driver first; same pattern as the supervisor
-    /// slot).
-    driver_slot: Arc<std::sync::OnceLock<Arc<iroh_driver::IrohDriver>>>,
+    transport: IrohEdgePort,
+    gossip: super::GossipSender,
     producer: TelemetryProducer,
     edge_channel: telemetry::ChannelId,
-    runtime: EdgeRuntime<DriverTransport>,
+    runtime: EdgeRuntime<IrohEdgePort>,
     arena: ArenaManager,
     worker: DemoWorkerPort,
     edge_id: Option<EdgeId>,
@@ -507,7 +476,8 @@ impl NodeEdgeAgent {
         attempt: u64,
         logical_node: String,
         supervisor_addr: EndpointAddr,
-        driver_slot: Arc<std::sync::OnceLock<Arc<iroh_driver::IrohDriver>>>,
+        transport: IrohEdgePort,
+        gossip: super::GossipSender,
         producer: TelemetryProducer,
         edge_channel: telemetry::ChannelId,
     ) -> Self {
@@ -515,7 +485,8 @@ impl NodeEdgeAgent {
             attempt,
             logical_node,
             supervisor_addr,
-            driver_slot,
+            transport,
+            gossip,
             producer,
             edge_channel,
             runtime: EdgeRuntime::new(NodeId(attempt)),
@@ -527,9 +498,6 @@ impl NodeEdgeAgent {
     }
 
     fn send_ack(&self, outcome: &str) {
-        let Some(driver) = self.driver_slot.get() else {
-            return;
-        };
         let ack = EdgeAck {
             attempt: self.attempt,
             edge_id: self.edge_id.map(|edge| edge.0).unwrap_or(0),
@@ -539,7 +507,11 @@ impl NodeEdgeAgent {
         let Ok(bytes) = serde_json::to_vec(&ack) else {
             return;
         };
-        driver.send_tagged_gossip(self.supervisor_addr.clone(), EDGE_ACK_TAG.as_bytes(), bytes);
+        self.gossip.send_tagged_gossip(
+            self.supervisor_addr.clone(),
+            EDGE_ACK_TAG.as_bytes(),
+            bytes,
+        );
     }
 
     fn submit_observation(&self, observation: &Observation) {
@@ -636,16 +608,12 @@ impl NodeEdgeAgent {
     /// One poll pass: drive the runtime, mirror observations, ack
     /// readiness/fault once (or again if the runtime was rebuilt).
     fn pump(&mut self) {
-        let Some(driver) = self.driver_slot.get().cloned() else {
-            return;
-        };
         if self.edge_id.is_none() {
             return;
         }
-        let mut transport = DriverTransport(driver);
         let result = self
             .runtime
-            .poll(&mut transport, &mut self.arena, &mut self.worker);
+            .poll(&mut self.transport, &mut self.arena, &mut self.worker);
         let observations = self.runtime.take_observations();
         let mut ready = false;
         let mut fault: Option<String> = result.err();

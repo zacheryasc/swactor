@@ -1,8 +1,8 @@
 //! Node role: a real swactor runtime that joins the supervisor over iroh.
 //!
 //! Re-exec'd from the xtask binary by the demo provider (local process kind)
-//! or launched as the entrypoint of the demo docker image. Builds an engine +
-//! `IrohDriver` (relay disabled), joins the supervisor's endpoint, and then
+//! or launched as the entrypoint of the demo docker image. Receives the engine
+//! and task capability from `main`, builds an `IrohDriver` (relay disabled), and
 //! **announces itself over the control plane**: a tagged gossip frame
 //! ([`ANNOUNCE_TAG`]) carrying the provision attempt token, its iroh node
 //! key, and its advertised endpoint address. The supervisor's announce relay
@@ -25,9 +25,8 @@ use std::time::Duration;
 use iroh::RelayMode;
 use serde_json::json;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
-use swactor::config::RuntimeConfig;
-use swactor::runtime::{ExternalSender, RuntimeParts};
-use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor::runtime::{ExternalSender, Runtime};
+use swactor_engine::{ActorCompletion, Engine, EngineHandle, TaskSpawner};
 
 use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, spawn_pull_server};
@@ -63,8 +62,6 @@ pub struct NodeAnnounce {
 /// connections.
 const PULL_POLL_PERIOD: Duration = Duration::from_millis(200);
 
-/// Idle sleep for the pull answer writer between subscription batches.
-const WRITER_IDLE: Duration = Duration::from_millis(100);
 
 /// Number of beat actors on the node — real actors whose message flow keeps
 /// the `runtime.actors` roster visibly alive.
@@ -73,25 +70,24 @@ const BEAT_ACTORS: u64 = 2;
 /// Run the node role. `supervisor_addr_json` is a serde-serialized
 /// `iroh::EndpointAddr` of the supervisor's iroh endpoint; `attempt` is the
 /// provision attempt token echoed back in every announce.
-pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), String> {
+pub fn run_node_role(
+    supervisor_addr_json: &str,
+    attempt: u64,
+    runtime: Runtime,
+    engine: Engine,
+    tasks: TaskSpawner,
+) -> Result<(), String> {
     install_parent_death_signal()?;
     let supervisor_addr: iroh::EndpointAddr = serde_json::from_str(supervisor_addr_json)
         .map_err(|error| format!("invalid supervisor endpoint address: {error}"))?;
     let logical_node = std::env::var("DEMO_NODE_ID").unwrap_or_else(|_| "node".to_owned());
-
-    let parts = RuntimeParts::new(RuntimeConfig::default());
-    let runtime = parts.runtime().clone();
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig::default()).map_err(|error| format!("backend: {error}"))?,
-    )
-    .map_err(|error| format!("engine: {error}"))?;
 
     // Bind the driver, then keep it alive for the process lifetime: dropping
     // it closes the endpoint. The endpoint must advertise TELEMETRY_ALPN so
     // the supervisor's pull connection can negotiate it, and EDGE_ALPN so
     // the supervisor's data-plane edges can dial in.
     let mut driver = IrohDriver::with_engine(
+        tasks.clone(),
         engine.handle(),
         IrohDriverConfig {
             secret_key: None,
@@ -121,12 +117,6 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         16,
     );
     let producer = endpoint.producer();
-    let actors_channel = endpoint.register_channel(
-        "runtime.actors",
-        ChannelContent::JsonRecord {
-            schema: Some("runtime.actors".to_owned()),
-        },
-    );
     let status_channel = endpoint.register_channel(
         "node.status",
         ChannelContent::JsonRecord {
@@ -139,7 +129,7 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
             schema: Some("demo.node.beat.v1".to_owned()),
         },
     );
-    runtime.set_stats_hook(producer.stats_hook_on(actors_channel));
+    runtime.set_stats_hook(producer.stats_hook());
 
     // Data-plane edge agent: owns this node's (single) inbound edge. The
     // supervisor provisions it over the control plane (tagged gossip
@@ -152,14 +142,14 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
             schema: Some("demo.node.edge.v1".to_owned()),
         },
     );
-    let driver_slot: Arc<std::sync::OnceLock<Arc<IrohDriver>>> =
-        Arc::new(std::sync::OnceLock::new());
+    let (gossip, gossip_requests) = super::GossipSender::channel();
     let edge_agent = runtime
         .spawn(edge::NodeEdgeAgent::new(
             attempt,
             logical_node.clone(),
             supervisor_addr.clone(),
-            driver_slot.clone(),
+            driver.edge_port(),
+            gossip.clone(),
             producer.clone(),
             edge_channel,
         ))
@@ -191,10 +181,10 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
             route_view,
             outbox,
         });
-        driver.install_actor_bridge_pump(Duration::from_millis(250));
+        driver.install_actor_bridge();
     }
     let driver = Arc::new(driver);
-    let _ = driver_slot.set(Arc::clone(&driver));
+    super::GossipSender::serve(&tasks, Arc::clone(&driver), gossip_requests);
     // The node serves telemetry pulls itself (spawn_pull_server): keep
     // TELEMETRY_ALPN connections out of the driver-owned ingress so the
     // serve loop below can drain them.
@@ -225,18 +215,24 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
     // Serve telemetry pulls: accepted TELEMETRY_ALPN connections answer with
     // this endpoint's subscription stream.
     let telemetry_endpoint = Arc::new(endpoint);
+    let telemetry_wake = start_telemetry_server(
+        &tasks,
+        Arc::clone(&driver),
+        Arc::clone(&telemetry_endpoint),
+    );
     let completion = ActorCompletion::new();
     let runtime_actor = NodeRuntimeActor {
         engine: engine.handle(),
         sender: runtime.create_sender(),
         edge_agent,
-        driver: Arc::clone(&driver),
+        gossip,
         attempt,
         supervisor_addr,
         logical_node,
         node_hex,
         endpoint_addr_json: addr_json,
         endpoint: Arc::clone(&telemetry_endpoint),
+        telemetry_wake,
         producer,
         status_channel,
         beats: beat_addrs
@@ -257,12 +253,39 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         })
         .map_err(|error| format!("spawn node stop actor: {error}"))?;
     #[cfg(target_os = "linux")]
-    swactor_process::spawn_os_stop_signal_wait(runtime.create_sender(), stop_actor)
-        .map_err(|error| format!("install node stop signal handler: {error}"))?;
+    swactor_process::spawn_os_stop_signal_wait(
+        &engine.handle().blocking_work_sender(),
+        runtime.create_sender(),
+        stop_actor,
+    )
+    .map_err(|error| format!("install node stop signal handler: {error}"))?;
 
     // The actor owns lifecycle; the entrypoint waits only for its terminal signal.
     completion.wait();
     Ok(())
+}
+
+/// Telemetry connections and their tasks belong to this execution owner,
+/// never to the runtime actor that publishes telemetry records.
+fn start_telemetry_server(
+    tasks: &TaskSpawner,
+    driver: Arc<IrohDriver>,
+    endpoint: Arc<TelemetryEndpoint>,
+) -> tokio::sync::mpsc::Sender<()> {
+    let (wake, mut requests) = tokio::sync::mpsc::channel(1);
+    let owner_tasks = tasks.clone();
+    tasks.spawn(async move {
+        while requests.recv().await.is_some() {
+            for (_node, connection) in driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
+                spawn_pull_server(
+                    &owner_tasks,
+                    connection,
+                    Arc::clone(&endpoint),
+                );
+            }
+        }
+    });
+    wake
 }
 
 #[derive(Clone, Debug)]
@@ -280,12 +303,13 @@ struct NodeRuntimeActor {
     sender: ExternalSender,
     attempt: u64,
     edge_agent: ActorAddress,
-    driver: Arc<IrohDriver>,
+    gossip: super::GossipSender,
     supervisor_addr: iroh::EndpointAddr,
     logical_node: String,
     node_hex: String,
     endpoint_addr_json: String,
     endpoint: Arc<TelemetryEndpoint>,
+    telemetry_wake: tokio::sync::mpsc::Sender<()>,
     producer: TelemetryProducer,
     status_channel: telemetry::ChannelId,
     beats: Vec<(ActorAddress, Duration)>,
@@ -331,7 +355,7 @@ impl ActorInterface for NodeRuntimeActor {
                     at_ms: unix_ms(),
                 };
                 if let Ok(bytes) = serde_json::to_vec(&announce) {
-                    self.driver.send_tagged_gossip(
+                    self.gossip.send_tagged_gossip(
                         self.supervisor_addr.clone(),
                         ANNOUNCE_TAG.as_bytes(),
                         bytes,
@@ -362,14 +386,7 @@ impl ActorInterface for NodeRuntimeActor {
             }
             NodeRuntimeMsg::PullTelemetry => {
                 let _ = self.endpoint.tick();
-                for (_node, connection) in self.driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
-                    spawn_pull_server(
-                        &self.engine,
-                        connection,
-                        Arc::clone(&self.endpoint),
-                        WRITER_IDLE,
-                    );
-                }
+                let _ = self.telemetry_wake.try_send(());
                 self.schedule(ctx, PULL_POLL_PERIOD, NodeRuntimeMsg::PullTelemetry);
             }
             NodeRuntimeMsg::Stop => {
@@ -558,8 +575,10 @@ mod properties {
             let backend = SteppingBackend::new();
             let engine =
                 Engine::new(parts, backend.clone()).expect("one-worker node stepping engine");
-            let driver = crate::demo::shared_test_driver();
-            let supervisor_addr = driver.endpoint_addr();
+            let (gossip, _gossip_requests) = crate::demo::GossipSender::channel();
+            let supervisor_addr = iroh::EndpointAddr::new(
+                iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            );
             let endpoint = Arc::new(TelemetryEndpoint::with_descriptor(
                 telemetry::frame::StreamDescriptor {
                     stream: telemetry::frame::StreamId::new(
@@ -584,19 +603,21 @@ mod properties {
                 .new_inbox::<edge::NodeEdgeMsg>()
                 .expect("create generated node edge inbox");
             let completion = ActorCompletion::new();
+            let (telemetry_wake, _telemetry_requests) = tokio::sync::mpsc::channel(1);
             let runtime_actor = runtime
                 .spawn(NodeRuntimeActor {
                     engine: engine.handle(),
                     sender: runtime.create_sender(),
                     attempt,
                     edge_agent: *edge_inbox.addr(),
-                    driver: Arc::clone(&driver),
-                    supervisor_addr,
+                    gossip,
+                    supervisor_addr: supervisor_addr.clone(),
                     logical_node: format!("node-{attempt}"),
                     node_hex: format!("{attempt:016x}"),
-                    endpoint_addr_json: serde_json::to_string(&driver.endpoint_addr())
+                    endpoint_addr_json: serde_json::to_string(&supervisor_addr)
                         .expect("serialize generated node endpoint"),
                     endpoint: Arc::clone(&endpoint),
+                    telemetry_wake,
                     producer,
                     status_channel,
                     beats: Vec::new(),
