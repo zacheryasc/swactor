@@ -6,7 +6,7 @@ use crate::budget::Budget;
 use crate::ir::{
     AccessSpec, Action, ActionClass, ActionOp, BehaviorCase, CoverageScenario, DataEdge, DataKind,
     DataRoute, DescriptorFinish, DescriptorReadMethod, DescriptorWriteMethod, FailureInjection,
-    LaunchFailureKind, ProcessProgram, ProcessStopPhase, PythonException, TopologyFamily,
+    LaunchFailureKind, ProcessProgram, ProcessStopPhase, TopologyFamily,
 };
 use crate::ir::{
     BARRIER_LAP_COMPLETED, BARRIER_TOKEN_FORWARDED, BARRIER_TOKEN_RECEIVED, EVIDENCE_HINT_BARRIER,
@@ -778,17 +778,6 @@ fn descriptor_corpus(node_count: u8, seed: u64) -> Vec<BehaviorCase> {
             access: AccessSpec::unrestricted("descriptor-invalid"),
             depends_on: Vec::new(),
             actions: vec![
-                Action::exception(
-                    ActionOp::DescriptorRead {
-                        path: SEEDED_MODEL_PATH.to_owned(),
-                        flags: libc::O_ACCMODE,
-                        expected: Vec::new(),
-                        method: DescriptorReadMethod::Read,
-                        offset: 0,
-                        finish: DescriptorFinish::Close,
-                    },
-                    PythonException::ValueError,
-                ),
                 Action::error(
                     ActionOp::DescriptorRead {
                         path: SEEDED_MODEL_PATH.to_owned(),
@@ -810,13 +799,6 @@ fn descriptor_corpus(node_count: u8, seed: u64) -> Vec<BehaviorCase> {
                         finish: DescriptorFinish::Close,
                     },
                     libc::EINVAL,
-                ),
-                Action::exception(
-                    ActionOp::MappingExportClose {
-                        path: SEEDED_MODEL_PATH.to_owned(),
-                        length: SEEDED_MODEL_BYTES.len() as u64,
-                    },
-                    PythonException::BufferError,
                 ),
             ],
         }],
@@ -963,13 +945,13 @@ fn namespace_edge_corpus(node_count: u8, seed: u64) -> Vec<BehaviorCase> {
                 logical_node_id: u64::from(node_count),
                 access: AccessSpec::unrestricted("stream-collider"),
                 depends_on: vec!["blob-owner".to_owned()],
-                actions: vec![Action::exception(
+                actions: vec![Action::error(
                     ActionOp::StreamWrite {
                         path: blob_collision,
                         chunks: vec![b"stream".to_vec()],
                         replace: false,
                     },
-                    PythonException::StreamError,
+                    libc::ENXIO,
                 )],
             },
         ],
@@ -1018,12 +1000,12 @@ fn namespace_edge_corpus(node_count: u8, seed: u64) -> Vec<BehaviorCase> {
                     "stream-owner-writer".to_owned(),
                     "stream-owner-reader".to_owned(),
                 ],
-                actions: vec![Action::exception(
+                actions: vec![Action::error(
                     ActionOp::PublishBlob {
                         path: stream_collision,
                         bytes: b"blob".to_vec(),
                     },
-                    PythonException::StreamError,
+                    libc::ENXIO,
                 )],
             },
         ],
@@ -1494,7 +1476,7 @@ pub fn failure_corpus(node_count: u8, seed: u64) -> Vec<BehaviorCase> {
         failure: FailureInjection::StopProcess {
             process: "stopped-process".to_owned(),
             phase,
-            kill_after_ms: Some(100),
+            force: false,
         },
     };
     vec![
@@ -1545,18 +1527,6 @@ pub fn failure_corpus(node_count: u8, seed: u64) -> Vec<BehaviorCase> {
             seed,
             LaunchFailureKind::MalformedExecutionIdentity,
             "malformed-execution-identity",
-        ),
-        failure_corpus_launch_case(
-            node_count,
-            seed,
-            LaunchFailureKind::PythonSyntax,
-            "python-syntax",
-        ),
-        failure_corpus_launch_case(
-            node_count,
-            seed,
-            LaunchFailureKind::PythonRuntime,
-            "python-runtime",
         ),
     ]
 }
@@ -2078,7 +2048,7 @@ fn append_churn_target(case: &mut BehaviorCase, node: u64) -> Result<(), String>
     case.failure = FailureInjection::StopProcess {
         process: "churn-target".to_owned(),
         phase: ProcessStopPhase::AfterSiblingStreamFirstFrame,
-        kill_after_ms: Some(100),
+        force: false,
     };
     Ok(())
 }
@@ -2126,14 +2096,14 @@ fn append_active_stream_fault(case: &mut BehaviorCase, nodes: &[u64], abort_writ
         (
             vec![Action::ok(write)],
             vec![
-                Action::exception(read, PythonException::StreamError),
+                Action::error(read, libc::ECONNRESET),
                 Action::ok(ActionOp::WaitForQuiescent { path }),
             ],
         )
     } else {
         (
             vec![
-                Action::exception(write, PythonException::StreamError),
+                Action::error(write, libc::EPIPE),
                 Action::ok(ActionOp::WaitForQuiescent { path }),
             ],
             vec![Action::ok(read)],
@@ -2175,7 +2145,7 @@ fn append_active_stream_fault(case: &mut BehaviorCase, nodes: &[u64], abort_writ
     case.failure = FailureInjection::StopProcess {
         process: if abort_writer { writer_id } else { reader_id },
         phase: ProcessStopPhase::AfterStreamFirstFrame,
-        kill_after_ms: Some(100),
+        force: false,
     };
 }
 
@@ -2665,7 +2635,7 @@ fn append_dag_processes(
 const RING_LAPS: usize = 2;
 
 /// Labels a ring action with its lap token identity, lap, edge, and barrier
-/// kind using the canonical evidence-hint keys shared with codegen.
+/// kind using the canonical evidence-hint keys shared with executors.
 fn tag_ring_action(action: &mut Action, token: &str, lap: usize, edge_index: usize, barrier: &str) {
     action
         .evidence_hints
@@ -2697,7 +2667,7 @@ fn append_ring_read(
         actions
             .last_mut()
             .expect("ring read appends a consuming action"),
-        &crate::codegen::digest(token),
+        &crate::oracle::digest(token),
         lap,
         edge_index,
         barrier,
@@ -2720,7 +2690,7 @@ fn append_ring_write(
         actions
             .last_mut()
             .expect("ring write appends a forwarding action"),
-        &crate::codegen::digest(token),
+        &crate::oracle::digest(token),
         lap,
         edge_index,
         barrier,

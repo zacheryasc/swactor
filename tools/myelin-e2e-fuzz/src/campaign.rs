@@ -1,7 +1,7 @@
 //! Versioned campaign planning and durable artifact contracts.
 
-use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,14 +10,15 @@ use crate::corpus::{
     SEEDED_MODEL_PATH, generated_campaign_cases, generated_campaign_cases_budgeted,
 };
 use crate::coverage::CoverageLedger;
-use crate::harness::ClusterHarness;
+use crate::diagnosis::FailureFingerprint;
 use crate::ir::{
-    Action, ActionOp, AttemptPaths, BehaviorCase, CASE_SCHEMA_VERSION, CaseResources,
-    GENERATOR_VERSION, validate_artifact_id,
+    AccessSpec, Action, ActionOp, AttemptPaths, BehaviorCase, CASE_SCHEMA_VERSION,
+    CaseResourceBounds, CaseResources, CoverageScenario, FailureInjection, GENERATOR_VERSION,
+    ProcessProgram, TopologyFamily, validate_artifact_id,
 };
 
-pub const CAMPAIGN_SCHEMA_VERSION: u32 = 2;
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const CAMPAIGN_SCHEMA_VERSION: u32 = 3;
+pub const ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub const INITIAL_NODE_COUNT: usize = 5;
 pub const NORMAL_CASE_COUNT: usize = 128;
 pub const RECOVERY_CASE_COUNT: usize = 16;
@@ -25,7 +26,7 @@ pub const SURVIVOR_CASE_COUNT: usize = 32;
 pub const PREPARATION_DEADLINE_SECS: u64 = 10 * 60;
 pub const CLEANUP_DEADLINE_SECS: u64 = provisioning::PAID_CLEANUP_RESERVE_MS / 1_000;
 pub const CAMPAIGN_DEADLINE_SECS: u64 = 5 * 60;
-pub const WORKLOAD_DEADLINE_SECS: u64 = 285;
+pub const WORKLOAD_DEADLINE_SECS: u64 = 295;
 pub const DIAGNOSTIC_DEADLINE_SECS: u64 = 10;
 pub const LOCAL_CLEANUP_RESERVE_SECS: u64 = 5;
 
@@ -86,6 +87,296 @@ impl CampaignLimits {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionWaveLimits {
+    pub max_cases: usize,
+    pub max_processes: u64,
+    pub max_actions: u64,
+    pub max_payload_bytes: u64,
+    pub max_allocation_bytes: u64,
+    pub max_control_observations: u64,
+}
+
+impl ExecutionWaveLimits {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_cases == 0
+            || self.max_processes == 0
+            || self.max_actions == 0
+            || self.max_payload_bytes == 0
+            || self.max_allocation_bytes == 0
+            || self.max_control_observations == 0
+        {
+            return Err("execution wave limits must be nonzero".to_owned());
+        }
+        Ok(())
+    }
+
+    fn admits(&self, cases: usize, resources: CaseResources) -> bool {
+        cases <= self.max_cases
+            && resources.process_count <= self.max_processes
+            && resources.action_count <= self.max_actions
+            && resources.payload_bytes <= self.max_payload_bytes
+            && resources.allocation_bytes <= self.max_allocation_bytes
+            && resources.observation_count <= self.max_control_observations
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionWave {
+    pub case_indices: Vec<usize>,
+    pub resources: CaseResources,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseCursorEvidence {
+    pub request_id: String,
+    pub execution_incarnation: String,
+    pub through_sequence: u64,
+    pub terminal_acknowledged: bool,
+}
+
+#[derive(Debug)]
+pub struct CaseExecutionCompletion<T> {
+    pub oracle: Result<T, String>,
+    pub failure: Option<FailureFingerprint>,
+    pub cursors: Vec<CaseCursorEvidence>,
+    pub cleanup: Result<(), String>,
+}
+
+impl<T> CaseExecutionCompletion<T> {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cursors.is_empty()
+            || self.cursors.iter().any(|cursor| {
+                cursor.request_id.is_empty()
+                    || cursor.execution_incarnation.is_empty()
+                    || cursor.through_sequence == 0
+                    || !cursor.terminal_acknowledged
+            })
+        {
+            return Err("case completion lacks terminal cursor acknowledgement".to_owned());
+        }
+        let identities = self
+            .cursors
+            .iter()
+            .map(|cursor| (&cursor.request_id, &cursor.execution_incarnation))
+            .collect::<BTreeSet<_>>();
+        if identities.len() != self.cursors.len() {
+            return Err("case completion contains duplicate execution cursor".to_owned());
+        }
+        let failed = self.oracle.is_err() || self.cleanup.is_err();
+        match (failed, &self.failure) {
+            (false, None) => {}
+            (false, Some(_)) => {
+                return Err("successful case cannot retain a failure signature".to_owned());
+            }
+            (true, None) => return Err("failed case lacks a typed failure signature".to_owned()),
+            (true, Some(failure))
+                if !failure.typed_signature.is_object()
+                    || failure.cleanup_restored != self.cleanup.is_ok() =>
+            {
+                return Err("failure signature disagrees with typed outcome or cleanup".to_owned());
+            }
+            (true, Some(_)) => {}
+        }
+        Ok(())
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.validate().is_ok() && self.oracle.is_ok() && self.cleanup.is_ok()
+    }
+}
+
+#[derive(Debug)]
+pub struct CaseWaveResult<T> {
+    pub case_index: usize,
+    pub case_id: String,
+    pub wave_index: usize,
+    pub completion: Result<CaseExecutionCompletion<T>, String>,
+}
+
+/// Only namespace-isolated cases without recovery fixtures, injected lifecycle
+/// faults, or destructive/mutation scenarios are admitted beside siblings.
+pub fn wave_independent(case: &BehaviorCase) -> bool {
+    case.read_only_fixture_paths.is_empty()
+        && matches!(case.failure, FailureInjection::None)
+        && !case.scenarios.iter().any(|scenario| {
+            matches!(
+                scenario,
+                CoverageScenario::ProcessChurn
+                    | CoverageScenario::ActiveMutation
+                    | CoverageScenario::QuiescentMutation
+                    | CoverageScenario::ActiveStreamWriterAbort
+                    | CoverageScenario::ActiveStreamReaderStop
+                    | CoverageScenario::FailureIsolation
+            )
+        })
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Deterministic first-fit waves. Input order is the coverage commit order;
+/// lifecycle-sensitive cases are singleton waves.
+pub fn plan_execution_waves(
+    cases: &[BehaviorCase],
+    limits: &ExecutionWaveLimits,
+) -> Result<Vec<ExecutionWave>, String> {
+    limits.validate()?;
+    let mut waves = Vec::new();
+    let mut current = ExecutionWave {
+        case_indices: Vec::new(),
+        resources: CaseResources::default(),
+    };
+    let mut current_paths = BTreeSet::new();
+    let mut current_execution_ids = BTreeSet::new();
+    let mut case_ids = BTreeSet::new();
+    let flush = |waves: &mut Vec<ExecutionWave>,
+                 current: &mut ExecutionWave,
+                 paths: &mut BTreeSet<String>,
+                 execution_ids: &mut BTreeSet<String>| {
+        if !current.case_indices.is_empty() {
+            waves.push(std::mem::replace(
+                current,
+                ExecutionWave {
+                    case_indices: Vec::new(),
+                    resources: CaseResources::default(),
+                },
+            ));
+            paths.clear();
+            execution_ids.clear();
+        }
+    };
+    for (index, case) in cases.iter().enumerate() {
+        case.validate()?;
+        if !case_ids.insert(case.id.clone()) {
+            return Err(format!("duplicate execution wave case ID {:?}", case.id));
+        }
+        let resources = case.resource_summary()?;
+        if !limits.admits(1, resources) {
+            return Err(format!("case {} exceeds execution wave limits", case.id));
+        }
+        let paths = case.owned_paths();
+        let execution_ids = case
+            .processes
+            .iter()
+            .map(|process| process.access.execution_id.clone())
+            .collect::<BTreeSet<_>>();
+        if execution_ids.len() != case.processes.len() {
+            return Err(format!("case {} reuses an execution identity", case.id));
+        }
+        if !wave_independent(case) {
+            flush(
+                &mut waves,
+                &mut current,
+                &mut current_paths,
+                &mut current_execution_ids,
+            );
+            waves.push(ExecutionWave {
+                case_indices: vec![index],
+                resources,
+            });
+            continue;
+        }
+        let conflicts = !execution_ids.is_disjoint(&current_execution_ids)
+            || paths.iter().any(|path| {
+                current_paths
+                    .iter()
+                    .any(|current_path| paths_overlap(path, current_path))
+            });
+        let fits = current
+            .resources
+            .checked_add(resources)
+            .is_ok_and(|combined| limits.admits(current.case_indices.len() + 1, combined));
+        if conflicts || !fits {
+            flush(
+                &mut waves,
+                &mut current,
+                &mut current_paths,
+                &mut current_execution_ids,
+            );
+        }
+        current.resources = current.resources.checked_add(resources)?;
+        current.case_indices.push(index);
+        current_paths.extend(paths);
+        current_execution_ids.extend(execution_ids);
+    }
+    flush(
+        &mut waves,
+        &mut current,
+        &mut current_paths,
+        &mut current_execution_ids,
+    );
+    Ok(waves)
+}
+
+/// Execute each planned wave with one child deadline and join every sibling.
+/// Failures and panics are retained per case; they never cancel or erase a
+/// sibling's oracle, cursor, or cleanup result.
+pub fn execute_case_waves<T, F>(
+    blocking: &swactor_engine::BlockingWorkSender,
+    cases: Vec<BehaviorCase>,
+    limits: &ExecutionWaveLimits,
+    parent: &Budget,
+    per_case_deadline: Duration,
+    execute_and_cleanup: F,
+) -> Result<Vec<CaseWaveResult<T>>, String>
+where
+    T: Send + 'static,
+    F: Fn(&BehaviorCase, Budget) -> Result<CaseExecutionCompletion<T>, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    if per_case_deadline.is_zero() {
+        return Err("case execution deadline must be nonzero".to_owned());
+    }
+    let waves = plan_execution_waves(&cases, limits)?;
+    let mut results = Vec::with_capacity(cases.len());
+    let execute_and_cleanup = std::sync::Arc::new(execute_and_cleanup);
+    // Transfer each planned index exactly once instead of depending on a
+    // planner implementation detail about wave ordering.
+    let mut cases = cases.into_iter().map(Some).collect::<Vec<_>>();
+    for (wave_index, wave) in waves.iter().enumerate() {
+        parent.check("execute bounded case wave")?;
+        let mut handles = Vec::with_capacity(wave.case_indices.len());
+        for &case_index in &wave.case_indices {
+            let case = cases[case_index].take().expect("planned case exists once");
+            let case_id = case.id.clone();
+            let budget = parent.child(per_case_deadline);
+            let execute_and_cleanup = std::sync::Arc::clone(&execute_and_cleanup);
+            handles.push((
+                case_index,
+                case_id,
+                blocking.submit_joinable(move || execute_and_cleanup(&case, budget)),
+            ));
+        }
+        for (case_index, case_id, submitted) in handles {
+            let completion = match submitted {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err("case executor panicked or was cancelled".to_owned())),
+                Err(_) => Err("case executor engine stopped before submission".to_owned()),
+            };
+            results.push(CaseWaveResult {
+                case_index,
+                case_id,
+                wave_index,
+                completion,
+            });
+        }
+    }
+    Ok(results)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OfferPolicy {
     pub gpu_model: Option<String>,
@@ -124,6 +415,17 @@ pub struct CampaignConfig {
     pub runtime_image: String,
     pub limits: CampaignLimits,
     pub offers: OfferPolicy,
+}
+
+impl CampaignConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        self.limits.validate(self.provider == ProviderMode::Real)?;
+        self.offers.validate()?;
+        if self.runtime_image.trim().is_empty() {
+            return Err("runtime image must not be empty".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,13 +533,16 @@ pub struct CampaignResourcePlan {
     pub planned_runtime_secs: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CampaignPlan {
     pub schema_version: u32,
     pub case_schema_version: u32,
     pub generator_version: u32,
     pub campaign_id: String,
     pub seed: u64,
+    pub provider: ProviderMode,
+    pub runtime_image: String,
+    pub source_config: CampaignConfig,
     pub expected_initial_nodes: BTreeSet<u64>,
     pub first_survivors: BTreeSet<u64>,
     pub second_survivors: BTreeSet<u64>,
@@ -320,15 +625,9 @@ impl CampaignPlan {
         regressions: Vec<BehaviorCase>,
         budget: Option<&Budget>,
     ) -> Result<Self, String> {
+        config.validate()?;
         if let Some(budget) = budget {
             budget.check("campaign plan generation and admission")?;
-        }
-        config
-            .limits
-            .validate(config.provider == ProviderMode::Real)?;
-        config.offers.validate()?;
-        if config.runtime_image.trim().is_empty() {
-            return Err("runtime image must not be empty".to_owned());
         }
 
         let expected_initial_nodes = BTreeSet::from([1, 2, 3, 4, 5]);
@@ -447,6 +746,9 @@ impl CampaignPlan {
             generator_version: GENERATOR_VERSION,
             campaign_id,
             seed: config.seed,
+            provider: config.provider,
+            runtime_image: config.runtime_image.clone(),
+            source_config: config.clone(),
             expected_initial_nodes,
             first_survivors,
             second_survivors,
@@ -490,6 +792,21 @@ impl CampaignPlan {
             || self.generator_version != GENERATOR_VERSION
         {
             return Err("campaign schema or generator version is incompatible".to_owned());
+        }
+        self.source_config.validate()?;
+        if self.seed != self.source_config.seed
+            || self.provider != self.source_config.provider
+            || self.runtime_image != self.source_config.runtime_image
+            || self.resources.fixture_cleanup_budget_secs
+                != if self.provider == ProviderMode::Real {
+                    CLEANUP_DEADLINE_SECS
+                } else {
+                    LOCAL_CLEANUP_RESERVE_SECS
+                }
+        {
+            return Err(
+                "campaign source configuration or cleanup contract is incompatible".to_owned(),
+            );
         }
         if self.expected_initial_nodes.len() != INITIAL_NODE_COUNT
             || self.normal.len() != NORMAL_CASE_COUNT
@@ -699,13 +1016,14 @@ fn saturate_case_allocation(case: &mut BehaviorCase) -> Result<(), String> {
     if additional == 0 {
         return Ok(());
     }
-    let action = Action::exception(
-        ActionOp::MappingExportClose {
-            path: SEEDED_MODEL_PATH.to_owned(),
-            length: additional,
-        },
-        crate::ir::PythonException::BufferError,
-    );
+    let action = Action::ok(ActionOp::DescriptorWrite {
+        path: format!("/cases/{}/admission-allocation", case.id),
+        flags: libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+        length: Some(additional),
+        bytes: Vec::new(),
+        method: crate::ir::DescriptorWriteMethod::Mapping,
+        finish: crate::ir::DescriptorFinish::Abort,
+    });
     let process_index = if resources.action_count < u64::from(case.resource_bounds.max_actions)
         && resources.action_count < 64
     {
@@ -1024,6 +1342,172 @@ fn planned_coverage(
     ledger.assert_planned_closed()?;
     Ok(ledger)
 }
+pub(crate) fn convergence_case(nodes: &[u64], run_nonce: u128) -> Result<BehaviorCase, String> {
+    if nodes.is_empty() {
+        return Err("convergence requires live nodes".to_owned());
+    }
+    let blob_path = |source: u64, destination: u64| {
+        format!("/cases/convergence/{run_nonce}/blob-{source}-to-{destination}")
+    };
+    let stream_path = |source: u64, destination: u64| {
+        format!("/cases/convergence/{run_nonce}/stream-{source}-to-{destination}")
+    };
+    let ready_path = |process: &str| format!("/cases/convergence/{run_nonce}/ready/{process}");
+    let release_path = format!("/cases/convergence/{run_nonce}/release");
+    let boundary_lengths = [0_usize, 1, 4_095, 4_096, 4_097, 65_537];
+    let mut blob_payloads = BTreeMap::new();
+    let mut stream_payloads = BTreeMap::new();
+    let mut programs = Vec::new();
+    for (source_index, &source) in nodes.iter().enumerate() {
+        let process_id = format!("convergence-writer-{source}");
+        let mut actions = vec![
+            Action::ok(ActionOp::PublishBlob {
+                path: ready_path(&process_id),
+                bytes: Vec::new(),
+            }),
+            Action::ok(ActionOp::AwaitEntry {
+                path: release_path.clone(),
+                expected_kind: "blob".to_owned(),
+            }),
+        ];
+        for round in 1..nodes.len() {
+            let destination = nodes[(source_index + round) % nodes.len()];
+            let pair_index = source_index * (nodes.len() - 1) + round - 1;
+            let length = boundary_lengths[pair_index % boundary_lengths.len()];
+            let body = (0..length)
+                .map(|offset| {
+                    (u128::from(source) * 17 + u128::from(destination) * 31 + offset as u128) as u8
+                })
+                .collect::<Vec<_>>();
+            let blob = blob_path(source, destination);
+            actions.push(Action::ok(ActionOp::PublishBlob {
+                path: blob.clone(),
+                bytes: body.clone(),
+            }));
+            blob_payloads.insert(blob, body.clone());
+
+            let mut framed = Vec::with_capacity(body.len() + 8);
+            let split = body.len() / 2;
+            for frame in [&body[..split], &body[split..]] {
+                framed.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+                framed.extend_from_slice(frame);
+            }
+            let stream = stream_path(source, destination);
+            let mut cuts = vec![0, 1, 3, 257, framed.len().saturating_sub(1), framed.len()];
+            cuts.retain(|cut| *cut <= framed.len());
+            cuts.sort_unstable();
+            cuts.dedup();
+            let chunks = cuts
+                .windows(2)
+                .filter(|range| range[0] != range[1])
+                .map(|range| framed[range[0]..range[1]].to_vec())
+                .collect();
+            actions.push(Action::ok(ActionOp::StreamWrite {
+                path: stream.clone(),
+                chunks,
+                replace: false,
+            }));
+            stream_payloads.insert(stream, framed);
+        }
+        programs.push(ProcessProgram {
+            id: process_id,
+            logical_node_id: source,
+            access: AccessSpec::unrestricted(format!("convergence-writer-{run_nonce}-{source}")),
+            depends_on: Vec::new(),
+            actions,
+        });
+    }
+    for (destination_index, &destination) in nodes.iter().enumerate() {
+        let process_id = format!("convergence-reader-{destination}");
+        let mut actions = vec![
+            Action::ok(ActionOp::PublishBlob {
+                path: ready_path(&process_id),
+                bytes: Vec::new(),
+            }),
+            Action::ok(ActionOp::AwaitEntry {
+                path: release_path.clone(),
+                expected_kind: "blob".to_owned(),
+            }),
+        ];
+        for round in 1..nodes.len() {
+            let source = nodes[(destination_index + nodes.len() - round) % nodes.len()];
+            let blob = blob_path(source, destination);
+            actions.push(Action::ok(ActionOp::AwaitEntry {
+                path: blob.clone(),
+                expected_kind: "blob".to_owned(),
+            }));
+            actions.push(Action::ok(ActionOp::ReadBlob {
+                path: blob.clone(),
+                expected: blob_payloads[&blob].clone(),
+            }));
+            actions.push(Action::ok(ActionOp::Unlink { path: blob }));
+
+            let stream = stream_path(source, destination);
+            actions.push(Action::ok(ActionOp::StreamRead {
+                path: stream.clone(),
+                expected: stream_payloads[&stream].clone(),
+            }));
+            actions.push(Action::ok(ActionOp::WaitForQuiescent {
+                path: stream.clone(),
+            }));
+            actions.push(Action::ok(ActionOp::Unlink { path: stream }));
+        }
+        programs.push(ProcessProgram {
+            id: process_id,
+            logical_node_id: destination,
+            access: AccessSpec::unrestricted(format!(
+                "convergence-reader-{run_nonce}-{destination}"
+            )),
+            depends_on: Vec::new(),
+            actions,
+        });
+    }
+    let participant_ready_paths = programs
+        .iter()
+        .map(|program| ready_path(&program.id))
+        .collect::<Vec<_>>();
+    programs.push(ProcessProgram {
+        id: "zz-convergence-release".to_owned(),
+        logical_node_id: nodes[0],
+        access: AccessSpec::unrestricted(format!("convergence-release-{run_nonce}")),
+        depends_on: Vec::new(),
+        actions: participant_ready_paths
+            .into_iter()
+            .map(|path| {
+                Action::ok(ActionOp::AwaitEntry {
+                    path,
+                    expected_kind: "blob".to_owned(),
+                })
+            })
+            .chain(std::iter::once(Action::ok(ActionOp::PublishBlob {
+                path: release_path,
+                bytes: Vec::new(),
+            })))
+            .collect(),
+    });
+    let case = BehaviorCase {
+        schema_version: CASE_SCHEMA_VERSION,
+        generator_version: GENERATOR_VERSION,
+        id: format!("convergence-{run_nonce}"),
+        seed: u64::try_from(run_nonce).unwrap_or(u64::MAX),
+        live_nodes: nodes.iter().copied().collect(),
+        topology: TopologyFamily::Fixed,
+        scenarios: Default::default(),
+        routes: Vec::new(),
+        read_only_fixture_paths: Default::default(),
+        resource_bounds: CaseResourceBounds {
+            max_actions: 256,
+            max_processes: 20,
+            max_payload_bytes: 4 * 1024 * 1024,
+            max_allocation_bytes: 64 * 1024 * 1024,
+            max_race_states: 65_536,
+        },
+        processes: programs,
+        failure: FailureInjection::None,
+    };
+    case.validate()?;
+    Ok(case)
+}
 
 fn validate_phase(cases: &[BehaviorCase], live_nodes: &BTreeSet<u64>) -> Result<(), String> {
     for case in cases {
@@ -1037,18 +1521,92 @@ fn validate_phase(cases: &[BehaviorCase], live_nodes: &BTreeSet<u64>) -> Result<
     }
     Ok(())
 }
+pub(crate) fn persistence_probe_case<'a>(
+    template: &BehaviorCase,
+    entries: &[PersistedFixtureEntry],
+    node_ids: &[u64],
+    absent_paths: impl IntoIterator<Item = &'a String>,
+    probe_id: u64,
+) -> Result<BehaviorCase, String> {
+    if entries.is_empty() {
+        return Err("recovery case did not declare persisted fixture entries".to_owned());
+    }
+    let logical_node_id = node_ids
+        .first()
+        .copied()
+        .ok_or_else(|| "fixture has no live node for persistence probe".to_owned())?;
+    let mut probe = probe_case(template, format!("{}-persistence", template.id), node_ids);
+    probe.read_only_fixture_paths = entries
+        .iter()
+        .map(|entry| entry.path().to_owned())
+        .collect();
+    let mut actions = Vec::new();
+    for entry in entries {
+        match entry {
+            PersistedFixtureEntry::Blob { path, expected } => {
+                actions.push(Action::ok(ActionOp::Lookup {
+                    path: path.clone(),
+                    expected_kind: "blob".to_owned(),
+                }));
+                actions.push(Action::ok(ActionOp::ReadBlob {
+                    path: path.clone(),
+                    expected: expected.clone(),
+                }));
+            }
+            PersistedFixtureEntry::QuiescentStream { path } => {
+                actions.push(Action::ok(ActionOp::Lookup {
+                    path: path.clone(),
+                    expected_kind: "stream".to_owned(),
+                }));
+                actions.push(Action::ok(ActionOp::WaitForQuiescent {
+                    path: path.clone(),
+                }));
+            }
+        }
+    }
+    for path in absent_paths {
+        if !probe.read_only_fixture_paths.insert(path.clone()) {
+            return Err(format!(
+                "persisted fixture path {path} is also claimed by the next attempt"
+            ));
+        }
+        actions.push(Action::error(
+            ActionOp::Lookup {
+                path: path.clone(),
+                expected_kind: "absent".to_owned(),
+            },
+            libc::ENOENT,
+        ));
+    }
+    probe.resource_bounds.max_actions = probe
+        .resource_bounds
+        .max_actions
+        .max(u32::try_from(actions.len()).unwrap_or(u32::MAX));
+    probe.processes = vec![ProcessProgram {
+        id: "persisted-path-probe".to_owned(),
+        logical_node_id,
+        access: read_only_access(
+            format!("{}-persistence-attempt-{probe_id}", template.id),
+            &probe.read_only_fixture_paths,
+        ),
+        depends_on: Vec::new(),
+        actions,
+    }];
+    probe.validate()?;
+    Ok(probe)
+}
 
 fn auxiliary_campaign_resources(
     initial_nodes: &BTreeSet<u64>,
     recovery: &[RecoveryCase],
 ) -> Result<CaseResources, String> {
     let nodes = initial_nodes.iter().copied().collect::<Vec<_>>();
-    // Use the executable constructors: nonce/attempt identities change paths,
-    // never their requested payload, buffer, endpoint, or observation counts.
-    let mut total = ClusterHarness::convergence_case(&nodes, 0)?.resource_summary()?;
+    // Nonce/attempt identities change paths, never their requested payload,
+    // buffer, endpoint, or observation counts.
+    let mut total = convergence_case(&nodes, 0)?.resource_summary()?;
     for case in recovery {
         for absent_paths in [BTreeSet::new(), case.post_restart.owned_paths()] {
-            let probe = ClusterHarness::persistence_probe_case(
+            let probe = persistence_probe_case(
                 &case.pre_restart,
                 &case.persisted_entries,
                 &nodes,
@@ -1059,6 +1617,13 @@ fn auxiliary_campaign_resources(
         }
     }
     Ok(total)
+}
+fn read_only_access(execution_id: String, paths: &BTreeSet<String>) -> AccessSpec {
+    AccessSpec {
+        execution_id,
+        read_prefixes: paths.iter().cloned().collect(),
+        write_prefixes: Vec::new(),
+    }
 }
 
 fn campaign_resources<'a>(
@@ -1071,6 +1636,24 @@ fn campaign_resources<'a>(
         })
 }
 
+fn probe_case(template: &BehaviorCase, id: String, node_ids: &[u64]) -> BehaviorCase {
+    // Do not clone the workload's payloads/routes merely to replace every
+    // process. Probe source contains only the boundary facts it actually uses.
+    BehaviorCase {
+        schema_version: template.schema_version,
+        generator_version: template.generator_version,
+        id,
+        seed: template.seed,
+        live_nodes: node_ids.iter().copied().collect(),
+        topology: TopologyFamily::Fixed,
+        scenarios: BTreeSet::new(),
+        routes: Vec::new(),
+        read_only_fixture_paths: BTreeSet::new(),
+        resource_bounds: template.resource_bounds.clone(),
+        processes: Vec::new(),
+        failure: FailureInjection::None,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,7 +1712,7 @@ mod tests {
             assert!((2..=20).contains(&resources.process_count), "{}", case.id);
             workload_allocation += resources.allocation_bytes;
         }
-        let readiness = ClusterHarness::convergence_case(&[1, 2, 3, 4, 5], 0)
+        let readiness = convergence_case(&[1, 2, 3, 4, 5], 0)
             .unwrap()
             .resource_summary()
             .unwrap();
@@ -1230,89 +1813,131 @@ mod tests {
         assert_eq!(totals.process_count, 2);
     }
 
-    #[test]
-    fn recovery_attempts_share_owned_persistence_but_not_external_fixtures() {
-        let blob = "/cases/recovery/persisted";
-        let stream = "/cases/recovery/quiescent";
-        let external = "/cases/external/fixture";
-        let mut pre = crate::corpus::stable_corpus(2, 1).remove(0);
-        pre.processes.truncate(1);
-        pre.processes[0].actions = vec![
-            Action::ok(ActionOp::PublishBlob {
-                path: blob.to_owned(),
-                bytes: vec![1],
-            }),
-            Action::ok(ActionOp::StreamRoundTrip {
-                path: stream.to_owned(),
-                chunks: vec![vec![2]],
-            }),
-        ];
-        let mut post = pre.clone();
-        post.id = "post-restart".to_owned();
-        post.read_only_fixture_paths =
-            BTreeSet::from([blob.to_owned(), stream.to_owned(), external.to_owned()]);
-        post.processes[0].actions = vec![
-            Action::ok(ActionOp::ReadBlob {
-                path: blob.to_owned(),
-                expected: vec![1],
-            }),
-            Action::ok(ActionOp::WaitForQuiescent {
-                path: stream.to_owned(),
-            }),
-            Action::ok(ActionOp::ReadBlob {
-                path: external.to_owned(),
-                expected: vec![3],
-            }),
-        ];
-        let recovery = RecoveryCase {
-            id: "recovery".to_owned(),
-            pre_restart: pre,
-            post_restart: post,
-            persisted_entries: vec![
-                PersistedFixtureEntry::Blob {
-                    path: blob.to_owned(),
-                    expected: vec![1],
-                },
-                PersistedFixtureEntry::QuiescentStream {
-                    path: stream.to_owned(),
-                },
-            ],
-        };
-        let first = recovery.for_attempt(7);
-        let second = recovery.for_attempt(8);
-        first.pre_restart.validate().unwrap();
-        first.post_restart.validate().unwrap();
-        for (step, entry) in first.persisted_entries.iter().enumerate() {
-            assert_eq!(
-                entry.path(),
-                first.pre_restart.processes[0].actions[step]
-                    .operation
-                    .path()
-            );
-            assert_eq!(
-                entry.path(),
-                first.post_restart.processes[0].actions[step]
-                    .operation
-                    .path()
-            );
-            assert!(
-                first
-                    .post_restart
-                    .read_only_fixture_paths
-                    .contains(entry.path())
-            );
-            assert!(!first.post_restart.owned_paths().contains(entry.path()));
+    fn generous_wave_limits() -> ExecutionWaveLimits {
+        ExecutionWaveLimits {
+            max_cases: 8,
+            max_processes: u64::MAX,
+            max_actions: u64::MAX,
+            max_payload_bytes: u64::MAX,
+            max_allocation_bytes: u64::MAX,
+            max_control_observations: u64::MAX,
         }
-        assert!(
-            first
-                .pre_restart
-                .owned_paths()
-                .is_disjoint(&second.pre_restart.owned_paths())
-        );
+    }
+
+    #[test]
+    fn wave_planner_groups_only_independent_resource_bounded_cases() {
+        let mut cases = crate::corpus::stable_corpus(3, 19);
+        cases.truncate(3);
+        for case in &mut cases {
+            case.scenarios.clear();
+            case.failure = FailureInjection::None;
+            case.read_only_fixture_paths.clear();
+        }
+        cases[2].scenarios.insert(CoverageScenario::ProcessChurn);
+        let waves = plan_execution_waves(&cases, &generous_wave_limits()).unwrap();
+        assert_eq!(waves.len(), 2);
+        assert_eq!(waves[0].case_indices, vec![0, 1]);
+        assert_eq!(waves[1].case_indices, vec![2]);
+    }
+
+    #[test]
+    fn wave_planner_serializes_shared_execution_identity_and_rejects_duplicate_cases() {
+        let mut cases = crate::corpus::stable_corpus(2, 29);
+        cases.truncate(2);
+        for case in &mut cases {
+            case.scenarios.clear();
+            case.failure = FailureInjection::None;
+            case.read_only_fixture_paths.clear();
+        }
+        cases[1].processes[0].access.execution_id =
+            cases[0].processes[0].access.execution_id.clone();
+        let waves = plan_execution_waves(&cases, &generous_wave_limits()).unwrap();
+        assert_eq!(waves.len(), 2);
+
+        cases[1].id = cases[0].id.clone();
+        assert!(plan_execution_waves(&cases, &generous_wave_limits()).is_err());
+    }
+
+    #[test]
+    fn wave_execution_joins_siblings_and_preserves_independent_cleanup_results() {
+        use std::sync::{Arc, Barrier};
+        use swactor::runtime::{RuntimeConfig, RuntimeParts};
+        use swactor_engine::{Engine, SteppingBackend};
+
+        let mut cases = crate::corpus::stable_corpus(2, 23);
+        cases.truncate(2);
+        for case in &mut cases {
+            case.scenarios.clear();
+            case.failure = FailureInjection::None;
+            case.read_only_fixture_paths.clear();
+        }
         assert_eq!(
-            first.post_restart.processes[0].actions[2].operation.path(),
-            external
+            plan_execution_waves(&cases, &generous_wave_limits()).unwrap()[0]
+                .case_indices
+                .len(),
+            2
         );
-        assert!(first.post_restart.owned_paths().is_empty());
+        let failing_id = cases[0].id.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .unwrap();
+        let results = execute_case_waves(
+            &engine.handle().blocking_work_sender(),
+            cases,
+            &generous_wave_limits(),
+            &Budget::new(Duration::from_secs(5)),
+            Duration::from_secs(2),
+            {
+                let barrier = Arc::clone(&barrier);
+                move |case, _| {
+                    barrier.wait();
+                    let failed = case.id == failing_id;
+                    Ok(CaseExecutionCompletion {
+                        oracle: if failed {
+                            Err("typed case failure".to_owned())
+                        } else {
+                            Ok(case.id.len())
+                        },
+                        failure: Some(FailureFingerprint {
+                            typed_signature: if failed {
+                                serde_json::json!({"kind":"typed_case_failure"})
+                            } else {
+                                serde_json::json!({"kind":"cleanup_failure"})
+                            },
+                            cleanup_restored: failed,
+                        }),
+                        cursors: vec![CaseCursorEvidence {
+                            request_id: case.id.clone(),
+                            execution_incarnation: "incarnation-1".to_owned(),
+                            through_sequence: 1,
+                            terminal_acknowledged: true,
+                        }],
+                        cleanup: if failed {
+                            Ok(())
+                        } else {
+                            Err("independent cleanup failure".to_owned())
+                        },
+                    })
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        let first = results[0].completion.as_ref().unwrap();
+        let second = results[1].completion.as_ref().unwrap();
+        assert!(first.oracle.is_err());
+        assert!(first.cleanup.is_ok());
+        assert!(second.oracle.is_ok());
+        assert!(second.cleanup.is_err());
+        first.validate().unwrap();
+        second.validate().unwrap();
+        assert_eq!(
+            engine.handle().ownership_snapshot().blocking,
+            0,
+            "all wave workers must be joined"
+        );
     }
 }

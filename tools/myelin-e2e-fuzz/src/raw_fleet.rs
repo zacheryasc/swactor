@@ -20,17 +20,19 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use swactor_engine::BlockingWorkSender;
 
-use crate::budget::{Budget, record_execution_stage};
+use crate::budget::{Budget, ExecutionStage, WorkKind, execution_span};
 
 pub(crate) const BASE_IMAGE: &str = "myelin-node-base:cuda12.6";
 
 const SSH_BANNER_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_BANNER_POLL: Duration = Duration::from_millis(200);
+const CENSUS_WIDTH: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct RawNode {
@@ -50,7 +52,8 @@ pub struct RawDockerFleet {
     prior_processes: Mutex<BTreeMap<u32, Vec<RawProcessFact>>>,
     budget: Budget,
     cleanup_budget: Budget,
-    manifest: RawManifestStore,
+    manifest: Arc<RawManifestStore>,
+    blocking_work: BlockingWorkSender,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +73,7 @@ struct RawResourceClaim {
     // A create reservation permits label-based reconciliation, not name-based
     // deletion. Once observed, the immutable provider ID can never be replaced.
     creation: Option<String>,
-    id: OnceLock<String>,
+    id: Arc<OnceLock<String>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +87,14 @@ struct RawResourceObservation {
     id: String,
     name: String,
     labels: BTreeMap<String, String>,
+    // A single Docker observation supplies identity and compatible configuration
+    // checks. Dynamic fields are never retained across a lifecycle boundary.
+    details: serde_json::Value,
+}
+
+struct RawVerifiedNode {
+    identity: RawFixtureNodeIdentity,
+    container: RawResourceObservation,
 }
 
 impl RawResourceClaim {
@@ -244,7 +255,7 @@ impl ManifestClaim {
     fn retained(&self) -> RawResourceClaim {
         RawResourceClaim {
             creation: self.attempted.then(|| self.creation.clone()),
-            id: self.id.clone().map(OnceLock::from).unwrap_or_default(),
+            id: Arc::new(self.id.clone().map(OnceLock::from).unwrap_or_default()),
         }
     }
 }
@@ -429,6 +440,16 @@ struct RawManifestStore {
     _lock: std::fs::File,
 }
 
+impl Drop for RawManifestStore {
+    fn drop(&mut self) {
+        // A concurrently forked child can briefly inherit this open file
+        // description before exec closes its CLOEXEC descriptors. Unlock
+        // explicitly so store teardown does not depend on that child closing
+        // the inherited descriptor first.
+        let _ = unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl RawManifestStore {
     fn lock(artifacts: &Path) -> Result<std::fs::File, String> {
         let lock = std::fs::OpenOptions::new()
@@ -510,7 +531,8 @@ fn command_output(
     budget: &Budget,
     predicate: &str,
 ) -> Result<Output, String> {
-    let started = Instant::now();
+    let mut span = execution_span(ExecutionStage::ExternalInspection, WorkKind::RemoteWait);
+    span.add_records(1);
     budget.check(predicate)?;
     let mut stdout = tempfile::tempfile().map_err(|error| format!("{predicate}: {error}"))?;
     let mut stderr = tempfile::tempfile().map_err(|error| format!("{predicate}: {error}"))?;
@@ -521,13 +543,12 @@ fn command_output(
     command.stderr(Stdio::from(
         stderr.try_clone().map_err(|error| error.to_string())?,
     ));
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("{predicate}: {error}"))?;
+    let mut child =
+        swactor_process::command_spawn(command).map_err(|error| format!("{predicate}: {error}"))?;
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
     let exit = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) });
     let status = loop {
-        match child.try_wait() {
+        match swactor_process::child_try_wait(&mut child) {
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
             Err(error) => break Err(format!("{predicate}: wait: {error}")),
@@ -554,13 +575,9 @@ fn command_output(
         unsafe {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
-        let _ = child.kill();
-        child
-            .wait()
+        let _ = swactor_process::child_kill(&mut child);
+        swactor_process::child_wait(&mut child)
             .map_err(|error| format!("{predicate}: reap: {error}"))?;
-    }
-    if status.is_err() {
-        record_execution_stage(predicate, started.elapsed(), 0, 1);
     }
     let status = status?;
     stdout.rewind().map_err(|error| error.to_string())?;
@@ -576,12 +593,7 @@ fn command_output(
     stderr
         .read_to_end(&mut output.stderr)
         .map_err(|error| error.to_string())?;
-    record_execution_stage(
-        predicate,
-        started.elapsed(),
-        (output.stdout.len() + output.stderr.len()) as u64,
-        1,
-    );
+    span.add_bytes((output.stdout.len() + output.stderr.len()) as u64);
     budget.check(predicate)?;
     Ok(output)
 }
@@ -729,13 +741,56 @@ PY
 :"#
 }
 
-fn process_census(container: &str, budget: &Budget) -> Result<Vec<RawProcessFact>, String> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNodeProbe {
+    processes: Vec<RawProcessFact>,
+    agent_pid: Option<String>,
+    active_link_target: Option<String>,
+    active_executable_digest: Option<String>,
+    active_deployment_raw: Option<String>,
+}
+
+fn node_census_probe(container: &str, budget: &Budget) -> Result<RawNodeProbe, String> {
     let output = docker_shell(
         container,
         r#"python3 - <<'PY'
 import hashlib
 import json
+import os
 from pathlib import Path
+
+def optional_text(path):
+    try:
+        value = Path(path).read_bytes().decode("utf-8", errors="replace").strip()
+        return value or None
+    except OSError:
+        return None
+
+def digest(path):
+    try:
+        with Path(path).open("rb") as source:
+            return "sha256:" + hashlib.file_digest(source, "sha256").hexdigest()
+    except OSError:
+        return None
+
+active_executable = Path("/opt/myelin/current/bin/myelin-worker")
+active_executable_digest = digest(active_executable)
+try:
+    active_stat = active_executable.stat()
+    active_executable_identity = (active_stat.st_dev, active_stat.st_ino)
+except OSError:
+    active_executable_identity = None
+
+def worker_digest(path):
+    try:
+        executable = Path(path)
+        identity = (executable.stat().st_dev, executable.stat().st_ino)
+        if identity == active_executable_identity:
+            return active_executable_digest
+    except OSError:
+        return None
+    return digest(executable)
 
 processes = []
 for directory in Path("/proc").iterdir():
@@ -749,12 +804,7 @@ for directory in Path("/proc").iterdir():
         artifact_digest = None
         deployment_generation = None
         if command == "myelin-worker":
-            try:
-                with (directory / "exe").open("rb") as executable:
-                    executable_digest = "sha256:" + hashlib.file_digest(executable, "sha256").hexdigest()
-            except (FileNotFoundError, ProcessLookupError):
-                # A zombie still has an incarnation even though exe is gone.
-                pass
+            executable_digest = worker_digest(directory / "exe")
         try:
             for entry in (directory / "environ").read_bytes().split(b'\0'):
                 if entry.startswith(b'MYELIN_ARTIFACT_DIGEST=sha256:') and len(entry) > 30:
@@ -778,12 +828,28 @@ for directory in Path("/proc").iterdir():
         })
     except (FileNotFoundError, ProcessLookupError):
         continue
-print(json.dumps(processes))
+
+try:
+    active_link_target = os.readlink("/opt/myelin/current")
+except OSError:
+    active_link_target = None
+
+print(json.dumps({
+    "processes": processes,
+    "agent_pid": optional_text("/opt/myelin/agent.pid"),
+    "active_link_target": active_link_target,
+    "active_executable_digest": active_executable_digest,
+    "active_deployment_raw": optional_text("/opt/myelin/active-deployment.json"),
+}))
 PY"#,
         budget,
     )?;
     serde_json::from_str(&output)
-        .map_err(|error| format!("parse raw process census for {container}: {error}"))
+        .map_err(|error| format!("parse raw node census for {container}: {error}"))
+}
+
+fn process_census(container: &str, budget: &Budget) -> Result<Vec<RawProcessFact>, String> {
+    Ok(node_census_probe(container, budget)?.processes)
 }
 
 fn related_worker_processes(
@@ -840,41 +906,35 @@ fn related_worker_processes(
     related
 }
 
-fn container_running(container: &str, budget: &Budget) -> Result<bool, String> {
-    let output = command_output(
-        Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", container]),
-        budget,
-        "inspect raw container running",
-    )?;
-    if !output.status.success() {
-        return Err(format!(
-            "docker inspect {container} exited {}",
-            output.status
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
-}
-
-fn container_has_init(container: &str, budget: &Budget) -> Result<bool, String> {
-    docker(
-        &["inspect", "-f", "{{.HostConfig.Init}}", container],
-        budget,
-    )
-    .map(|value| value.trim() == "true")
-}
-
-fn published_ssh_port(container: &str, budget: &Budget) -> Result<u16, String> {
-    let text = docker(&["port", container, "22"], budget)?;
-    let mut endpoints = text.lines();
+fn inspected_ssh_port(container: &RawResourceObservation) -> Result<u16, String> {
+    let endpoints = container.details["NetworkSettings"]["Ports"]["22/tcp"].as_array();
     let port = endpoints
-        .next()
-        .and_then(|line| line.strip_prefix("127.0.0.1:"))
-        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|endpoints| endpoints.len() == 1)
+        .and_then(|endpoints| {
+            let endpoint = &endpoints[0];
+            (endpoint["HostIp"].as_str() == Some("127.0.0.1"))
+                .then(|| endpoint["HostPort"].as_str()?.parse::<u16>().ok())
+                .flatten()
+        })
         .filter(|port| *port != 0);
-    match (port, endpoints.next()) {
-        (Some(port), None) => Ok(port),
+    port.ok_or_else(|| {
+        format!(
+            "container {} has no exclusive loopback SSH endpoint",
+            container.name
+        )
+    })
+}
+
+fn inspected_network(container: &RawResourceObservation) -> Result<&serde_json::Value, String> {
+    let networks = container.details["NetworkSettings"]["Networks"].as_object();
+    match networks {
+        Some(networks) if networks.len() == 1 => Ok(networks
+            .values()
+            .next()
+            .expect("exactly one inspected network")),
         _ => Err(format!(
-            "container {container} has no exclusive loopback SSH endpoint"
+            "raw node {} is not attached to exactly one network",
+            container.name
         )),
     }
 }
@@ -948,7 +1008,19 @@ fn inspect_resource(
             "raw {kind:?} {reference} has ambiguous inspection results"
         ));
     }
-    let value = values.pop().expect("exactly one inspected resource");
+    resource_observation(
+        kind,
+        reference,
+        values.pop().expect("exactly one inspected resource"),
+    )
+    .map(Some)
+}
+
+fn resource_observation(
+    kind: RawResourceKind,
+    reference: &str,
+    value: serde_json::Value,
+) -> Result<RawResourceObservation, String> {
     let id = value["Id"]
         .as_str()
         .ok_or_else(|| format!("raw {kind:?} {reference} has no provider ID"))?
@@ -970,7 +1042,71 @@ fn inspect_resource(
     let labels = serde_json::from_value::<Option<BTreeMap<String, String>>>(labels.clone())
         .map_err(|error| format!("decode raw {kind:?} ownership labels: {error}"))?
         .unwrap_or_default();
-    Ok(Some(RawResourceObservation { id, name, labels }))
+    Ok(RawResourceObservation {
+        id,
+        name,
+        labels,
+        details: value,
+    })
+}
+
+fn inspect_resources(
+    kind: RawResourceKind,
+    references: &[String],
+    budget: &Budget,
+) -> Result<Vec<RawResourceObservation>, String> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        match kind {
+            RawResourceKind::Container => "container",
+            RawResourceKind::Network => "network",
+        },
+        "inspect",
+    ];
+    args.extend(references.iter().map(String::as_str));
+    // Full boundaries require every resource. A failed batch is never
+    // interpreted as absence; cleanup retains its exact-ID reconciliation path.
+    let output = docker(&args, budget)?;
+    let values: Vec<serde_json::Value> = serde_json::from_str(&output)
+        .map_err(|error| format!("decode raw {kind:?} census: {error}"))?;
+    ordered_resource_observations(kind, references, values)
+}
+
+fn ordered_resource_observations(
+    kind: RawResourceKind,
+    references: &[String],
+    values: Vec<serde_json::Value>,
+) -> Result<Vec<RawResourceObservation>, String> {
+    if values.len() != references.len() {
+        return Err(format!("incomplete raw {kind:?} inspection census"));
+    }
+    let mut by_reference = BTreeMap::new();
+    for value in values {
+        let reference = references
+            .iter()
+            .find(|reference| {
+                value["Id"].as_str() == Some(reference.as_str())
+                    || value["Name"]
+                        .as_str()
+                        .map(|name| name.trim_start_matches('/'))
+                        == Some(reference.as_str())
+            })
+            .ok_or_else(|| format!("unexpected raw {kind:?} inspection result"))?;
+        let observed = resource_observation(kind, reference, value)?;
+        if by_reference.insert(reference.as_str(), observed).is_some() {
+            return Err(format!("duplicate raw {kind:?} inspection for {reference}"));
+        }
+    }
+    references
+        .iter()
+        .map(|reference| {
+            by_reference
+                .remove(reference.as_str())
+                .ok_or_else(|| format!("missing raw {kind:?} inspection for {reference}"))
+        })
+        .collect()
 }
 
 fn owned_resource(
@@ -1025,23 +1161,6 @@ fn remove_resource(kind: RawResourceKind, id: &str, budget: &Budget) -> Result<(
         }
     }
     Ok(())
-}
-
-fn container_ip_on_network(container: &str, budget: &Budget) -> Result<String, String> {
-    let text = docker(
-        &[
-            "inspect",
-            "-f",
-            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-            container,
-        ],
-        budget,
-    )?;
-    let ip = text.trim().to_owned();
-    if ip.is_empty() {
-        return Err(format!("container {container} has no network address"));
-    }
-    Ok(ip)
 }
 
 fn ensure_base_image(workspace: &Path, budget: &Budget) -> Result<(), String> {
@@ -1187,6 +1306,7 @@ impl RawDockerFleet {
         build_image: bool,
         budget: &Budget,
         cleanup_budget: &Budget,
+        blocking_work: BlockingWorkSender,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(artifacts)
             .map_err(|error| format!("create raw-fleet artifacts dir: {error}"))?;
@@ -1247,28 +1367,37 @@ impl RawDockerFleet {
             prior_processes: Mutex::new(BTreeMap::new()),
             budget: budget.clone(),
             cleanup_budget: cleanup_budget.clone(),
-            manifest: RawManifestStore {
+            manifest: Arc::new(RawManifestStore {
                 path,
                 state: Mutex::new(manifest),
                 _lock: lock,
-            },
+            }),
+            blocking_work,
         };
         let prepared = (|| {
-            let prefix = fleet.prefix.as_str();
-            let manifest = &fleet.manifest;
-            std::thread::scope(|scope| {
+            {
                 // Five construction owners at most, irrespective of manifest size.
-                // Each owner is cancellable; scope cannot strand a Docker child.
+                // Every accepted job is joined, including after cancellation or panic.
                 let mut errors = Vec::new();
                 for batch in fleet.nodes.chunks_mut(5) {
                     let mut pending = Vec::new();
                     for node in batch {
-                        let public_key = &public_key;
-                        let image_id = &image_id;
-                        pending.push(scope.spawn(move || {
-                            let started = Instant::now();
-                            let fixture_budget = budget;
-                            let node_budget = budget.child(Duration::from_secs(60));
+                        let state = Arc::new(Mutex::new(node.clone()));
+                        let owner_state = Arc::clone(&state);
+                        let public_key = public_key.clone();
+                        let image_id = image_id.clone();
+                        let prefix = fleet.prefix.clone();
+                        let manifest = Arc::clone(&fleet.manifest);
+                        let fixture_budget = budget.clone();
+                        let owner = fleet.blocking_work.submit_joinable(move || {
+                            let mut state = owner_state.lock().unwrap_or_else(|error| error.into_inner());
+                            let node = &mut *state;
+                            let prefix = prefix.as_str();
+                            let mut span = execution_span(
+                                ExecutionStage::ProcessLaunchReadiness, WorkKind::RemoteWait,
+                            );
+                            span.add_records(1);
+                            let node_budget = fixture_budget.child(Duration::from_secs(60));
                             let budget = &node_budget;
                             let result = (|| {
                                 let slot = node.slot;
@@ -1305,8 +1434,8 @@ impl RawDockerFleet {
                                     container, prefix, slot, budget,
                                 )?;
                                 let created_now = existing_container.is_none();
-                                if let Some(observed) = existing_container {
-                                    node.container_claim.adopt(&observed, prefix, slot)?;
+                                let mut observed = if let Some(observed) = existing_container {
+                                    observed
                                 } else {
                                     let port = reserve_port()?;
                                     let nonce = manifest.begin_creation(slot, RawResourceKind::Container)?;
@@ -1321,20 +1450,21 @@ impl RawDockerFleet {
                                         "--network", network_id,
                                         "--publish", &format!("127.0.0.1:{port}:22"),
                                         "--env", &format!("PUBLIC_KEY={public_key}"),
-                                        image_id,
+                                        &image_id,
                                     ], budget)?;
-                                    let observed = inspect_resource(
-                                        RawResourceKind::Container, id.trim(), budget,
-                                    )?.ok_or_else(|| format!("created raw node {container} disappeared"))?;
-                                    node.container_claim.adopt(&observed, prefix, slot)?;
-                                }
+                                    inspect_resource(
+                                        RawResourceKind::Container,
+                                        id.trim(),
+                                        budget,
+                                    )?
+                                    .ok_or_else(|| {
+                                        format!("created raw node {container} disappeared")
+                                    })?
+                                };
+                                node.container_claim.adopt(&observed, prefix, slot)?;
                                 manifest.record(node)?;
                                 let container_id = node.container_claim.retained_id()?;
-                                let configuration = docker(&[
-                                    "inspect", "-f", "{{json .}}", container_id,
-                                ], budget)?;
-                                let configuration: serde_json::Value = serde_json::from_str(&configuration)
-                                    .map_err(|error| format!("decode retained raw node configuration: {error}"))?;
+                                let configuration = &observed.details;
                                 let expected_key = format!("PUBLIC_KEY={public_key}");
                                 if configuration["Image"].as_str() != Some(image_id.as_str())
                                     || !configuration["Config"]["Env"].as_array().is_some_and(|env| {
@@ -1348,33 +1478,30 @@ impl RawDockerFleet {
                                 if created_now {
                                     // Blank-node guarantee: the base image must not carry
                                     // Myelin deployment state.
-                                    docker(&["exec", container_id, "test", "!", "-e", "/opt/myelin"], budget)
-                                        .map_err(|error| format!("fresh raw node {container} is not blank: {error}"))?;
-                                    docker(&[
-                                        "exec", container_id, "test", "!", "-e",
-                                        "/usr/local/bin/myelin-node",
-                                    ], budget).map_err(|error| {
-                                        format!("fresh raw node {container} ships myelin-node: {error}")
-                                    })?;
-                                } else if !container_running(container_id, budget)? {
+                                    docker_shell(container_id,
+                                        "test ! -e /opt/myelin && test ! -e /usr/local/bin/myelin-node",
+                                        budget,
+                                    ).map_err(|error| format!("fresh raw node {container} is not blank: {error}"))?;
+                                } else if configuration["State"]["Running"].as_bool() != Some(true) {
                                     docker(&["start", container_id], budget)?;
+                                    // Starting a stopped container changes network endpoints.
+                                    // Discard dynamic pre-start fields, then verify the same ID.
+                                    observed = inspect_resource(
+                                        RawResourceKind::Container, container_id, budget,
+                                    )?.ok_or_else(|| format!("started raw node {container} disappeared"))?;
+                                    node.container_claim.verify(&observed, prefix, slot)?;
                                 }
-                                if !container_has_init(container_id, budget)? {
+                                if observed.details["HostConfig"]["Init"].as_bool() != Some(true) {
                                     return Err(format!(
                                         "raw node {container} has no init reaper; refresh the fixture"
                                     ));
                                 }
-                                let attached = docker(&[
-                                    "inspect", "-f",
-                                    "{{range .NetworkSettings.Networks}}{{.NetworkID}}{{end}}",
-                                    container_id,
-                                ], budget)?;
-                                if attached.trim() != network_id {
+                                if inspected_network(&observed)?["NetworkID"].as_str() != Some(network_id) {
                                     return Err(format!(
                                         "raw node {container} is not attached exclusively to retained network {network_id}"
                                     ));
                                 }
-                                let ssh_port = published_ssh_port(container_id, budget)?;
+                                let ssh_port = inspected_ssh_port(&observed)?;
                                 if node.ssh_port != 0 && node.ssh_port != ssh_port {
                                     return Err(format!("retained raw node {container} SSH endpoint changed"));
                                 }
@@ -1383,20 +1510,36 @@ impl RawDockerFleet {
                                 manifest.record(node)?;
                                 Ok::<(), String>(())
                             })();
-                            record_execution_stage("raw_fleet.construct_node", started.elapsed(), 0, 1);
                             if result.is_err() {
                                 fixture_budget.cancel();
                             }
                             result
-                        }));
+                        });
+                        match owner {
+                            Ok(owner) => pending.push((node, state, owner)),
+                            Err(error) => {
+                                budget.cancel();
+                                errors.push(format!("submit raw construction owner: {error}"));
+                                break;
+                            }
+                        }
                     }
-                    for owner in pending {
-                        match owner.join() {
+                    for (node, state, owner) in pending {
+                        let result = owner.join();
+                        // Recover partial ownership even if the worker unwound while
+                        // creating a resource, so teardown can reconcile its nonce.
+                        std::mem::swap(
+                            node,
+                            &mut *state.lock().unwrap_or_else(|error| error.into_inner()),
+                        );
+                        match result {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => errors.push(error),
                             Err(_) => {
                                 budget.cancel();
-                                errors.push("raw construction owner panicked".to_owned());
+                                errors.push(
+                                    "raw construction owner panicked or cancelled".to_owned(),
+                                );
                             }
                         }
                     }
@@ -1409,9 +1552,9 @@ impl RawDockerFleet {
                 } else {
                     Err(errors.join("; "))
                 }
-            })?;
-            fleet.assert_isolated()?;
-            fleet.snapshot()?;
+            }?;
+            let observations = fleet.inspect_fixture()?;
+            fleet.assert_isolated_observed(&observations)?;
             fleet.manifest.update(|manifest| {
                 manifest.ready = true;
                 Ok(())
@@ -1477,34 +1620,102 @@ impl RawDockerFleet {
 
     /// Immutable provider-resource and logical mapping evidence.
     pub fn snapshot(&self) -> Result<RawFleetSnapshot, String> {
-        let budget = &self.budget;
-        let mut nodes = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let container = inspect_resource(RawResourceKind::Container, &node.container, budget)?
-                .ok_or_else(|| format!("retained raw container {} disappeared", node.container))?;
-            let network = inspect_resource(RawResourceKind::Network, &node.network, budget)?
-                .ok_or_else(|| format!("retained raw network {} disappeared", node.network))?;
-            // Snapshot must compare to acquisition identities, not establish a
-            // new baseline after a same-name resource has been replaced.
-            node.container_claim
-                .verify(&container, &self.prefix, node.slot)?;
-            node.network_claim
-                .verify(&network, &self.prefix, node.slot)?;
-            let container_id = node.container_claim.retained_id()?.to_owned();
-            let network_id = node.network_claim.retained_id()?.to_owned();
-            nodes.push(RawFixtureNodeIdentity {
-                logical_node_id: u64::from(node.slot) + 1,
-                slot: node.slot,
-                container: node.container.clone(),
-                container_id,
-                network: node.network.clone(),
-                network_id,
-                ssh_host: node.ssh_host.clone(),
-                ssh_port: published_ssh_port(node.container_claim.retained_id()?, budget)?,
-            });
-        }
+        let mut nodes = self
+            .inspect_fixture()?
+            .into_iter()
+            .map(|observed| observed.identity)
+            .collect::<Vec<_>>();
         nodes.sort_by_key(|node| node.slot);
         Ok(RawFleetSnapshot { nodes })
+    }
+
+    fn inspect_fixture(&self) -> Result<Vec<RawVerifiedNode>, String> {
+        let mut observations = Vec::with_capacity(self.nodes.len());
+        for batch in self.nodes.chunks(CENSUS_WIDTH) {
+            let pending = [RawResourceKind::Container, RawResourceKind::Network].map(|kind| {
+                let references = batch
+                    .iter()
+                    .map(|node| match kind {
+                        RawResourceKind::Container => node.container.clone(),
+                        RawResourceKind::Network => node.network.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let budget = self.budget.clone();
+                self.blocking_work
+                    .submit_joinable(move || inspect_resources(kind, &references, &budget))
+            });
+            // Materialize every join before propagating any error. A failed
+            // provider query cannot detach the other query or its subprocess.
+            let results = pending.map(|owner| match owner {
+                Ok(owner) => owner.join().unwrap_or_else(|_| {
+                    Err("raw fixture inspection owner panicked or cancelled".to_owned())
+                }),
+                Err(error) => Err(format!("submit raw fixture inspection owner: {error}")),
+            });
+            let [containers, networks] = match results {
+                [Ok(containers), Ok(networks)] => [containers, networks],
+                results => {
+                    return Err(results
+                        .into_iter()
+                        .filter_map(Result::err)
+                        .collect::<Vec<_>>()
+                        .join("; "));
+                }
+            };
+            for ((node, container), network) in batch.iter().zip(containers).zip(networks) {
+                // Compare against acquisition identities; never establish a
+                // replacement baseline from a same-name resource.
+                node.container_claim
+                    .verify(&container, &self.prefix, node.slot)?;
+                node.network_claim
+                    .verify(&network, &self.prefix, node.slot)?;
+                let identity = RawFixtureNodeIdentity {
+                    logical_node_id: u64::from(node.slot) + 1,
+                    slot: node.slot,
+                    container: node.container.clone(),
+                    container_id: node.container_claim.retained_id()?.to_owned(),
+                    network: node.network.clone(),
+                    network_id: node.network_claim.retained_id()?.to_owned(),
+                    ssh_host: node.ssh_host.clone(),
+                    ssh_port: inspected_ssh_port(&container)?,
+                };
+                observations.push(RawVerifiedNode {
+                    identity,
+                    container,
+                });
+            }
+        }
+        Ok(observations)
+    }
+
+    fn node_probes(&self) -> Vec<Result<RawNodeProbe, String>> {
+        let mut observations = Vec::with_capacity(self.nodes.len());
+        for batch in self.nodes.chunks(CENSUS_WIDTH) {
+            let pending = batch
+                .iter()
+                .map(|node| {
+                    let node = node.clone();
+                    // Clone the same absolute budget, not a fresh timeout per
+                    // node or batch. Every accepted owner is joined on all paths.
+                    let budget = self.budget.clone();
+                    self.blocking_work.submit_joinable(move || {
+                        node_census_probe(node.container_claim.retained_id()?, &budget)
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (node, owner) in batch.iter().zip(pending) {
+                let result = match owner {
+                    Ok(owner) => owner.join().unwrap_or_else(|_| {
+                        Err("raw census owner panicked or cancelled".to_owned())
+                    }),
+                    Err(error) => Err(format!("submit raw census owner: {error}")),
+                };
+                observations.push(
+                    result.map_err(|error| format!("raw census for {}: {error}", node.container)),
+                );
+            }
+        }
+        observations
     }
 
     pub fn assert_unchanged(&self, expected: &RawFleetSnapshot) -> Result<(), String> {
@@ -1521,21 +1732,38 @@ impl RawDockerFleet {
     /// Retains process identities on the host before a new generation starts.
     /// Node reset cannot erase this evidence by removing deployment metadata.
     pub fn record_prior_processes(&self) -> Result<(), String> {
-        for node in &self.nodes {
-            self.record_node_processes(node)?;
+        let mut errors = Vec::new();
+        for (node, probe) in self.nodes.iter().zip(self.node_probes()) {
+            if let Err(error) =
+                probe.and_then(|probe| self.retain_node_processes(node, &probe.processes))
+            {
+                errors.push(error);
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     fn record_node_processes(&self, node: &RawNode) -> Result<(), String> {
         let budget = &self.budget;
         let processes = process_census(node.container_claim.retained_id()?, budget)?;
+        self.retain_node_processes(node, &processes)
+    }
+
+    fn retain_node_processes(
+        &self,
+        node: &RawNode,
+        processes: &[RawProcessFact],
+    ) -> Result<(), String> {
         let mut prior = self
             .prior_processes
             .lock()
             .map_err(|_| "raw prior-process census lock poisoned".to_owned())?;
         let recorded = prior.entry(node.slot).or_default();
-        let related = related_worker_processes(&processes, recorded);
+        let related = related_worker_processes(processes, recorded);
         for process in related {
             if !recorded
                 .iter()
@@ -1551,10 +1779,15 @@ impl RawDockerFleet {
     /// Docker is used only as a census mechanism. It does not launch or
     /// install the tested worker.
     pub fn census(&self) -> Result<Vec<RawNodeCensus>, String> {
-        let budget = &self.budget;
         let mut census = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let processes = process_census(node.container_claim.retained_id()?, budget)?;
+        for (node, probe) in self.nodes.iter().zip(self.node_probes()) {
+            let RawNodeProbe {
+                processes,
+                agent_pid,
+                active_link_target,
+                active_executable_digest,
+                active_deployment_raw,
+            } = probe?;
             let prior_processes = self
                 .prior_processes
                 .lock()
@@ -1579,37 +1812,9 @@ impl RawDockerFleet {
             worker_processes.sort_by_key(|process| process.pid);
             let worker_group_processes = related_worker_processes(&processes, &prior_processes);
             let agent_pid = parse_optional_u32(
-                &docker_shell(
-                    node.container_claim.retained_id()?,
-                    "cat /opt/myelin/agent.pid 2>/dev/null || true",
-                    budget,
-                )?,
+                agent_pid.as_deref().unwrap_or_default(),
                 "raw node agent pid",
             )?;
-            let active_link_target = docker_shell(
-                node.container_claim.retained_id()?,
-                "readlink /opt/myelin/current 2>/dev/null || true",
-                budget,
-            )?;
-            let active_link_target = (!active_link_target.trim().is_empty())
-                .then(|| active_link_target.trim().to_owned());
-            let active_digest = docker_shell(
-                node.container_claim.retained_id()?,
-                "sha256sum /opt/myelin/current/bin/myelin-worker 2>/dev/null || true",
-                budget,
-            )?;
-            let active_executable_digest = active_digest
-                .split_whitespace()
-                .next()
-                .filter(|digest| digest.len() == 64)
-                .map(|digest| format!("sha256:{digest}"));
-            let active_deployment = docker_shell(
-                node.container_claim.retained_id()?,
-                "cat /opt/myelin/active-deployment.json 2>/dev/null || true",
-                budget,
-            )?;
-            let active_deployment_raw =
-                (!active_deployment.trim().is_empty()).then(|| active_deployment.trim().to_owned());
             census.push(RawNodeCensus {
                 logical_node_id: u64::from(node.slot) + 1,
                 container: node.container.clone(),
@@ -1854,8 +2059,17 @@ PY"#
     /// Nodes must sit on exactly one network each, and no node may open a TCP
     /// connection to another node's address.
     pub fn assert_isolated(&self) -> Result<(), String> {
+        let observations = self.inspect_fixture()?;
+        self.assert_isolated_observed(&observations)
+    }
+
+    fn assert_isolated_observed(&self, observations: &[RawVerifiedNode]) -> Result<(), String> {
         let budget = &self.budget;
-        let started = Instant::now();
+        let mut span = execution_span(
+            ExecutionStage::FixtureQuiescenceHealth,
+            WorkKind::RemoteWait,
+        );
+        span.add_records((self.nodes.len() * self.nodes.len().saturating_sub(1)) as u64);
         #[derive(Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum Outcome {
@@ -1886,29 +2100,28 @@ def probe(address):
 with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)) as workers:
     print(json.dumps(list(workers.map(probe, sys.argv[1:]))))
 "#;
-        let mut addresses = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let networks = docker(
-                &[
-                    "inspect",
-                    "-f",
-                    "{{len .NetworkSettings.Networks}}",
-                    node.container_claim.retained_id()?,
-                ],
-                budget,
-            )?;
-            if networks.trim() != "1" {
-                return Err(format!(
-                    "raw node {} is attached to {} networks; expected exactly 1",
-                    node.container,
-                    networks.trim()
-                ));
-            }
-            addresses.push(container_ip_on_network(
-                node.container_claim.retained_id()?,
-                budget,
-            )?);
-        }
+        let addresses = observations
+            .iter()
+            .map(|observed| {
+                let network = inspected_network(&observed.container)?;
+                if network["NetworkID"].as_str() != Some(observed.identity.network_id.as_str()) {
+                    return Err(format!(
+                        "raw node {} is not attached to its retained network {}",
+                        observed.identity.container, observed.identity.network_id
+                    ));
+                }
+                network["IPAddress"]
+                    .as_str()
+                    .filter(|address| !address.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!(
+                            "container {} has no network address",
+                            observed.identity.container
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if addresses
             .iter()
             .enumerate()
@@ -1920,8 +2133,8 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
         // One interpreter per source, with four independent socket probes.
         // All 20 directions remain concurrent for five nodes. Startup is inside
         // the command budget, not a competing 3s fuse around a 2.8s socket wait.
-        for batch in self.nodes.chunks(5) {
-            let results = std::thread::scope(|scope| {
+        for batch in self.nodes.chunks(CENSUS_WIDTH) {
+            let results = {
                 let pending = batch
                     .iter()
                     .map(|source| {
@@ -1930,17 +2143,23 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
                             .iter()
                             .zip(&addresses)
                             .filter(|(target, _)| target.slot != source.slot)
-                            .map(|(target, address)| (address.as_str(), target))
+                            .map(|(target, address)| (address.clone(), target.container.clone()))
                             .collect::<BTreeMap<_, _>>();
-                        scope.spawn(move || {
+                        let source = source.clone();
+                        let budget = budget.clone();
+                        self.blocking_work.submit_joinable(move || {
                             if targets.is_empty() {
                                 return Ok(());
                             }
+                            let probe_budget = budget.child(Duration::from_secs(10));
+                            let seconds = probe_budget.remaining("directed raw isolation probes")?
+                                .as_secs_f64().to_string();
                             let probe = command_output(
                                 Command::new("docker")
-                                    .args(["exec", source.container_claim.retained_id()?, "python3", "-c", PROBE])
+                                    .args(["exec", source.container_claim.retained_id()?,
+                                        "timeout", "-s", "KILL", &seconds, "python3", "-c", PROBE])
                                     .args(targets.keys()),
-                                &budget.child(Duration::from_secs(10)),
+                                &probe_budget,
                                 "directed raw isolation probes",
                             )?;
                             if !probe.status.success() {
@@ -1969,11 +2188,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
                                     Outcome::Unreachable => {}
                                     Outcome::Reachable => failures.push(format!(
                                         "raw node {} reached {} at {}:22",
-                                        source.container, target.container, observation.address,
+                                        source.container, target, observation.address,
                                     )),
                                     Outcome::Error => failures.push(format!(
                                         "isolation probe {} -> {} failed without absence proof: {}",
-                                        source.container, target.container,
+                                        source.container, target,
                                         observation.error.as_deref().unwrap_or("missing probe error"),
                                     )),
                                 }
@@ -1984,21 +2203,16 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
                     .collect::<Vec<_>>();
                 pending
                     .into_iter()
-                    .map(|owner| {
-                        owner
-                            .join()
-                            .unwrap_or_else(|_| Err("raw isolation owner panicked".to_owned()))
+                    .map(|owner| match owner {
+                        Ok(owner) => owner.join().unwrap_or_else(|_| {
+                            Err("raw isolation owner panicked or cancelled".to_owned())
+                        }),
+                        Err(error) => Err(format!("submit raw isolation owner: {error}")),
                     })
                     .collect::<Vec<_>>()
-            });
+            };
             errors.extend(results.into_iter().filter_map(Result::err));
         }
-        record_execution_stage(
-            "raw_fleet.isolation",
-            started.elapsed(),
-            0,
-            (self.nodes.len() * self.nodes.len().saturating_sub(1)) as u64,
-        );
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2010,9 +2224,53 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
         self.remaining_resources_with_budget(&self.budget)
     }
 
+    fn known_absent_resources(&self, budget: &Budget) -> Result<[BTreeSet<String>; 2], String> {
+        let pending = [RawResourceKind::Container, RawResourceKind::Network].map(|kind| {
+            // Capture IDs before the provider query. An unresolved creation
+            // adopted concurrently must still take its own reconciliation path.
+            let mut known = self
+                .nodes
+                .iter()
+                .filter_map(|node| match kind {
+                    RawResourceKind::Container => node.container_claim.id.get().cloned(),
+                    RawResourceKind::Network => node.network_claim.id.get().cloned(),
+                })
+                .collect::<BTreeSet<_>>();
+            let budget = budget.clone();
+            self.blocking_work.submit_joinable(move || {
+                if !known.is_empty() {
+                    for (id, _) in resource_census(kind, None, &budget)? {
+                        known.remove(&id);
+                    }
+                }
+                Ok::<_, String>(known)
+            })
+        });
+        let results = pending.map(|owner| match owner {
+            Ok(owner) => owner.join().unwrap_or_else(|_| {
+                Err("raw absence census owner panicked or cancelled".to_owned())
+            }),
+            Err(error) => Err(format!("submit raw absence census owner: {error}")),
+        });
+        match results {
+            [Ok(containers), Ok(networks)] => Ok([containers, networks]),
+            results => Err(results
+                .into_iter()
+                .filter_map(Result::err)
+                .collect::<Vec<_>>()
+                .join("; ")),
+        }
+    }
+
     pub fn remaining_resources_with_budget(&self, budget: &Budget) -> Result<Vec<String>, String> {
-        let results = std::thread::scope(|scope| {
-            self.nodes
+        // One exact-ID provider census per resource kind proves all known
+        // absences for this boundary. Present resources still require their
+        // complete labels/creation-ID checks; no observation crosses calls.
+        let absent = self.known_absent_resources(budget)?;
+        let mut remaining = Vec::new();
+        let mut errors = Vec::new();
+        for batch in self.nodes.chunks(5) {
+            let pending = batch
                 .iter()
                 .flat_map(|node| {
                     [
@@ -2020,37 +2278,45 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
                         (RawResourceKind::Network, &node.network_claim),
                     ]
                     .map(|(kind, claim)| {
-                        scope.spawn(move || {
-                            owned_resource(kind, claim, &self.prefix, node.slot, budget).map(
-                                |resource| {
-                                    resource.map(|resource| {
-                                        let kind = match kind {
-                                            RawResourceKind::Container => "container",
-                                            RawResourceKind::Network => "network",
-                                        };
-                                        format!("{kind}:{}:{}", resource.name, resource.id)
-                                    })
-                                },
-                            )
-                        })
+                        let absent = &absent[match kind {
+                            RawResourceKind::Container => 0,
+                            RawResourceKind::Network => 1,
+                        }];
+                        if claim.id.get().is_some_and(|id| absent.contains(id)) {
+                            return None;
+                        }
+                        let claim = claim.clone();
+                        let prefix = self.prefix.clone();
+                        let slot = node.slot;
+                        let budget = budget.clone();
+                        Some(self.blocking_work.submit_joinable(move || {
+                            owned_resource(kind, &claim, &prefix, slot, &budget).map(|resource| {
+                                resource.map(|resource| {
+                                    let kind = match kind {
+                                        RawResourceKind::Container => "container",
+                                        RawResourceKind::Network => "network",
+                                    };
+                                    format!("{kind}:{}:{}", resource.name, resource.id)
+                                })
+                            })
+                        }))
                     })
+                    .into_iter()
+                    .flatten()
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|owner| {
-                    owner
-                        .join()
-                        .unwrap_or_else(|_| Err("raw ownership census owner panicked".to_owned()))
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut remaining = Vec::new();
-        let mut errors = Vec::new();
-        for result in results {
-            match result {
-                Ok(Some(resource)) => remaining.push(resource),
-                Ok(None) => {}
-                Err(error) => errors.push(error),
+                .collect::<Vec<_>>();
+            for owner in pending {
+                let result = match owner {
+                    Ok(owner) => owner.join().unwrap_or_else(|_| {
+                        Err("raw ownership census owner panicked or cancelled".to_owned())
+                    }),
+                    Err(error) => Err(format!("submit raw ownership census owner: {error}")),
+                };
+                match result {
+                    Ok(Some(resource)) => remaining.push(resource),
+                    Ok(None) => {}
+                    Err(error) => errors.push(error),
+                }
             }
         }
         if !errors.is_empty() {
@@ -2062,11 +2328,14 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sys.argv) - 1)
 
     /// Preserve bounded worker failure evidence before destroying the local fixture.
     pub fn failure_diagnostics(&self, budget: &Budget) -> serde_json::Value {
-        let nodes = std::thread::scope(|scope| {
-            self.nodes
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for batch in self.nodes.chunks(5) {
+            let pending = batch
                 .iter()
                 .map(|node| {
-                    scope.spawn(move || {
+                    let node = node.clone();
+                    let budget = budget.clone();
+                    self.blocking_work.submit_joinable(move || {
                         let log = node
                             .container_claim
                             .retained_id()
@@ -2081,7 +2350,7 @@ with p.open("rb") as f:
     f.seek(max(0, size - 65536))
     print(json.dumps({"log_bytes": size, "log_tail": f.read().decode("utf-8", errors="replace")}))
 '"#,
-                                    budget,
+                                    &budget,
                                 )
                             })
                             .and_then(|text| {
@@ -2095,15 +2364,16 @@ with p.open("rb") as f:
                         })
                     })
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|owner| {
-                    owner.join().unwrap_or_else(
-                        |_| serde_json::json!({"error": "worker diagnostic collector panicked"}),
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+                .collect::<Vec<_>>();
+            nodes.extend(pending.into_iter().map(|owner| match owner {
+                Ok(owner) => owner.join().unwrap_or_else(|_| {
+                    serde_json::json!({"error": "worker diagnostic collector panicked or cancelled"})
+                }),
+                Err(error) => serde_json::json!({
+                    "error": format!("submit worker diagnostic collector: {error}")
+                }),
+            }));
+        }
         serde_json::json!({"schema_version": 1, "nodes": nodes})
     }
 
@@ -2113,16 +2383,21 @@ with p.open("rb") as f:
     }
 
     pub fn teardown_with_budget(&self, budget: &Budget) -> Result<(), String> {
-        let mut errors = std::thread::scope(|scope| {
-            let pending = self
-                .nodes
+        let mut errors = Vec::new();
+        for batch in self.nodes.chunks(5) {
+            let pending = batch
                 .iter()
                 .flat_map(|node| {
-                    let container = scope.spawn(move || {
+                    let container_node = node.clone();
+                    let container_prefix = self.prefix.clone();
+                    let container_budget = budget.clone();
+                    let container = self.blocking_work.submit_joinable(move || {
+                        let node = &container_node;
+                        let budget = &container_budget;
                         let result = owned_resource(
                             RawResourceKind::Container,
                             &node.container_claim,
-                            &self.prefix,
+                            &container_prefix,
                             node.slot,
                             budget,
                         )
@@ -2134,7 +2409,11 @@ with p.open("rb") as f:
                         });
                         result.err().into_iter().collect::<Vec<_>>()
                     });
-                    let network = scope.spawn(move || {
+                    let node = node.clone();
+                    let prefix = self.prefix.clone();
+                    let budget = budget.clone();
+                    let network = self.blocking_work.submit_joinable(move || {
+                        let budget = &budget;
                         // Endpoint detachment, not container process reaping, is
                         // the network removal dependency. Own it independently
                         // so a slow rm cannot consume the network's whole reserve.
@@ -2144,7 +2423,7 @@ with p.open("rb") as f:
                             let Some(network) = owned_resource(
                                 RawResourceKind::Network,
                                 &node.network_claim,
-                                &self.prefix,
+                                &prefix,
                                 node.slot,
                                 budget,
                             )?
@@ -2154,7 +2433,7 @@ with p.open("rb") as f:
                             let disconnect = owned_resource(
                                 RawResourceKind::Container,
                                 &node.container_claim,
-                                &self.prefix,
+                                &prefix,
                                 node.slot,
                                 budget,
                             )
@@ -2183,15 +2462,13 @@ with p.open("rb") as f:
                     [container, network]
                 })
                 .collect::<Vec<_>>();
-            pending
-                .into_iter()
-                .flat_map(|owner| {
-                    owner
-                        .join()
-                        .unwrap_or_else(|_| vec!["raw teardown owner panicked".to_owned()])
-                })
-                .collect::<Vec<_>>()
-        });
+            errors.extend(pending.into_iter().flat_map(|owner| match owner {
+                Ok(owner) => owner.join().unwrap_or_else(|_| {
+                    vec!["raw teardown owner panicked or cancelled".to_owned()]
+                }),
+                Err(error) => vec![format!("submit raw teardown owner: {error}")],
+            }));
+        }
         match self.remaining_resources_with_budget(budget) {
             Ok(remaining) if remaining.is_empty() => {
                 // Preserve IDs recovered during teardown before recording the
@@ -2205,13 +2482,13 @@ with p.open("rb") as f:
                     Ok(())
                 })?;
                 for path in [&self.identity, &self.identity.with_extension("pub")] {
-                    if let Err(error) = std::fs::remove_file(path) {
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            errors.push(format!(
-                                "remove private fixture identity {}: {error}",
-                                path.display()
-                            ));
-                        }
+                    if let Err(error) = std::fs::remove_file(path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        errors.push(format!(
+                            "remove private fixture identity {}: {error}",
+                            path.display()
+                        ));
                     }
                 }
             }
@@ -2240,7 +2517,55 @@ mod tests {
                 ("myelin.raw-fixture".to_owned(), fixture.to_owned()),
                 ("myelin.raw-slot".to_owned(), slot.to_string()),
             ]),
+            details: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn batch_inspection_matches_exact_resources_and_rejects_duplicate_results() {
+        let first = serde_json::json!({
+            "Id": "a".repeat(64), "Name": "/fixture-node-0",
+            "Config": {"Labels": {"myelin.raw-fixture": "fixture", "myelin.raw-slot": "0"}}
+        });
+        let second = serde_json::json!({
+            "Id": "b".repeat(64), "Name": "/fixture-node-1",
+            "Config": {"Labels": {"myelin.raw-fixture": "fixture", "myelin.raw-slot": "1"}}
+        });
+        let references = vec!["fixture-node-0".to_owned(), "fixture-node-1".to_owned()];
+        let observations = ordered_resource_observations(
+            RawResourceKind::Container,
+            &references,
+            vec![second, first.clone()],
+        )
+        .unwrap();
+        assert_eq!(observations[0].id, "a".repeat(64));
+        assert_eq!(observations[1].id, "b".repeat(64));
+        // Correct row count is insufficient: a repeated resource cannot stand
+        // in for the missing node, even when Docker output is reordered.
+        assert!(
+            ordered_resource_observations(
+                RawResourceKind::Container,
+                &references,
+                vec![first.clone(), first],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn combined_inspection_preserves_exclusive_loopback_ssh_endpoint() {
+        let mut container = observation('a', "fixture", 0);
+        container.details = serde_json::json!({
+            "NetworkSettings": {"Ports": {"22/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": "32000"}
+            ]}}
+        });
+        assert_eq!(inspected_ssh_port(&container).unwrap(), 32000);
+        container.details["NetworkSettings"]["Ports"]["22/tcp"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"HostIp": "0.0.0.0", "HostPort": "32000"}));
+        assert!(inspected_ssh_port(&container).is_err());
     }
 
     #[test]
@@ -2317,6 +2642,12 @@ mod tests {
             _lock: RawManifestStore::lock(directory.path()).unwrap(),
         };
         let nonce = store.begin_creation(0, RawResourceKind::Network).unwrap();
+        let inherited_fd = unsafe { libc::dup(store._lock.as_raw_fd()) };
+        assert!(inherited_fd >= 0);
+        // Model the open file description inherited across fork before exec
+        // applies CLOEXEC. Store teardown must release ownership immediately,
+        // even while that inherited descriptor remains open.
+        let inherited_lock = unsafe { OwnedFd::from_raw_fd(inherited_fd) };
         // Simulate runner loss after Docker accepted creation, before its ID
         // reached the journal. A different runner must use this exact nonce.
         drop(store);
@@ -2337,6 +2668,7 @@ mod tests {
             state: Mutex::new(recovered),
             _lock: RawManifestStore::lock(directory.path()).unwrap(),
         };
+        drop(inherited_lock);
         store.record(&node).unwrap();
         assert!(store.begin_creation(0, RawResourceKind::Network).is_err());
         drop(store);
@@ -2356,6 +2688,12 @@ mod tests {
 
     #[test]
     fn legacy_or_changed_fixture_configuration_is_retained_without_execution() {
+        let engine = swactor_engine::Engine::new(
+            swactor::runtime::RuntimeParts::new(swactor::runtime::RuntimeConfig::default()),
+            swactor_engine::SteppingBackend::new(),
+        )
+        .unwrap();
+        let blocking_work = engine.handle().blocking_work_sender();
         let directory = tempfile::tempdir().unwrap();
         let path = RawDockerFleet::manifest_path(directory.path());
         let legacy = r#"{"nodes":[{"slot":0,"container":"old-pid-node-0","ssh_host":"127.0.0.1","ssh_port":32000}]}"#;
@@ -2369,6 +2707,7 @@ mod tests {
                 false,
                 &budget,
                 &budget,
+                blocking_work.clone(),
             )
             .is_err()
         );
@@ -2389,6 +2728,7 @@ mod tests {
                 false,
                 &budget,
                 &budget,
+                blocking_work,
             )
             .is_err()
         );

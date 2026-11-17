@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Local VastAI wire fixture and independent real-CLI safety scenarios.
+"""Local VastAI wire fixture and retained cleanup-supervisor safety scenario.
 
-Server: scripted_provider.py PORT CONTROL_JSON REQUEST_LOG [READY_FD]
-Gate:   scripted_provider.py --gate ROOT OUTPUT HARNESS_BINARY
+Server:  scripted_provider.py PORT CONTROL_JSON REQUEST_LOG [READY_FD]
+Cleanup: scripted_provider.py --retained-cleanup ROOT OUTPUT HARNESS_BINARY
 
 Each server owns its contracts, request ledger, and fault controls. The ready
 pipe is written only after HTTP bind/listen succeeds. No credential is logged.
+This checks cleanup only, not runtime deployment or full campaign qualification.
 """
 
 import json
@@ -29,8 +30,6 @@ UNRELATED_CONTRACTS = {UNRELATED_ID: UNRELATED_LABEL}
 UNRELATED_WIRE_CONTRACTS = {str(UNRELATED_ID): UNRELATED_LABEL}
 KEY_ENV = "MYELIN_SCRIPTED_VASTAI_KEY"
 CREDENTIAL_ENVS = (KEY_ENV, "VAST_API_KEY", "MYELIN_VASTAI_API_KEY", "VASTAI_API_KEY")
-
-
 def credential_values(env):
     return tuple(env[name].encode() for name in CREDENTIAL_ENVS if env.get(name))
 
@@ -202,6 +201,7 @@ class Handler(BaseHTTPRequestHandler):
                                          "pending": list(state.pending), "destroyed": sorted(state.destroyed)})
             if path == "/api/v0/instances/":
                 state.list_count += 1
+                state.reveal(control)
                 now = time.monotonic()
                 rate_limited = (
                     state.list_count <= control.get("rate_limit_listings", 0)
@@ -360,86 +360,6 @@ def run_process(command, directory, env, stdout_path, stderr_path, timeout=150):
     return {"exit_status": status, "elapsed_seconds": time.monotonic() - started}
 
 
-def crash_runner(command, root, env, directory, request_path, failure, boundary):
-    require_credential_absence(b"\0".join(os.fsencode(part) for part in command), env, "process arguments")
-    started = time.monotonic()
-    with (directory / "stdout.log").open("w") as stdout, (directory / "stderr.log").open("w") as stderr:
-        process = subprocess.Popen(command, cwd=root, env=env, stdout=stdout,
-                                   stderr=stderr, start_new_session=True)
-        try:
-            until = time.monotonic() + 90
-            while time.monotonic() < until:
-                rows = [json.loads(line) for line in request_path.read_text().splitlines()] if request_path.exists() else []
-                state_paths = list((directory / "campaign").glob("*/paid-state.json"))
-                admission = None
-                if len(state_paths) == 1:
-                    paid = json.loads(state_paths[0].read_text())
-                    admission_path = Path(paid["state_dir"]) / "paid-admission.json"
-                    if admission_path.exists():
-                        admission = json.loads(admission_path.read_text())
-                creates = [row for row in rows
-                           if row["method"] == "PUT" and row["path"].startswith("/api/v0/asks/")]
-                accepted = sum(row["path"] == "create-accepted-before-response" for row in rows)
-                offers = sum(row["path"] == "/api/v0/bundles/" for row in rows)
-                reached = admission is not None and {
-                    "admission-before-create-reservation":
-                        offers >= 3 and not admission["create_reservations"] and not admission["contracts"],
-                    "create-reserved-before-provider-acceptance":
-                        len(creates) == 5 and len(admission["create_reservations"]) == 5
-                        and accepted == 0 and not admission["contracts"],
-                    "provider-accepted-before-response-accounting":
-                        accepted == 5 and len(admission["create_reservations"]) == 5
-                        and not admission["contracts"],
-                    "contract-accounted-before-bootstrap":
-                        len(admission["contracts"]) == 5 and not admission["initial_bootstraps"],
-                    "bootstrap-reserved-before-prepared-commit":
-                        len(admission["initial_bootstraps"]) == 5
-                        and admission["mode"] == "preparing",
-                }[boundary]
-                if reached:
-                    break
-                assert process.poll() is None, f"runner exited before {boundary}"
-                time.sleep(0.02)
-            else:
-                raise AssertionError(f"{boundary} was not observed before runner kill")
-            assert len(state_paths) == 1 and admission is not None
-            for role in ("runner", "orchestrator", "owner", "supervisor"):
-                identity = admission["cleanup"][role]
-                assert identity, f"missing admitted {role} identity"
-                require_credential_absence(
-                    Path(f"/proc/{identity['pid']}/cmdline").read_bytes(), env, f"{role} arguments")
-            if failure == "workstation-loss":
-                # The provider is outside the failed workstation. Stop its local
-                # supervision first so no owner can be restarted during the crash.
-                signal_cleanup_process(admission_path, "supervisor", signal.SIGKILL)
-            if failure in ("owner-loss-automatic", "workstation-loss"):
-                signal_cleanup_process(admission_path, "owner", signal.SIGKILL)
-            if failure in ("orchestrator-loss", "workstation-loss"):
-                signal_cleanup_process(admission_path, "orchestrator", signal.SIGKILL)
-            if failure == "orchestrator-loss":
-                process.wait(timeout=60)
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-            before = state_paths[0].read_bytes()
-            repeated = run_process(command, root, env, directory / "repeat.stdout.log", directory / "repeat.stderr.log")
-            assert repeated["exit_status"] != 0, "repeated paid campaign overwrote ownership"
-            assert state_paths[0].read_bytes() == before, "refusal modified original paid ownership"
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-    return {"exit_status": process.returncode, "elapsed_seconds": time.monotonic() - started,
-            "crash_boundary": boundary,
-            "runner_killed_before_accounting": failure != "orchestrator-loss",
-            "cleanup_owner_killed": failure in ("owner-loss-automatic", "workstation-loss"),
-            "original_cleanup": admission["cleanup"],
-            "original_contracts": admission["contracts"],
-            "original_initial_bootstraps": admission["initial_bootstraps"],
-            "original_create_reservations": admission["create_reservations"],
-            "post_crash_sequence": rows[-1]["sequence"]}
-
-
 def signal_cleanup_process(admission_path, role, sig):
     identity = json.loads(admission_path.read_text())["cleanup"][role]
     assert identity, f"missing cleanup {role} identity"
@@ -450,11 +370,7 @@ def signal_cleanup_process(admission_path, role, sig):
         command = (proc / "cmdline").read_bytes().split(b"\0")
         assert int(fields[19]) == identity["start_ticks"], "cleanup process incarnation changed"
         assert Path("/proc/sys/kernel/random/boot_id").read_text().strip() == identity["boot_id"]
-        if role == "orchestrator":
-            assert Path(os.fsdecode(command[0])).name == "myelin-orchestrator"
-            assert str(admission_path.parent).encode() in command
-        else:
-            assert f"--paid-cleanup-{role}".encode() in command and str(admission_path).encode() in command
+        assert f"--paid-cleanup-{role}".encode() in command and str(admission_path).encode() in command
         signal.pidfd_send_signal(pidfd, sig)
         assert select.select([pidfd], [], [], 5)[0], f"{role} crash did not stop the admitted incarnation"
     finally:
@@ -464,9 +380,6 @@ def signal_cleanup_process(admission_path, role, sig):
 
 def stop_scripted_cleanup_owners(directory):
     paths = [directory / "private" / "paid-admission.json"]
-    for paid_path in (directory / "campaign").glob("*/paid-state.json"):
-        paid = json.loads(paid_path.read_text())
-        paths.append(Path(paid["state_dir"]) / "paid-admission.json")
     for admission_path in paths:
         if not admission_path.exists():
             continue
@@ -583,486 +496,110 @@ def retained_owner_loss(binary, root, env, directory, request, ledger):
             "unrelated_preserved": True, "scope": "admission-and-real-cleanup-processes"}
 
 
-def gate(root, output, binary):
+def retained_cleanup_gate(root, output, binary):
     if not __debug__:
         raise RuntimeError("scripted safety proofs require Python assertions; optimization is forbidden")
     gate_started = time.monotonic()
     root, output, binary = Path(root).resolve(), Path(output).resolve(), Path(binary).resolve()
-    from ordered_acceptance import ROOT, TEST_COMMAND, digest, source_digest
-
-    assert root == ROOT, "gate fixtures must hash the harness workspace"
-    rejection_build_artifacts = {
-        name: digest(root / "target/release" / name)
-        for name in ("myelin-e2e-fuzz", "myelin-orchestrator", "myelin-worker")
-    }
-    assert digest(binary) == rejection_build_artifacts["myelin-e2e-fuzz"], "scripted gate binary is not the qualified executable"
-    rejection_source_digest = source_digest()
-    rejection_image = "registry.invalid/myelin-node@sha256:" + "0" * 64
-    rejected_gates = {
-        "missing-gates": "paid execution requires --gate-attestation from ordered_acceptance.py; operator authorization is not gate evidence",
-        "stale-gates": "paid gate attestation is missing, incomplete, stale, or incompatible",
-        "failed-gates": "paid gate stages failed or were not executed in order",
-        "out-of-order-gates": "missing, duplicate or out-of-order required gate warm-1-campaign",
-        "changed-binaries": "paid gate evidence does not attest the current binaries, sources and image",
-    }
     output.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ, **{name: "scripted-" + secrets.token_hex(24) for name in CREDENTIAL_ENVS})
+    env = dict(os.environ)
+    for name in CREDENTIAL_ENVS:
+        env[name] = "scripted-" + secrets.token_hex(24)
     marker = env[KEY_ENV]
-    key = output / "dummy_ed25519"
-    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key),
-                    "-C", "scripted-safety"], check=True)
-    duplicate_offers = default_offers()
-    for offer in duplicate_offers:
-        offer["host_id"] = 2001
-    malformed_offers = default_offers()
-    malformed_offers[0]["dph_total"] = -1.0
-    priced_offers = list(reversed(default_offers()))
-    priced_offers += [
-        dict(default_offers()[0], id=1101, dph_total=0.01),
-        dict(default_offers()[0], id=1102, host_id=2102, dph_total=0.001, verification="unverified"),
-        dict(default_offers()[0], id=1103, host_id=59017, dph_total=0.001),
-        dict(default_offers()[0], id=1104, host_id=2104, dph_total=0.08),
-    ]
-    preflight = {
-        "zero-cost": ("--max-total-cost-usd", "0", "explicit positive paid-run ceiling"),
-        "invalid-cost": ("--max-hourly-cost-usd", "NaN", "must be finite and non-negative"),
-        "zero-lifetime": ("--fixture-lifetime-secs", "0", "resource bounds must be nonzero"),
-        "short-lifetime": ("--fixture-lifetime-secs", "1199", "planned campaign requires"),
-        "empty-image": ("--image", " ", "runtime image must not be empty"),
-        "missing-credential": (None, None, "credential environment"),
-    }
-    provider_admissions = {
-        "selected-cost-over-budget": ("--max-total-cost-usd", "1", "selected worst-case cost"),
-    }
-    crash_scenarios = {
-        "runner-loss": ("runner-loss", "provider-accepted-before-response-accounting"),
-        "owner-loss-automatic": ("owner-loss-automatic", "provider-accepted-before-response-accounting"),
-        "orchestrator-loss": ("orchestrator-loss", "provider-accepted-before-response-accounting"),
-        "workstation-loss": ("workstation-loss", "provider-accepted-before-response-accounting"),
-        "crash-before-create-reservation": ("runner-loss", "admission-before-create-reservation"),
-        "crash-after-create-reservation": ("runner-loss", "create-reserved-before-provider-acceptance"),
-        "crash-after-contract-accounting": ("runner-loss", "contract-accounted-before-bootstrap"),
-        "crash-after-bootstrap-reservation": ("runner-loss", "bootstrap-reserved-before-prepared-commit"),
-    }
-    scenarios = {
-        "missing-gates": {},
-        "stale-gates": {},
-        "failed-gates": {},
-        "out-of-order-gates": {},
-        "changed-binaries": {},
-        **{name: {} for name in preflight},
-        "campaign-resource-overflow": {},
-        **{name: {} for name in provider_admissions},
-        "runner-loss": {"create_mode": "withheld-response"},
-        "owner-loss-automatic": {"create_mode": "withheld-response"},
-        "orchestrator-loss": {"create_mode": "withheld-response"},
-        "workstation-loss": {"create_mode": "withheld-response"},
-        "crash-before-create-reservation": {"withhold_offer_responses_after": 2},
-        "crash-after-create-reservation": {"create_mode": "withheld-acceptance"},
-        "crash-after-contract-accounting": {"status_mode": "loading"},
-        "crash-after-bootstrap-reservation": {"status_mode": "running", "ssh_endpoint": True},
-        "retained-owner-loss": {"initial_contracts": {
-            str(8999 + node): f"scripted-retained-42-{node}-attempt-0" for node in range(1, 6)}},
-        "duplicate-hosts": {"offers": duplicate_offers},
-        "insufficient-offers": {"offers": []},
-        "malformed-offers": {"offers": malformed_offers},
-        "cheapest-distinct-verified": {"offers": priced_offers},
-        "create-rejected": {"create_mode": "reject", "credential_echo": True},
-        "rate-limited-listing": {"create_mode": "reject", "rate_limit_listings": 1, "retry_after": 1},
-        "delayed-ambiguous-create": {"create_mode": "ambiguous", "reveal_after_listings": 2,
-                                     "create_visibility_delay": 0},
-        "late-contract": {"status_mode": "running", "late_contract_after_delete": 9700,
-                          "extra_owned_contracts": 2},
-        "slow-delete": {"slow_delete": 9000, "slow_delete_seconds": 1.5, "extra_owned_contracts": 2,
-                         "late_contract_after_delete": 9700},
-        "cleanup-only-recovery": {"extra_owned_contracts": 2},
-    }
-    summary = {"schema_version": 3, "state": "running", "scenarios": {},
-               "provider": "loopback-scripted", "paid_resources": 0}
-    for name, control in scenarios.items():
-        directory = output / name
-        directory.mkdir(parents=True, exist_ok=False)
-        control_path = directory / "control.json"
-        control_path.write_text(json.dumps(control))
-        request_path = directory / "requests.jsonl"
-        ready_read, ready_write = os.pipe()
-        provider_log = (directory / "provider.log").open("w")
-        provider = subprocess.Popen([sys.executable, "-E", "-B", __file__, "0", str(control_path), str(request_path),
-                                     str(ready_write)], env=env, pass_fds=(ready_write,),
-                                    stdout=provider_log, stderr=provider_log)
-        os.close(ready_write)
+    name = "retained-owner-loss"
+    directory = output / name
+    directory.mkdir()
+    control_path = directory / "control.json"
+    control_path.write_text(json.dumps({"initial_contracts": {
+        str(8999 + node): f"scripted-retained-42-{node}-attempt-0" for node in range(1, 6)}}))
+    request_path = directory / "requests.jsonl"
+    summary = {"schema_version": 1, "state": "running", "scenarios": {},
+               "provider": "loopback-scripted", "paid_resources": 0,
+               "scope": "retained-cleanup-lifecycle",
+               "qualification": "cleanup only; not runtime deployment or full campaign"}
+    summary_path = output / "scripted-cleanup-summary.json"
+    ready_read, ready_write = os.pipe()
+    provider_log = (directory / "provider.log").open("w")
+    provider = subprocess.Popen([sys.executable, "-E", "-B", __file__, "0", str(control_path), str(request_path),
+                                 str(ready_write)], env=env, pass_fds=(ready_write,),
+                                stdout=provider_log, stderr=provider_log)
+    os.close(ready_write)
+    try:
+        assert select.select([ready_read], [], [], 10)[0], "provider did not signal readiness"
+        ready = json.loads(os.read(ready_read, 4096))
+        assert ready["pid"] == provider.pid and provider.poll() is None
+        url = f"http://127.0.0.1:{ready['port']}"
+        scenario_env = dict(env, VASTAI_BASE_URL=url,
+                            XDG_STATE_HOME=str(directory / "private-state"))
+
+        def request(path, body=None):
+            data = None if body is None else json.dumps(body).encode()
+            req = urllib.request.Request(url + path, data=data,
+                                         headers={"Authorization": f"Bearer {marker}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return json.load(response)
+
+        def ledger():
+            return [json.loads(line) for line in request_path.read_text().splitlines()] if request_path.exists() else []
+
+        summary["scenarios"][name] = retained_owner_loss(
+            binary, root, scenario_env, directory, request, ledger)
+        for application_root in (directory / "private-state", directory / "private"):
+            for artifact in application_root.rglob("*"):
+                if artifact.is_file():
+                    content = artifact.read_bytes()
+                    assert not any(label.encode() in content for label in UNRELATED_CONTRACTS.values()), "application persisted unrelated account data"
+    except BaseException as error:
+        summary["state"] = "failed"
+        detail = str(error)
+        for value in credential_values(env):
+            detail = detail.replace(value.decode(), "[REDACTED]")
+        summary["error"] = detail
+        raise
+    finally:
         try:
-            assert select.select([ready_read], [], [], 10)[0], "provider did not signal readiness"
-            ready = json.loads(os.read(ready_read, 4096))
-            assert ready["pid"] == provider.pid and provider.poll() is None
-            url = f"http://127.0.0.1:{ready['port']}"
-            scenario_env = dict(env, VASTAI_BASE_URL=url,
-                                XDG_STATE_HOME=str(directory / "private-state"))
-
-            def request(path, body=None):
-                data = None if body is None else json.dumps(body).encode()
-                req = urllib.request.Request(url + path, data=data,
-                                             headers={"Authorization": f"Bearer {marker}", "Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    return json.load(response)
-
-            def ledger():
-                return [json.loads(line) for line in request_path.read_text().splitlines()] if request_path.exists() else []
-
-            if name == "retained-owner-loss":
-                summary["scenarios"][name] = retained_owner_loss(
-                    binary, root, scenario_env, directory, request, ledger)
-                (output / "scripted-safety-summary.json").write_text(json.dumps(summary, indent=2))
-                continue
-
-            command = [str(binary), "--paid-vastai", "--authorize-paid-vastai", "--scripted-provider",
-                       "--seed", "20260910", "--fixture-lifetime-secs", "43200", "--max-total-cost-usd", "5",
-                       "--max-hourly-cost-usd", "0.5", "--ssh-identity", str(key),
-                       "--image", "myelin-node:latest", "--api-key-env", KEY_ENV,
-                       "--deadline-secs", "5", "--no-build-image", "--artifacts", str(directory / "campaign")]
-            # These fixtures reject before runtime-image or deployment-artifact inspection.
-            if name in rejected_gates:
-                command.remove("--scripted-provider")
-                command[command.index("--image") + 1] = rejection_image
-                if name != "missing-gates":
-                    now = time.time_ns() // 1_000_000
-                    stages = []
-                    qualified_binary = str(root / "target/release/myelin-e2e-fuzz")
-                    qualified_artifacts = directory / "qualified-local-gates"
-
-                    def stage(stage_name, argv):
-                        stages.append({"name": stage_name, "command": argv,
-                                       "state": "passed", "exit_code": 0, "elapsed_secs": 0.001,
-                                       "started_unix_ms": now - 1000 + len(stages) * 2,
-                                       "completed_unix_ms": now - 999 + len(stages) * 2})
-
-                    stage("build", ["cargo", "build", "--release", "-p", "myelin",
-                                    "--bins", "-p", "myelin-e2e-fuzz"])
-                    stage("build-test-binaries", TEST_COMMAND + ["--no-run"])
-                    stage("build-deployment-artifacts",
-                          [qualified_binary, "--prepare-artifacts", "--deadline-secs", "3600",
-                           "--artifacts", str(qualified_artifacts / "build-deployment-artifacts")])
-                    for index in range(1, 4):
-                        common = [qualified_binary, "--seed", "20260910", "--deadline-secs",
-                                  "120", "--no-build-image", "--image", rejection_image]
-                        for suffix, flags in [
-                                ("gate-a", ["--deployment-e2e", "--deployment-nodes", "5"]),
-                                ("campaign", ["--campaign", "--fixture-lifetime-secs", "43200"]),
-                                ("failure-cases", ["--nodes", "5", "--failure-cases"])]:
-                            stage(f"warm-{index}-{suffix}", common + flags + ["--artifacts",
-                                  str(qualified_artifacts / f"warm-{index}" / suffix)])
-                        stage(f"warm-{index}-contract-model-safety", TEST_COMMAND)
-                        stage(f"warm-{index}-scripted-provider",
-                              ["bash", "tools/myelin-e2e-fuzz/scripted_safety_gate.sh",
-                               str(qualified_artifacts / f"warm-{index}" / "scripted-provider")])
-                    stage("verify-qualified-deployment-artifacts",
-                          [qualified_binary, "--prepare-artifacts", "--deadline-secs", "120",
-                           "--artifacts", str(qualified_artifacts / "verify-qualified-deployment-artifacts")])
-                    # Synthetic image/deployment identities satisfy the schema, not paid
-                    # qualification. Only the intended guard below may reject each fixture.
-                    evidence = {"schema_version": 5, "state": "passed", "completed_unix_ms": now - 2,
-                                "expires_unix_ms": now + 60_000,
-                                "build_elapsed_secs": 0.02, "elapsed_secs": 0.1,
-                                "build_artifacts": dict(rejection_build_artifacts),
-                                "deployment_artifacts": {
-                                    "schema_version": 2, "source_build_input_digest": "0" * 64,
-                                    "executables": dict(rejection_build_artifacts),
-                                    "wheel_input_digest": "0" * 64, "wheels": {}, "payload": {}},
-                                "source_digest": rejection_source_digest,
-                                "image_identities": {
-                                    image: {"id": "sha256:" + str(index) * 64, "os": "linux",
-                                            "architecture": "amd64", "variant": "",
-                                            "repo_digests": [rejection_image],
-                                            "provenance_version": 1,
-                                            "source_build_input_digest": "0" * 64,
-                                            "image_role": role,
-                                            "parent_image_id": None if index == 0 else "sha256:" + str(index - 1) * 64}
-                                    for index, (image, role) in enumerate([
-                                        ("myelin-node-base:cuda12.6", "base"),
-                                        ("myelin-node:latest", "node"), (rejection_image, "e2e")])},
-                                "configuration": {"warm_runs": 3, "image": rejection_image,
-                                                  "seed": 20260910, "case_deadline_secs": 120,
-                                                  "build_images": False, "workspace": str(root),
-                                                  "artifacts": str(qualified_artifacts)},
-                                "stages": stages, "runs": [{"index": index, "state": "passed", "gate_a": "passed",
-                                                          "inside_target": True, "campaign_elapsed_secs": 0.001,
-                                                          "elapsed_secs": 0.01} for index in range(1, 4)]}
-                    if name == "stale-gates":
-                        evidence["expires_unix_ms"] = now - 1
-                    elif name == "failed-gates":
-                        stages[1]["state"], stages[1]["exit_code"] = "failed", 1
-                    elif name == "out-of-order-gates":
-                        stages[4]["name"], stages[5]["name"] = stages[5]["name"], stages[4]["name"]
-                    elif name == "changed-binaries":
-                        tested = evidence["build_artifacts"]["myelin-e2e-fuzz"]
-                        evidence["build_artifacts"]["myelin-e2e-fuzz"] = (
-                            ("1" if tested[0] == "0" else "0") + tested[1:])
-                    attestation_path = directory / "rejected-attestation.json"
-                    attestation_path.write_text(json.dumps(evidence))
-                    command += ["--gate-attestation", str(attestation_path)]
-            if name in preflight:
-                flag, value, _ = preflight[name]
-                if flag is not None:
-                    command[command.index(flag) + 1] = value
-                else:
-                    scenario_env.pop(KEY_ENV)
-            if name in provider_admissions:
-                flag, value, _ = provider_admissions[name]
-                command[command.index(flag) + 1] = value
-            if name == "campaign-resource-overflow":
-                command.append("--scripted-campaign-resource-overflow")
-            if name in crash_scenarios:
-                failure, boundary = crash_scenarios[name]
-                result = crash_runner(
-                    command, root, scenario_env, directory, request_path, failure, boundary)
-            else:
-                result = run_process(command, root, scenario_env, directory / "stdout.log", directory / "stderr.log")
-            assert result["exit_status"] != 0, f"{name}: fault scenario incorrectly passed"
-            rows = ledger()
-            creates = [row for row in rows
-                       if row["method"] == "PUT" and row["path"].startswith("/api/v0/asks/")]
-            assert all(row["authorized"] for row in rows), f"{name}: unauthenticated provider work"
-            assert len(creates) <= 5, f"{name}: exceeded five admitted acquisition attempts"
-            assert len({row["path"] for row in creates}) == len(creates), f"{name}: create retried for an admitted offer"
-            if (name in rejected_gates or name in preflight or name in provider_admissions
-                    or name == "campaign-resource-overflow"
-                    or name in ("duplicate-hosts", "insufficient-offers", "malformed-offers",
-                                "crash-before-create-reservation")):
-                assert not creates, f"{name}: rejected or pre-create scenario acquired contracts"
-            else:
-                assert creates, f"{name}: scenario never exercised admitted acquisition"
-            if name in rejected_gates:
-                assert not rows, "rejected gate evidence reached the provider"
-                expected_guard = rejected_gates[name]
-                stderr = (directory / "stderr.log").read_text()
-                assert f"myelin-e2e-behavioral-fuzz: {expected_guard}" in stderr.splitlines(), (
-                    f"{name}: did not reach intended rejection guard {expected_guard!r}")
-                result.update({"rejection_guard": expected_guard, "provider_requests_before_rejection": 0})
-            if name in preflight:
-                assert not rows, f"{name}: admission failure reached provider"
-                assert preflight[name][2] in (directory / "stderr.log").read_text(), f"{name}: wrong preflight failure"
-                result["provider_requests_before_rejection"] = 0
-            if name in provider_admissions:
-                assert any(row["path"] == "/api/v0/bundles/" for row in rows), f"{name}: offer-cost admission was not exercised"
-                assert provider_admissions[name][2] in (directory / "stderr.log").read_text(), f"{name}: wrong provider admission failure"
-                result["provider_requests_before_rejection"] = len(rows)
-            if name == "campaign-resource-overflow":
-                assert not rows, f"{name}: campaign resource admission reached provider"
-                assert "campaign resources exceed the hard admission ceilings" in (
-                    directory / "stderr.log").read_text(), f"{name}: wrong campaign resource admission failure"
-                result["provider_requests_before_rejection"] = 0
-            if name == "malformed-offers":
-                assert any(row["path"] == "/api/v0/bundles/" for row in rows), "malformed offer response was not exercised"
-            if control.get("credential_echo"):
-                assert any(row["path"] == "credential-echo" for row in rows), "credential echo was not exercised"
-            state_paths = list((directory / "campaign").rglob("paid-state.json"))
-            paid_path = state_paths[0] if state_paths else None
-            if creates or name in crash_scenarios:
-                assert len(state_paths) == 1, f"{name}: missing unique durable cleanup state"
-                paid = json.loads(paid_path.read_text())
-                if name not in crash_scenarios:
-                    assert paid["phase"] not in ("planned", "acquiring", "prepared"), f"{name}: acquisition remained authorized"
-                assert all(row["label"] in paid["owned_labels"] for row in creates), f"{name}: unauthorized owned label"
-                assert all(int(row["path"].rstrip("/").split("/")[-1]) in paid["selected_offer_ids"]
-                           for row in creates), f"{name}: unselected offer acquired"
-                if name == "cheapest-distinct-verified":
-                    assert paid["selected_offer_ids"] == [1101, 1002, 1003, 1004, 1005], "price/verification/distinct-host policy selected the wrong offers"
-                    result["selected_offer_ids"] = paid["selected_offer_ids"]
-
-            def cleanup(suffix, seconds=15):
-                before = ledger()[-1]["sequence"] if ledger() else 0
-                outcome = run_process([str(binary), "--cleanup-only", str(paid_path),
-                                       "--deadline-secs", str(seconds), "--api-key-env", KEY_ENV,
-                                       "--artifacts", str(directory / "cleanup-artifacts")],
-                                      root, scenario_env, directory / f"{suffix}.stdout.log",
-                                      directory / f"{suffix}.stderr.log", timeout=seconds + 15)
-                new_rows = [row for row in ledger() if row["sequence"] > before]
-                assert not any(row["method"] == "PUT" or row["path"] == "/api/v0/bundles/"
-                               for row in new_rows), f"{name}: cleanup-only searched or acquired"
-                return outcome, new_rows
-
-            if name == "workstation-loss":
-                recovered, _ = cleanup("workstation-recovery")
-                assert recovered["exit_status"] == 0, "workstation cleanup-only recovery failed"
-                recovered_admission = json.loads((Path(paid["state_dir"]) / "paid-admission.json").read_text())
-                assert recovered_admission["mode"] == "cleanup_only"
-                for field in ("limits", "started_unix_ms", "stop_unix_ms"):
-                    assert recovered_admission["cleanup"][field] == result["original_cleanup"][field], "workstation recovery renewed cleanup ceilings"
-                result["cleanup_only"] = recovered
-                result["manual_cleanup_commands"] = 1
-
-            if name in set(crash_scenarios) - {"workstation-loss"}:
-                admission_path = Path(paid["state_dir"]) / "paid-admission.json"
-                until = time.monotonic() + 30
-                while time.monotonic() < until:
-                    state = request("/__scripted__/state")
-                    admission = json.loads(admission_path.read_text())
-                    if (state["contracts"] == UNRELATED_WIRE_CONTRACTS
-                            and not state["pending"] and admission["cleanup"]["complete"]):
-                        break
-                    time.sleep(0.05)
-                else:
-                    raise AssertionError("independent supervision did not automatically stop spending")
-                for field in ("limits", "started_unix_ms", "stop_unix_ms", "supervisor"):
-                    assert admission["cleanup"][field] == result["original_cleanup"][field]
-                assert admission["mode"] == "cleanup_only"
-                if name == "owner-loss-automatic":
-                    assert admission["cleanup"]["owner"] != result["original_cleanup"]["owner"]
-                result["automatic_cleanup"] = True
-                result["manual_cleanup_commands"] = 0
-
-            if name in crash_scenarios:
-                restored = json.loads((Path(paid["state_dir"]) / "paid-admission.json").read_text())
-                assert restored["initial_bootstraps"] == result["original_initial_bootstraps"], "crash recovery resumed initial bootstrap"
-                assert restored["create_reservations"] == result["original_create_reservations"], "crash recovery changed acquisition reservations"
-                assert restored["contracts"] == result["original_contracts"], "crash recovery changed contract accounting"
-                result["acquisition_slots"] = len(restored["create_reservations"])
-                result["initial_bootstrap_slots"] = len(restored["initial_bootstraps"])
-                assert not any(row["sequence"] > result["post_crash_sequence"]
-                               and (row["method"] == "PUT" or row["path"] == "/api/v0/bundles/")
-                               for row in ledger()), "crash recovery searched or acquired"
-
-            if name == "delayed-ambiguous-create":
-                initial = request("/__scripted__/state")
-                if initial["pending"] or len(initial["contracts"]) > 1:
-                    assert json.loads(paid_path.read_text())["phase"] == "cleanup_only", "late create obligation was abandoned"
-                recovery, _ = cleanup("ambiguous-recovery")
-                result["cleanup_only"] = recovery
-                assert recovery["exit_status"] == 0, "observed ambiguous identities failed cleanup-only recovery"
-                assert any(row["path"] == "contract-visible" for row in ledger()), "delayed discovery was not exercised"
-
-            if name == "cleanup-only-recovery":
-                prior = request("/__scripted__/state")
-                assert len(prior["created"]) >= 3, "independent cleanup siblings were not constructed"
-                control["withhold_delete"] = 9000
-                control_path.write_text(json.dumps(control))
-                request("/__scripted__/restore", {"contracts": prior["created"]})
-                failed, cleanup_rows = cleanup("withheld-delete", seconds=1)
-                assert failed["exit_status"] != 0 and failed["elapsed_seconds"] < 5, "withheld deletion did not yield bounded failure"
-                assert json.loads(paid_path.read_text())["phase"] == "cleanup_only", "foreground expiry abandoned durable cleanup"
-                pending = request("/__scripted__/state")
-                assert set(map(int, pending["contracts"])) == set(UNRELATED_CONTRACTS) | {9000}, "withheld delete blocked healthy cleanup"
-                assert any(row["path"] == "delete-completed" and row["contract_id"] != 9000 for row in cleanup_rows)
-                request("/__scripted__/release-deletes", {})
-                recovered, recovery_rows = cleanup("cleanup-recovery")
-                assert recovered["exit_status"] != 0, "duplicate-label accounting must remain a failure after spending stops"
-                assert not any(row["method"] == "PUT" or row["path"] == "/api/v0/bundles/"
-                               for row in recovery_rows), "cleanup-only recovery reopened acquisition"
-                result["withheld_delete"] = failed
-                result["cleanup_only"] = recovered
-
-            final = request("/__scripted__/state")
-            (directory / "provider-final-state.json").write_text(json.dumps(final, indent=2))
-            assert final["contracts"] == UNRELATED_WIRE_CONTRACTS and not final["pending"], f"{name}: exact attributable absence not proved"
-            rows = ledger()
-            assert not any(row["method"] == "DELETE"
-                           and int(row["path"].rstrip("/").split("/")[-1]) in UNRELATED_CONTRACTS
-                           for row in rows if row["path"].startswith("/api/v0/instances/")), f"{name}: unrelated resource touched"
-            created_ids = set(map(int, final["created"]))
-            if created_ids:
-                successful_listings = [row for row in rows if row["path"] == "/api/v0/instances/" and row.get("status") == 200]
-                assert successful_listings and not created_ids.intersection(successful_listings[-1]["returned_ids"]), "missing final typed provider absence census"
-                assert created_ids <= set(final["destroyed"]), "destroy accounting omitted an attributable identity"
-            if name == "rate-limited-listing":
-                rate_limited = [row for row in rows if row.get("status") == 429]
-                assert rate_limited, "listing rate limit not exercised"
-                for limited in rate_limited:
-                    subsequent = next(row for row in rows if row["sequence"] > limited["sequence"]
-                                      and row["path"] == "/api/v0/instances/")
-                    assert subsequent["elapsed_ns"] - limited["elapsed_ns"] >= limited["retry_after"] * 1e9, "Retry-After was violated"
-            if name == "slow-delete":
-                completions = [row for row in rows if row["path"] == "delete-completed"]
-                slow = next(row for row in completions if row["contract_id"] == 9000)
-                healthy = [row for row in completions if row["contract_id"] in (9500, 9501)]
-                assert len(healthy) == 2 and all(row["elapsed_ns"] < slow["elapsed_ns"] for row in healthy), "slow delete serialized healthy deletion"
-                late = next(row for row in completions if row["contract_id"] == 9700)
-                assert late["elapsed_ns"] < slow["elapsed_ns"], "pending delete blocked late-contract discovery"
-            for application_root in (directory / "campaign", directory / "private-state", directory / "private"):
-                for artifact in application_root.rglob("*"):
-                    if artifact.is_file():
-                        content = artifact.read_bytes()
-                        assert not any(label.encode() in content for label in UNRELATED_CONTRACTS.values()), "application persisted unrelated account data"
-            result.update({"creates": len(creates), "created_contract_ids": sorted(created_ids),
-                           "destroyed_contract_ids": sorted(final["destroyed"]), "exact_absence": True,
-                           "unrelated_preserved": True,
-                           "listing_requests": sum(row["path"] == "/api/v0/instances/" for row in rows)})
-            summary["scenarios"][name] = result
-            (output / "scripted-safety-summary.json").write_text(json.dumps(summary, indent=2))
-        except BaseException as error:
+            stop_scripted_cleanup_owners(directory)
+        except BaseException:
             summary["state"] = "failed"
-            summary["failed_scenario"] = name
-            detail = str(error)
-            for value in credential_values(env):
-                detail = detail.replace(value.decode(), "[REDACTED]")
-            summary["error"] = detail
             raise
         finally:
+            os.close(ready_read)
+            provider.terminate()
             try:
-                stop_scripted_cleanup_owners(directory)
+                provider.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                provider.kill()
+                provider.wait()
+            provider_log.close()
+            try:
+                summary["credential_scan"] = scan_credentials(output, env)
+                summary["credential_absence"] = True
+            except BaseException:
+                summary["state"] = "failed"
+                summary["credential_absence"] = False
+                raise
             finally:
-                os.close(ready_read)
-                provider.terminate()
-                try:
-                    provider.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    provider.kill()
-                    provider.wait()
-                provider_log.close()
-                try:
-                    scanned = scan_credentials(directory, env)
-                    summary["scenarios"].setdefault(name, {})["credential_scan"] = scanned
-                except BaseException:
-                    summary["state"] = "failed"
-                    summary["failed_scenario"] = name
-                    summary["credential_absence"] = False
-                    raise
-                finally:
-                    summary["elapsed_seconds"] = time.monotonic() - gate_started
-                    (output / "scripted-safety-summary.json").write_text(json.dumps(summary, indent=2))
-    summary["credential_scan"] = scan_credentials(output, env)
-    summary["gate_b_coverage"] = {
-        "4_offer_selection": [
-            "duplicate-hosts", "insufficient-offers", "malformed-offers",
-            "cheapest-distinct-verified",
-        ],
-        "5_admission": [
-            *preflight, *provider_admissions, "campaign-resource-overflow",
-        ],
-        "6_shared_acquisition_bound": [
-            *crash_scenarios, "create-rejected", "delayed-ambiguous-create",
-            "retained-owner-loss",
-        ],
-        "7_bootstrap_and_redeployment_bound": [
-            "crash-after-bootstrap-reservation", "retained-owner-loss",
-        ],
-        "8_preparation_crash_accounting": [
-            "crash-before-create-reservation", "crash-after-create-reservation",
-            "runner-loss", "crash-after-contract-accounting",
-            "crash-after-bootstrap-reservation", "retained-owner-loss",
-        ],
-        "9_cleanup_only_failure_recovery": [
-            "runner-loss", "owner-loss-automatic", "orchestrator-loss",
-            "workstation-loss", "retained-owner-loss", "cleanup-only-recovery",
-        ],
-        "15_concurrent_exact_cleanup": [
-            "late-contract", "slow-delete", "cleanup-only-recovery",
-        ],
-        "16_credential_redaction": ["create-rejected", "all-scenario-artifact-scans"],
-    }
+                summary["elapsed_seconds"] = time.monotonic() - gate_started
+                summary_path.write_text(json.dumps(summary, indent=2))
     summary["state"] = "passed"
-    summary["credential_absence"] = True
-    summary["elapsed_seconds"] = time.monotonic() - gate_started
-    (output / "scripted-safety-summary.json").write_text(json.dumps(summary, indent=2))
-    (output.parent / "vastai-gate-b-scripted.json").write_text(json.dumps(summary, indent=2))
+    summary_path.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 
 
+
+
+
+
+
 if __name__ == "__main__":
-    if sys.argv[1] == "--gate":
+    if sys.argv[1:2] == ["--retained-cleanup"]:
         try:
-            gate(*sys.argv[2:])
+            retained_cleanup_gate(*sys.argv[2:])
         except Exception as error:
-            print(f"scripted safety gate failed ({type(error).__name__}); inspect its summary and logs", file=sys.stderr)
+            print(f"scripted retained cleanup failed ({type(error).__name__}); inspect its summary and logs", file=sys.stderr)
             sys.exit(1)
-    else:
+    elif len(sys.argv) in (4, 5) and sys.argv[1].isdigit():
         serve()
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)

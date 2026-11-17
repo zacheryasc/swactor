@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use swactor_engine::BlockingWorkSender;
 use swactor_vastai::{BlockingVastClient, VastClient};
 
 use myelin_control_contract::{ControlReply, Offer, OfferSearchRequest, OfferSearchResults};
@@ -16,10 +17,13 @@ use provisioning::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+use crate::budget::{ExecutionStage, WorkKind, execution_span};
 use crate::campaign::{
     ARTIFACT_SCHEMA_VERSION, ArtifactEnvelope, CampaignConfig, CampaignLimits, CampaignPlan,
 };
+use crate::ir::BehaviorCase;
 
 pub const PAID_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -426,26 +430,100 @@ pub fn read_paid_state(path: &Path) -> Result<PaidCampaignState, String> {
     Ok(state)
 }
 
-pub fn write_campaign_plan(path: &Path, plan: &CampaignPlan) -> Result<(), String> {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignPlanSource {
+    config: CampaignConfig,
+    regressions: Vec<BehaviorCase>,
+    expanded_digest: String,
+}
+
+fn campaign_plan_digest(
+    plan: &CampaignPlan,
+    budget: &crate::budget::Budget,
+) -> Result<String, String> {
+    struct DigestWriter<'a> {
+        digest: Sha256,
+        budget: &'a crate::budget::Budget,
+        written: usize,
+        next_check: usize,
+    }
+
+    impl std::io::Write for DigestWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.digest.update(bytes);
+            self.written = self.written.saturating_add(bytes.len());
+            if self.written >= self.next_check {
+                self.budget
+                    .check("hash expanded campaign plan")
+                    .map_err(std::io::Error::other)?;
+                self.next_check = self.written.saturating_add(1024 * 1024);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    budget.check("hash expanded campaign plan")?;
+    let mut writer = DigestWriter {
+        digest: Sha256::new(),
+        budget,
+        written: 0,
+        next_check: 1024 * 1024,
+    };
+    writer
+        .digest
+        .update(b"myelin-e2e-expanded-campaign-plan-v1\0");
+    serde_json::to_writer(&mut writer, plan)
+        .map_err(|error| format!("hash expanded campaign plan: {error}"))?;
+    Ok(format!("{:x}", writer.digest.finalize()))
+}
+
+pub fn write_campaign_plan(
+    path: &Path,
+    plan: &CampaignPlan,
+    budget: &crate::budget::Budget,
+) -> Result<(), String> {
     plan.validate()?;
-    let envelope = ArtifactEnvelope::new("campaign-plan", plan.campaign_id.clone(), plan)?;
+    let source = CampaignPlanSource {
+        config: plan.source_config.clone(),
+        regressions: plan.regressions.clone(),
+        expanded_digest: campaign_plan_digest(plan, budget)?,
+    };
+    let envelope = ArtifactEnvelope::new("campaign-plan-source", plan.campaign_id.clone(), source)?;
     if envelope.artifact_schema_version != ARTIFACT_SCHEMA_VERSION {
         return Err("campaign artifact schema mismatch".to_owned());
     }
     durable_json(path, &envelope)
 }
-pub fn read_campaign_plan(path: &Path) -> Result<CampaignPlan, String> {
-    let envelope =
-        serde_json::from_reader::<_, ArtifactEnvelope<CampaignPlan>>(std::io::BufReader::new(
+
+pub fn read_campaign_plan(
+    path: &Path,
+    budget: &crate::budget::Budget,
+) -> Result<CampaignPlan, String> {
+    let envelope = serde_json::from_reader::<_, ArtifactEnvelope<CampaignPlanSource>>(
+        std::io::BufReader::new(
             File::open(path).map_err(|error| format!("read campaign plan: {error}"))?,
-        ))
-        .map_err(|error| format!("parse campaign plan: {error}"))?;
-    envelope.validate("campaign-plan")?;
-    envelope.payload.validate()?;
-    if envelope.campaign_id != envelope.payload.campaign_id {
+        ),
+    )
+    .map_err(|error| format!("parse campaign plan: {error}"))?;
+    envelope.validate("campaign-plan-source")?;
+    let plan = CampaignPlan::build_with_budget(
+        &envelope.payload.config,
+        envelope.payload.regressions,
+        budget,
+    )?;
+    if envelope.campaign_id != plan.campaign_id {
         return Err("campaign plan envelope identity differs from its payload".to_owned());
     }
-    Ok(envelope.payload)
+    let digest = campaign_plan_digest(&plan, budget)?;
+    if digest != envelope.payload.expanded_digest {
+        return Err("regenerated campaign plan differs from its committed digest".to_owned());
+    }
+    Ok(plan)
 }
 
 pub fn read_coverage_ledger(
@@ -505,25 +583,18 @@ pub fn authorized_cleanup_limits(limits: &CampaignLimits) -> Result<PaidCleanupL
 }
 
 /// Convert the operator ceiling and selected rental prices conservatively.
-/// Nonzero metered network prices cannot be bounded by rental lifetime alone.
+/// Metered transfer is admitted separately against the total cost ceiling.
 pub fn selected_cleanup_limits(
     offers: &[Offer],
     limits: &CampaignLimits,
 ) -> Result<PaidCleanupLimits, String> {
-    if offers
-        .iter()
-        .any(|offer| offer.download_cost_per_tb != 0.0 || offer.upload_cost_per_tb != 0.0)
-    {
-        return Err(
-            "paid spending ceiling requires zero metered upload/download charges".to_owned(),
-        );
-    }
     cleanup_limits(offers.iter().map(|offer| offer.hourly_price).sum(), limits)
 }
 
 /// Install detached restart supervision before provision_selected. Credentials
 /// are inherited through the environment, never process arguments.
 pub fn start_cleanup_owner(
+    blocking_work: &BlockingWorkSender,
     executable: &Path,
     admission_path: &Path,
     api_key_env: &str,
@@ -542,11 +613,19 @@ pub fn start_cleanup_owner(
             );
         }
     }
-    spawn_cleanup_supervisor(executable, admission_path, api_key_env, false, deadline)
+    spawn_cleanup_supervisor(
+        blocking_work,
+        executable,
+        admission_path,
+        api_key_env,
+        false,
+        deadline,
+    )
 }
 
 /// Recovery is always deny-only. It cannot extend limits or create reservations.
 pub fn recover_cleanup_owner(
+    blocking_work: &BlockingWorkSender,
     executable: &Path,
     admission_path: &Path,
     api_key_env: &str,
@@ -554,10 +633,18 @@ pub fn recover_cleanup_owner(
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let admission = PaidFixtureAdmission::open(admission_path)?;
     admission.enter_cleanup_only()?;
-    spawn_cleanup_supervisor(executable, admission_path, api_key_env, true, deadline)
+    spawn_cleanup_supervisor(
+        blocking_work,
+        executable,
+        admission_path,
+        api_key_env,
+        true,
+        deadline,
+    )
 }
 
 fn spawn_cleanup_supervisor(
+    blocking_work: &BlockingWorkSender,
     executable: &Path,
     admission_path: &Path,
     api_key_env: &str,
@@ -591,8 +678,7 @@ fn spawn_cleanup_supervisor(
         }
         #[cfg(not(unix))]
         return Err("independent paid cleanup requires Unix process supervision".to_owned());
-        command
-            .spawn()
+        swactor_process::command_spawn(&mut command)
             .map_err(|error| format!("start independent paid cleanup supervisor: {error}"))
     };
     let mut child = if admission.cleanup_supervisor_active()? {
@@ -613,7 +699,7 @@ fn spawn_cleanup_supervisor(
         }
         let exited = child
             .as_mut()
-            .map(|child| child.try_wait())
+            .map(swactor_process::child_try_wait)
             .transpose()
             .map_err(|error| format!("observe cleanup supervisor: {error}"))?
             .flatten()
@@ -661,10 +747,15 @@ fn spawn_cleanup_supervisor(
         );
     })();
     if let Some(mut child) = child {
-        // Detach cleanup responsibility, but retain reaping on every return.
-        std::thread::spawn(move || {
-            let _ = child.wait();
+        // The independently supervised duty survives runner exit. The engine
+        // blocking pool retains reaping without delaying runtime shutdown.
+        let reap = Box::new(move || {
+            let _ = swactor_process::child_wait(&mut child);
         });
+        if let Err(reap) = blocking_work.submit(reap) {
+            // A stopped owner cannot accept responsibility for this child.
+            reap();
+        }
     }
     result
 }
@@ -709,17 +800,18 @@ pub fn run_cleanup_supervisor(admission_path: &Path, api_key_env: &str) -> Resul
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let result = Command::new(&executable)
-            .arg("--paid-cleanup-owner")
-            .arg(admission_path)
-            .arg("--api-key-env")
-            .arg(api_key_env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let result = swactor_process::command_spawn(
+            Command::new(&executable)
+                .arg("--paid-cleanup-owner")
+                .arg(admission_path)
+                .arg("--api-key-env")
+                .arg(api_key_env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
         if let Ok(mut child) = result {
-            let _ = child.wait();
+            let _ = swactor_process::child_wait(&mut child);
         }
         // Spawn errors and worker exits retain the duty and original ceilings.
         // A short bounded backoff prevents a broken executable spinning.
@@ -759,6 +851,7 @@ pub fn run_cleanup_owner(admission_path: &Path, api_key_env: &str) -> Result<(),
             );
             match result {
                 Ok(census) => {
+                    admission.record_create_absence(&census.missing_labels)?;
                     admission.complete_cleanup(&census.missing_contract_ids)?;
                     return Ok(());
                 }
@@ -767,6 +860,7 @@ pub fn run_cleanup_owner(admission_path: &Path, api_key_env: &str) -> Result<(),
                         admission.record_cleanup_accounting_error(error.detail.clone())?;
                     }
                     if let Some(census) = error.absence {
+                        admission.record_create_absence(&census.missing_labels)?;
                         admission.record_cleanup_absence(&census.missing_contract_ids)?;
                         return Err(error.detail);
                     }
@@ -781,6 +875,7 @@ pub fn run_cleanup_owner(admission_path: &Path, api_key_env: &str) -> Result<(),
 /// contracts, while real admission and detached processes exercise retention.
 /// This does not claim SSH/runtime readiness or perform provider acquisition.
 pub fn run_scripted_retained_lifecycle(
+    blocking_work: &BlockingWorkSender,
     admission_path: &Path,
     api_key_env: &str,
 ) -> Result<(), String> {
@@ -860,6 +955,7 @@ pub fn run_scripted_retained_lifecycle(
             unix_ms()? + provisioning::PAID_CLEANUP_RESERVE_MS + 45_000,
         )?;
         start_cleanup_owner(
+            blocking_work,
             &std::env::current_exe().map_err(|error| error.to_string())?,
             admission_path,
             api_key_env,
@@ -921,6 +1017,7 @@ pub fn await_cleanup_owner(admission_path: &Path, deadline: Duration) -> Result<
 /// The only runner-level cleanup integration: reconcile durable sources before
 /// touching the provider, delegate to the owner, and retain identities on error.
 pub fn cleanup_paid_ownership(
+    blocking_work: &BlockingWorkSender,
     paid: &mut PaidCampaignState,
     state_path: &Path,
     executable: &Path,
@@ -1046,16 +1143,17 @@ pub fn cleanup_paid_ownership(
                         state.accounting_errors
                     ));
                 }
-                if !admission.cleanup_owner_active()? {
-                    if let Err(error) = spawn_cleanup_supervisor(
+                if !admission.cleanup_owner_active()?
+                    && let Err(error) = spawn_cleanup_supervisor(
+                        blocking_work,
                         executable,
                         &path,
                         api_key_env,
                         true,
                         until.min(std::time::Instant::now() + Duration::from_secs(10)),
-                    ) {
-                        break Err(error);
-                    }
+                    )
+                {
+                    break Err(error);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1076,7 +1174,10 @@ pub fn cleanup_paid_ownership(
                     &mut |discovered| admission.reconcile_cleanup_discovery(discovered),
                 )
                 .map_err(|error| error.detail)
-                .and_then(|census| admission.complete_cleanup(&census.missing_contract_ids))
+                .and_then(|census| {
+                    admission.record_create_absence(&census.missing_labels)?;
+                    admission.complete_cleanup(&census.missing_contract_ids)
+                })
         };
         let final_state = admission.snapshot()?;
         paid.owned_contract_ids
@@ -1125,6 +1226,10 @@ fn durable_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("create temporary artifact: {error}"))?;
     {
+        let mut span = execution_span(
+            ExecutionStage::EvidenceSerialization,
+            WorkKind::RunnerOverhead,
+        );
         let mut writer = std::io::BufWriter::new(&mut temp);
         serde_json::to_writer(&mut writer, value)
             .map_err(|error| format!("serialize durable artifact: {error}"))?;
@@ -1132,7 +1237,12 @@ fn durable_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
             .write_all(b"\n")
             .and_then(|()| writer.flush())
             .map_err(|error| format!("finish durable artifact: {error}"))?;
+        span.add_records(1);
     }
+    let mut span = execution_span(
+        ExecutionStage::EvidenceSynchronization,
+        WorkKind::RunnerOverhead,
+    );
     temp.as_file_mut()
         .sync_all()
         .map_err(|error| format!("sync durable artifact: {error}"))?;
@@ -1141,6 +1251,7 @@ fn durable_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync artifact directory {}: {error}", parent.display()))?;
+    span.add_records(1);
     Ok(())
 }
 
@@ -1155,13 +1266,52 @@ fn unix_ms() -> Result<u64, String> {
 pub fn conservative_selected_cost(
     offers: &[Offer],
     limits: &CampaignLimits,
+    runtime_image_bytes: u64,
+    workload_transfer_bytes: u64,
 ) -> Result<f64, String> {
+    const BYTES_PER_TB: f64 = 1_000_000_000_000.0;
+    const CONTROL_TRANSFER_RESERVE_PER_NODE: u64 = 1024 * 1024 * 1024;
+
     let hourly: f64 = offers.iter().map(|offer| offer.hourly_price).sum();
-    let lifetime = hourly * limits.fixture_lifetime_secs as f64 / 3_600.0;
-    if !lifetime.is_finite() {
-        return Err("selected worst-case cost overflowed".to_owned());
+    let rental = hourly * limits.fixture_lifetime_secs as f64 / 3_600.0;
+    let control_bytes = CONTROL_TRANSFER_RESERVE_PER_NODE as f64;
+    let image_bytes = runtime_image_bytes as f64;
+    let image_and_control = offers
+        .iter()
+        .map(|offer| {
+            ((image_bytes + control_bytes) * offer.download_cost_per_tb
+                + control_bytes * offer.upload_cost_per_tb)
+                / BYTES_PER_TB
+        })
+        .sum::<f64>();
+    let maximum_download = offers
+        .iter()
+        .map(|offer| offer.download_cost_per_tb)
+        .fold(0.0_f64, f64::max);
+    let maximum_upload = offers
+        .iter()
+        .map(|offer| offer.upload_cost_per_tb)
+        .fold(0.0_f64, f64::max);
+    let workload =
+        workload_transfer_bytes as f64 * (maximum_download + maximum_upload) / BYTES_PER_TB;
+    let total = rental + image_and_control + workload;
+    if !total.is_finite()
+        || offers.iter().any(|offer| {
+            !offer.download_cost_per_tb.is_finite()
+                || offer.download_cost_per_tb < 0.0
+                || !offer.upload_cost_per_tb.is_finite()
+                || offer.upload_cost_per_tb < 0.0
+        })
+    {
+        return Err("selected worst-case cost overflowed or contains invalid pricing".to_owned());
     }
-    Ok(lifetime)
+    if total > limits.total_cost_usd {
+        return Err(format!(
+            "selected rental and metered-transfer worst-case cost ${total:.6} exceeds ceiling ${:.6}",
+            limits.total_cost_usd
+        ));
+    }
+    Ok(total)
 }
 
 pub fn scan_artifacts_for_secret(root: &Path, secret: &[u8]) -> Result<(), String> {
@@ -1215,7 +1365,7 @@ mod tests {
 
     fn prepared_admission() -> PaidAdmissionSnapshot {
         PaidAdmissionSnapshot {
-            schema_version: 3,
+            schema_version: 4,
             run_id: 7,
             nodes: (1..=5)
                 .map(|id| provisioning::PaidNodeAdmission {
@@ -1238,6 +1388,7 @@ mod tests {
                 })
                 .collect(),
             rejected_creates: BTreeSet::new(),
+            absent_creates: BTreeSet::new(),
             initial_bootstraps: (1..=5)
                 .map(|id| {
                     (
@@ -1279,14 +1430,33 @@ mod tests {
     }
 
     #[test]
-    fn metered_transfer_prices_cannot_hide_outside_operator_ceiling() {
+    fn metered_transfer_is_included_in_operator_ceiling() {
         let mut offers = (0..5).map(offer).collect::<Vec<_>>();
-        assert!(selected_cleanup_limits(&offers, &config().limits).is_ok());
-        offers[0].download_cost_per_tb = 0.001;
-        assert!(selected_cleanup_limits(&offers, &config().limits).is_err());
-        offers[0].download_cost_per_tb = 0.0;
-        offers[0].upload_cost_per_tb = 0.001;
-        assert!(selected_cleanup_limits(&offers, &config().limits).is_err());
+        for offer in &mut offers {
+            offer.download_cost_per_tb = 4.0;
+            offer.upload_cost_per_tb = 4.0;
+        }
+        let limits = config().limits;
+        let cost = conservative_selected_cost(
+            &offers,
+            &limits,
+            2 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(cost > 12.0);
+        assert!(selected_cleanup_limits(&offers, &limits).is_ok());
+
+        offers[0].download_cost_per_tb = 1_000.0;
+        assert!(
+            conservative_selected_cost(
+                &offers,
+                &limits,
+                2 * 1024 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+            )
+            .is_err()
+        );
     }
 
     fn config() -> CampaignConfig {
@@ -1492,8 +1662,8 @@ mod tests {
 
         impl Drop for FixtureProcess {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                let _ = swactor_process::child_kill(&mut self.0);
+                let _ = swactor_process::child_wait(&mut self.0);
             }
         }
 
@@ -1569,6 +1739,12 @@ mod tests {
                 }
                 return;
             }
+            let engine = swactor_engine::Engine::new(
+                swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+                swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+            )
+            .unwrap();
+            let blocking_work = engine.handle().blocking_work_sender();
 
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1593,14 +1769,15 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut observed = FixtureProcess(
-                Command::new(&executable)
-                    .args(["--exact", RECOVERY_TEST, "--nocapture"])
-                    .env(CHILD_ROLE, "observed")
-                    .env(CHILD_PATH, &path)
-                    .stdin(Stdio::from(OwnedFd::from(child_socket)))
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .unwrap(),
+                swactor_process::command_spawn(
+                    Command::new(&executable)
+                        .args(["--exact", RECOVERY_TEST, "--nocapture"])
+                        .env(CHILD_ROLE, "observed")
+                        .env(CHILD_PATH, &path)
+                        .stdin(Stdio::from(OwnedFd::from(child_socket)))
+                        .stdout(Stdio::null()),
+                )
+                .unwrap(),
             );
             release.read_exact(&mut [0]).unwrap();
             let settled = admission.snapshot().unwrap();
@@ -1638,10 +1815,13 @@ mod tests {
                 "{}",
                 std::io::Error::last_os_error(),
             );
-            let releasing = std::thread::spawn(move || {
-                release_after_supervisor_probe(events, release);
-            });
+            let releasing = blocking_work
+                .submit_joinable(move || {
+                    release_after_supervisor_probe(events, release);
+                })
+                .unwrap();
             let recovered = spawn_cleanup_supervisor(
+                &blocking_work,
                 &launcher,
                 &path,
                 "MYELIN_SUPERVISOR_REGRESSION_UNUSED_CREDENTIAL",
@@ -1649,7 +1829,11 @@ mod tests {
                 Instant::now() + Duration::from_secs(5),
             );
             releasing.join().unwrap();
-            assert!(observed.0.wait().unwrap().success());
+            assert!(
+                swactor_process::child_wait(&mut observed.0)
+                    .unwrap()
+                    .success()
+            );
             assert!(!old_identity.is_live());
             recovered.unwrap();
             let ready = admission.snapshot().unwrap();
@@ -1684,6 +1868,12 @@ mod tests {
 
         #[test]
         fn expired_readiness_cannot_authorize_acquisition() {
+            let engine = swactor_engine::Engine::new(
+                swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+                swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+            )
+            .unwrap();
+            let blocking_work = engine.handle().blocking_work_sender();
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let path = directory.path().join("admission.json");
@@ -1695,6 +1885,7 @@ mod tests {
             let before = admission.snapshot().unwrap();
 
             let result = spawn_cleanup_supervisor(
+                &blocking_work,
                 &directory.path().join("must-not-spawn"),
                 &path,
                 "MYELIN_SUPERVISOR_REGRESSION_UNUSED_CREDENTIAL",
@@ -1718,6 +1909,12 @@ mod tests {
 
         #[test]
         fn expired_recovery_cannot_accept_a_completed_receipt() {
+            let engine = swactor_engine::Engine::new(
+                swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+                swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+            )
+            .unwrap();
+            let blocking_work = engine.handle().blocking_work_sender();
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let path = directory.path().join("admission.json");
@@ -1728,6 +1925,7 @@ mod tests {
             let before = admission.snapshot().unwrap();
 
             let result = spawn_cleanup_supervisor(
+                &blocking_work,
                 &directory.path().join("must-not-spawn"),
                 &path,
                 "MYELIN_SUPERVISOR_REGRESSION_UNUSED_CREDENTIAL",

@@ -1,8 +1,12 @@
 //! Real-binary cluster lifecycle: build, start, provision, health, teardown.
 
+mod ssh_faults;
+
 mod control;
 mod convergence;
-pub mod raw_fleet;
+mod frame_archive;
+mod telemetry_capture;
+use crate::raw_fleet;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -12,12 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::budget::Budget;
 use crate::ir::BehaviorCase;
 use serde_json::{Value, json};
+use swactor_engine::{BlockingWorkSender, EngineHandle, TaskSpawner};
 use swactor_vastai::{BlockingVastClient, VastClient};
 
 use crate::resources::{
@@ -27,12 +31,30 @@ use crate::resources::{
     resolve_myelin_binaries,
 };
 
+/// Execution authority supplied by the binary or test composition root.
+/// The root owns the engine; a harness can neither mint tasks nor replace it.
+#[derive(Clone)]
+pub struct HarnessExecution {
+    pub runtime: swactor::runtime::Runtime,
+    pub engine: EngineHandle,
+    pub tasks: TaskSpawner,
+    pub blocking: BlockingWorkSender,
+}
+
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_millis(10);
-pub(crate) const GENERATED_LAUNCHER: &str = "/usr/local/bin/myelin-e2e-python";
 const BUILTIN_FIXTURE_PATH: &str = "/models/tiny-linear/weights";
 type CapturedLines = Arc<Mutex<VecDeque<String>>>;
 type SpawnedOrchestrator = (Child, OwnedFd, CapturedLines, CapturedLines);
+
+/// The protocol executor is native unless binding conformance is explicitly selected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadBackend {
+    #[default]
+    Native,
+    PythonConformance,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HarnessProvider {
@@ -107,9 +129,11 @@ pub struct RetainedCaseActors {
 
 pub struct ClusterHarness {
     config: ClusterHarnessConfig,
+    workload_backend: WorkloadBackend,
     pub(crate) execution_budget: Budget,
     pub(crate) cleanup_budget: Option<Budget>,
     fixture_cleanup_budget: Budget,
+    blocking_work: Option<BlockingWorkSender>,
     binaries: BuiltBinaries,
     provider_client: Option<BlockingVastClient>,
     lifecycle_started: Instant,
@@ -122,6 +146,7 @@ pub struct ClusterHarness {
     container_prefix: String,
     telemetry: PathBuf,
     telemetry_census: Mutex<TelemetryResourceCensus>,
+    telemetry_capture: telemetry_capture::TelemetryCapture,
     provider_baseline: BTreeSet<String>,
     fixture_mapping: BTreeMap<u64, Value>,
     stopped_nodes: BTreeSet<u64>,
@@ -152,8 +177,8 @@ fn spawn_orchestrator(
     state_dir: &Path,
     image: &str,
     container_prefix: &str,
-    telemetry: &Path,
     budget: &Budget,
+    blocking_work: &BlockingWorkSender,
     reset_state: bool,
 ) -> Result<SpawnedOrchestrator, String> {
     budget.check("spawn retained orchestrator process")?;
@@ -175,6 +200,11 @@ fn spawn_orchestrator(
             command
                 .args(["--vastai-provisioning", "mock"])
                 .env("MYELIN_MOCK_VASTAI_CONTAINER_PREFIX", container_prefix)
+                .env(
+                    "MYELIN_MOCK_VASTAI_OFFERS",
+                    serde_json::to_string(&config.selected_offer_ids)
+                        .map_err(|error| error.to_string())?,
+                )
                 .env("MYELIN_DOCKER_GPUS", "");
         }
         HarnessProvider::StaticSsh {
@@ -228,43 +258,31 @@ fn spawn_orchestrator(
                 .env("MYELIN_PAID_FIXTURE_ADMISSION", admission);
         }
     }
-    let mut monotonic = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut monotonic) } != 0 {
-        return Err(format!(
-            "read monotonic subprocess deadline: {}",
-            std::io::Error::last_os_error()
-        ));
+    if matches!(
+        &config.provider,
+        HarnessProvider::StaticSsh { .. }
+            | HarnessProvider::VastAiReal {
+                bundle: Some(_),
+                ..
+            }
+    ) {
+        ssh_faults::install(&mut command, state_dir)?;
     }
-    let now_ms = (monotonic.tv_sec as u128) * 1_000 + (monotonic.tv_nsec as u128) / 1_000_000;
-    let deadline_ms = now_ms
-        + budget
-            .remaining("orchestrator subprocess ownership")?
-            .as_millis();
-    command.env(
-        "MYELIN_E2E_EXECUTION_DEADLINE_MONOTONIC_MS",
-        deadline_ms.to_string(),
-    );
     if reset_state {
         command.arg("--reset-state");
     }
     command
-        .arg("--telemetry-frame-log")
-        .arg(telemetry)
         .env("MYELIN_DASHBOARD_PORT", dashboard_port.to_string())
         .env("MYELIN_IROH_BIND_PORT", dashboard_port.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut orchestrator = command
-        .spawn()
+    let mut orchestrator = swactor_process::command_spawn(&mut command)
         .map_err(|error| format!("start real Myelin orchestrator: {error}"))?;
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, orchestrator.id(), 0) };
     if pidfd < 0 {
         let error = std::io::Error::last_os_error();
-        let _ = orchestrator.kill();
+        let _ = swactor_process::child_kill(&mut orchestrator);
         let _ = wait_for_child(
             &mut orchestrator,
             budget,
@@ -276,37 +294,64 @@ fn spawn_orchestrator(
     let stdout = Arc::new(Mutex::new(VecDeque::new()));
     let stderr = Arc::new(Mutex::new(VecDeque::new()));
     capture_lines(
+        blocking_work,
         orchestrator
             .stdout
             .take()
             .expect("captured orchestrator stdout"),
         Arc::clone(&stdout),
-    );
+    )?;
     capture_lines(
+        blocking_work,
         orchestrator
             .stderr
             .take()
             .expect("captured orchestrator stderr"),
         Arc::clone(&stderr),
-    );
+    )?;
     Ok((orchestrator, pidfd, stdout, stderr))
 }
 
 impl ClusterHarness {
-    pub fn start(config: ClusterHarnessConfig) -> Result<Self, String> {
+    pub fn workload_backend(&self) -> WorkloadBackend {
+        self.workload_backend
+    }
+
+    /// Select the executor only between fully cleaned-up attempts.
+    /// The caller must provision the corresponding conformance artifacts first.
+    pub fn set_workload_backend(&mut self, backend: WorkloadBackend) -> Result<(), String> {
+        if !self.active_attempts.is_empty()
+            || !self.pending_attempts.is_empty()
+            || !self
+                .pending_control_processes
+                .lock()
+                .map_err(|_| "owned execution tracking is poisoned")?
+                .is_empty()
+        {
+            return Err("cannot change workload backend while an attempt is owned".to_owned());
+        }
+        self.workload_backend = backend;
+        Ok(())
+    }
+
+    pub fn start(
+        config: ClusterHarnessConfig,
+        capabilities: HarnessExecution,
+    ) -> Result<Self, String> {
         let execution = Budget::new(config.deadline);
         let cleanup = Budget::new(
             config.deadline + Duration::from_secs(crate::campaign::CLEANUP_DEADLINE_SECS),
         );
-        Self::start_with_budgets(config, execution, cleanup)
+        Self::start_with_budgets(config, execution, cleanup, capabilities)
     }
 
     pub fn start_with_budgets(
         config: ClusterHarnessConfig,
         execution: Budget,
         cleanup: Budget,
+        capabilities: HarnessExecution,
     ) -> Result<Self, String> {
-        Self::start_internal(config, execution, cleanup, true)
+        Self::start_internal(config, execution, cleanup, capabilities, true)
     }
 
     /// Dispatch real deployment while keeping boundary injection on the caller's owner.
@@ -314,14 +359,16 @@ impl ClusterHarness {
         config: ClusterHarnessConfig,
         budget: Budget,
         cleanup: Budget,
+        capabilities: HarnessExecution,
     ) -> Result<Self, String> {
-        Self::start_internal(config, budget, cleanup, false)
+        Self::start_internal(config, budget, cleanup, capabilities, false)
     }
 
     fn start_internal(
         config: ClusterHarnessConfig,
         budget: Budget,
         fixture_cleanup_budget: Budget,
+        capabilities: HarnessExecution,
         observe_deployment: bool,
     ) -> Result<Self, String> {
         let lifecycle_started = Instant::now();
@@ -416,6 +463,17 @@ impl ClusterHarness {
         let base_url = format!("http://127.0.0.1:{port}");
         let container_prefix = format!("myelin-e2e-{}-{nonce}", std::process::id());
         let telemetry = config.artifacts.join(format!("telemetry-{nonce}.jsonl"));
+        let relay_mode = match config.relay_url.as_deref() {
+            Some(url) => iroh::RelayMode::custom([url
+                .parse::<iroh::RelayUrl>()
+                .map_err(|error| format!("invalid capture relay URL: {error}"))?]),
+            None if matches!(config.provider, HarnessProvider::LocalMock) => {
+                iroh::RelayMode::Disabled
+            }
+            None => iroh::RelayMode::Default,
+        };
+        let telemetry_capture =
+            telemetry_capture::TelemetryCapture::start(&telemetry, relay_mode, &capabilities)?;
         let provider_client = match &config.provider {
             HarnessProvider::VastAiReal { api_key_env, .. } => {
                 let key = std::env::var(api_key_env).map_err(|_| {
@@ -432,16 +490,18 @@ impl ClusterHarness {
             &state_dir,
             &image,
             &container_prefix,
-            &telemetry,
             &fixture_cleanup_budget,
+            &capabilities.blocking,
             config.reset_state,
         )?;
         let retain_on_start_error =
             !matches!(config.provider, HarnessProvider::LocalMock) && !config.reset_state;
         let mut harness = Self {
+            workload_backend: WorkloadBackend::Native,
             execution_budget: budget,
             cleanup_budget: None,
             fixture_cleanup_budget,
+            blocking_work: Some(capabilities.blocking),
             binaries,
             provider_client,
             lifecycle_started,
@@ -455,6 +515,7 @@ impl ClusterHarness {
             container_prefix,
             telemetry,
             telemetry_census: Mutex::new(TelemetryResourceCensus::default()),
+            telemetry_capture,
             provider_baseline: BTreeSet::new(),
             fixture_mapping: BTreeMap::new(),
             stopped_nodes: BTreeSet::new(),
@@ -482,7 +543,7 @@ impl ClusterHarness {
                 let binding = provisioning::PaidFixtureAdmission::open(admission)
                     .and_then(|ownership| ownership.bind_orchestrator(harness.orchestrator.id()));
                 if let Err(error) = binding {
-                    let _ = harness.orchestrator.kill();
+                    let _ = swactor_process::child_kill(&mut harness.orchestrator);
                     let _ = wait_for_child(
                         &mut harness.orchestrator,
                         &harness.fixture_cleanup_budget,
@@ -493,6 +554,7 @@ impl ClusterHarness {
             }
         }
         harness.wait_for_dashboard()?;
+        harness.connect_telemetry(&harness.operation_budget().child(harness.config.deadline))?;
         if !harness.config.reset_state {
             harness.adopt_retained_nodes()?;
         }
@@ -533,6 +595,12 @@ impl ClusterHarness {
         self.cleanup_budget
             .as_ref()
             .unwrap_or(&self.execution_budget)
+    }
+
+    pub(crate) fn blocking_work(&self) -> Result<&BlockingWorkSender, String> {
+        self.blocking_work
+            .as_ref()
+            .ok_or_else(|| "harness has no engine-owned blocking work capability".to_owned())
     }
 
     pub fn complete_deployment(&mut self) -> Result<(), String> {
@@ -613,7 +681,7 @@ impl ClusterHarness {
             "POST",
             &format!("{}/api/control/changes", self.base_url),
             Some(json!({"schema_version": 1, "payload": {
-                "generation": null, "after_revision": null, "wait_ms": 0
+                "generation": null, "after_revision": null, "wait": false
             }})),
             budget,
         )?;
@@ -628,23 +696,27 @@ impl ClusterHarness {
         predicate: &str,
     ) -> Result<(), String> {
         self.ensure_orchestrator_live()?;
-        let wait_ms = budget.remaining(predicate)?.as_millis().min(1_000) as u64;
-        let reply = http_json_budget(
-            "POST",
-            &format!("{}/api/control/changes", self.base_url),
-            Some(json!({"schema_version": 1, "payload": {
-                "generation": cursor["generation"], "after_revision": cursor["revision"], "wait_ms": wait_ms
-            }})),
-            budget,
-        );
-        match reply {
-            Ok(reply) => validate_control_revision(&reply)?,
-            Err(error) if error.contains("504") => {}
-            Err(error) => {
-                budget.wait(
-                    POLL_INTERVAL,
-                    &format!("{predicate}; control observation reconnect: {error}"),
-                )?;
+        loop {
+            budget.check(predicate)?;
+            let reply = http_json_budget(
+                "POST",
+                &format!("{}/api/control/changes", self.base_url),
+                Some(json!({"schema_version": 1, "payload": {
+                    "generation": cursor["generation"], "after_revision": cursor["revision"], "wait": true
+                }})),
+                budget,
+            );
+            match reply {
+                Ok(reply) => {
+                    validate_control_revision(&reply)?;
+                    break;
+                }
+                Err(error) => {
+                    budget.wait(
+                        POLL_INTERVAL,
+                        &format!("{predicate}; control observation reconnect: {error}"),
+                    )?;
+                }
             }
         }
         budget.check(predicate)?;
@@ -724,7 +796,7 @@ impl ClusterHarness {
 
     /// Captured orchestrator process output for failure diagnostics.
     pub fn orchestrator_diagnostics(&mut self) -> String {
-        let exit = match self.orchestrator.try_wait() {
+        let exit = match swactor_process::child_try_wait(&mut self.orchestrator) {
             Ok(Some(status)) => format!("exited: {status}"),
             Ok(None) => "running".to_owned(),
             Err(error) => format!("try_wait failed: {error}"),
@@ -1101,7 +1173,7 @@ impl ClusterHarness {
         self.torn_down = true;
         // Retention releases the local owner, including after injected death
         // or execution expiry. It is cleanup, not a new crash injection.
-        let signal = self.orchestrator.kill();
+        let signal = swactor_process::child_kill(&mut self.orchestrator);
         wait_for_child(
             &mut self.orchestrator,
             &self.fixture_cleanup_budget,
@@ -1111,6 +1183,55 @@ impl ClusterHarness {
             Ok(()) => error,
             Err(signal) => format!("stop retained orchestrator: {signal}; {error}"),
         })
+    }
+}
+
+impl ClusterHarness {
+    fn connect_telemetry(&self, budget: &Budget) -> Result<(), String> {
+        let endpoint = http_json_budget(
+            "GET",
+            &format!("{}/api/control/endpoint", self.base_url),
+            None,
+            budget,
+        )?;
+        let endpoint = endpoint["MYELIN_COORDINATOR_ENDPOINT"]
+            .as_str()
+            .ok_or_else(|| format!("control endpoint omitted coordinator endpoint: {endpoint}"))?;
+        let endpoint = serde_json::from_str(endpoint)
+            .map_err(|error| format!("decode telemetry coordinator endpoint: {error}"))?;
+        self.telemetry_capture
+            .subscribe("orchestrator", endpoint, self.config.run_id, 0)?;
+        let fleet = http_json_budget(
+            "GET",
+            &format!("{}/api/control/fleet", self.base_url),
+            None,
+            budget,
+        )?;
+        self.subscribe_fleet_telemetry(&fleet)
+    }
+
+    fn subscribe_fleet_telemetry(&self, fleet: &Value) -> Result<(), String> {
+        for node in fleet
+            .pointer("/FleetStatus/nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if node["phase"] == "stopped" {
+                continue;
+            }
+            let Some(endpoint) = node.pointer("/runtime/endpoint").and_then(Value::as_str) else {
+                continue;
+            };
+            let node_id = node["logical_node_id"]
+                .as_u64()
+                .ok_or("telemetry node omitted logical identity")?;
+            let endpoint = serde_json::from_str(endpoint)
+                .map_err(|error| format!("decode node {node_id} telemetry endpoint: {error}"))?;
+            self.telemetry_capture
+                .subscribe("node", endpoint, self.config.run_id, node_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -1320,19 +1441,16 @@ impl ClusterHarness {
         self.operation_budget()
             .check("orchestrator crash and reap")?;
         self.ensure_orchestrator_live()?;
-        self.orchestrator
-            .kill()
+        swactor_process::child_kill(&mut self.orchestrator)
             .map_err(|error| format!("kill orchestrator for recovery: {error}"))?;
         let budget = self.operation_budget().clone();
         wait_for_child(&mut self.orchestrator, &budget, "reap crashed orchestrator")?;
+        self.telemetry_capture.flush()?;
         let mut census = self
             .telemetry_census
             .lock()
             .map_err(|_| "telemetry census is poisoned".to_owned())?;
-        // Drain the stopped producer before resetting its sequence. Otherwise
-        // unread pre-crash frames can repopulate the retired incarnation.
         census.update(&self.telemetry, &budget)?;
-        census.forget_stream(&format!("myelin-orchestrator#{}", self.config.run_id));
         Ok(())
     }
 
@@ -1347,6 +1465,7 @@ impl ClusterHarness {
                 self.node_ids, self.stopped_nodes
             ));
         }
+        let blocking_work = self.blocking_work()?.clone();
         let (orchestrator, orchestrator_pidfd, stdout, stderr) = spawn_orchestrator(
             &self.config,
             &self.binaries.orchestrator,
@@ -1354,8 +1473,8 @@ impl ClusterHarness {
             &self.state_dir,
             &self.image,
             &self.container_prefix,
-            &self.telemetry,
             &self.fixture_cleanup_budget,
+            &blocking_work,
             false,
         )?;
         self.orchestrator = orchestrator;
@@ -1366,7 +1485,8 @@ impl ClusterHarness {
             provisioning::PaidFixtureAdmission::open(admission)?
                 .bind_orchestrator(self.orchestrator.id())?;
         }
-        self.wait_for_dashboard()
+        self.wait_for_dashboard()?;
+        self.connect_telemetry(&self.operation_budget().child(self.config.deadline))
     }
 
     pub fn verify_running_recovery(&mut self) -> Result<(), String> {
@@ -1610,33 +1730,34 @@ impl ClusterHarness {
                 let cursor = self.control_revision(budget)?;
                 let generation = self.next_observation_generation();
                 let actor_request_id = format!("health-actors-{}-{generation}", self.config.seed);
-                let (fleet, nodes, provider_resources) = thread::scope(|scope| {
-                    let fleet = scope.spawn(|| {
+                let base_url = self.base_url.clone();
+                let fleet_budget = budget.clone();
+                let fleet = self
+                    .blocking_work()?
+                    .submit_joinable(move || {
                         http_json_budget(
                             "GET",
-                            &format!("{}/api/control/fleet", self.base_url),
+                            &format!("{base_url}/api/control/fleet"),
                             None,
-                            budget,
+                            &fleet_budget,
                         )
-                    });
-                    let nodes = scope.spawn(|| self.query_contextual_nodes(expected_nodes, budget));
-                    let provider = scope.spawn(|| {
-                        if matches!(self.config.provider, HarnessProvider::LocalMock) {
-                            let census = container_census(&self.container_prefix, budget)?;
-                            Ok((census.values().cloned().collect(), Some(census)))
-                        } else {
-                            self.provider_resources_budget(budget)
-                                .map(|resources| (resources, None))
-                        }
-                    });
-                    // All bounded operations are joined even if the first result fails.
-                    (fleet.join(), nodes.join(), provider.join())
-                });
-                let fleet = fleet.map_err(|_| "fleet census collector panicked".to_owned())??;
-                let nodes =
-                    nodes.map_err(|_| "contextual census collector panicked".to_owned())??;
-                let (provider_resources, containers) = provider_resources
-                    .map_err(|_| "provider census collector panicked".to_owned())??;
+                    })
+                    .map_err(|error| format!("submit fleet census collector: {error}"))?;
+                let nodes = self.query_contextual_nodes(expected_nodes, budget);
+                let provider_resources =
+                    if matches!(self.config.provider, HarnessProvider::LocalMock) {
+                        let census = container_census(&self.container_prefix, budget)?;
+                        Ok((census.values().cloned().collect(), Some(census)))
+                    } else {
+                        self.provider_resources_budget(budget)
+                            .map(|resources| (resources, None))
+                    };
+                // Join the fleet request even when either sibling census fails.
+                let fleet = fleet
+                    .join()
+                    .map_err(|_| "fleet census collector panicked".to_owned())??;
+                let nodes = nodes?;
+                let (provider_resources, containers) = provider_resources?;
                 // Query observers must finish before the actor census. They
                 // are not fixture actors eligible for a baseline exemption.
                 let actors = http_json_budget(
@@ -1669,6 +1790,8 @@ impl ClusterHarness {
                             .ok_or_else(|| format!("running node omitted identity: {node}"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                self.subscribe_fleet_telemetry(&fleet)?;
+                self.telemetry_capture.flush()?;
                 let resources = {
                     let mut census = self
                         .telemetry_census
@@ -1676,7 +1799,7 @@ impl ClusterHarness {
                         .map_err(|_| "telemetry census is poisoned".to_owned())?;
                     census.update(&self.telemetry, budget)?;
                     census.record_orchestrator_snapshot(
-                        &format!("myelin-orchestrator#{}", self.config.run_id),
+                        &self.telemetry_capture.orchestrator_stream()?,
                         &actor_request_id,
                         &actors,
                     )?;
@@ -1845,16 +1968,8 @@ impl ClusterHarness {
             drop(pending);
             loop {
                 budget.check("fixture health restoration")?;
-                let (health, fixture) = thread::scope(|scope| {
-                    let health =
-                        scope.spawn(|| self.health_snapshot_for_nodes(&self.node_ids, &budget));
-                    let fixture = scope.spawn(|| self.builtin_fixture_blobs(&budget));
-                    (health.join(), fixture.join())
-                });
-                let mut health =
-                    health.map_err(|_| "health snapshot collector panicked".to_owned())??;
-                let fixture =
-                    fixture.map_err(|_| "fixture ownership collector panicked".to_owned())??;
+                let mut health = self.health_snapshot_for_nodes(&self.node_ids, &budget)?;
+                let fixture = self.builtin_fixture_blobs(&budget)?;
                 if contains_poison(&health) {
                     return Err(format!("actor poison or worker panic detected: {health}"));
                 }
@@ -2008,12 +2123,14 @@ impl ClusterHarness {
 
     /// Raw fleet status from the control plane.
     pub fn fleet_snapshot(&self) -> Result<Value, String> {
-        http_json_budget(
+        let fleet = http_json_budget(
             "GET",
             &format!("{}/api/control/fleet", self.base_url),
             None,
             &self.operation_budget().child(self.config.deadline),
-        )
+        )?;
+        self.subscribe_fleet_telemetry(&fleet)?;
+        Ok(fleet)
     }
 
     fn ensure_orchestrator_live(&self) -> Result<(), String> {
@@ -2039,12 +2156,12 @@ impl ClusterHarness {
     }
     fn stop_orchestrator_process_for_cleanup(&mut self, budget: &Budget) -> Result<(), String> {
         let mut errors = Vec::new();
-        let live = self.orchestrator.try_wait();
+        let live = swactor_process::child_try_wait(&mut self.orchestrator);
         if let Err(error) = &live {
             errors.push(format!("observe paid runner: {error}"));
         }
         if !matches!(live, Ok(Some(_))) {
-            if let Err(error) = self.orchestrator.kill() {
+            if let Err(error) = swactor_process::child_kill(&mut self.orchestrator) {
                 errors.push(format!("stop paid runner: {error}"));
             }
             let reap_budget = budget.child(
@@ -2113,8 +2230,11 @@ impl ClusterHarness {
             // Discovery, exact absence and durable accounting remain required
             // even when sealing, signaling or reaping failed.
             let resources = self.cleanup_provider_resources(&budget);
-            self.torn_down =
-                resources.is_ok() && self.orchestrator.try_wait().ok().flatten().is_some();
+            self.torn_down = resources.is_ok()
+                && swactor_process::child_try_wait(&mut self.orchestrator)
+                    .ok()
+                    .flatten()
+                    .is_some();
             if let Err(error) = resources {
                 errors.push(error);
             }
@@ -2134,7 +2254,8 @@ impl ClusterHarness {
         // scaled product protocol timers.
         let stop_budget = budget.child((remaining / 4).min(self.config.deadline));
         let mut recovery_complete = false;
-        let orchestrator_live = self.orchestrator.try_wait().map(|status| status.is_none());
+        let orchestrator_live =
+            swactor_process::child_try_wait(&mut self.orchestrator).map(|status| status.is_none());
         match orchestrator_live {
             Ok(true) => {
                 let stop_nodes = if self.node_ids.is_empty() {
@@ -2142,43 +2263,40 @@ impl ClusterHarness {
                 } else {
                     self.node_ids.clone()
                 };
-                let stop_errors = thread::scope(|scope| {
-                    let requests = stop_nodes
-                        .iter()
-                        .map(|&node| {
-                            let base_url = &self.base_url;
-                            let seed = self.config.seed;
-                            let request_budget = stop_budget.child(Duration::from_secs(2));
-                            scope.spawn(move || {
-                                http_json_budget(
-                                    "POST",
-                                    &format!("{base_url}/api/control/nodes/{node}/kill"),
-                                    Some(json!({"command_id": format!("e2e-kill-{seed}-{node}")})),
-                                    &request_budget,
-                                )
-                                .map(|_| ())
-                                .map_err(|error| format!("stop node {node}: {error}"))
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    requests
-                        .into_iter()
-                        .filter_map(|request| match request.join() {
+                let mut stop_requests = Vec::with_capacity(stop_nodes.len());
+                for node in stop_nodes {
+                    let base_url = self.base_url.clone();
+                    let seed = self.config.seed;
+                    let request_budget = stop_budget.child(Duration::from_secs(2));
+                    stop_requests.push(self.blocking_work()?.submit_joinable(move || {
+                        http_json_budget(
+                            "POST",
+                            &format!("{base_url}/api/control/nodes/{node}/kill"),
+                            Some(json!({"command_id": format!("e2e-kill-{seed}-{node}")})),
+                            &request_budget,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| format!("stop node {node}: {error}"))
+                    }));
+                }
+                let stop_errors = stop_requests
+                    .into_iter()
+                    .filter_map(|request| match request {
+                        Ok(request) => match request.join() {
                             Ok(Ok(())) => None,
                             Ok(Err(error)) => Some(error),
                             Err(_) => Some("node stop collector panicked".to_owned()),
-                        })
-                        .collect::<Vec<_>>()
-                });
+                        },
+                        Err(error) => Some(format!("submit node stop collector: {error}")),
+                    })
+                    .collect::<Vec<_>>();
                 errors.extend(stop_errors);
                 let stopped = (|| {
                     loop {
                         let cursor = self.control_revision(&stop_budget)?;
                         stop_budget
                             .check("all managed nodes terminal before orchestrator shutdown")?;
-                        if self
-                            .orchestrator
-                            .try_wait()
+                        if swactor_process::child_try_wait(&mut self.orchestrator)
                             .map_err(|error| format!("observe stop owner: {error}"))?
                             .is_some()
                         {
@@ -2217,7 +2335,11 @@ impl ClusterHarness {
         }
 
         let mut graceful_shutdown = false;
-        if self.orchestrator.try_wait().ok().flatten().is_none() {
+        if swactor_process::child_try_wait(&mut self.orchestrator)
+            .ok()
+            .flatten()
+            .is_none()
+        {
             match i32::try_from(self.orchestrator.id()) {
                 Ok(pid) => {
                     if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
@@ -2246,8 +2368,12 @@ impl ClusterHarness {
                 Err(_) => errors.push("orchestrator pid exceeds platform range".to_owned()),
             }
         }
-        if self.orchestrator.try_wait().ok().flatten().is_none() {
-            if let Err(error) = self.orchestrator.kill() {
+        if swactor_process::child_try_wait(&mut self.orchestrator)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            if let Err(error) = swactor_process::child_kill(&mut self.orchestrator) {
                 errors.push(format!("force stop orchestrator: {error}"));
             }
             if let Err(error) =
@@ -2267,7 +2393,11 @@ impl ClusterHarness {
 
         // Never short-circuit this owner because a stop, reap, or discovery failed.
         let resources = self.cleanup_provider_resources(&budget);
-        self.torn_down = resources.is_ok() && self.orchestrator.try_wait().ok().flatten().is_some();
+        self.torn_down = resources.is_ok()
+            && swactor_process::child_try_wait(&mut self.orchestrator)
+                .ok()
+                .flatten()
+                .is_some();
         if let Err(error) = resources {
             errors.push(error);
         }
@@ -2318,20 +2448,23 @@ impl ClusterHarness {
                             })
                     })
                     .collect::<Result<BTreeSet<_>, _>>()?;
-                let removals = thread::scope(|scope| {
-                    let requests = containers
-                        .iter()
-                        .map(|container| scope.spawn(move || remove_container(container, budget)))
-                        .collect::<Vec<_>>();
-                    requests
-                        .into_iter()
-                        .map(|request| {
-                            request.join().unwrap_or_else(|_| {
-                                Err("raw container removal owner panicked".to_owned())
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                });
+                let mut requests = Vec::with_capacity(containers.len());
+                for container in containers {
+                    let budget = budget.clone();
+                    requests.push(
+                        self.blocking_work()?
+                            .submit_joinable(move || remove_container(&container, &budget)),
+                    );
+                }
+                let removals = requests
+                    .into_iter()
+                    .map(|request| match request {
+                        Ok(request) => request.join().unwrap_or_else(|_| {
+                            Err("raw container removal owner panicked".to_owned())
+                        }),
+                        Err(error) => Err(format!("submit raw container removal owner: {error}")),
+                    })
+                    .collect::<Vec<_>>();
                 let absence =
                     raw_fleet::read_manifest_containers(manifest, budget).and_then(|remaining| {
                         if remaining.is_empty() {
@@ -2417,7 +2550,7 @@ impl Drop for ClusterHarness {
         // A retained remote fixture still relinquishes its local process owner.
         // Failed cleanup reuses the original reserve; Drop cannot extend it.
         if self.torn_down {
-            let _ = self.orchestrator.kill();
+            let _ = swactor_process::child_kill(&mut self.orchestrator);
             let _ = wait_for_child(
                 &mut self.orchestrator,
                 &self.fixture_cleanup_budget,
@@ -2472,8 +2605,7 @@ fn wait_for_child(child: &mut Child, budget: &Budget, predicate: &str) -> Result
         }
     };
     loop {
-        if child
-            .try_wait()
+        if swactor_process::child_try_wait(child)
             .map_err(|error| format!("{predicate}: {error}"))?
             .is_some()
         {
@@ -2690,12 +2822,10 @@ mod fixture_census_tests {
         let owner = Budget::new(Duration::from_secs(2));
         let cleanup = owner.child(Duration::from_secs(2));
         let execution = owner.child(Duration::ZERO);
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
+        let mut child = swactor_process::command_spawn(&mut Command::new("sleep").arg("30"))
             .expect("start parked child");
         let expired = wait_for_child(&mut child, &execution, "withheld process exit");
-        let killed = child.kill();
+        let killed = swactor_process::child_kill(&mut child);
         let reaped = wait_for_child(&mut child, &cleanup, "reserved process reap");
         assert!(expired.is_err());
         assert!(killed.is_ok());
@@ -2722,7 +2852,7 @@ mod fixture_census_tests {
     fn fleet_node(id: u64, resource: u64, phase: &str) -> Value {
         json!({
             "logical_node_id": id, "provider_ref": format!("vastai:{resource}"),
-            "selected_offer_id": id+1000, "phase": phase, "last_error": null, "last_seen_unix_ms": 1,
+            "selected_offer_id": id+1000, "phase": phase, "last_error": null,
             "runtime": {"run_id": 9, "attempt_id": 1, "endpoint": format!("host-{id}"),
                 "node_actor": vec![id as u8; 32], "swim_node_id": vec![id as u8; 32],
                 "stage_index": 0, "readiness_id": id},

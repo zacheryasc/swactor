@@ -30,7 +30,6 @@ pub struct ObservedOutcome {
     pub expected: OutcomeExpectation,
     pub outcome: String,
     pub errno: Option<i32>,
-    pub error_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +37,6 @@ pub struct ObservedOutcome {
 pub enum OutcomeExpectation {
     Ok,
     Error(i32),
-    Exception(String),
     Linearized { successes: u8, error: i32 },
 }
 
@@ -95,7 +93,6 @@ pub enum SemanticAction {
     Unlink,
     DescriptorWrite,
     DescriptorRead,
-    MappingExportClose,
 }
 
 impl From<&ActionOp> for SemanticAction {
@@ -117,7 +114,6 @@ impl From<&ActionOp> for SemanticAction {
             ActionOp::Unlink { .. } => Self::Unlink,
             ActionOp::DescriptorWrite { .. } => Self::DescriptorWrite,
             ActionOp::DescriptorRead { .. } => Self::DescriptorRead,
-            ActionOp::MappingExportClose { .. } => Self::MappingExportClose,
         }
     }
 }
@@ -126,7 +122,7 @@ impl From<&ActionOp> for SemanticAction {
 pub struct OracleViolation {
     pub invariant: &'static str,
     pub detail: String,
-    pub signature: FailureSignature,
+    pub signature: Box<FailureSignature>,
 }
 
 impl OracleViolation {
@@ -139,7 +135,7 @@ impl OracleViolation {
             "payload_integrity" | "stream_bytes" | "blob_publication" => {
                 FailureClass::PayloadMismatch
             }
-            "unexpected_error" | "typed_error" | "typed_exception" => FailureClass::OutcomeMismatch,
+            "unexpected_error" | "typed_error" => FailureClass::OutcomeMismatch,
             "namespace_linearizability" => FailureClass::NamespaceHistoryConflict,
             _ => FailureClass::ContractViolation,
         };
@@ -165,12 +161,12 @@ impl OracleViolation {
         Self {
             invariant,
             detail: detail.into(),
-            signature: FailureSignature {
+            signature: Box::new(FailureSignature {
                 invariant: invariant.to_owned(),
                 failure_class,
                 causal_role,
                 observed_outcome: None,
-            },
+            }),
         }
     }
 
@@ -190,16 +186,12 @@ impl OracleViolation {
             expected: match expected {
                 ExpectedOutcome::Ok => OutcomeExpectation::Ok,
                 ExpectedOutcome::Error(errno) => OutcomeExpectation::Error(errno),
-                ExpectedOutcome::Exception(exception) => {
-                    OutcomeExpectation::Exception(exception.as_str().to_owned())
-                }
                 ExpectedOutcome::Linearized {
                     successes, error, ..
                 } => OutcomeExpectation::Linearized { successes, error },
             },
             outcome: result.outcome.clone(),
             errno: result.errno,
-            error_type: result.error_type.clone(),
         });
         self
     }
@@ -228,9 +220,9 @@ fn check_budget(budget: Option<&Budget>, predicate: &str) -> Result<(), OracleVi
     Ok(())
 }
 
-/// An action exception explains an unexecuted suffix only when the original
-/// cursor ends in a normal nonzero Python exit, not cancellation or a failed
-/// transport/bootstrap. The collector separately proves cursor durability.
+/// An action error explains an unexecuted suffix only when the original cursor
+/// ends in a normal nonzero exit, not cancellation or transport/bootstrap failure.
+/// The collector separately proves cursor durability.
 fn terminal_action_error(execution: &ExecutionObservation) -> Option<&ActionObservation> {
     if execution.exit_success || !execution.terminal {
         return None;
@@ -253,13 +245,9 @@ fn terminal_action_error(execution: &ExecutionObservation) -> Option<&ActionObse
         return None;
     }
     let result = execution.results.last()?;
-    let error_type = result.error_type.as_deref()?;
+    let errno = result.errno?;
     if result.outcome != "error"
-        || error_type.is_empty()
-        || matches!(
-            error_type,
-            "TimeoutError" | "CancelledError" | "KeyboardInterrupt" | "SystemExit" | "MemoryError"
-        )
+        || matches!(errno, libc::ECANCELED | libc::ETIMEDOUT | libc::ENOMEM)
     {
         return None;
     }
@@ -267,7 +255,7 @@ fn terminal_action_error(execution: &ExecutionObservation) -> Option<&ActionObse
 }
 
 /// Recognize a complete, causally identified action prefix ending in an
-/// unexpected typed exception. Never fill in the suffix the program did not run.
+/// unexpected protocol error. Never fill in the suffix the program did not run.
 pub(crate) fn recorded_action_failure(
     program: &ProcessProgram,
     execution: &ExecutionObservation,
@@ -745,22 +733,6 @@ impl BehaviorOracle {
                                 program.id, result.errno),
                         ).at_action(&action.operation).with_outcome(action.expected, result));
                     }
-                    ExpectedOutcome::Exception(expected)
-                        if result.outcome != "expected_error"
-                            || result.error_type.as_deref() != Some(expected.as_str()) =>
-                    {
-                        return Err(OracleViolation::new(
-                            "typed_exception",
-                            format!(
-                                "{} step {step} expected {}, observed {:?}",
-                                program.id,
-                                expected.as_str(),
-                                result.error_type
-                            ),
-                        )
-                        .at_action(&action.operation)
-                        .with_outcome(action.expected, result));
-                    }
                     _ => {}
                 }
                 verify_action_payload(&program.id, step, &action.operation, result)
@@ -1011,12 +983,6 @@ impl BehaviorOracle {
                     LaunchFailureKind::MalformedExecutionIdentity => {
                         has("spawn_rejected") || has("bootstrap_failed")
                     }
-                    LaunchFailureKind::PythonSyntax => {
-                        has("bootstrap_failed") && !has("context_ready")
-                    }
-                    LaunchFailureKind::PythonRuntime => {
-                        has("context_ready") && has("exited") && !has("bootstrap_failed")
-                    }
                 };
                 if !expected {
                     return violation(
@@ -1177,7 +1143,6 @@ fn verify_action_payload(
                 );
             }
         }
-        ActionOp::MappingExportClose { .. } => {}
         ActionOp::Rename { .. } | ActionOp::Unlink { .. } => {
             if success && result.revision.is_none() {
                 return violation(
@@ -1190,7 +1155,7 @@ fn verify_action_payload(
     Ok(())
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -1645,11 +1610,16 @@ fn descriptor_completion(
     ) {
         return Ok(false);
     }
-    if !matches!(terminals.as_slice(), [
-        DescriptorTerminalResult::Ok,
-        DescriptorTerminalResult::Error { errno: Some(libc::EBADF), error_type }
-    ] if error_type == "OSError")
-    {
+    if !matches!(
+        terminals.as_slice(),
+        [
+            DescriptorTerminalResult::Ok,
+            DescriptorTerminalResult::Error {
+                errno: Some(libc::EBADF),
+                ..
+            }
+        ]
+    ) {
         return Err(OracleViolation::new(
             "namespace_model_evidence",
             "repeated descriptor finish omitted first-terminal success and second-terminal EBADF",
@@ -1664,6 +1634,32 @@ fn descriptor_completion(
 
 fn publication_matches(length: Option<usize>, content_digest: Option<&str>, bytes: &[u8]) -> bool {
     length == Some(bytes.len()) && content_digest == Some(digest(bytes).as_str())
+}
+
+// Descriptor option validation precedes authorization and namespace lookup.
+// Keep this model independent of the executor's OpenOptions construction.
+fn descriptor_open_errno(flags: i32, length: Option<u64>) -> Option<i32> {
+    let known = libc::O_ACCMODE | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_NONBLOCK;
+    if flags & !known != 0 {
+        return Some(libc::ENOTSUP);
+    }
+    let access = flags & libc::O_ACCMODE;
+    if !matches!(access, libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR) {
+        return Some(libc::EINVAL);
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        return Some(libc::ENOTSUP);
+    }
+    let writable = access != libc::O_RDONLY;
+    let create = flags & libc::O_CREAT != 0;
+    let truncate = flags & libc::O_TRUNC != 0;
+    if (flags & libc::O_EXCL != 0 && !create)
+        || ((create || truncate) && !writable)
+        || (length.is_some() && !(writable && truncate))
+    {
+        return Some(libc::EINVAL);
+    }
+    None
 }
 
 // Publications separate lookup/open, exclusive reservation, and commit.
@@ -1686,6 +1682,7 @@ enum NamespaceOperation<'a> {
         expected: &'a [u8],
         offset: usize,
         whole: bool,
+        mapping: bool,
     },
     Lookup {
         path: String,
@@ -1757,6 +1754,9 @@ enum NamespaceOperation<'a> {
     GateLookup {
         path: String,
     },
+    DescriptorRejected {
+        errno: i32,
+    },
     Ignore,
 }
 
@@ -1779,7 +1779,7 @@ impl NamespaceOperation<'_> {
             | Self::GatePublish { path }
             | Self::GateLookup { path } => Some(path),
             Self::Rename { source, .. } => Some(source),
-            Self::Ignore => None,
+            Self::DescriptorRejected { .. } | Self::Ignore => None,
         }
     }
 
@@ -1912,24 +1912,6 @@ fn namespace_prefix_allows(prefixes: &[String], path: &str) -> bool {
 fn namespace_errno(result: &ActionObservation, errno: i32) -> bool {
     result.outcome == "expected_error" && result.errno == Some(errno)
 }
-fn namespace_binding_error(result: &ActionObservation, errno: i32, raw: bool) -> bool {
-    if raw {
-        return namespace_errno(result, errno);
-    }
-    let exception = match errno {
-        libc::ENXIO | libc::ECONNRESET | libc::EPIPE => Some("StreamError"),
-        libc::EEXIST | libc::EIO => Some("SessionError"),
-        _ => None,
-    };
-    match exception {
-        Some(exception) => {
-            result.outcome == "expected_error"
-                && result.errno.is_none()
-                && result.error_type.as_deref() == Some(exception)
-        }
-        None => namespace_errno(result, errno),
-    }
-}
 
 fn initial_fixture_revision(
     case: &BehaviorCase,
@@ -2023,7 +2005,7 @@ fn verify_stream_frames<'a>(
                         .any(|event| event == "context_ready")
                 {
                     // Native rendezvous may attach the reader before the
-                    // stopped writer can emit its Python opened milestone.
+                    // stopped writer can emit its opened milestone.
                     // This is only a candidate: the history search must still
                     // attach this exact IR source to the observed incarnation.
                     sources.push((
@@ -2239,8 +2221,7 @@ fn verify_namespace_histories(
                 | ActionOp::DescriptorRead { .. }
                 | ActionOp::Lookup { .. }
                 | ActionOp::AwaitEntry { .. }
-                | ActionOp::WaitForQuiescent { .. }
-                | ActionOp::MappingExportClose { .. } => {}
+                | ActionOp::WaitForQuiescent { .. } => {}
             }
             // A read alone cannot turn an initially absent attempt-owned name
             // into a fixture. Model its absence even when no writer was planned.
@@ -2407,7 +2388,21 @@ fn verify_namespace_histories(
                 // Route preparations for later steps are added independently.
                 break;
             }
+            let open_error = match &action.operation {
+                ActionOp::DescriptorWrite { flags, length, .. } => {
+                    descriptor_open_errno(*flags, *length)
+                }
+                ActionOp::DescriptorRead { flags, .. } => descriptor_open_errno(*flags, None),
+                _ => None,
+            };
             let operation = match &action.operation {
+                ActionOp::DescriptorWrite { .. } | ActionOp::DescriptorRead { .. }
+                    if open_error.is_some() =>
+                {
+                    NamespaceOperation::DescriptorRejected {
+                        errno: open_error.expect("descriptor option rejection resolved"),
+                    }
+                }
                 ActionOp::PublishBlob { bytes, .. } => NamespaceOperation::Publish {
                     path,
                     bytes,
@@ -2450,6 +2445,7 @@ fn verify_namespace_histories(
                     expected,
                     offset: 0,
                     whole: true,
+                    mapping: false,
                 },
                 ActionOp::DescriptorRead {
                     flags,
@@ -2482,6 +2478,7 @@ fn verify_namespace_histories(
                             0
                         },
                         whole: false,
+                        mapping: *method == DescriptorReadMethod::Mapping,
                     }
                 }
                 ActionOp::Lookup { .. } | ActionOp::AwaitEntry { .. } if relevant => {
@@ -2559,22 +2556,12 @@ fn verify_namespace_histories(
                 ActionOp::WaitForQuiescent { .. } if relevant => {
                     NamespaceOperation::StreamProbe { path }
                 }
-                ActionOp::MappingExportClose { .. } if relevant => {
-                    return violation(
-                        "namespace_model_evidence",
-                        format!(
-                            "{} step {step}: mapped descriptor namespace effects are not observed",
-                            program.id,
-                        ),
-                    );
-                }
                 ActionOp::ReadBlob { .. }
                 | ActionOp::DescriptorRead { .. }
                 | ActionOp::DescriptorWrite { .. }
                 | ActionOp::Lookup { .. }
                 | ActionOp::AwaitEntry { .. }
-                | ActionOp::WaitForQuiescent { .. }
-                | ActionOp::MappingExportClose { .. } => NamespaceOperation::Ignore,
+                | ActionOp::WaitForQuiescent { .. } => NamespaceOperation::Ignore,
             };
             let Some(result) = execution
                 .results
@@ -3704,6 +3691,14 @@ fn namespace_action_key(
     action: &NamespaceAction<'_>,
     revision_hints: &BTreeMap<String, u64>,
 ) -> u64 {
+    if matches!(
+        action.operation,
+        NamespaceOperation::GatePublish { .. } | NamespaceOperation::GateLookup { .. }
+    ) {
+        return operation_paths(&action.operation)
+            .find_map(|path| revision_hints.get(path).copied())
+            .unwrap_or(u64::MAX);
+    }
     action
         .result
         .and_then(|result| result.revision.or(result.incarnation))
@@ -3726,12 +3721,6 @@ fn namespace_commit_key(
     }
     let result = action.result;
     let success = result.is_some_and(|result| result.outcome == "ok" && result.errno.is_none());
-    let path_hint = || {
-        action
-            .operation
-            .path()
-            .and_then(|path| revision_hints.get(path).copied())
-    };
     match action.operation {
         NamespaceOperation::StreamOpen {
             incarnation: Some(incarnation),
@@ -3742,10 +3731,64 @@ fn namespace_commit_key(
         | NamespaceOperation::Unlink { .. }
             if success =>
         {
-            result.and_then(|result| result.revision).or_else(path_hint)
+            result.and_then(|result| result.revision)
         }
-        NamespaceOperation::GatePublish { .. } => path_hint(),
+        NamespaceOperation::GatePublish { ref path } => revision_hints.get(path).copied(),
         _ => None,
+    }
+}
+
+fn namespace_has_unobserved_commit(
+    action: &NamespaceAction<'_>,
+    revision_hints: &BTreeMap<String, u64>,
+) -> bool {
+    if namespace_commit_key(action, revision_hints).is_some() || action.denied {
+        return false;
+    }
+    let success = action
+        .result
+        .is_some_and(|result| result.outcome == "ok" && result.errno.is_none());
+    matches!(
+        action.operation,
+        NamespaceOperation::GatePublish { .. }
+            | NamespaceOperation::Publish { commit: true, .. }
+            | NamespaceOperation::Rename { .. }
+            | NamespaceOperation::Unlink { .. }
+    ) && success
+}
+
+fn namespace_constructive_candidate_key(
+    action: &NamespaceAction<'_>,
+    remaining: &[NamespaceAction<'_>],
+    revision_hints: &BTreeMap<String, u64>,
+    next_unobserved_key: Option<u64>,
+) -> u64 {
+    let action_key = namespace_action_key(action, revision_hints);
+    if namespace_has_unobserved_commit(action, revision_hints)
+        && let Some(path) = action.operation.path()
+        && let Some(origin) = remaining
+            .iter()
+            .find_map(|pending| match &pending.operation {
+                NamespaceOperation::MutationOrigin {
+                    path: origin_path,
+                    revision,
+                } if origin_path == path => Some(*revision),
+                _ => None,
+            })
+        && origin < action_key
+    {
+        return origin;
+    }
+    let process_commit_floor = remaining
+        .iter()
+        .filter_map(|pending| namespace_commit_key(pending, revision_hints))
+        .min();
+    if namespace_has_unobserved_commit(action, revision_hints)
+        && process_commit_floor.is_some_and(|floor| floor < action_key)
+    {
+        next_unobserved_key.unwrap_or(action_key)
+    } else {
+        action_key
     }
 }
 pub(crate) fn stream_record_action_matches(action: &ActionOp, record: &ActionObservation) -> bool {
@@ -3780,7 +3823,7 @@ fn stream_incarnation_evidence(
     });
     // Only typed open failures can lack attachment identity. The transition
     // model still requires the exact collision/displacement state; a generic
-    // StreamError is not itself proof of any legal transition.
+    // error is not itself proof of any legal transition.
     let Some(incarnation) = observed.or(opened) else {
         if result.is_some_and(|result| {
             [
@@ -3791,7 +3834,7 @@ fn stream_incarnation_evidence(
                 libc::EIO,
             ]
             .into_iter()
-            .any(|errno| namespace_binding_error(result, errno, false))
+            .any(|errno| namespace_errno(result, errno))
                 && result.transfer.is_none()
         }) && !records().any(|record| {
             matches!(
@@ -4219,6 +4262,17 @@ fn namespace_transition<'a>(
         return Some(next);
     }
     let result = action.result?;
+    if let NamespaceOperation::DescriptorRejected { errno } = action.operation {
+        if !namespace_errno(result, errno)
+            || result.transfer.is_some()
+            || result.descriptor.is_some()
+        {
+            return None;
+        }
+        let mut next = state.clone();
+        next.positions[process] += 1;
+        return Some(next);
+    }
     let mut next = Cow::Borrowed(state);
     if action.denied {
         if !namespace_errno(result, libc::EACCES)
@@ -4288,13 +4342,13 @@ fn namespace_transition<'a>(
             } else if (*exclusive && state.entries.contains_key(path))
                 || state.reservations.contains_key(path)
             {
-                if !namespace_binding_error(result, libc::EEXIST, *exclusive || *require_existing) {
+                if !namespace_errno(result, libc::EEXIST) {
                     return None;
                 }
             } else if state.streams.contains_key(path) {
                 // Staged-blob opens reject a stream seen by their lookup.
                 // Only an already-open publication can replace one.
-                if !namespace_binding_error(result, libc::ENXIO, *exclusive || *require_existing) {
+                if !namespace_errno(result, libc::ENXIO) {
                     return None;
                 }
             } else if *require_existing && !state.entries.contains_key(path) {
@@ -4319,23 +4373,27 @@ fn namespace_transition<'a>(
             expected,
             offset,
             whole,
+            mapping,
         } => {
             if state.reservations.contains_key(path) {
-                if !namespace_binding_error(result, libc::EEXIST, !*whole) {
+                if !namespace_errno(result, libc::EEXIST) {
                     return None;
                 }
             } else if let Some(binding) = state.entries.get(path) {
-                if !action.publication_finished {
-                    return None;
-                }
                 let bytes = if *whole {
-                    binding.bytes
+                    Some(binding.bytes)
                 } else {
-                    let end = offset.checked_add(expected.len())?;
-                    binding.bytes.get(*offset..end)?
+                    offset
+                        .checked_add(expected.len())
+                        .and_then(|end| binding.bytes.get(*offset..end))
                 };
-                if bytes != *expected {
-                    return None;
+                match bytes {
+                    Some(bytes) if action.publication_finished && bytes == *expected => {}
+                    None if *mapping
+                        && namespace_errno(result, libc::EINVAL)
+                        && result.transfer.is_none()
+                        && result.descriptor.is_none() => {}
+                    _ => return None,
                 }
                 if let Some(revision) = result.revision
                     && !next.to_mut().constrain_revision(binding.revision, revision)
@@ -4343,7 +4401,7 @@ fn namespace_transition<'a>(
                     return None;
                 }
             } else if state.streams.contains_key(path) {
-                if !namespace_binding_error(result, libc::ENXIO, !*whole) {
+                if !namespace_errno(result, libc::ENXIO) {
                     return None;
                 }
             } else if !namespace_errno(result, libc::ENOENT) {
@@ -4481,7 +4539,7 @@ fn namespace_transition<'a>(
                 None
             };
             if let Some(errno) = error {
-                if incarnation.is_some() || !namespace_binding_error(result, errno, false) {
+                if incarnation.is_some() || !namespace_errno(result, errno) {
                     return None;
                 }
             } else {
@@ -4646,8 +4704,8 @@ fn namespace_transition<'a>(
                     return None;
                 }
             } else if session.aborted {
-                if !namespace_binding_error(result, libc::ECONNRESET, false)
-                    && !namespace_binding_error(result, libc::EPIPE, false)
+                if !namespace_errno(result, libc::ECONNRESET)
+                    && !namespace_errno(result, libc::EPIPE)
                 {
                     return None;
                 }
@@ -4729,7 +4787,9 @@ fn namespace_transition<'a>(
             let session = next.to_mut().sessions.get_mut(revision)?;
             session.first_frame_permitted = stream_initial_frame(session.chunks, false);
         }
-        NamespaceOperation::StreamStop { .. } | NamespaceOperation::MutationOrigin { .. } => {
+        NamespaceOperation::StreamStop { .. }
+        | NamespaceOperation::MutationOrigin { .. }
+        | NamespaceOperation::DescriptorRejected { .. } => {
             return None;
         }
         NamespaceOperation::Ignore => {}
@@ -4761,7 +4821,7 @@ mod namespace_tests {
     use super::*;
     use crate::ir::{
         AccessSpec, Action, DataEdge, DataRoute, DescriptorObservation, DescriptorTerminalResult,
-        DescriptorWriteMethod, PythonException, TransferObservation,
+        DescriptorWriteMethod, TransferObservation,
     };
 
     fn program(id: &str, actions: Vec<Action>, dependencies: &[&str]) -> ProcessProgram {
@@ -4848,9 +4908,7 @@ mod namespace_tests {
                                 step,
                                 action: action.operation.class().as_str().to_owned(),
                                 path: action.operation.path().to_owned(),
-                                outcome: if errno.is_some()
-                                    || matches!(action.expected, ExpectedOutcome::Exception(_))
-                                {
+                                outcome: if errno.is_some() {
                                     "expected_error"
                                 } else {
                                     "ok"
@@ -4873,13 +4931,7 @@ mod namespace_tests {
                                 .then_some(10 + step as u64),
                                 active: None,
                                 errno,
-                                error_type: match action.expected {
-                                    ExpectedOutcome::Exception(exception) => {
-                                        Some(exception.as_str().to_owned())
-                                    }
-                                    ExpectedOutcome::Error(_) => Some("OSError".to_owned()),
-                                    _ => None,
-                                },
+                                error_type: None,
                                 error: None,
                                 descriptor: match &action.operation {
                                     ActionOp::DescriptorWrite { method, finish, .. }
@@ -4911,6 +4963,125 @@ mod namespace_tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn unobserved_publish_uses_revision_gap_when_it_gates_an_earlier_commit() {
+        let destination = "/cases/order/destination";
+        let source = "/cases/order/source";
+        let case = case(vec![program(
+            "mutator",
+            vec![
+                Action::ok(publication(destination, b"value")),
+                Action::ok(ActionOp::Rename {
+                    source: source.to_owned(),
+                    destination: destination.to_owned(),
+                    replace: true,
+                }),
+            ],
+            &[],
+        )]);
+        let mut observed = observe(&case);
+        observed.executions[0].results[1].revision = Some(569);
+        let publish_result = &observed.executions[0].results[0];
+        let rename_result = &observed.executions[0].results[1];
+        let actions = [
+            NamespaceAction {
+                step: 0,
+                stream_owner: None,
+                preparation: false,
+                operation: NamespaceOperation::Publish {
+                    path: destination.to_owned(),
+                    bytes: b"value",
+                    commit: true,
+                    exclusive: false,
+                    require_existing: false,
+                },
+                role: (&case.processes[0].actions[0].operation).into(),
+                result: Some(publish_result),
+                denied: false,
+                publication_finished: true,
+            },
+            NamespaceAction {
+                step: 1,
+                stream_owner: None,
+                preparation: false,
+                operation: NamespaceOperation::Rename {
+                    source: source.to_owned(),
+                    destination: destination.to_owned(),
+                    replace: true,
+                },
+                role: (&case.processes[0].actions[1].operation).into(),
+                result: Some(rename_result),
+                denied: false,
+                publication_finished: true,
+            },
+        ];
+        let hints = BTreeMap::from([(destination.to_owned(), 573)]);
+
+        assert_eq!(
+            namespace_constructive_candidate_key(&actions[0], &actions, &hints, Some(563)),
+            563
+        );
+        assert_eq!(
+            namespace_constructive_candidate_key(&actions[0], &actions[..1], &hints, Some(563)),
+            573
+        );
+    }
+
+    #[test]
+    fn mutation_origin_keys_its_unobserved_source_publication() {
+        let source = "/cases/order/source";
+        let case = case(vec![program(
+            "mutator",
+            vec![
+                Action::ok(publication(source, b"value")),
+                Action::ok(ActionOp::Rename {
+                    source: source.to_owned(),
+                    destination: "/cases/order/destination".to_owned(),
+                    replace: false,
+                }),
+            ],
+            &[],
+        )]);
+        let observed = observe(&case);
+        let actions = [
+            NamespaceAction {
+                step: 0,
+                stream_owner: None,
+                preparation: false,
+                operation: NamespaceOperation::Publish {
+                    path: source.to_owned(),
+                    bytes: b"value",
+                    commit: true,
+                    exclusive: false,
+                    require_existing: false,
+                },
+                role: (&case.processes[0].actions[0].operation).into(),
+                result: Some(&observed.executions[0].results[0]),
+                denied: false,
+                publication_finished: true,
+            },
+            NamespaceAction {
+                step: 1,
+                stream_owner: None,
+                preparation: false,
+                operation: NamespaceOperation::MutationOrigin {
+                    path: source.to_owned(),
+                    revision: 1866,
+                },
+                role: (&case.processes[0].actions[1].operation).into(),
+                result: None,
+                denied: false,
+                publication_finished: true,
+            },
+        ];
+        let hints = BTreeMap::from([(source.to_owned(), 1871)]);
+
+        assert_eq!(
+            namespace_constructive_candidate_key(&actions[0], &actions, &hints, None),
+            1866
+        );
     }
 
     #[test]
@@ -5268,7 +5439,7 @@ mod namespace_tests {
         loser.outcome = "expected_error".to_owned();
         loser.revision = None;
         loser.errno = Some(libc::ENOENT);
-        loser.error_type = Some("OSError".to_owned());
+        loser.error_type = None;
         BehaviorOracle::verify(&case, &observation).unwrap();
     }
 
@@ -6381,13 +6552,13 @@ mod namespace_tests {
                     path: "/cases/race/stream".to_owned(),
                     expected_kind: "blob".to_owned(),
                 }),
-                Action::exception(
+                Action::error(
                     ActionOp::StreamWrite {
                         path: "/cases/race/stream".to_owned(),
                         chunks: vec![b"x".to_vec()],
                         replace: false,
                     },
-                    PythonException::StreamError,
+                    libc::ENXIO,
                 ),
             ],
             &[],
@@ -6601,7 +6772,7 @@ mod namespace_tests {
         case.failure = FailureInjection::StopProcess {
             process: "stopped".to_owned(),
             phase: ProcessStopPhase::AfterContextReady,
-            kill_after_ms: Some(10),
+            force: false,
         };
         let mut observed = observe(&case);
         observed.executions[0].results.clear();
@@ -6735,15 +6906,15 @@ mod namespace_tests {
     }
 
     #[test]
-    fn binding_collision_exceptions_require_the_operation_specific_namespace_state() {
+    fn collision_errors_require_the_operation_specific_namespace_state() {
         let path = "/cases/collision/name";
-        let stream_collision = Action::exception(
+        let stream_collision = Action::error(
             ActionOp::StreamWrite {
                 path: path.to_owned(),
                 chunks: vec![b"stream".to_vec()],
                 replace: false,
             },
-            PythonException::StreamError,
+            libc::ENXIO,
         );
         let blob_first = case(vec![program(
             "owner",
@@ -6755,7 +6926,7 @@ mod namespace_tests {
         )]);
         let mut observed = observe(&blob_first);
         BehaviorOracle::verify(&blob_first, &observed).unwrap();
-        observed.executions[0].results[1].error_type = Some("SessionError".to_owned());
+        observed.executions[0].results[1].errno = Some(libc::EEXIST);
         assert!(BehaviorOracle::verify(&blob_first, &observed).is_err());
         let absent = case(vec![program("owner", vec![stream_collision], &[])]);
         assert_eq!(
@@ -6769,16 +6940,17 @@ mod namespace_tests {
             "owner",
             vec![
                 stream_roundtrip(path),
-                Action::exception(publication(path, b"blob"), PythonException::StreamError),
+                Action::error(publication(path, b"blob"), libc::ENXIO),
                 Action::error(exclusive(path, b"raw"), libc::ENXIO),
             ],
             &[],
         )]);
         let mut observed = stream_observation(&stream_first, &[("owner", 0, 20)]);
         BehaviorOracle::verify(&stream_first, &observed).unwrap();
-        // A high-level exception cannot masquerade as the raw descriptor errno.
+        // Diagnostic text cannot substitute for the normalized protocol errno.
         stream_result(&mut observed.executions[0], 2).errno = None;
-        stream_result(&mut observed.executions[0], 2).error_type = Some("StreamError".to_owned());
+        stream_result(&mut observed.executions[0], 2).error_type =
+            Some("wrong_entry_type".to_owned());
         assert!(BehaviorOracle::verify(&stream_first, &observed).is_err());
     }
 
@@ -6852,6 +7024,70 @@ mod namespace_tests {
     }
 
     #[test]
+    fn descriptor_validation_preserves_namespace_and_checks_error_precedence() {
+        let path = "/cases/descriptor-validation/blob";
+        let mut case = case(vec![program(
+            "descriptor",
+            vec![
+                Action::ok(publication(path, b"a")),
+                Action::error(
+                    ActionOp::DescriptorRead {
+                        path: path.to_owned(),
+                        flags: libc::O_RDONLY | libc::O_NONBLOCK,
+                        expected: Vec::new(),
+                        method: DescriptorReadMethod::Read,
+                        offset: 0,
+                        finish: DescriptorFinish::Close,
+                    },
+                    libc::ENOTSUP,
+                ),
+                Action::error(
+                    ActionOp::DescriptorRead {
+                        path: path.to_owned(),
+                        flags: libc::O_RDONLY,
+                        expected: b"a".to_vec(),
+                        method: DescriptorReadMethod::Mapping,
+                        offset: 1,
+                        finish: DescriptorFinish::Close,
+                    },
+                    libc::EINVAL,
+                ),
+                Action::ok(ActionOp::ReadBlob {
+                    path: path.to_owned(),
+                    expected: b"a".to_vec(),
+                }),
+            ],
+            &[],
+        )]);
+        let mut observed = observe(&case);
+        BehaviorOracle::verify(&case, &observed).unwrap();
+
+        // Matching the requested errno cannot waive validation precedence.
+        case.processes[0].actions[1].expected = ExpectedOutcome::Error(libc::ENOENT);
+        observed.executions[0].results[1].errno = Some(libc::ENOENT);
+        assert_eq!(
+            BehaviorOracle::verify(&case, &observed)
+                .unwrap_err()
+                .invariant,
+            "namespace_linearizability"
+        );
+        case.processes[0].actions[1].expected = ExpectedOutcome::Error(libc::ENOTSUP);
+        observed.executions[0].results[1].errno = Some(libc::ENOTSUP);
+
+        // An in-bounds mapping cannot explain a claimed bounds error.
+        if let ActionOp::DescriptorRead { offset, .. } = &mut case.processes[0].actions[2].operation
+        {
+            *offset = 0;
+        }
+        assert_eq!(
+            BehaviorOracle::verify(&case, &observed)
+                .unwrap_err()
+                .invariant,
+            "namespace_linearizability"
+        );
+    }
+
+    #[test]
     fn descriptor_terminal_error_cannot_hide_a_completed_corrupt_fixture_read() {
         let path = "/models/fixture";
         let mut case = case(vec![program(
@@ -6879,7 +7115,7 @@ mod namespace_tests {
                 DescriptorTerminalResult::Ok,
                 DescriptorTerminalResult::Error {
                     errno: Some(libc::EBADF),
-                    error_type: "OSError".to_owned(),
+                    error_type: "bad_descriptor".to_owned(),
                 },
             ],
         });
@@ -6942,7 +7178,7 @@ mod namespace_tests {
         let serialized = serde_json::to_vec(&fresh.signature).unwrap();
         assert_eq!(
             serde_json::from_slice::<FailureSignature>(&serialized).unwrap(),
-            fresh.signature
+            *fresh.signature
         );
     }
 
@@ -6970,24 +7206,24 @@ mod namespace_tests {
                 .unwrap_err()
                 .signature
         };
-        let missing = abort(&case, libc::ENOENT, "FileNotFoundError");
-        let denied = abort(&case, libc::EACCES, "PermissionError");
+        let missing = abort(&case, libc::ENOENT, "path_not_found");
+        let denied = abort(&case, libc::EACCES, "unauthorized");
         assert_eq!(missing.failure_class, FailureClass::OutcomeMismatch);
         assert_ne!(missing, denied);
-        assert_ne!(missing, abort(&case, libc::ENOENT, "OSError"));
-        assert_ne!(missing, abort(&case, libc::EACCES, "FileNotFoundError"));
+        assert_eq!(missing, abort(&case, libc::ENOENT, "different_diagnostic"));
+        assert_ne!(missing, abort(&case, libc::EACCES, "path_not_found"));
         case.id = "another-attempt".to_owned();
         case.processes[0].id = "another-process".to_owned();
         case.processes[0].access.execution_id = "another-execution".to_owned();
-        assert_eq!(missing, abort(&case, libc::ENOENT, "FileNotFoundError"));
+        assert_eq!(missing, abort(&case, libc::ENOENT, "path_not_found"));
         case.processes[0].actions[0].expected = ExpectedOutcome::Error(libc::ENOENT);
-        let expected_missing = abort(&case, libc::EIO, "OSError");
+        let expected_missing = abort(&case, libc::EIO, "io");
         case.processes[0].actions[0].expected = ExpectedOutcome::Error(libc::EACCES);
-        assert_ne!(expected_missing, abort(&case, libc::EIO, "OSError"));
+        assert_ne!(expected_missing, abort(&case, libc::EIO, "io"));
         let encoded = serde_json::to_vec(&missing).unwrap();
         assert_eq!(
             serde_json::from_slice::<FailureSignature>(&encoded).unwrap(),
-            missing
+            *missing
         );
     }
 
@@ -7014,7 +7250,7 @@ mod namespace_tests {
         execution.exit_status = Some(r#"{"kind":"code","value":1}"#.to_owned());
         execution.results[0].outcome = "error".to_owned();
         execution.results[0].errno = Some(libc::ENOENT);
-        execution.results[0].error_type = Some("FileNotFoundError".to_owned());
+        execution.results[0].error_type = None;
         assert_eq!(
             BehaviorOracle::verify(&case, &observation)
                 .unwrap_err()
@@ -7057,13 +7293,13 @@ mod namespace_tests {
         let mut case = case(vec![
             program(
                 "writer",
-                vec![Action::exception(
+                vec![Action::error(
                     ActionOp::StreamWrite {
                         path: path.to_owned(),
                         chunks: vec![b"a".to_vec(), b"b".to_vec()],
                         replace: false,
                     },
-                    PythonException::StreamError,
+                    libc::EPIPE,
                 )],
                 &[],
             ),
@@ -7079,7 +7315,7 @@ mod namespace_tests {
         case.failure = FailureInjection::StopProcess {
             process: "reader".to_owned(),
             phase: ProcessStopPhase::AfterContextReady,
-            kill_after_ms: Some(10),
+            force: false,
         };
         let mut observed = stream_observation(&case, &[("writer", 0, 20), ("reader", 0, 20)]);
         let writer_terminal = observed.executions[0].results.pop().unwrap();
@@ -7137,12 +7373,12 @@ mod namespace_tests {
             ),
             program(
                 "reader",
-                vec![Action::exception(
+                vec![Action::error(
                     ActionOp::StreamRead {
                         path: path.to_owned(),
                         expected: b"unsent".to_vec(),
                     },
-                    PythonException::StreamError,
+                    libc::ECONNRESET,
                 )],
                 &[],
             ),
@@ -7150,7 +7386,7 @@ mod namespace_tests {
         case.failure = FailureInjection::StopProcess {
             process: "writer".to_owned(),
             phase: ProcessStopPhase::AfterContextReady,
-            kill_after_ms: Some(0),
+            force: true,
         };
         let mut observed = stream_observation(&case, &[("reader", 0, 20)]);
         observed.executions[0].results.clear();
@@ -7454,6 +7690,21 @@ fn verify_namespace_constructively(
             .flat_map(|(process, program)| program[state.positions[process]..].iter())
             .filter_map(|action| namespace_commit_key(action, revision_hints))
             .min();
+        let commit_floor = pending_commit_key;
+        let next_unobserved_key = commit_floor.and_then(|floor| {
+            let (last_known, trailing) = state.revisions.iter().rposition(Option::is_some).map_or(
+                (state.initial_revision, state.revisions.len()),
+                |index| {
+                    (
+                        state.revisions[index].expect("position selected a known revision"),
+                        state.revisions.len() - index - 1,
+                    )
+                },
+            );
+            last_known
+                .checked_add(u64::try_from(trailing).ok()?.checked_add(1)?)
+                .filter(|next| *next < floor)
+        });
         // Try observed namespace revisions/incarnations first, never collector
         // receipt order. An unsuccessful construction falls back to all states.
         let mut candidates: Vec<(u64, usize, usize)> = Vec::new();
@@ -7461,13 +7712,14 @@ fn verify_namespace_constructively(
             let Some(action) = ready_action(&state, programs, dependencies, process) else {
                 continue;
             };
-            candidates.push((
-                namespace_action_key(action, revision_hints),
-                process,
-                state.positions[process],
-            ));
+            let key = namespace_constructive_candidate_key(
+                action,
+                &programs[process][state.positions[process]..],
+                revision_hints,
+                next_unobserved_key,
+            );
+            candidates.push((key, process, state.positions[process]));
         }
-        let commit_floor = pending_commit_key;
         if candidates.is_empty() {
             if let Some(next) = state.active_streams.keys().find_map(|path| {
                 namespace_first_frame(&state, path).or_else(|| namespace_quiescence(&state, path))
@@ -7493,10 +7745,11 @@ fn verify_namespace_constructively(
                 .revisions
                 .get(state.revisions.len())
                 .and_then(|revision| *revision)
-                .or_else(|| namespace_commit_key(action, revision_hints))
-                .unwrap_or(key);
+                .or_else(|| namespace_commit_key(action, revision_hints));
             if next.revisions.len() > state.revisions.len()
-                && commit_floor.is_some_and(|floor| floor < appended_key)
+                && appended_key
+                    .zip(commit_floor)
+                    .is_some_and(|(appended, floor)| floor < appended)
             {
                 continue;
             }

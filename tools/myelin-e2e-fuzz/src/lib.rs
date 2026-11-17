@@ -1,53 +1,65 @@
-//! Real-binary, multi-node behavioral fuzz harness for Myelin and Swactor.
-//!
-//! The crate is organized as a module tree; this root is a thin facade that
-//! preserves the historical flat API used by `main.rs`.
+//! Protocol oracles, campaign planning, and local integration infrastructure.
+//! Cases and observations describe language-independent protocol behavior;
+//! passing local tests does not qualify a deployed multi-node campaign.
 
+pub mod binding_cases;
+pub mod binding_conformance;
 mod budget;
 mod campaign;
 mod codegen;
 mod corpus;
 mod coverage;
+pub mod diagnosis;
+pub mod evidence;
+mod executor;
+pub mod fixture_providers;
 mod harness;
 mod ir;
+pub mod native;
 mod oracle;
+mod raw_fleet;
 mod remote;
 mod resources;
 mod shrink;
 
-pub use budget::{Budget, execution_evidence, record_execution_stage};
+pub use budget::{
+    Budget, ExecutionSpan, ExecutionStage, WorkKind, execution_evidence, execution_span,
+    record_remote_work,
+};
 pub use campaign::{
     ArtifactEnvelope, CAMPAIGN_DEADLINE_SECS, CLEANUP_DEADLINE_SECS, CampaignConfig,
-    CampaignLimits, CampaignPlan, DIAGNOSTIC_DEADLINE_SECS, LOCAL_CLEANUP_RESERVE_SECS,
+    CampaignLimits, CampaignPlan, CaseCursorEvidence, CaseExecutionCompletion, CaseWaveResult,
+    DIAGNOSTIC_DEADLINE_SECS, ExecutionWave, ExecutionWaveLimits, LOCAL_CLEANUP_RESERVE_SECS,
     OfferPolicy, PREPARATION_DEADLINE_SECS, PersistedFixtureEntry, ProviderMode, RecoveryCase,
-    WORKLOAD_DEADLINE_SECS,
+    WORKLOAD_DEADLINE_SECS, execute_case_waves, plan_execution_waves, wave_independent,
 };
-pub use codegen::{render_case_python, render_python};
+pub use codegen::{render_case_python, render_conformance_python, render_python};
 pub use corpus::{
     failure_corpus, ordered_pair_corpus, random_short_dags, random_short_dags_budgeted,
     stable_corpus,
 };
 pub use coverage::{
-    CoverageKey, CoverageLedger, EvidenceIdentity, NodeRole, PayloadClass, case_coverage,
+    CoverageKey, CoverageLedger, DeveloperCampaign, EvidenceIdentity, NodeRole, PayloadClass,
+    VerificationTier, case_coverage, generate_developer_campaign, high_risk_lifecycle_case,
 };
-pub use harness::raw_fleet::{
-    DeploymentBoundary, RawDockerFleet, RawFleetSnapshot, RawNodeCensus, RawPriorState,
-};
+pub use executor::{CaseExecutor, ExecutionFailure};
 pub use harness::{
     ClusterHarness, ClusterHarnessConfig, FixturePathObservation, FixturePathSnapshot,
-    HarnessProvider,
+    HarnessExecution, HarnessProvider, WorkloadBackend,
 };
 pub use ir::{
     AccessSpec, Action, ActionClass, ActionObservation, ActionOp, BehaviorCase, CaseObservation,
     CaseResourceBounds, CaseResources, CoverageScenario, DataEdge, DataKind, DataRoute,
     DescriptorFinish, DescriptorObservation, DescriptorReadMethod, DescriptorTerminalResult,
     DescriptorWriteMethod, ExecutionObservation, ExpectedOutcome, FailureInjection,
-    LaunchFailureKind, ProcessProgram, ProcessStopPhase, PythonException, TopologyFamily,
-    TransferObservation,
+    LaunchFailureKind, ProcessProgram, ProcessStopPhase, TopologyFamily, TransferObservation,
 };
 pub use oracle::{
     BehaviorOracle, BlobPublicationTrace, CausalRole, FailureClass, FailureSignature,
     ObservedOutcome, OracleViolation, OutcomeExpectation, SemanticAction, StreamIncarnationTrace,
+};
+pub use raw_fleet::{
+    DeploymentBoundary, RawDockerFleet, RawFleetSnapshot, RawNodeCensus, RawPriorState,
 };
 pub use remote::{
     PaidCampaignPhase, PaidCampaignState, authorized_cleanup_limits, await_cleanup_owner,
@@ -61,7 +73,8 @@ pub use resources::{
     BuiltBinaries, DeploymentBundle, GateImageIdentity, PreparedArtifactIdentity,
     assemble_deployment_bundle, distinguish_deployment_payload, immutable_registry_reference,
     private_fixture_dir, require_prepared_artifacts, resolve_myelin_binaries,
-    runtime_image_identity, stage_deployment_payload,
+    runtime_image_identity, runtime_image_transfer_bytes, stage_deployment_payload,
+    stage_python_conformance_payload,
 };
 pub use shrink::{shrink_failure, try_shrink_failure, try_shrink_failure_budgeted};
 
@@ -71,8 +84,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::process::{Command, Stdio};
 
-    use crate::codegen::digest;
     use crate::corpus::SEEDED_MODEL_PATH;
+    use crate::oracle::digest;
 
     fn valid_execution() -> ExecutionObservation {
         ExecutionObservation {
@@ -126,15 +139,14 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let mut child = Command::new("python3")
+        let mut child = swactor_process::command_spawn(Command::new("python3")
             .args([
                 "-c",
                 "import json,sys\nfor i,source in enumerate(json.load(sys.stdin)):\n compile(source, f'<generated-{i}>', 'exec')",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped()))
             .expect("spawn Python syntax checker");
         serde_json::to_writer(
             child.stdin.as_mut().expect("Python syntax checker stdin"),
@@ -142,7 +154,7 @@ mod tests {
         )
         .unwrap();
         drop(child.stdin.take());
-        let output = child.wait_with_output().unwrap();
+        let output = swactor_process::child_wait_with_output(child).unwrap();
         assert!(
             output.status.success(),
             "generated Python syntax failed: {}",
@@ -437,7 +449,7 @@ mod tests {
         );
 
         let mut canceled = failed.clone();
-        canceled.results[0].error_type = Some("TimeoutError".to_owned());
+        canceled.results[0].errno = Some(libc::ETIMEDOUT);
         assert!(crate::oracle::recorded_action_failure(&case.processes[0], &canceled).is_none());
         let mut missing_prefix = failed.clone();
         missing_prefix.results[0].step = 1;
@@ -527,14 +539,13 @@ mod tests {
     #[test]
     fn failure_injections_validate_real_targets() {
         let corpus = failure_corpus(2, 11);
-        assert_eq!(corpus.len(), 8);
         assert!(corpus.iter().all(|case| case.validate().is_ok()));
 
         let mut invalid = corpus[0].clone();
         invalid.failure = FailureInjection::StopProcess {
             process: "missing".to_owned(),
             phase: ProcessStopPhase::AfterSpawn,
-            kill_after_ms: None,
+            force: false,
         };
         assert!(invalid.validate().is_err());
 

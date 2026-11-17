@@ -12,7 +12,7 @@ use crate::ir::{
     ExpectedOutcome, FailureInjection, ProcessProgram, TopologyFamily,
 };
 
-pub const COVERAGE_SCHEMA_VERSION: u32 = 5;
+pub const COVERAGE_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +73,88 @@ pub enum CoverageKey {
     Scenario {
         scenario: CoverageScenario,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationTier {
+    ProtocolDeterministic,
+    AccumulatedStateSoak,
+    DeveloperNonAcceptance,
+    FormalAcceptance,
+}
+
+impl VerificationTier {
+    pub const fn qualifies_formal_acceptance(self) -> bool {
+        matches!(self, Self::FormalAcceptance)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeveloperCampaign {
+    pub schema_version: u32,
+    pub tier: VerificationTier,
+    pub source_plan_digest: String,
+    pub source_case_count: usize,
+    pub cases: Vec<BehaviorCase>,
+    pub target_coverage: BTreeSet<CoverageKey>,
+    pub covered: BTreeSet<CoverageKey>,
+    pub high_risk_case_ids: BTreeSet<String>,
+}
+
+impl DeveloperCampaign {
+    pub fn validate_against_source(&self, source: &[BehaviorCase]) -> Result<(), String> {
+        if self.schema_version != COVERAGE_SCHEMA_VERSION
+            || self.tier != VerificationTier::DeveloperNonAcceptance
+            || self.tier.qualifies_formal_acceptance()
+            || self.source_case_count != source.len()
+            || self.source_plan_digest != evidence_digest(&source)?
+            || self.cases.len() >= source.len()
+        {
+            return Err("developer campaign identity or non-acceptance tier is invalid".to_owned());
+        }
+        let source_by_id = source
+            .iter()
+            .map(|case| (case.id.as_str(), case))
+            .collect::<BTreeMap<_, _>>();
+        if source_by_id.len() != source.len()
+            || self.cases.iter().any(|case| {
+                source_by_id
+                    .get(case.id.as_str())
+                    .is_none_or(|source_case| *source_case != case)
+            })
+        {
+            return Err("developer campaign contains a case outside its source plan".to_owned());
+        }
+        let target = source
+            .iter()
+            .flat_map(case_coverage)
+            .collect::<BTreeSet<_>>();
+        let covered = self
+            .cases
+            .iter()
+            .flat_map(case_coverage)
+            .collect::<BTreeSet<_>>();
+        let high_risk = source
+            .iter()
+            .filter(|case| high_risk_lifecycle_case(case))
+            .map(|case| case.id.clone())
+            .collect::<BTreeSet<_>>();
+        if target != self.target_coverage
+            || covered != self.covered
+            || covered != target
+            || high_risk != self.high_risk_case_ids
+            || !high_risk
+                .iter()
+                .all(|id| self.cases.iter().any(|case| &case.id == id))
+        {
+            return Err(
+                "developer campaign does not close representative or high-risk coverage".to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Immutable environment that produced coverage. Changing any component
@@ -1412,8 +1494,12 @@ fn observe_scenario(
                 || !survivor_records.steps[survivor_step].iter().any(|result| {
                     result.outcome == "expected_error"
                         && result.incarnation == Some(incarnation)
-                        && matches!(result.errno, None | Some(libc::EPIPE | libc::ECONNRESET))
-                        && result.error_type.as_deref() == Some("StreamError")
+                        && result.errno
+                            == Some(if writer_abort {
+                                libc::ECONNRESET
+                            } else {
+                                libc::EPIPE
+                            })
                 })
             {
                 return Ok(false);
@@ -1688,10 +1774,8 @@ fn observe_descriptor(
                 .any(|terminal| !matches!(terminal, DescriptorTerminalResult::Ok))
             || !match terminals.last() {
                 Some(DescriptorTerminalResult::Ok) => result.outcome == "ok",
-                Some(DescriptorTerminalResult::Error { errno, error_type }) => {
-                    result.outcome == "expected_error"
-                        && *errno == result.errno
-                        && Some(error_type.as_str()) == result.error_type.as_deref()
+                Some(DescriptorTerminalResult::Error { errno, .. }) => {
+                    result.outcome == "expected_error" && errno.is_some() && *errno == result.errno
                 }
                 None => false,
             })
@@ -1704,7 +1788,7 @@ fn observe_descriptor(
     if let Some(transfer) = &result.transfer {
         if !transfer.complete
             || transfer.length != bytes.len()
-            || transfer.digest != crate::codegen::digest(bytes)
+            || transfer.digest != crate::oracle::digest(bytes)
         {
             return Err(format!(
                 "{} step {} changed transferred descriptor bytes",
@@ -2049,7 +2133,11 @@ fn active_stream_fault_pair(
             || faulted.actions[faulted_step].expected != ExpectedOutcome::Ok
             || first_frame.is_none_or(Vec::is_empty)
             || survivor.actions[survivor_step].expected
-                != ExpectedOutcome::Exception(crate::ir::PythonException::StreamError)
+                != ExpectedOutcome::Error(if writer_abort {
+                    libc::ECONNRESET
+                } else {
+                    libc::EPIPE
+                })
         {
             continue;
         }
@@ -2391,9 +2479,7 @@ pub fn case_coverage(case: &BehaviorCase) -> BTreeSet<CoverageKey> {
             }
             let outcome = match action.expected {
                 ExpectedOutcome::Ok => "success",
-                ExpectedOutcome::Error(_)
-                | ExpectedOutcome::Exception(_)
-                | ExpectedOutcome::Linearized { .. } => "modeled_error",
+                ExpectedOutcome::Error(_) | ExpectedOutcome::Linearized { .. } => "modeled_error",
             };
             keys.insert(CoverageKey::Outcome {
                 class: outcome.to_owned(),
@@ -2409,6 +2495,103 @@ pub fn case_coverage(case: &BehaviorCase) -> BTreeSet<CoverageKey> {
         });
     }
     keys
+}
+
+pub fn high_risk_lifecycle_case(case: &BehaviorCase) -> bool {
+    !case.read_only_fixture_paths.is_empty()
+        || !matches!(case.failure, FailureInjection::None)
+        || case.scenarios.iter().any(|scenario| {
+            matches!(
+                scenario,
+                CoverageScenario::ProcessChurn
+                    | CoverageScenario::ActiveMutation
+                    | CoverageScenario::QuiescentMutation
+                    | CoverageScenario::ActiveStreamWriterAbort
+                    | CoverageScenario::ActiveStreamReaderStop
+                    | CoverageScenario::FailureIsolation
+            )
+        })
+}
+
+/// Deterministic greedy set cover for edit-time feedback. This intentionally
+/// closes unique coverage keys rather than the formal ledger's required
+/// multiplicities and is therefore always non-acceptance evidence.
+pub fn generate_developer_campaign(
+    source: &[BehaviorCase],
+    max_cases: usize,
+) -> Result<DeveloperCampaign, String> {
+    if source.len() < 2 || max_cases == 0 || max_cases >= source.len() {
+        return Err(
+            "developer campaign requires a strict nonempty case-count reduction".to_owned(),
+        );
+    }
+    let mut ids = BTreeSet::new();
+    for case in source {
+        case.validate()?;
+        if !ids.insert(case.id.clone()) {
+            return Err("developer campaign source contains duplicate case IDs".to_owned());
+        }
+    }
+    let coverage = source.iter().map(case_coverage).collect::<Vec<_>>();
+    let target_coverage = coverage
+        .iter()
+        .flat_map(|keys| keys.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut selected = source
+        .iter()
+        .enumerate()
+        .filter(|(_, case)| high_risk_lifecycle_case(case))
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    if selected.len() > max_cases {
+        return Err("high-risk lifecycle regressions exceed developer campaign limit".to_owned());
+    }
+    let mut covered = selected
+        .iter()
+        .flat_map(|&index| coverage[index].iter().cloned())
+        .collect::<BTreeSet<_>>();
+    while covered != target_coverage {
+        let mut best = None;
+        let mut best_gain = 0;
+        for (index, keys) in coverage.iter().enumerate() {
+            if selected.contains(&index) {
+                continue;
+            }
+            let gain = keys.iter().filter(|key| !covered.contains(*key)).count();
+            if gain > best_gain {
+                best = Some(index);
+                best_gain = gain;
+            }
+        }
+        let index = best.ok_or("developer coverage cannot be closed from source cases")?;
+        if selected.len() == max_cases {
+            return Err("developer campaign limit cannot close representative coverage".to_owned());
+        }
+        selected.insert(index);
+        covered.extend(coverage[index].iter().cloned());
+    }
+    if selected.len() >= source.len() {
+        return Err("developer campaign did not reduce the formal source case set".to_owned());
+    }
+    let campaign = DeveloperCampaign {
+        schema_version: COVERAGE_SCHEMA_VERSION,
+        tier: VerificationTier::DeveloperNonAcceptance,
+        source_plan_digest: evidence_digest(&source)?,
+        source_case_count: source.len(),
+        cases: selected
+            .iter()
+            .map(|&index| source[index].clone())
+            .collect(),
+        target_coverage,
+        covered,
+        high_risk_case_ids: source
+            .iter()
+            .filter(|case| high_risk_lifecycle_case(case))
+            .map(|case| case.id.clone())
+            .collect(),
+    };
+    campaign.validate_against_source(source)?;
+    Ok(campaign)
 }
 
 fn action_payload_length(operation: &ActionOp) -> Option<usize> {
@@ -2488,10 +2671,10 @@ mod tests {
 
     fn evidence_identity(generation: &str) -> EvidenceIdentity {
         EvidenceIdentity {
-            plan_digest: crate::codegen::digest(b"test immutable plan"),
-            artifacts_digest: crate::codegen::digest(b"test artifact contents"),
+            plan_digest: crate::oracle::digest(b"test immutable plan"),
+            artifacts_digest: crate::oracle::digest(b"test artifact contents"),
             deployment_generation: generation.to_owned(),
-            fixture_mapping_digest: crate::codegen::digest(b"test exact fixture mapping"),
+            fixture_mapping_digest: crate::oracle::digest(b"test exact fixture mapping"),
         }
     }
 
@@ -2681,7 +2864,7 @@ mod tests {
                                 path: action.operation.path().to_owned(),
                                 outcome: "ok".to_owned(),
                                 length: Some(payload.len()),
-                                digest: Some(crate::codegen::digest(payload)),
+                                digest: Some(crate::oracle::digest(payload)),
                                 kind: None,
                                 revision: None,
                                 active: None,
@@ -2813,7 +2996,7 @@ mod tests {
                         };
                         terminal.length = payload.as_ref().map(Vec::len);
                         terminal.digest =
-                            payload.as_ref().map(|bytes| crate::codegen::digest(bytes));
+                            payload.as_ref().map(|bytes| crate::oracle::digest(bytes));
                         let write = matches!(action.operation, ActionOp::GatedStreamWrite { .. });
                         let read = matches!(action.operation, ActionOp::GatedStreamRead { .. });
                         if write || read {
@@ -2832,7 +3015,7 @@ mod tests {
                                     incarnation: 1,
                                     index: index as u64,
                                     length: frame.len() as u64,
-                                    digest: crate::codegen::digest(frame),
+                                    digest: crate::oracle::digest(frame),
                                 });
                                 if index == 0 {
                                     emit(if write {
@@ -2872,7 +3055,7 @@ mod tests {
         case.failure = FailureInjection::StopProcess {
             process: case.processes[target].id.clone(),
             phase: crate::ir::ProcessStopPhase::AfterStreamFirstFrame,
-            kill_after_ms: Some(100),
+            force: false,
         };
         if !writer_abort {
             let ActionOp::GatedStreamWrite { path, frames, .. } =
@@ -2894,8 +3077,12 @@ mod tests {
             };
             *park_after_first_frame = true;
         }
-        case.processes[survivor].actions[0].expected =
-            ExpectedOutcome::Exception(crate::ir::PythonException::StreamError);
+        let peer_errno = if writer_abort {
+            libc::ECONNRESET
+        } else {
+            libc::EPIPE
+        };
+        case.processes[survivor].actions[0].expected = ExpectedOutcome::Error(peer_errno);
         let path = case.processes[survivor].actions[0]
             .operation
             .path()
@@ -2940,10 +3127,11 @@ mod tests {
                 terminal.outcome = "expected_error".to_owned();
                 terminal.length = None;
                 terminal.digest = None;
-                terminal.error_type = Some("StreamError".to_owned());
+                terminal.errno = Some(peer_errno);
+                terminal.error_type = None;
                 terminal.transfer = Some(crate::ir::TransferObservation {
                     length: b"first".len(),
-                    digest: crate::codegen::digest(b"first"),
+                    digest: crate::oracle::digest(b"first"),
                     complete: false,
                 });
                 execution.results.extend([terminal, cleanup]);
@@ -2981,7 +3169,7 @@ mod tests {
                             .find(|result| result.outcome == "expected_error")
                             .unwrap();
                         error.errno = Some(libc::ESTALE);
-                        error.error_type = Some("OSError".to_owned());
+                        error.error_type = None;
                     }
                     _ => {
                         incomplete.executions[survivor]
@@ -3129,7 +3317,7 @@ mod tests {
         case.failure = FailureInjection::StopProcess {
             process: target.id.clone(),
             phase: crate::ir::ProcessStopPhase::AfterSiblingStreamFirstFrame,
-            kill_after_ms: Some(100),
+            force: false,
         };
         case.processes.push(target);
         observation.executions.push(stopped);
@@ -3193,7 +3381,7 @@ mod tests {
         case.failure = FailureInjection::StopProcess {
             process: target.id.clone(),
             phase: crate::ir::ProcessStopPhase::AfterContextReady,
-            kill_after_ms: Some(100),
+            force: false,
         };
         case.processes.push(target);
         observation.executions.push(stopped);
@@ -3258,7 +3446,7 @@ mod tests {
                 seen.executions[0].results[0].digest = None
             }),
             ("wrong payload digest", |seen| {
-                seen.executions[0].results[0].digest = Some(crate::codegen::digest(b"forged"))
+                seen.executions[0].results[0].digest = Some(crate::oracle::digest(b"forged"))
             }),
             ("wrong outcome", |seen| {
                 seen.executions[0].results[0].outcome = "expected_error".to_owned()
@@ -3496,7 +3684,7 @@ mod tests {
                                 path: action.operation.path().to_owned(),
                                 outcome: "ok".to_owned(),
                                 length: Some(payload.len()),
-                                digest: Some(crate::codegen::digest(&payload)),
+                                digest: Some(crate::oracle::digest(&payload)),
                                 kind: None,
                                 revision: None,
                                 active: None,
@@ -3674,13 +3862,13 @@ mod tests {
         );
         let terminal_error = DescriptorTerminalResult::Error {
             errno: Some(libc::EBADF),
-            error_type: "OSError".to_owned(),
+            error_type: "bad_descriptor".to_owned(),
         };
         let result = &mut observation.executions[0].results[0];
         result.action = "descriptor".to_owned();
         result.outcome = "expected_error".to_owned();
         result.errno = Some(libc::EBADF);
-        result.error_type = Some("OSError".to_owned());
+        result.error_type = None;
         result.length = None;
         result.digest = None;
         result.descriptor = Some(DescriptorObservation::Write {
@@ -3696,7 +3884,7 @@ mod tests {
 
         observation.executions[0].results[0].transfer = Some(crate::ir::TransferObservation {
             length: bytes.len(),
-            digest: crate::codegen::digest(&bytes),
+            digest: crate::oracle::digest(&bytes),
             complete: true,
         });
         let mut complete = ledger_for_case(&case);
@@ -3710,7 +3898,7 @@ mod tests {
                 DescriptorTerminalResult::Ok,
                 DescriptorTerminalResult::Error {
                     errno: Some(libc::ENOENT),
-                    error_type: "OSError".to_owned(),
+                    error_type: "path_not_found".to_owned(),
                 },
             ],
         ] {
@@ -3790,7 +3978,7 @@ mod tests {
                 };
                 if let Some(payload) = &payload {
                     terminal.length = Some(payload.len());
-                    terminal.digest = Some(crate::codegen::digest(payload));
+                    terminal.digest = Some(crate::oracle::digest(payload));
                 }
                 if matches!(
                     action.operation,
@@ -3813,7 +4001,7 @@ mod tests {
                         incarnation,
                         index: 0,
                         length: payload.len() as u64,
-                        digest: crate::codegen::digest(payload),
+                        digest: crate::oracle::digest(payload),
                     });
                     if matches!(action.operation, ActionOp::StreamRead { .. }) {
                         emit(BarrierObservation::StreamFirstFrame { incarnation });
@@ -3962,7 +4150,7 @@ mod tests {
         let terminal = &mut observation.executions[0].results[0];
         terminal.action = ActionClass::StreamWrite.as_str().to_owned();
         terminal.length = Some(1);
-        terminal.digest = Some(crate::codegen::digest(b"a"));
+        terminal.digest = Some(crate::oracle::digest(b"a"));
         terminal.incarnation = Some(20);
         let terminal = terminal.clone();
         let mut records = Vec::new();
@@ -3986,7 +4174,7 @@ mod tests {
                         incarnation: 20,
                         index: index as u64,
                         length: chunk.len() as u64,
-                        digest: crate::codegen::digest(chunk),
+                        digest: crate::oracle::digest(chunk),
                     },
                     direction,
                 );
@@ -4072,7 +4260,7 @@ mod tests {
                         if let Some(BarrierObservation::StreamFrame { digest, .. }) =
                             &mut records[last].barrier
                         {
-                            *digest = crate::codegen::digest(b"corrupt empty frame");
+                            *digest = crate::oracle::digest(b"corrupt empty frame");
                         }
                     }
                 }
@@ -4202,7 +4390,7 @@ mod tests {
         let sink = &case.processes[2];
         observation.executions[2].request_id = case.execution_request_id(sink);
         observation.executions[2].results[0].length = Some(root_payload.len());
-        observation.executions[2].results[0].digest = Some(crate::codegen::digest(&root_payload));
+        observation.executions[2].results[0].digest = Some(crate::oracle::digest(&root_payload));
         let mut writer_execution = observation.executions[1].clone();
         writer_execution.process = writer.id.clone();
         writer_execution.request_id = case.execution_request_id(&writer);
@@ -4210,7 +4398,7 @@ mod tests {
         write.process = writer.id.clone();
         write.step = 0;
         write.length = Some(root_payload.len());
-        write.digest = Some(crate::codegen::digest(&root_payload));
+        write.digest = Some(crate::oracle::digest(&root_payload));
         writer_execution.results = vec![write];
         case.topology = TopologyFamily::Fixed;
         case.routes[0].edges[1].source_role = writer.id.clone();
@@ -4242,9 +4430,9 @@ mod tests {
             let identity = next.identity.as_mut().unwrap();
             match changed {
                 0 => identity.deployment_generation = "redeployment-b".to_owned(),
-                1 => identity.fixture_mapping_digest = crate::codegen::digest(b"recreated fixture"),
-                2 => identity.artifacts_digest = crate::codegen::digest(b"different binaries"),
-                _ => identity.plan_digest = crate::codegen::digest(b"different immutable plan"),
+                1 => identity.fixture_mapping_digest = crate::oracle::digest(b"recreated fixture"),
+                2 => identity.artifacts_digest = crate::oracle::digest(b"different binaries"),
+                _ => identity.plan_digest = crate::oracle::digest(b"different immutable plan"),
             }
             let mut stale = decode();
             assert!(stale.validate_resume(&next).is_err());
@@ -4280,7 +4468,7 @@ mod tests {
                     .values_mut()
                     .next()
                     .unwrap()
-                    .identity_digest = crate::codegen::digest(b"another deployment");
+                    .identity_digest = crate::oracle::digest(b"another deployment");
             },
             |ledger| {
                 let evidence = ledger.completed_evidence.values_mut().next().unwrap();
@@ -4443,5 +4631,25 @@ mod tests {
         let mut forged = ledger_for_case(&case);
         assert!(forged.observe_case(&case, &observation).is_err());
         assert!(forged.observed.is_empty());
+    }
+    #[test]
+    fn developer_campaign_is_smaller_high_risk_and_never_acceptance_evidence() {
+        let risk = crate::corpus::failure_corpus(5, 31).remove(0);
+        let mut normal_one = risk.clone();
+        normal_one.id = "developer-normal-one".to_owned();
+        normal_one.failure = FailureInjection::None;
+        let mut normal_two = normal_one.clone();
+        normal_two.id = "developer-normal-two".to_owned();
+        let source = vec![risk.clone(), normal_one, normal_two];
+
+        let campaign = generate_developer_campaign(&source, 1).unwrap();
+        assert_eq!(campaign.cases, vec![risk]);
+        assert_eq!(campaign.covered, campaign.target_coverage);
+        assert!(!campaign.tier.qualifies_formal_acceptance());
+        campaign.validate_against_source(&source).unwrap();
+
+        let mut relabeled = campaign;
+        relabeled.tier = VerificationTier::FormalAcceptance;
+        assert!(relabeled.validate_against_source(&source).is_err());
     }
 }

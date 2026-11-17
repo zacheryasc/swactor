@@ -15,9 +15,42 @@ serde_json = "1"
 sha2 = "0.10"
 ureq = "2"
 myelin-control-contract = { path = "../../crates/myelin-control-contract" }
+myelin = { path = "../../apps/myelin" }
+dashboard = { path = "../../crates/dashboard" }
 provisioning = { path = "../../crates/provisioning" }
+protocol-telemetry = { path = "../../crates/protocol-telemetry" }
 swactor-vastai = { path = "../vastai" }
+swactor = { path = "../.." }
+swactor-engine = { path = "../../crates/engine" }
+swactor-process = { path = "../../crates/process" }
 tempfile = "3"
+iroh.workspace = true
+iroh-driver = { path = "../../crates/iroh-driver" }
+telemetry = { path = "../../crates/telemetry" }
+tokio.workspace = true
+data-plane = { path = "../../crates/data-plane" }
+distribution = { path = "../../crates/distribution" }
+swactor-transport = { path = "../../crates/transport" }
+futures-lite = "2"
+futures-util = "0.3"
+
+[dev-dependencies]
+swactor-vastai = { path = "../vastai", features = ["test-support"] }
+
+[[bin]]
+name = "myelin-e2e-fuzz"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "myelin-e2e-native"
+path = "src/bin/myelin_e2e_native.rs"
+test = false
+
+[[bin]]
+name = "myelin-fixture-orchestrator"
+path = "src/bin/myelin-fixture-orchestrator.rs"
+test = false
 
 [lints]
 workspace = true

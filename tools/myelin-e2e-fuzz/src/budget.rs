@@ -104,13 +104,7 @@ impl Budget {
             wake_count = wake_count.saturating_add(1);
         };
         drop(revision);
-        record_stage(
-            &format!("wait:{predicate}"),
-            started.elapsed(),
-            0,
-            0,
-            wake_count,
-        );
+        record_wakes(wake_count);
         result
     }
 
@@ -126,47 +120,186 @@ impl Budget {
     }
 }
 
+/// Fixed lifecycle categories: identities and predicates belong in diagnostic
+/// evidence, never in metric keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStage {
+    PreparationAdmission,
+    ProcessLaunchReadiness,
+    WorkloadExecution,
+    EventWaiting,
+    EventIngestion,
+    TerminalAcknowledgement,
+    NamespaceCleanup,
+    FixtureQuiescenceHealth,
+    DeploymentTransferActivation,
+    ExternalInspection,
+    EvidenceSerialization,
+    EvidenceSynchronization,
+    EvidenceCompaction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkKind {
+    RunnerOverhead,
+    /// Use only for measured productive work, not request round-trip latency.
+    RemoteWork,
+    RemoteWait,
+}
+
 #[derive(Default, Serialize)]
 struct StageEvidence {
     count: u64,
-    elapsed_ns: u128,
+    aggregate_ns: u128,
     max_elapsed_ns: u128,
+    wall_active_ns: u128,
     bytes: u64,
     records: u64,
-    wake_count: u64,
+    active: u64,
+    peak_active: u64,
+    #[serde(skip)]
+    active_since_ns: u128,
+}
+
+impl StageEvidence {
+    fn begin(&mut self, now: u128) {
+        if self.active == 0 {
+            self.active_since_ns = now;
+        }
+        self.active = self.active.saturating_add(1);
+        self.peak_active = self.peak_active.max(self.active);
+    }
+
+    fn finish(&mut self, started: u128, now: u128, bytes: u64, records: u64) {
+        let elapsed = now.saturating_sub(started);
+        self.count = self.count.saturating_add(1);
+        self.aggregate_ns = self.aggregate_ns.saturating_add(elapsed);
+        self.max_elapsed_ns = self.max_elapsed_ns.max(elapsed);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.records = self.records.saturating_add(records);
+        self.active = self.active.saturating_sub(1);
+        if self.active == 0 {
+            self.wall_active_ns = self
+                .wall_active_ns
+                .saturating_add(now.saturating_sub(self.active_since_ns));
+        }
+    }
+
+    fn snapshot(&self, now: u128) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        if self.active != 0 {
+            value["wall_active_ns"] = json!(
+                self.wall_active_ns
+                    .saturating_add(now.saturating_sub(self.active_since_ns))
+            );
+        }
+        value
+    }
+}
+
+#[derive(Default, Serialize)]
+struct RemoteWorkEvidence {
+    count: u64,
+    aggregate_ns: u128,
+    max_elapsed_ns: u128,
 }
 
 #[derive(Default)]
 struct ExecutionEvidence {
-    stages: BTreeMap<String, StageEvidence>,
+    stages: BTreeMap<ExecutionStage, BTreeMap<WorkKind, StageEvidence>>,
+    remote_work: BTreeMap<ExecutionStage, RemoteWorkEvidence>,
     pending: BTreeMap<String, BTreeMap<String, u64>>,
+    omitted_pending: u64,
+    wake_count: u64,
     immutable_artifacts: BTreeMap<String, Value>,
 }
 
+static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
 static EVIDENCE: LazyLock<Mutex<ExecutionEvidence>> = LazyLock::new(Mutex::default);
 
 fn evidence() -> &'static Mutex<ExecutionEvidence> {
     &EVIDENCE
 }
 
-/// Record runner work without changing the causal workload stdout protocol.
-pub fn record_execution_stage(stage: &str, elapsed: Duration, bytes: u64, records: u64) {
-    record_stage(stage, elapsed, bytes, records, 0);
+/// Observational interval ownership. Starting and dropping a span never changes
+/// budgets, cancellation, or the workload's causal output protocol.
+pub struct ExecutionSpan {
+    stage: ExecutionStage,
+    kind: WorkKind,
+    started_ns: u128,
+    bytes: u64,
+    records: u64,
 }
 
-fn record_stage(stage: &str, elapsed: Duration, bytes: u64, records: u64, wakes: u64) {
+pub fn execution_span(stage: ExecutionStage, kind: WorkKind) -> ExecutionSpan {
     let mut evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
-    let entry = evidence.stages.entry(stage.to_owned()).or_default();
+    let started_ns = ORIGIN.elapsed().as_nanos();
+    evidence
+        .stages
+        .entry(stage)
+        .or_default()
+        .entry(kind)
+        .or_default()
+        .begin(started_ns);
+    ExecutionSpan {
+        stage,
+        kind,
+        started_ns,
+        bytes: 0,
+        records: 0,
+    }
+}
+
+/// Remote clocks are not synchronized with the runner. Preserve their measured
+/// durations, but never manufacture cross-host wall intervals from receipt time.
+pub fn record_remote_work(stage: ExecutionStage, elapsed: Duration) {
+    let mut evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
+    let entry = evidence.remote_work.entry(stage).or_default();
     entry.count = entry.count.saturating_add(1);
-    entry.elapsed_ns = entry.elapsed_ns.saturating_add(elapsed.as_nanos());
+    entry.aggregate_ns = entry.aggregate_ns.saturating_add(elapsed.as_nanos());
     entry.max_elapsed_ns = entry.max_elapsed_ns.max(elapsed.as_nanos());
-    entry.bytes = entry.bytes.saturating_add(bytes);
-    entry.records = entry.records.saturating_add(records);
-    entry.wake_count = entry.wake_count.saturating_add(wakes);
+}
+
+impl ExecutionSpan {
+    pub fn add_bytes(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    pub fn add_records(&mut self, records: u64) {
+        self.records = self.records.saturating_add(records);
+    }
+}
+
+impl Drop for ExecutionSpan {
+    fn drop(&mut self) {
+        let mut evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
+        let now = ORIGIN.elapsed().as_nanos();
+        if let Some(entry) = evidence
+            .stages
+            .get_mut(&self.stage)
+            .and_then(|kinds| kinds.get_mut(&self.kind))
+        {
+            entry.finish(self.started_ns, now, self.bytes, self.records);
+        }
+    }
+}
+
+fn record_wakes(wakes: u64) {
+    let mut evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
+    evidence.wake_count = evidence.wake_count.saturating_add(wakes);
 }
 
 fn record_pending(predicate: &str, reason: &str) {
     let mut evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
+    // Pending identities are bounded diagnostic examples, not timing categories.
+    if predicate.len() > 4096
+        || (evidence.pending.len() >= 64 && !evidence.pending.contains_key(predicate))
+    {
+        evidence.omitted_pending = evidence.omitted_pending.saturating_add(1);
+        return;
+    }
     let count = evidence
         .pending
         .entry(predicate.to_owned())
@@ -174,6 +307,40 @@ fn record_pending(predicate: &str, reason: &str) {
         .entry(reason.to_owned())
         .or_default();
     *count = count.saturating_add(1);
+}
+
+/// Record a completed interval from helper code that measured its own start.
+/// Labels select only a fixed lifecycle category; they are never metric keys.
+pub(crate) fn record_execution_stage(label: &str, elapsed: Duration, bytes: u64, records: u64) {
+    let stage = if label.starts_with("telemetry.ingest") {
+        ExecutionStage::EventIngestion
+    } else if label.starts_with("telemetry.snapshot") {
+        ExecutionStage::FixtureQuiescenceHealth
+    } else if label.starts_with("http.") {
+        ExecutionStage::ExternalInspection
+    } else {
+        ExecutionStage::PreparationAdmission
+    };
+    let kind = if label.starts_with("http.connect")
+        || label.starts_with("http.read")
+        || label.starts_with("http.attempt")
+        || label.starts_with("http.total")
+    {
+        WorkKind::RemoteWait
+    } else {
+        WorkKind::RunnerOverhead
+    };
+    let now = ORIGIN.elapsed().as_nanos();
+    let started = now.saturating_sub(elapsed.as_nanos());
+    let mut evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
+    let entry = evidence
+        .stages
+        .entry(stage)
+        .or_default()
+        .entry(kind)
+        .or_default();
+    entry.begin(started);
+    entry.finish(started, now, bytes, records);
 }
 
 /// Retain verified source/build/image identities alongside timing evidence.
@@ -185,15 +352,37 @@ pub(crate) fn record_execution_identity(name: &str, identity: Value) {
         .insert(name.to_owned(), identity);
 }
 
-/// A versioned cumulative snapshot persisted at phase and failure boundaries,
-/// separately from observations used to establish causal ordering.
+/// Union wall time and aggregate operation time are intentionally separate.
+/// Categories can overlap; summing wall_active_ns across them is not a causal
+/// critical path. elapsed_wall_ns is the measured reporting window.
 pub fn execution_evidence() -> Value {
     let evidence = evidence().lock().unwrap_or_else(|error| error.into_inner());
+    let now = ORIGIN.elapsed().as_nanos();
+    let stages: BTreeMap<_, BTreeMap<_, _>> = evidence
+        .stages
+        .iter()
+        .map(|(stage, kinds)| {
+            (
+                *stage,
+                kinds
+                    .iter()
+                    .map(|(kind, entry)| (*kind, entry.snapshot(now)))
+                    .collect(),
+            )
+        })
+        .collect();
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "clock": "monotonic",
-        "stages": evidence.stages,
+        "elapsed_wall_ns": now,
+        "wall_time_semantics": "union of active intervals per category; categories may overlap",
+        "aggregate_time_semantics": "sum of completed intervals; includes concurrent and nested work",
+        "stages": stages,
+        "remote_work": evidence.remote_work,
+        "remote_work_semantics": "remote action durations; includes action-local waits; no shared wall clock",
+        "wake_count": evidence.wake_count,
         "pending_predicates": evidence.pending,
+        "omitted_pending_predicates": evidence.omitted_pending,
         "immutable_artifacts": evidence.immutable_artifacts,
     })
 }
@@ -201,6 +390,23 @@ pub fn execution_evidence() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overlapping_work_counts_union_wall_time_without_hiding_concurrent_waits() {
+        let mut entry = StageEvidence::default();
+        entry.begin(10);
+        entry.begin(20);
+        entry.finish(10, 30, 5, 1);
+        assert_eq!(entry.snapshot(35)["wall_active_ns"], 25);
+        entry.finish(20, 40, 7, 1);
+        assert_eq!(entry.aggregate_ns, 40);
+        assert_eq!(entry.wall_active_ns, 30);
+        assert_eq!(entry.peak_active, 2);
+        entry.begin(50);
+        entry.finish(50, 60, 0, 1);
+        assert_eq!(entry.aggregate_ns, 50);
+        assert_eq!(entry.wall_active_ns, 40);
+        assert_eq!(entry.snapshot(80)["wall_active_ns"], 40);
+    }
 
     #[test]
     fn child_cancellation_does_not_cancel_parent_or_sibling() {
@@ -217,11 +423,18 @@ mod tests {
 
     #[test]
     fn ancestor_cancellation_interrupts_descendant_wait() {
+        let engine = swactor_engine::Engine::new(
+            swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let blocking_work = engine.handle().blocking_work_sender();
         let parent = Budget::new(Duration::from_secs(30));
         let child = parent.child(Duration::from_secs(30));
         let started = Instant::now();
-        let waiter =
-            std::thread::spawn(move || child.wait(Duration::from_secs(20), "withheld event"));
+        let waiter = blocking_work
+            .submit_joinable(move || child.wait(Duration::from_secs(20), "withheld event"))
+            .unwrap();
         parent.cancel();
         assert!(
             waiter

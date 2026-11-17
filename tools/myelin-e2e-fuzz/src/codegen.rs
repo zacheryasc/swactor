@@ -1,4 +1,4 @@
-//! Rendering of typed action IR into executable Python programs.
+//! Python binding-conformance adapter for the language-neutral action IR.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -9,17 +9,16 @@ use crate::ir::{
     Action, ActionClass, ActionOp, BARRIER_LAP_COMPLETED, BARRIER_TOKEN_FORWARDED,
     BARRIER_TOKEN_RECEIVED, BehaviorCase, DescriptorFinish, DescriptorReadMethod,
     DescriptorWriteMethod, EVIDENCE_HINT_BARRIER, EVIDENCE_HINT_EDGE_INDEX, EVIDENCE_HINT_LAP,
-    EVIDENCE_HINT_TOKEN, ExpectedOutcome, FailureInjection, LaunchFailureKind, ProcessProgram,
-    TopologyFamily,
+    EVIDENCE_HINT_TOKEN, ExpectedOutcome, ProcessProgram, TopologyFamily,
 };
+use crate::oracle::digest;
 
 /// Per-action ceiling, subordinate to the process owner's remaining budget.
 const NAMESPACE_BARRIER_DEADLINE_SECONDS: f64 = 30.0;
 
 // The public binding has no predicate subscription yet. Poll immediately, then
-// pace adaptively; cancelling the actual binding future propagates into its Rust
-// request owner. The harness also stops/reaps the contextual process on expiry,
-// including a misbehaving coroutine that refuses cancellation.
+// pace adaptively; cancelling the supplied context's future propagates to its
+// request owner. These coroutines do not launch or supervise a runtime.
 const BUDGET_PYTHON: &str = r#"
 def remaining(deadline, predicate):
     value = deadline - asyncio.get_running_loop().time()
@@ -52,16 +51,18 @@ async def pace(deadline, predicate, delay, cap=0.01):
     return min(delay * 2, cap)
 
 def timing(predicate, started, requests, wakes, pending, kind='generated_wait'):
-    # Successful action output already carries the typed behavioral record.
-    # Emit a second stderr record only for waits or a failed/timed-out action.
-    if kind == 'generated_action' and not pending:
-        return
-    record = {'type': kind, 'predicate': predicate,
-              'elapsed_seconds': asyncio.get_running_loop().time() - started,
-              'pending': pending}
-    if requests is not None:
-        record.update(request_count=requests, wake_count=wakes)
-    print(json.dumps(record, separators=(',', ':')), file=sys.stderr)
+    # Telemetry must not turn a completed action into a protocol failure.
+    try:
+        record = {'type': kind, 'predicate': predicate,
+                  'elapsed_seconds': asyncio.get_running_loop().time() - started,
+                  'pending': pending,
+                  'stage': 'workload_execution',
+                  'work_kind': 'remote_work'}
+        if requests is not None:
+            record.update(request_count=requests, wake_count=wakes)
+        print(json.dumps(record, separators=(',', ':')), file=sys.stderr)
+    except Exception:
+        pass
 async def wait_entry(data, path, deadline, quiescent=False):
     predicate = f'{"quiescence" if quiescent else "publication"}: {path}'
     started = asyncio.get_running_loop().time()
@@ -87,6 +88,74 @@ async def wait_entry(data, path, deadline, quiescent=False):
             wakes += 1
     finally:
         timing(predicate, started, requests, wakes, pending)
+"#;
+
+// High-level binding errors predate errno-bearing descriptor errors. Decode
+// only the binding's documented DataPlaneError projections, not arbitrary
+// exception class names or caller-provided expected outcomes.
+const ERROR_PYTHON: &str = r#"
+def protocol_errno(error):
+    number = getattr(error, 'errno', None)
+    if number is not None:
+        return number
+    if isinstance(error, asyncio.CancelledError):
+        return errno.ECANCELED
+    if isinstance(error, TimeoutError):
+        return errno.ETIMEDOUT
+    message = str(error)
+    def binding_error(name):
+        kind = getattr(swactor, name, None)
+        return kind is not None and isinstance(error, kind)
+    if binding_error('DataPathError'):
+        return errno.EINVAL
+    if binding_error('BlobError'):
+        variant = message.split(' ', 1)[0]
+        return {
+            'Bounds': errno.EINVAL, 'Length': errno.EINVAL,
+            'StaleGeneration': errno.ESTALE, 'Access': errno.EBADF,
+            'ActiveWritableView': errno.EBUSY, 'Digest': errno.EIO,
+            'State': errno.EIO, 'InvalidLease': errno.EIO,
+            'AlreadyFinished': errno.EIO,
+        }.get(variant)
+    if binding_error('StreamError'):
+        exact = {
+            'stream peer is closed': errno.EPIPE,
+            'stream peer was lost': errno.ECONNRESET,
+            'stream is closed': errno.EBADF,
+        }
+        if message in exact:
+            return exact[message]
+        if message.startswith('stream fault: '):
+            return errno.EIO
+        if message.startswith('data path ') and ' has entry kind ' in message:
+            return errno.ENXIO
+    if binding_error('SessionError'):
+        exact = {
+            'invalid job capability': errno.EINVAL,
+            'data-plane session is not running': errno.EIO,
+            'data-plane arena is exhausted': errno.ENOSPC,
+            'data-plane operation was cancelled': errno.ECANCELED,
+            'bad descriptor': errno.EBADF,
+            'object does not support mapping': errno.ENODEV,
+        }
+        if message in exact:
+            return exact[message]
+        for prefix, number in (
+            ('invalid argument: ', errno.EINVAL),
+            ('attachment failed: ', errno.EIO),
+            ('data-plane session failed: ', errno.EIO),
+            ('data path already exists: ', errno.EEXIST),
+            ('blob source failed: ', errno.EIO),
+            ('operation is not supported: ', errno.ENOTSUP),
+            ('resource is busy: ', errno.EBUSY),
+            ('stale capability: ', errno.ESTALE),
+        ):
+            if message.startswith(prefix):
+                return number
+    return None
+
+def protocol_error_type(number):
+    return 'errno' if number is not None else 'protocol_error'
 "#;
 
 const TRANSFER_PYTHON: &str = r#"
@@ -124,6 +193,9 @@ async def observe_drop_release(data, path, deadline):
         try:
             await bounded(data.lookup(path), deadline, 'dropped writer nonpublication')
         except OSError as error:
+            if error.errno == errno.EEXIST:
+                delay = await pace(deadline, 'dropped writer reservation release', delay)
+                continue
             if error.errno != errno.ENOENT:
                 raise
         else:
@@ -494,6 +566,10 @@ fn render_route_specs(
     );
 }
 
+/// Render Python source defining `async main(ctx)` with a 120-second process budget.
+///
+/// The source is not a standalone program: importing it does not execute actions.
+/// Generator behavior tests supply a data context and await `main` explicitly.
 pub fn render_python(program: &ProcessProgram) -> String {
     render_program(program, Duration::from_secs(120), None)
 }
@@ -531,6 +607,7 @@ fn render_program(
     );
     let _ = writeln!(source, "PROCESS = {}", python_string(&program.id));
     source.push_str(BUDGET_PYTHON);
+    source.push_str(ERROR_PYTHON);
     source.push_str(TRANSFER_PYTHON);
     source.push_str(FRAMING_PYTHON);
     let _ = writeln!(
@@ -601,7 +678,6 @@ fn render_program(
     if first_route.is_some() {
         source.push_str("    finally:\n        await routes.close()\n        gc.collect()\n");
     }
-    source.push_str("\nswactor.run(main)\n");
     source
 }
 
@@ -617,24 +693,41 @@ fn render_frames(source: &mut String, frames: &[Vec<u8>]) {
     source.push_str("        ]\n");
 }
 
+/// Render case-specific Python coroutine source using the supplied process budget.
+///
+/// Like [`render_python`], this defines `async main(ctx)` without launching it.
 pub fn render_case_python(
     case: &BehaviorCase,
     program: &ProcessProgram,
     budget: Duration,
 ) -> String {
-    match &case.failure {
-        FailureInjection::LaunchFailure {
-            process,
-            kind: LaunchFailureKind::PythonSyntax,
-        } if process == &program.id => "def invalid(:\n".to_owned(),
-        FailureInjection::LaunchFailure {
-            process,
-            kind: LaunchFailureKind::PythonRuntime,
-        } if process == &program.id => "import swactor\n\nasync def main(ctx):\n    raise RuntimeError('injected Python runtime failure')\n\nswactor.run(main)\n".to_owned(),
-        _ => render_program(program, budget, Some(case)),
-    }
+    render_program(program, budget, Some(case))
 }
 
+/// Render the explicit conformance gate, including binding-only checks exactly
+/// once on the designated corpus role. Ordinary protocol rendering never runs
+/// these interpreter/buffer checks.
+pub fn render_conformance_python(
+    case: &BehaviorCase,
+    program: &ProcessProgram,
+    budget: Duration,
+) -> String {
+    let mut source = render_case_python(case, program, budget);
+    if case.id == "binding-namespace" && program.id == "namespace" {
+        source.push_str(&crate::binding_conformance::render_python_binding_checks(
+            &crate::binding_cases::python_binding_corpus(case.seed),
+            budget,
+        ));
+        let _ = writeln!(
+            source,
+            "\n_protocol_main = main\nasync def main(ctx):\n    deadline = asyncio.get_running_loop().time() + {:?}\n    await _protocol_main(ctx)\n    try:\n        await asyncio.wait_for(binding_checks(ctx), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))\n    except BaseException as error:\n        print(json.dumps({{'type': 'python_binding_conformance', 'outcome': 'error', 'error_type': type(error).__name__, 'error': str(error)}}, separators=(',', ':')), file=sys.stderr, flush=True)\n        raise",
+            budget.as_secs_f64()
+        );
+    }
+    source
+}
+
+/// Render an absence-check coroutine for the fake-context generator behavior test.
 #[cfg(test)]
 pub(crate) fn render_absence_probe_python(
     process: &str,
@@ -650,6 +743,7 @@ pub(crate) fn render_absence_probe_python(
         budget.as_secs_f64()
     );
     source.push_str(BUDGET_PYTHON);
+    source.push_str(ERROR_PYTHON);
     source.push_str(
         r#"
 async def main(ctx):
@@ -663,19 +757,18 @@ async def main(ctx):
             if isinstance(error, OSError) and error.errno == errno.ENOENT:
                 return {'process': PROCESS, 'step': step, 'action': 'lookup',
                         'path': path, 'outcome': 'expected_error',
-                        'errno': error.errno, 'error_type': type(error).__name__,
-                        'error': f'{type(error).__name__}: {error}'}
-            if isinstance(error, asyncio.CancelledError):
-                error = TimeoutError('absence probe budget expired or owner cancelled')
+                        'errno': error.errno, 'error_type': 'errno',
+                        'error': str(error)}
+            number = protocol_errno(error)
             return {'process': PROCESS, 'step': step, 'action': 'lookup',
                     'path': path, 'outcome': 'error',
-                    'errno': getattr(error, 'errno', None),
-                    'error_type': type(error).__name__,
-                    'error': f'{type(error).__name__}: {error}'}
+                    'errno': number,
+                    'error_type': protocol_error_type(number),
+                    'error': str(error)}
         return {'process': PROCESS, 'step': step, 'action': 'lookup',
                 'path': path, 'outcome': 'error', 'errno': None,
-                'error_type': 'PathExists',
-                'error': f'PathExists: expected absence for {path}'}
+                'error_type': 'protocol_error',
+                'error': f'expected absence for {path}'}
 
     records = await asyncio.gather(*(probe(step, path) for step, path in enumerate(PATHS)))
     for record in records:
@@ -683,8 +776,6 @@ async def main(ctx):
     failed = [record['path'] for record in records if record['outcome'] != 'expected_error']
     if failed:
         raise RuntimeError(f'absence unproved: {failed}')
-
-swactor.run(main)
 "#,
     );
     source
@@ -1435,19 +1526,6 @@ fn render_action(
                     "        emit({step}, {class:?}, {path}, 'ok', length=transfer.length, digest=transfer.hasher.hexdigest(), descriptor=descriptor_evidence{ok_facts})"
                 );
             }
-            ActionOp::MappingExportClose { length, .. } => {
-                let _ = writeln!(
-                    source,
-                    "        descriptor = await data.open({path}, 0)\n        mapping = await descriptor.map(offset=0, length={length}, writable=False)"
-                );
-                source.push_str(
-                "        view = memoryview(mapping)\n        try:\n            mapping.close()\n        except BaseException as close_error:\n            view.release()\n            mapping.close()\n            await descriptor.close()\n            raise close_error\n        view.release()\n        await descriptor.close()\n        payload = b''\n",
-            );
-                let _ = writeln!(
-                    source,
-                    "        emit({step}, {class:?}, {path}, 'ok', length=0, digest=digest(payload){ok_facts})"
-                );
-            }
         }
     }
     if let Some(kind) = plan.barrier {
@@ -1463,7 +1541,7 @@ fn render_action(
             "        emit({step}, {class:?}, {path}, 'barrier', barrier={{'type': '{kind}', 'token': {token}, 'lap': {lap}{edge_index}}}{hint_facts})"
         );
     }
-    source.push_str("    except BaseException as error:\n        if isinstance(error, asyncio.CancelledError):\n            error = TimeoutError('action budget expired or owner cancelled')\n        error_number = getattr(error, 'errno', None)\n        error_type = type(error).__name__\n");
+    source.push_str("    except BaseException as error:\n        error_number = protocol_errno(error)\n        error_type = protocol_error_type(error_number)\n");
     if route.is_some()
         && matches!(
             action.operation.class(),
@@ -1498,19 +1576,6 @@ fn render_action(
                 "        emit({step}, {class:?}, {path}, 'expected_error', errno=error_number, error_type=error_type, error=f'{{error_type}}: {{error}}', transfer=transfer_facts(transfer){descriptor_facts}{incarnation_facts})"
             );
         }
-        ExpectedOutcome::Exception(expected) => {
-            let expected = expected.as_str();
-            let _ = writeln!(source, "        if error_type != {expected:?}:");
-            let _ = writeln!(
-                source,
-                "            emit({step}, {class:?}, {path}, 'error', errno=error_number, error_type=error_type, error=f'{{error_type}}: {{error}}', transfer=transfer_facts(transfer){descriptor_facts}{incarnation_facts})"
-            );
-            source.push_str("            raise\n");
-            let _ = writeln!(
-                source,
-                "        emit({step}, {class:?}, {path}, 'expected_error', errno=error_number, error_type=error_type, error=f'{{error_type}}: {{error}}', transfer=transfer_facts(transfer){descriptor_facts}{incarnation_facts})"
-            );
-        }
     }
 }
 
@@ -1528,7 +1593,7 @@ fn render_descriptor_finish(source: &mut String, finish: DescriptorFinish) {
     for _ in 0..count {
         let _ = writeln!(source, "        try:\n            {operation}");
         source.push_str(
-            "        except BaseException as terminal_error:\n            descriptor_evidence['terminal_results'].append({'outcome': 'error', 'errno': getattr(terminal_error, 'errno', None), 'error_type': type(terminal_error).__name__})\n            raise\n        descriptor_evidence['terminal_results'].append({'outcome': 'ok'})\n",
+            "        except BaseException as terminal_error:\n            number = protocol_errno(terminal_error)\n            descriptor_evidence['terminal_results'].append({'outcome': 'error', 'errno': number, 'error_type': protocol_error_type(number)})\n            raise\n        descriptor_evidence['terminal_results'].append({'outcome': 'ok'})\n",
         );
     }
 }
@@ -1545,30 +1610,27 @@ fn hex(bytes: &[u8]) -> String {
     encoded
 }
 
-pub(crate) fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::AccessSpec;
+    use crate::ir::{AccessSpec, FailureInjection};
     use std::process::{Command, Stdio};
 
     fn execute_generated(sources: &[String], scenario: &str) -> String {
         let runner = format!(
-            "import asyncio,contextlib,errno,io,json,signal,sys,types\nsignal.alarm(5)\nsources = json.load(sys.stdin)\nswactor = types.ModuleType('swactor')\nswactor.run = lambda main: None\nswactor.SessionError = type('SessionError', (Exception,), {{}})\nswactor.StreamError = type('StreamError', (Exception,), {{}})\nsys.modules['swactor'] = swactor\n{scenario}"
+            "import asyncio,contextlib,errno,io,json,signal,sys,types\nsignal.alarm(5)\nsources = json.load(sys.stdin)\nswactor = types.ModuleType('swactor')\nswactor.SessionError = type('SessionError', (Exception,), {{}})\nswactor.StreamError = type('StreamError', (Exception,), {{}})\nsys.modules['swactor'] = swactor\n{scenario}"
         );
-        let mut child = Command::new("python3")
-            .args(["-c", &runner])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn generated execution regression");
+        let mut child = swactor_process::command_spawn(
+            Command::new("python3")
+                .args(["-c", &runner])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("spawn generated execution regression");
         serde_json::to_writer(child.stdin.as_mut().unwrap(), sources).unwrap();
         drop(child.stdin.take());
-        let output = child.wait_with_output().unwrap();
+        let output = swactor_process::child_wait_with_output(child).unwrap();
         assert!(
             output.status.success(),
             "generated execution failed:\n{}\n{}",
@@ -1576,6 +1638,111 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("generated output is UTF-8")
+    }
+
+    #[test]
+    fn binding_errno_translation_does_not_infer_the_expected_error() {
+        let program = ProcessProgram {
+            id: "error-translation".to_owned(),
+            logical_node_id: 1,
+            access: AccessSpec::unrestricted("error-translation"),
+            depends_on: Vec::new(),
+            actions: vec![Action::error(
+                ActionOp::StreamRead {
+                    path: "/cases/error-translation/blob".to_owned(),
+                    expected: Vec::new(),
+                },
+                libc::ENXIO,
+            )],
+        };
+        let output = execute_generated(
+            &[render_python(&program)],
+            r#"
+class Data:
+    def __init__(self, message):
+        self.message = message
+    async def read_stream(self, path):
+        raise swactor.StreamError(self.message)
+
+async def scenario():
+    observed = []
+    for message in (
+        'data path /cases/error-translation/blob has entry kind Blob, expected Stream',
+        'stream peer is closed',
+        'unrecognized stream failure',
+    ):
+        namespace, output = {}, io.StringIO()
+        exec(sources[0], namespace)
+        with contextlib.redirect_stdout(output):
+            try:
+                await namespace['main'](types.SimpleNamespace(data=Data(message)))
+            except swactor.StreamError:
+                pass
+        observed.extend(json.loads(line) for line in output.getvalue().splitlines())
+    print(json.dumps(observed))
+
+asyncio.run(scenario())
+"#,
+        );
+        let records: Vec<crate::ir::ActionObservation> = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.outcome.as_str(), record.errno))
+                .collect::<Vec<_>>(),
+            [
+                ("expected_error", Some(libc::ENXIO)),
+                ("error", Some(libc::EPIPE)),
+                ("error", None)
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_telemetry_preserves_action_failure_and_terminal_record() {
+        let program = ProcessProgram {
+            id: "telemetry-failure".to_owned(),
+            logical_node_id: 1,
+            access: AccessSpec::unrestricted("telemetry-failure"),
+            depends_on: Vec::new(),
+            actions: vec![Action::ok(ActionOp::Lookup {
+                path: "/cases/telemetry-failure/blob".to_owned(),
+                expected_kind: "blob".to_owned(),
+            })],
+        };
+        let output = execute_generated(
+            &[render_python(&program)],
+            r#"
+class BrokenTelemetry:
+    def write(self, value):
+        raise OSError('telemetry unavailable')
+    def flush(self):
+        pass
+
+class Data:
+    async def lookup(self, path):
+        raise OSError(errno.EACCES, 'primary action failure')
+
+async def scenario():
+    namespace, output = {}, io.StringIO()
+    exec(sources[0], namespace)
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(BrokenTelemetry()):
+        try:
+            await namespace['main'](types.SimpleNamespace(data=Data()))
+        except OSError as error:
+            assert error.errno == errno.EACCES, error
+        else:
+            raise AssertionError('action failure disappeared')
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert records[0]['outcome'] == 'error', records
+    assert records[0]['errno'] == errno.EACCES, records
+    print(json.dumps(records))
+
+asyncio.run(scenario())
+"#,
+        );
+        let records: Vec<crate::ir::ActionObservation> = serde_json::from_str(&output).unwrap();
+        assert_eq!(records[0].errno, Some(libc::EACCES));
     }
 
     fn generated_observation(
@@ -2356,7 +2523,7 @@ async def scenario():
         results = [record for record in records if record['outcome'] != 'barrier']
         assert len(results) == 1, records
         assert results[0]['outcome'] == 'error', records
-        assert results[0]['error_type'] == 'TimeoutError', records
+        assert results[0]['errno'] in (errno.ETIMEDOUT, errno.ECANCELED), records
         assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()], 'leaked awaited request'
 
 asyncio.run(scenario())

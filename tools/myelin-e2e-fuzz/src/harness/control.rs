@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::budget::Budget;
 use crate::campaign::{PersistedFixtureEntry, RecoveryCase};
-use crate::codegen::render_case_python;
+use crate::codegen::render_conformance_python;
 use crate::harness::{ClusterHarness, FixturePathObservation, FixturePathSnapshot};
 use crate::ir::{
     AccessSpec, Action, ActionObservation, ActionOp, BehaviorCase, CaseObservation,
@@ -33,13 +33,66 @@ use crate::oracle::{
 };
 use crate::resources::http_json_budget;
 
-use super::{GENERATED_LAUNCHER, HarnessProvider, POLL_INTERVAL};
+use super::{HarnessProvider, POLL_INTERVAL, WorkloadBackend};
 
-const GENERATED_SOURCE_ENV: &str = "MYELIN_E2E_PROGRAM_B64";
+const NATIVE_PROGRAM_ENV: &str = "MYELIN_E2E_NATIVE_PROGRAM";
+const PYTHON_SOURCE_ENV: &str = "MYELIN_E2E_PROGRAM_B64";
 const BOOTSTRAP_HOLD_ENV: &str = "MYELIN_E2E_HOLD_BEFORE_BOOTSTRAP";
 const MAX_CONTEXTUAL_SOURCE_ENV_BYTES: usize = 48 * 1024;
 const EVENT_REQUEST_SLICE: Duration = Duration::from_secs(1);
 const MIN_RECONCILE_INTERVAL: Duration = Duration::from_millis(5);
+
+#[derive(Clone)]
+struct WorkloadProgram {
+    backend: WorkloadBackend,
+    source: Arc<str>,
+}
+
+impl WorkloadProgram {
+    fn prepare(
+        backend: WorkloadBackend,
+        case: &BehaviorCase,
+        process: &ProcessProgram,
+        remaining: Duration,
+    ) -> Result<Self, String> {
+        let source = match backend {
+            WorkloadBackend::Native => crate::native::serialize_program(
+                case,
+                &process.id,
+                u64::try_from(remaining.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            )?,
+            WorkloadBackend::PythonConformance => {
+                render_conformance_python(case, process, remaining)
+            }
+        };
+        Ok(Self {
+            backend,
+            source: source.into(),
+        })
+    }
+
+    fn launch(&self) -> (&'static str, &'static str, &'static str) {
+        match self.backend {
+            WorkloadBackend::Native => (
+                "myelin-e2e-native",
+                "--program-env-zlib",
+                NATIVE_PROGRAM_ENV,
+            ),
+            WorkloadBackend::PythonConformance => {
+                ("myelin-e2e-python", "--source-env-zlib", PYTHON_SOURCE_ENV)
+            }
+        }
+    }
+
+    fn extension(&self) -> &'static str {
+        match self.backend {
+            WorkloadBackend::Native => "native.json",
+            WorkloadBackend::PythonConformance => "py",
+        }
+    }
+}
 
 /// The one immutable namespace and execution ownership map for an attempt.
 /// Preparing it does not grant permission to remove any of these paths.
@@ -85,6 +138,269 @@ impl CaseAttempt {
 pub(super) struct PendingAttempt {
     attempt: Arc<CaseAttempt>,
     preconditions_verified: bool,
+}
+
+#[derive(Clone)]
+struct ControlPeer {
+    base_url: String,
+    artifacts: PathBuf,
+    deadline: Duration,
+}
+
+impl ControlPeer {
+    fn spawn_program_budget(
+        &self,
+        process: &ProcessProgram,
+        request_id: &str,
+        program: &WorkloadProgram,
+        hold_before_bootstrap: bool,
+        launch_failure: Option<LaunchFailureKind>,
+        budget: &Budget,
+    ) -> Result<(), String> {
+        budget.check("compress contextual program")?;
+        let mut compressor =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        compressor
+            .write_all(program.source.as_bytes())
+            .map_err(|error| format!("compress workload program: {error}"))?;
+        let compressed = compressor
+            .finish()
+            .map_err(|error| format!("finish workload compression: {error}"))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
+        if encoded.len() > MAX_CONTEXTUAL_SOURCE_ENV_BYTES {
+            return Err(format!(
+                "compressed workload program is {} bytes; control limit is {}",
+                encoded.len(),
+                MAX_CONTEXTUAL_SOURCE_ENV_BYTES
+            ));
+        }
+        let (launcher, argument, program_env) = program.launch();
+        let mut env = BTreeMap::from([(program_env.to_owned(), encoded)]);
+        if hold_before_bootstrap {
+            env.insert(BOOTSTRAP_HOLD_ENV.to_owned(), "1".to_owned());
+        }
+        let (command, args) = match launch_failure {
+            Some(LaunchFailureKind::EmptyCommand) => (String::new(), Vec::<String>::new()),
+            Some(LaunchFailureKind::MissingExecutable) => (
+                "/definitely/missing/myelin-e2e-executable".to_owned(),
+                Vec::new(),
+            ),
+            _ => (
+                launcher.to_owned(),
+                vec![argument.to_owned(), program_env.to_owned()],
+            ),
+        };
+        let execution_id = if launch_failure == Some(LaunchFailureKind::MalformedExecutionIdentity)
+        {
+            String::new()
+        } else {
+            process.access.execution_id.clone()
+        };
+        let spawn_url = format!("{}/api/control/contextual/spawn", self.base_url);
+        let spawn_body = serde_json::to_value(ContextualSpawnRequest {
+            logical_node_id: process.logical_node_id,
+            request_id: request_id.to_owned(),
+            spec: ContextualProcessSpec {
+                command,
+                args,
+                env,
+                working_dir: None,
+                label: Some(process.id.clone()),
+                execution_id,
+                read_prefixes: process.access.read_prefixes.clone(),
+                write_prefixes: process.access.write_prefixes.clone(),
+                staged_program: None,
+            },
+        })
+        .map_err(|error| format!("serialize contextual spawn request: {error}"))?;
+        // A request is never retried: an ambiguous reply is reconciled through
+        // the already registered execution identity, not another spawn.
+        let reply = match http_json_budget("POST", &spawn_url, Some(spawn_body), budget) {
+            Ok(reply) => reply,
+            Err(_)
+                if self.contextual_execution_exists(
+                    request_id,
+                    process.logical_node_id,
+                    budget,
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let reply = serde_json::from_value::<ContextualControlReply>(reply)
+            .map_err(|error| format!("decode contextual spawn reply: {error}"))?;
+        let accepted = matches!(
+            &reply,
+            ContextualControlReply::Event { observation }
+                if observation.request_id == request_id
+                    && observation.logical_node_id == process.logical_node_id
+                    && (matches!(
+                        &observation.event,
+                        ContextualProcessEventKind::Spawned { .. }
+                    ) || (launch_failure.is_some()
+                        && matches!(
+                            &observation.event,
+                            ContextualProcessEventKind::SpawnRejected { .. }
+                        )))
+        );
+        if !accepted {
+            return Err(format!("contextual spawn was not accepted: {reply:?}"));
+        }
+        Ok(())
+    }
+    fn contextual_execution_exists(
+        &self,
+        request_id: &str,
+        logical_node_id: u64,
+        budget: &Budget,
+    ) -> bool {
+        let started = Instant::now();
+        let Ok(reply) = http_json_budget(
+            "GET",
+            &format!(
+                "{}/api/control/contextual/{request_id}/events?after_sequence=0",
+                self.base_url
+            ),
+            None,
+            budget,
+        ) else {
+            return false;
+        };
+        // This reconciliation GET may already contain terminal output. Retain
+        // its original reply too, even if the attempt expires before the main
+        // collector can request the same cursor again.
+        let Ok(mut log) = self.probe_event_log(request_id, "spawn-reconciliation") else {
+            return false;
+        };
+        if write_record(
+            &mut log,
+            &WireEvidence {
+                elapsed_ns: started.elapsed().as_nanos(),
+                request_ns: started.elapsed().as_nanos(),
+                response: &reply,
+            },
+        )
+        .and_then(|()| log.flush().map_err(|error| error.to_string()))
+        .is_err()
+        {
+            return false;
+        }
+        serde_json::from_value::<ContextualControlReply>(reply).is_ok_and(|reply| {
+            matches!(
+                reply,
+                ContextualControlReply::Events { execution }
+                    if execution.request_id == request_id
+                        && execution.logical_node_id == logical_node_id
+            )
+        })
+    }
+    fn stop_process_budget(
+        &self,
+        request_id: &str,
+        force: bool,
+        budget: &Budget,
+    ) -> Result<(), String> {
+        let control_request_id = format!("{}-{request_id}", if force { "cancel" } else { "stop" });
+        let request = serde_json::to_value(ContextualStopRequest {
+            control_request_id: control_request_id.clone(),
+            force,
+        })
+        .map_err(|error| format!("serialize contextual stop request: {error}"))?;
+        let reply = http_json_budget(
+            "POST",
+            &format!("{}/api/control/contextual/{request_id}/stop", self.base_url),
+            Some(request),
+            &budget.child(self.deadline),
+        )?;
+        let reply = serde_json::from_value::<ContextualControlReply>(reply)
+            .map_err(|error| format!("decode contextual stop reply: {error}"))?;
+        let resolved = match &reply {
+            ContextualControlReply::Event { observation }
+                if observation.request_id == control_request_id =>
+            {
+                match &observation.event {
+                    ContextualProcessEventKind::StopAccepted { .. } => true,
+                    // The target can retire before its stop reaches the node.
+                    // Its retained terminal cursor still provides cleanup proof.
+                    ContextualProcessEventKind::StopRejected { error }
+                        if error == "contextual process is not live on this node" =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !resolved {
+            return Err(format!("contextual stop was not accepted: {reply:?}"));
+        }
+        Ok(())
+    }
+    fn probe_event_log(
+        &self,
+        request_id: &str,
+        owner: &str,
+    ) -> Result<BufWriter<fs::File>, String> {
+        let directory = self.artifacts.join("control-executions");
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("create probe evidence directory: {error}"))?;
+        let digest = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join(format!("{digest}.{owner}.jsonl")))
+            .map_err(|error| format!("open probe evidence for {request_id}: {error}"))?;
+        Ok(BufWriter::new(file))
+    }
+    fn acknowledge_execution(
+        &self,
+        request_id: &str,
+        incarnation: &str,
+        cursor: u64,
+        budget: &Budget,
+    ) -> Result<(), String> {
+        let reply = http_json_budget(
+            "POST",
+            &format!("{}/api/control/contextual/{request_id}/ack", self.base_url),
+            Some(
+                serde_json::to_value(Versioned::new(ContextualEventsAckRequest {
+                    through_sequence: cursor,
+                    execution_incarnation: incarnation.to_owned(),
+                }))
+                .map_err(|error| format!("serialize terminal acknowledgement: {error}"))?,
+            ),
+            &budget.child(EVENT_REQUEST_SLICE),
+        )?;
+        let reply = serde_json::from_value::<Versioned<ContextualControlReply>>(reply)
+            .map_err(|error| format!("decode terminal acknowledgement: {error}"))?
+            .into_payload()?;
+        let ContextualControlReply::Acknowledged(acknowledgement) = &reply else {
+            return Err(format!(
+                "terminal acknowledgement returned the wrong reply type: {reply:?}"
+            ));
+        };
+        if acknowledgement.request_id != request_id
+            || acknowledgement.execution_incarnation != incarnation
+            || acknowledgement.through_sequence != cursor
+        {
+            return Err(format!(
+                "terminal acknowledgement did not cover owned cursor: {reply:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ClusterHarness {
+    fn control_peer(&self) -> ControlPeer {
+        ControlPeer {
+            base_url: self.base_url.clone(),
+            artifacts: self.config.artifacts.clone(),
+            deadline: self.config.deadline,
+        }
+    }
 }
 
 impl ClusterHarness {
@@ -575,21 +891,29 @@ impl ClusterHarness {
                 .insert(case.id.clone(), Arc::clone(attempt));
             timings.insert("precondition_ns", stage.elapsed().as_nanos());
             let stage = Instant::now();
-            let mut sources = Vec::with_capacity(case.processes.len());
+            let mut programs = Vec::with_capacity(case.processes.len());
             for process in &case.processes {
                 let remaining = self
                     .operation_budget()
-                    .remaining("prepare generated source")?;
-                let source = render_case_python(&case, process, remaining);
-                fs::write(case_dir.join(format!("{}.py", process.id)), &source)
-                    .map_err(|error| format!("write generated program {}: {error}", process.id))?;
-                sources.push(source);
+                    .remaining("prepare workload program")?;
+                let program =
+                    WorkloadProgram::prepare(self.workload_backend, case, process, remaining)?;
+                fs::write(
+                    case_dir.join(format!("{}.{}", process.id, program.extension())),
+                    program.source.as_bytes(),
+                )
+                .map_err(|error| format!("write workload program {}: {error}", process.id))?;
+                programs.push(program);
             }
+            write_json(
+                &case_dir.join("workload-backend.json"),
+                &self.workload_backend,
+            )?;
             timings.insert("source_preparation_ns", stage.elapsed().as_nanos());
             let stage = Instant::now();
             let errors = self.schedule_case(
                 &case,
-                &sources,
+                &programs,
                 &mut trackers,
                 &mut event_log,
                 started,
@@ -650,7 +974,7 @@ impl ClusterHarness {
                         | FailureClass::MissingEvidence
                         | FailureClass::InvalidEvidence
                 ) {
-                    self.last_failure_signature = Some(error.signature);
+                    self.last_failure_signature = Some(*error.signature);
                 }
             }
             if let Err(error) = self.operation_budget().check("complete behavioral oracle") {
@@ -955,216 +1279,26 @@ impl ClusterHarness {
         verify_cleanup_paths(paths, &stdout)?;
         self.mark_health_boundary()?;
         let baseline = self.restore_owned_baseline(Some(&case.id))?;
-        let (cleanup_evidence, baseline_evidence) = thread::scope(|scope| {
-            let cleanup = scope
-                .spawn(|| write_json(&attempt.directory.join("namespace-cleanup.json"), &reply));
-            let health = scope
-                .spawn(|| write_json(&attempt.directory.join("cleanup-baseline.json"), &baseline));
-            (cleanup.join(), health.join())
-        });
-        cleanup_evidence.map_err(|_| "cleanup evidence writer panicked".to_owned())??;
-        baseline_evidence.map_err(|_| "baseline evidence writer panicked".to_owned())??;
+        let cleanup_path = attempt.directory.join("namespace-cleanup.json");
+        let baseline_path = attempt.directory.join("cleanup-baseline.json");
+        let cleanup_reply = reply.clone();
+        let baseline_evidence = baseline.clone();
+        let cleanup = self
+            .blocking_work()?
+            .submit_joinable(move || write_json(&cleanup_path, &cleanup_reply))
+            .map_err(|error| format!("submit cleanup evidence writer: {error}"))?;
+        let health = self
+            .blocking_work()?
+            .submit_joinable(move || write_json(&baseline_path, &baseline_evidence))
+            .map_err(|error| format!("submit baseline evidence writer: {error}"))?;
+        cleanup
+            .join()
+            .map_err(|_| "cleanup evidence writer panicked".to_owned())??;
+        health
+            .join()
+            .map_err(|_| "baseline evidence writer panicked".to_owned())??;
         self.active_attempts.remove(&case.id);
         self.remember_local_baseline(&baseline);
-        Ok(())
-    }
-
-    fn spawn_program_budget(
-        &self,
-        process: &ProcessProgram,
-        request_id: &str,
-        source: &str,
-        hold_before_bootstrap: bool,
-        launch_failure: Option<LaunchFailureKind>,
-        budget: &Budget,
-    ) -> Result<(), String> {
-        budget.check("compress contextual program")?;
-        let mut compressor =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        compressor
-            .write_all(source.as_bytes())
-            .map_err(|error| format!("compress generated Python source: {error}"))?;
-        let compressed = compressor
-            .finish()
-            .map_err(|error| format!("finish generated Python compression: {error}"))?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
-        if encoded.len() > MAX_CONTEXTUAL_SOURCE_ENV_BYTES {
-            return Err(format!(
-                "compressed generated Python source is {} bytes; control limit is {}",
-                encoded.len(),
-                MAX_CONTEXTUAL_SOURCE_ENV_BYTES
-            ));
-        }
-        let mut env = BTreeMap::from([(GENERATED_SOURCE_ENV.to_owned(), encoded)]);
-        if hold_before_bootstrap {
-            env.insert(BOOTSTRAP_HOLD_ENV.to_owned(), "1".to_owned());
-        }
-        let (command, args) = match launch_failure {
-            Some(LaunchFailureKind::EmptyCommand) => (String::new(), Vec::<String>::new()),
-            Some(LaunchFailureKind::MissingExecutable) => (
-                "/definitely/missing/myelin-e2e-executable".to_owned(),
-                Vec::new(),
-            ),
-            _ => (
-                GENERATED_LAUNCHER.to_owned(),
-                vec![
-                    "--source-env-zlib".to_owned(),
-                    GENERATED_SOURCE_ENV.to_owned(),
-                ],
-            ),
-        };
-        let execution_id = if launch_failure == Some(LaunchFailureKind::MalformedExecutionIdentity)
-        {
-            String::new()
-        } else {
-            process.access.execution_id.clone()
-        };
-        let attach_timeout_ms =
-            u64::try_from(budget.remaining("attach contextual program")?.as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1);
-        let spawn_url = format!("{}/api/control/contextual/spawn", self.base_url);
-        let spawn_body = serde_json::to_value(ContextualSpawnRequest {
-            logical_node_id: process.logical_node_id,
-            request_id: request_id.to_owned(),
-            spec: ContextualProcessSpec {
-                command,
-                args,
-                env,
-                working_dir: None,
-                label: Some(process.id.clone()),
-                execution_id,
-                read_prefixes: process.access.read_prefixes.clone(),
-                write_prefixes: process.access.write_prefixes.clone(),
-                attach_timeout_ms,
-                staged_program: None,
-            },
-        })
-        .map_err(|error| format!("serialize contextual spawn request: {error}"))?;
-        // A request is never retried: an ambiguous reply is reconciled through
-        // the already registered execution identity, not another spawn.
-        let reply = match http_json_budget("POST", &spawn_url, Some(spawn_body), budget) {
-            Ok(reply) => reply,
-            Err(_)
-                if self.contextual_execution_exists(
-                    request_id,
-                    process.logical_node_id,
-                    budget,
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let reply = serde_json::from_value::<ContextualControlReply>(reply)
-            .map_err(|error| format!("decode contextual spawn reply: {error}"))?;
-        let accepted = matches!(
-            &reply,
-            ContextualControlReply::Event { observation }
-                if observation.request_id == request_id
-                    && observation.logical_node_id == process.logical_node_id
-                    && (matches!(
-                        &observation.event,
-                        ContextualProcessEventKind::Spawned { .. }
-                    ) || (launch_failure.is_some()
-                        && matches!(
-                            &observation.event,
-                            ContextualProcessEventKind::SpawnRejected { .. }
-                        )))
-        );
-        if !accepted {
-            return Err(format!("contextual spawn was not accepted: {reply:?}"));
-        }
-        Ok(())
-    }
-    fn contextual_execution_exists(
-        &self,
-        request_id: &str,
-        logical_node_id: u64,
-        budget: &Budget,
-    ) -> bool {
-        let started = Instant::now();
-        let Ok(reply) = http_json_budget(
-            "GET",
-            &format!(
-                "{}/api/control/contextual/{request_id}/events?after_sequence=0",
-                self.base_url
-            ),
-            None,
-            budget,
-        ) else {
-            return false;
-        };
-        // This reconciliation GET may already contain terminal output. Retain
-        // its original reply too, even if the attempt expires before the main
-        // collector can request the same cursor again.
-        let Ok(mut log) = self.probe_event_log(request_id, "spawn-reconciliation") else {
-            return false;
-        };
-        if write_record(
-            &mut log,
-            &WireEvidence {
-                elapsed_ns: started.elapsed().as_nanos(),
-                request_ns: started.elapsed().as_nanos(),
-                response: &reply,
-            },
-        )
-        .and_then(|()| log.flush().map_err(|error| error.to_string()))
-        .is_err()
-        {
-            return false;
-        }
-        serde_json::from_value::<ContextualControlReply>(reply).is_ok_and(|reply| {
-            matches!(
-                reply,
-                ContextualControlReply::Events { execution }
-                    if execution.request_id == request_id
-                        && execution.logical_node_id == logical_node_id
-            )
-        })
-    }
-
-    fn stop_process_budget(
-        &self,
-        request_id: &str,
-        kill_after_ms: Option<u64>,
-        budget: &Budget,
-    ) -> Result<(), String> {
-        let control_request_id = format!("stop-{request_id}");
-        let request = serde_json::to_value(ContextualStopRequest {
-            control_request_id: control_request_id.clone(),
-            kill_after_ms,
-        })
-        .map_err(|error| format!("serialize contextual stop request: {error}"))?;
-        let reply = http_json_budget(
-            "POST",
-            &format!("{}/api/control/contextual/{request_id}/stop", self.base_url),
-            Some(request),
-            &budget.child(self.config.deadline),
-        )?;
-        let reply = serde_json::from_value::<ContextualControlReply>(reply)
-            .map_err(|error| format!("decode contextual stop reply: {error}"))?;
-        let resolved = match &reply {
-            ContextualControlReply::Event { observation }
-                if observation.request_id == control_request_id =>
-            {
-                match &observation.event {
-                    ContextualProcessEventKind::StopAccepted { .. } => true,
-                    // The target can retire before its stop reaches the node.
-                    // Its retained terminal cursor still provides cleanup proof.
-                    ContextualProcessEventKind::StopRejected { error }
-                        if error == "contextual process is not live on this node" =>
-                    {
-                        true
-                    }
-                    _ => false,
-                }
-            }
-            _ => false,
-        };
-        if !resolved {
-            return Err(format!("contextual stop was not accepted: {reply:?}"));
-        }
         Ok(())
     }
 
@@ -1213,16 +1347,21 @@ impl ClusterHarness {
     fn schedule_case(
         &self,
         case: &BehaviorCase,
-        sources: &[impl AsRef<str>],
+        programs: &[WorkloadProgram],
         trackers: &mut [ExecutionTracker],
         log: &mut BufWriter<fs::File>,
         started: Instant,
         owner: &Budget,
     ) -> Vec<String> {
         let budget = owner.child(self.config.deadline);
-        let (mut errors, receiver) = thread::scope(|scope| {
+        let blocking = match self.blocking_work() {
+            Ok(blocking) => blocking.clone(),
+            Err(error) => return vec![error],
+        };
+        let (mut errors, receiver) = {
             let _cancel_before_join = CancelOnDrop(budget.clone());
             let (sender, receiver) = mpsc::channel::<ControlCompletion>();
+            let mut workers = Vec::new();
             let mut controls = 0;
             let mut errors = Vec::new();
             loop {
@@ -1270,15 +1409,18 @@ impl ClusterHarness {
                     state.stop_requested = true;
                     state.stop_pending = true;
                     let request = state.request_id.clone();
-                    let grace = state.stop_at.and_then(|(_, grace)| grace);
                     let sender = sender.clone();
                     let worker_budget = budget.child(self.config.deadline);
                     state.stop_budget = Some(worker_budget.clone());
-                    controls += 1;
-                    scope.spawn(move || {
+                    let peer = self.control_peer();
+                    let force = matches!(
+                        &case.failure,
+                        FailureInjection::StopProcess { force: true, .. }
+                    );
+                    match blocking.submit_joinable(move || {
                         let begin = Instant::now();
                         let result = catch_unwind(AssertUnwindSafe(|| {
-                            self.stop_process_budget(&request, grace, &worker_budget)
+                            peer.stop_process_budget(&request, force, &worker_budget)
                         }))
                         .map_err(|_| "stop worker panicked".to_owned())
                         .and_then(std::convert::identity);
@@ -1288,7 +1430,16 @@ impl ClusterHarness {
                             result,
                             elapsed: begin.elapsed(),
                         });
-                    });
+                    }) {
+                        Ok(worker) => {
+                            controls += 1;
+                            workers.push(worker);
+                        }
+                        Err(error) => {
+                            state.stop_pending = false;
+                            errors.push(format!("submit stop worker: {error}"));
+                        }
+                    }
                 }
                 let completed = trackers
                     .iter()
@@ -1327,11 +1478,9 @@ impl ClusterHarness {
                     state.spawn_pending = true;
                     state.dispatched_ns = Some(started.elapsed().as_nanos());
                     let request = state.request_id.clone();
-                    let process = &case.processes[index];
-                    let source = sources[index].as_ref();
-                    let hold = state
-                        .stop_at
-                        .is_some_and(|(phase, _)| phase == ProcessStopPhase::DuringBootstrap);
+                    let process = case.processes[index].clone();
+                    let program = programs[index].clone();
+                    let hold = state.stop_at == Some(ProcessStopPhase::DuringBootstrap);
                     let launch_failure = match &case.failure {
                         FailureInjection::LaunchFailure {
                             process: target,
@@ -1342,14 +1491,14 @@ impl ClusterHarness {
                     let sender = sender.clone();
                     let worker_budget = budget.child(self.config.deadline);
                     state.spawn_budget = Some(worker_budget.clone());
-                    controls += 1;
-                    scope.spawn(move || {
+                    let peer = self.control_peer();
+                    match blocking.submit_joinable(move || {
                         let begin = Instant::now();
                         let result = catch_unwind(AssertUnwindSafe(|| {
-                            self.spawn_program_budget(
-                                process,
+                            peer.spawn_program_budget(
+                                &process,
                                 &request,
-                                source,
+                                &program,
                                 hold,
                                 launch_failure,
                                 &worker_budget,
@@ -1363,7 +1512,16 @@ impl ClusterHarness {
                             result,
                             elapsed: begin.elapsed(),
                         });
-                    });
+                    }) {
+                        Ok(worker) => {
+                            controls += 1;
+                            workers.push(worker);
+                        }
+                        Err(error) => {
+                            state.spawn_pending = false;
+                            errors.push(format!("submit spawn worker: {error}"));
+                        }
+                    }
                 }
                 let progress = match self.collect_executions(trackers, &budget, log, started) {
                     Ok(progress) => progress,
@@ -1446,12 +1604,17 @@ impl ClusterHarness {
                     break;
                 }
             }
-            // HTTP checks shared cancellation during connect/write/read. The
-            // scope therefore joins owned workers; it never detaches a stalled
-            // request and calls that request canceled.
+            // HTTP checks shared cancellation during connect/write/read. Join
+            // every engine-owned worker before its execution identity can leave
+            // this scheduler.
             budget.cancel();
+            for worker in workers {
+                if worker.join().is_err() {
+                    errors.push("control worker panicked".to_owned());
+                }
+            }
             (errors, receiver)
-        });
+        };
         // The receiver outlives scoped joins, so final acceptance/stop outcomes
         // cannot disappear when cancellation races a worker's final send.
         for done in receiver.try_iter() {
@@ -1487,22 +1650,17 @@ impl ClusterHarness {
             .map(|state| ContextualEventCursor {
                 request_id: state.request_id.clone(),
                 after_sequence: state.cursor,
+                execution_incarnation: state.execution_incarnation.clone(),
             })
             .collect::<Vec<_>>();
         if cursors.is_empty() {
             return Ok(false);
         }
-        let wait_ms = if trackers
+        let wait = trackers
             .iter()
-            .all(|state| !state.dispatched || state.terminal)
-        {
-            0
-        } else {
-            100
-        };
-        let body =
-            serde_json::to_value(Versioned::new(ContextualEventsRequest { cursors, wait_ms }))
-                .map_err(|error| format!("serialize event cursors: {error}"))?;
+            .any(|state| state.dispatched && !state.terminal);
+        let body = serde_json::to_value(Versioned::new(ContextualEventsRequest { cursors, wait }))
+            .map_err(|error| format!("serialize event cursors: {error}"))?;
         let begin = Instant::now();
         let reply = http_json_budget(
             "POST",
@@ -1521,15 +1679,12 @@ impl ClusterHarness {
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
-                let idle = wait_ms != 0 && error.contains("status code 504");
                 for state in trackers
                     .iter_mut()
                     .filter(|state| state.dispatched && !state.acked)
                 {
-                    if !idle {
-                        state.retries += 1;
-                        state.last_transport_error = Some(error.clone());
-                    }
+                    state.retries += 1;
+                    state.last_transport_error = Some(error.clone());
                 }
                 write_record(
                     log,
@@ -1539,16 +1694,14 @@ impl ClusterHarness {
                     }),
                 )?;
                 budget.check("reconcile failed event transport")?;
-                if !idle {
-                    let retries = trackers
-                        .iter()
-                        .map(|state| state.retries)
-                        .max()
-                        .unwrap_or(0)
-                        .min(5);
-                    let backoff = (MIN_RECONCILE_INTERVAL * (1_u32 << retries)).min(POLL_INTERVAL);
-                    budget.wait(backoff, "bounded event transport reconciliation")?;
-                }
+                let retries = trackers
+                    .iter()
+                    .map(|state| state.retries)
+                    .max()
+                    .unwrap_or(0)
+                    .min(5);
+                let backoff = (MIN_RECONCILE_INTERVAL * (1_u32 << retries)).min(POLL_INTERVAL);
+                budget.wait(backoff, "bounded event transport reconciliation")?;
                 return Ok(false);
             }
         };
@@ -1657,25 +1810,48 @@ impl ClusterHarness {
                 .map_err(|error| format!("persist terminal execution records: {error}"))?;
             // A stalled terminal ACK cannot serialize all siblings' event
             // drains behind one request slice per completed execution.
-            let acknowledgements = thread::scope(|scope| {
-                let jobs = trackers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, state)| state.ack_ready())
-                    .map(|(index, state)| {
-                        scope.spawn(move || (index, self.acknowledge_execution(state, budget)))
-                    })
-                    .collect::<Vec<_>>();
-                jobs.into_iter().map(|job| job.join()).collect::<Vec<_>>()
-            });
-            for acknowledgement in acknowledgements {
+            let blocking = self.blocking_work()?.clone();
+            let mut acknowledgements = Vec::new();
+            for (index, state) in trackers
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| state.ack_ready())
+            {
+                let Some(incarnation) = state.execution_incarnation.clone() else {
+                    errors.push(format!(
+                        "terminal execution {} lacks incarnation",
+                        state.request_id
+                    ));
+                    continue;
+                };
+                let request_id = state.request_id.clone();
+                let cursor = state.cursor;
+                let peer = self.control_peer();
+                let budget = budget.clone();
+                acknowledgements.push((
+                    index,
+                    blocking.submit_joinable(move || {
+                        peer.acknowledge_execution(&request_id, &incarnation, cursor, &budget)
+                    }),
+                ));
+            }
+            for (index, acknowledgement) in acknowledgements {
                 match acknowledgement {
-                    Ok((index, Ok(()))) => trackers[index].acked = true,
-                    Ok((index, Err(error))) => {
+                    Ok(acknowledgement) => match acknowledgement.join() {
+                        Ok(Ok(())) => trackers[index].acked = true,
+                        Ok(Err(error)) => {
+                            trackers[index].retries += 1;
+                            trackers[index].last_transport_error = Some(error);
+                        }
+                        Err(_) => {
+                            errors.push("terminal acknowledgement worker panicked".to_owned())
+                        }
+                    },
+                    Err(error) => {
                         trackers[index].retries += 1;
-                        trackers[index].last_transport_error = Some(error);
+                        trackers[index].last_transport_error =
+                            Some(format!("submit terminal acknowledgement: {error}"));
                     }
-                    Err(_) => errors.push("terminal acknowledgement worker panicked".to_owned()),
                 }
             }
         }
@@ -1684,49 +1860,6 @@ impl ClusterHarness {
         } else {
             Err(errors.join("; "))
         }
-    }
-
-    fn acknowledge_execution(
-        &self,
-        state: &ExecutionTracker,
-        budget: &Budget,
-    ) -> Result<(), String> {
-        let incarnation = state
-            .execution_incarnation
-            .as_ref()
-            .ok_or_else(|| format!("terminal execution {} lacks incarnation", state.request_id))?;
-        let reply = http_json_budget(
-            "POST",
-            &format!(
-                "{}/api/control/contextual/{}/ack",
-                self.base_url, state.request_id
-            ),
-            Some(
-                serde_json::to_value(Versioned::new(ContextualEventsAckRequest {
-                    through_sequence: state.cursor,
-                    execution_incarnation: incarnation.clone(),
-                }))
-                .map_err(|error| format!("serialize terminal acknowledgement: {error}"))?,
-            ),
-            &budget.child(EVENT_REQUEST_SLICE),
-        )?;
-        let reply = serde_json::from_value::<Versioned<ContextualControlReply>>(reply)
-            .map_err(|error| format!("decode terminal acknowledgement: {error}"))?
-            .into_payload()?;
-        let ContextualControlReply::Acknowledged(acknowledgement) = &reply else {
-            return Err(format!(
-                "terminal acknowledgement returned the wrong reply type: {reply:?}"
-            ));
-        };
-        if acknowledgement.request_id != state.request_id
-            || acknowledgement.execution_incarnation != *incarnation
-            || acknowledgement.through_sequence != state.cursor
-        {
-            return Err(format!(
-                "terminal acknowledgement did not cover owned cursor: {reply:?}"
-            ));
-        }
-        Ok(())
     }
 
     fn stop_owned_processes(&self, requests: &[String], budget: &Budget) -> Vec<String> {
@@ -1738,27 +1871,32 @@ impl ClusterHarness {
             .unwrap_or_default()
             / 2;
         let stop_budget = budget.child(stop_cap.min(self.config.deadline));
-        thread::scope(|scope| {
-            let jobs = requests
-                .iter()
-                .map(|request| {
-                    let budget = &stop_budget;
-                    scope.spawn(move || {
-                        self.stop_process_budget(request, Some(0), budget)
-                            .map_err(|error| format!("stop owned execution {request}: {error}"))
-                    })
-                })
-                .collect::<Vec<_>>();
-            jobs.into_iter()
-                .filter_map(|job| match job.join() {
+        let blocking = match self.blocking_work() {
+            Ok(blocking) => blocking.clone(),
+            Err(error) => return vec![error],
+        };
+        let mut jobs = Vec::with_capacity(requests.len());
+        for request in requests {
+            let request = request.clone();
+            let budget = stop_budget.clone();
+            let peer = self.control_peer();
+            jobs.push(blocking.submit_joinable(move || {
+                peer.stop_process_budget(&request, true, &budget)
+                    .map_err(|error| format!("stop owned execution {request}: {error}"))
+            }));
+        }
+        jobs.into_iter()
+            .filter_map(|job| match job {
+                Ok(job) => match job.join() {
                     Ok(Ok(())) => None,
                     // A durable terminal ACK already retired this identity.
                     Ok(Err(error)) if error.contains("does not exist") => None,
                     Ok(Err(error)) => Some(error),
                     Err(_) => Some("owned execution stop worker panicked".to_owned()),
-                })
-                .collect()
-        })
+                },
+                Err(error) => Some(format!("submit owned execution stop worker: {error}")),
+            })
+            .collect()
     }
 
     fn drain_owned_executions(
@@ -1806,52 +1944,31 @@ impl ClusterHarness {
         errors
     }
 
-    fn probe_event_log(
-        &self,
-        request_id: &str,
-        owner: &str,
-    ) -> Result<BufWriter<fs::File>, String> {
-        let directory = self.config.artifacts.join("control-executions");
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("create probe evidence directory: {error}"))?;
-        let digest = format!("{:x}", Sha256::digest(request_id.as_bytes()));
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(directory.join(format!("{digest}.{owner}.jsonl")))
-            .map_err(|error| format!("open probe evidence for {request_id}: {error}"))?;
-        Ok(BufWriter::new(file))
-    }
-
     fn run_owned_probe(
         &self,
-        process: &ProcessProgram,
+        probe: &BehaviorCase,
         request_id: &str,
-        source: &str,
+        program: &WorkloadProgram,
         owner: &Budget,
         work: &Budget,
     ) -> Result<ExecutionObservation, String> {
+        let process = &probe.processes[0];
         let mut tracker = ExecutionTracker::new(process, request_id.to_owned(), None);
-        let mut log = self.probe_event_log(request_id, "collector")?;
-        write_record(&mut log, &ProbeSourceEvidence { request_id, source })?;
+        let mut log = self
+            .control_peer()
+            .probe_event_log(request_id, "collector")?;
+        write_record(
+            &mut log,
+            &ProbeSourceEvidence {
+                request_id,
+                backend: program.backend,
+                source: &program.source,
+            },
+        )?;
         let started = Instant::now();
-        let probe = BehaviorCase {
-            schema_version: crate::ir::CASE_SCHEMA_VERSION,
-            generator_version: crate::ir::GENERATOR_VERSION,
-            id: process.id.clone(),
-            seed: self.config.seed,
-            live_nodes: self.node_ids.iter().copied().collect(),
-            topology: TopologyFamily::Fixed,
-            scenarios: BTreeSet::new(),
-            routes: Vec::new(),
-            read_only_fixture_paths: BTreeSet::new(),
-            resource_bounds: Default::default(),
-            processes: vec![process.clone()],
-            failure: FailureInjection::None,
-        };
         let errors = self.schedule_case(
-            &probe,
-            &[source],
+            probe,
+            std::slice::from_ref(program),
             std::slice::from_mut(&mut tracker),
             &mut log,
             started,
@@ -1911,9 +2028,13 @@ impl ClusterHarness {
         let process = &probe.processes[0];
         let request = (probe).execution_request_id(process);
         let work = reserve_probe_cleanup(budget)?;
-        let source =
-            render_case_python(probe, process, work.remaining("generate read-only probe")?);
-        let observed = self.run_owned_probe(process, &request, &source, budget, &work)?;
+        let program = WorkloadProgram::prepare(
+            WorkloadBackend::Native,
+            probe,
+            process,
+            work.remaining("prepare read-only probe")?,
+        )?;
+        let observed = self.run_owned_probe(probe, &request, &program, budget, &work)?;
         let observation = CaseObservation {
             case_id: probe.id.clone(),
             executions: vec![observed],
@@ -2056,6 +2177,7 @@ fn reserve_probe_cleanup(owner: &Budget) -> Result<Budget, String> {
 #[derive(serde::Serialize)]
 struct ProbeSourceEvidence<'a> {
     request_id: &'a str,
+    backend: WorkloadBackend,
     source: &'a str,
 }
 
@@ -2087,7 +2209,7 @@ struct ControlCompletion {
 }
 
 /// One cursor owns each execution's byte stream. Arrival order between cursors
-/// is deliberately never used as causal order; the Python action records carry
+/// is deliberately never used as causal order; the action records carry
 /// the causal identities the oracle consumes.
 struct ExecutionTracker {
     process: String,
@@ -2112,7 +2234,7 @@ struct ExecutionTracker {
     parsed_stdout: usize,
     output_error: Option<String>,
     gap: Option<String>,
-    stop_at: Option<(ProcessStopPhase, Option<u64>)>,
+    stop_at: Option<ProcessStopPhase>,
     stop_due: bool,
     stop_requested: bool,
     stop_pending: bool,
@@ -2137,7 +2259,7 @@ impl ExecutionTracker {
     fn new(
         process: &ProcessProgram,
         request_id: String,
-        stop_at: Option<(ProcessStopPhase, Option<u64>)>,
+        stop_at: Option<ProcessStopPhase>,
     ) -> Self {
         Self {
             process: process.id.clone(),
@@ -2201,10 +2323,7 @@ impl ExecutionTracker {
                 match done.result {
                     Ok(()) => {
                         self.accepted = true;
-                        if self
-                            .stop_at
-                            .is_some_and(|(phase, _)| phase == ProcessStopPhase::AfterSpawn)
-                        {
+                        if self.stop_at == Some(ProcessStopPhase::AfterSpawn) {
                             self.stop_due = true;
                         }
                     }
@@ -2381,7 +2500,7 @@ impl ExecutionTracker {
                     ));
                 }
             }
-            let trigger = match self.stop_at.map(|(phase, _)| phase) {
+            let trigger = match self.stop_at {
                 Some(ProcessStopPhase::AfterSpawn) => Some("spawned"),
                 Some(ProcessStopPhase::DuringBootstrap) => Some("process_started"),
                 Some(ProcessStopPhase::AfterContextReady) => Some("context_ready"),
@@ -2471,7 +2590,7 @@ impl ExecutionTracker {
                 Ok(None) => {}
                 Err(error) => {
                     self.output_error.get_or_insert_with(|| format!(
-                        "parse structured Python output for {}: {error}; original bytes retained", self.process,
+                        "parse structured workload output for {}: {error}; original bytes retained", self.process,
                     ));
                 }
             }
@@ -2569,16 +2688,13 @@ fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<
         .map_err(|error| format!("flush {}: {error}", path.display()))
 }
 
-fn stop_injection(
-    case: &BehaviorCase,
-    process: &ProcessProgram,
-) -> Option<(ProcessStopPhase, Option<u64>)> {
+fn stop_injection(case: &BehaviorCase, process: &ProcessProgram) -> Option<ProcessStopPhase> {
     match &case.failure {
         FailureInjection::StopProcess {
             process: target,
             phase,
-            kill_after_ms,
-        } if target == &process.id => Some((*phase, *kill_after_ms)),
+            ..
+        } if target == &process.id => Some(*phase),
         _ => None,
     }
 }
@@ -2992,7 +3108,7 @@ mod tests {
         let mut state = ExecutionTracker::new(
             &process("held"),
             "request".to_owned(),
-            Some((ProcessStopPhase::DuringBootstrap, Some(0))),
+            Some(ProcessStopPhase::DuringBootstrap),
         );
         state
             .ingest(
@@ -3144,33 +3260,43 @@ mod tests {
 
     #[test]
     fn canceled_stalled_http_joins_and_preserves_final_channel_outcome() {
+        let backend =
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap();
+        let engine = swactor_engine::Engine::new(
+            swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+            backend,
+        )
+        .unwrap();
+        let blocking_work = engine.handle().blocking_work_sender();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let (accepted, accepted_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (_socket, _) = listener.accept().unwrap();
-            accepted.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(2));
-        });
+        let server = blocking_work
+            .submit_joinable(move || {
+                let (_socket, _) = listener.accept().unwrap();
+                accepted.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            })
+            .unwrap();
         let budget = Budget::new(Duration::from_secs(2));
-        let receiver = thread::scope(|scope| {
-            let cancel_before_join = CancelOnDrop(budget.clone());
-            let (sender, receiver) = mpsc::channel();
-            let worker_budget = &budget;
-            scope.spawn(move || {
+        let cancel_before_join = CancelOnDrop(budget.clone());
+        let (sender, receiver) = mpsc::channel();
+        let worker_budget = budget.clone();
+        let worker = blocking_work
+            .submit_joinable(move || {
                 let result = http_json_budget(
                     "POST",
                     &format!("http://{address}/stalled-spawn"),
                     None,
-                    worker_budget,
+                    &worker_budget,
                 );
                 sender.send(result).unwrap();
-            });
-            accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            drop(cancel_before_join);
-            receiver
-        });
+            })
+            .unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(cancel_before_join);
+        worker.join().unwrap();
         assert!(
             receiver
                 .recv_timeout(Duration::from_millis(100))
@@ -3185,26 +3311,38 @@ mod tests {
 
     impl Drop for PeerChild {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            self.0.wait().expect("reap owned loopback child");
+            let _ = swactor_process::child_kill(&mut self.0);
+            swactor_process::child_wait(&mut self.0).expect("reap owned loopback child");
         }
     }
 
-    fn collector_peer_harness(artifacts: &Path, address: std::net::SocketAddr) -> ClusterHarness {
+    fn collector_peer_harness(
+        artifacts: &Path,
+        address: std::net::SocketAddr,
+        execution: super::super::HarnessExecution,
+    ) -> ClusterHarness {
         use std::os::fd::FromRawFd;
         use std::sync::{Mutex, atomic::AtomicU64};
 
-        let mut orchestrator = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let telemetry = artifacts.join("telemetry");
+        let telemetry_capture = super::super::telemetry_capture::TelemetryCapture::start(
+            &telemetry,
+            iroh::RelayMode::Disabled,
+            &execution,
+        )
+        .unwrap();
+        let blocking_work = execution.blocking;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let mut orchestrator = swactor_process::command_spawn(&mut command).unwrap();
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, orchestrator.id(), 0) as i32 };
         if fd < 0 {
-            let _ = orchestrator.kill();
-            orchestrator.wait().unwrap();
+            let _ = swactor_process::child_kill(&mut orchestrator);
+            swactor_process::child_wait(&mut orchestrator).unwrap();
             panic!("pin collector peer process");
         }
-        ClusterHarness {
+        let harness = ClusterHarness {
+            workload_backend: WorkloadBackend::Native,
             config: super::super::ClusterHarnessConfig {
                 workspace: artifacts.to_owned(),
                 artifacts: artifacts.to_owned(),
@@ -3226,6 +3364,7 @@ mod tests {
             execution_budget: Budget::new(Duration::from_secs(1)),
             cleanup_budget: None,
             fixture_cleanup_budget: Budget::new(Duration::from_secs(10)),
+            blocking_work: Some(blocking_work),
             binaries: crate::resources::resource_deadline_tests::unused_binaries_for_control_peer(),
             provider_client: None,
             lifecycle_started: Instant::now(),
@@ -3236,8 +3375,9 @@ mod tests {
             dashboard_port: address.port(),
             image: String::new(),
             container_prefix: String::new(),
-            telemetry: artifacts.join("telemetry"),
+            telemetry,
             telemetry_census: Mutex::new(Default::default()),
+            telemetry_capture,
             provider_baseline: BTreeSet::new(),
             fixture_mapping: BTreeMap::new(),
             stopped_nodes: BTreeSet::new(),
@@ -3260,14 +3400,28 @@ mod tests {
             quarantine_reason: Mutex::new(None),
             // No provider resources exist; Drop still kills and reaps the child.
             torn_down: true,
-        }
+        };
+        harness
     }
 
     #[test]
     fn remote_retention_reaps_after_injected_exit_or_execution_cancellation() {
         for already_exited in [true, false] {
             let root = tempfile::tempdir().unwrap();
-            let mut harness = collector_peer_harness(root.path(), ([127, 0, 0, 1], 9).into());
+            let parts =
+                swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default());
+            let runtime = parts.runtime().clone();
+            let backend =
+                swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap();
+            let engine = swactor_engine::Engine::new(parts, backend).unwrap();
+            let execution = super::super::HarnessExecution {
+                runtime,
+                engine: engine.handle(),
+                tasks: engine.task_spawner(),
+                blocking: engine.handle().blocking_work_sender(),
+            };
+            let mut harness =
+                collector_peer_harness(root.path(), ([127, 0, 0, 1], 9).into(), execution);
             harness.config.provider = super::super::HarnessProvider::StaticSsh {
                 manifest: root.path().join("unused-manifest"),
                 identity: root.path().join("unused-identity"),
@@ -3275,7 +3429,7 @@ mod tests {
             };
             let pid = harness.orchestrator.id() as libc::pid_t;
             if already_exited {
-                harness.orchestrator.kill().unwrap();
+                swactor_process::child_kill(&mut harness.orchestrator).unwrap();
                 super::super::wait_for_child(
                     &mut harness.orchestrator,
                     &harness.fixture_cleanup_budget,
@@ -3328,12 +3482,24 @@ mod tests {
             .map(|process| (process.id.clone(), (&case).execution_request_id(process)))
             .collect::<BTreeMap<_, _>>();
         let attempt = Arc::new(CaseAttempt::prepare(1, root.path(), case).unwrap());
-        let mut harness = collector_peer_harness(root.path(), address);
+        let parts = swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend =
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap();
+        let engine = swactor_engine::Engine::new(parts, backend).unwrap();
+        let execution = super::super::HarnessExecution {
+            runtime,
+            engine: engine.handle(),
+            tasks: engine.task_spawner(),
+            blocking: engine.handle().blocking_work_sender(),
+        };
+        let mut harness = collector_peer_harness(root.path(), address, execution);
         let server_budget = Budget::new(Duration::from_secs(8));
         let started = Instant::now();
-        let (result, stops, acknowledgements, reaped) = thread::scope(|scope| {
-            let owner = &server_budget;
-            let server = scope.spawn(move || {
+        let blocking_work = harness.blocking_work().unwrap().clone();
+        let owner = server_budget.clone();
+        let server = blocking_work
+            .submit_joinable(move || {
                 let mut children = BTreeMap::<String, (String, PeerChild)>::new();
                 let mut stops = BTreeSet::new();
                 let mut acknowledgements = BTreeSet::new();
@@ -3381,15 +3547,12 @@ mod tests {
                     let reply = if path.ends_with("/spawn") {
                         let request = body["request_id"].as_str().unwrap().to_owned();
                         let label = body["label"].as_str().unwrap().to_owned();
-                        let child = if label == "healthy" {
-                            Command::new("true").spawn().unwrap()
-                        } else {
-                            Command::new("sleep")
-                                .arg("30")
-                                .stdin(Stdio::null())
-                                .spawn()
-                                .unwrap()
-                        };
+                        let mut command =
+                            Command::new(if label == "healthy" { "true" } else { "sleep" });
+                        if label != "healthy" {
+                            command.arg("30").stdin(Stdio::null());
+                        }
+                        let child = swactor_process::command_spawn(&mut command).unwrap();
                         assert!(
                             children
                                 .insert(request.clone(), (label.clone(), PeerChild(child)))
@@ -3418,7 +3581,7 @@ mod tests {
                                 missing.push(request.to_owned());
                                 continue;
                             };
-                            let status = child.0.try_wait().unwrap();
+                            let status = swactor_process::child_try_wait(&mut child.0).unwrap();
                             if status.is_some() {
                                 reaped.insert(request.to_owned());
                             }
@@ -3459,8 +3622,8 @@ mod tests {
                             .trim_start_matches("/api/control/contextual/")
                             .trim_end_matches("/stop");
                         let (label, child) = children.get_mut(request).unwrap();
-                        child.0.kill().unwrap();
-                        child.0.wait().unwrap();
+                        swactor_process::child_kill(&mut child.0).unwrap();
+                        swactor_process::child_wait(&mut child.0).unwrap();
                         reaped.insert(request.to_owned());
                         stops.insert(request.to_owned());
                         serde_json::to_value(ContextualControlReply::Event {
@@ -3507,14 +3670,13 @@ mod tests {
                 }
                 // PeerChild reaps all children even if the client panics.
                 (stops, acknowledgements, reaped)
-            });
-            let cancel_before_join = CancelOnDrop(server_budget.clone());
-            let cleanup = Budget::new(Duration::from_secs(3));
-            let result = harness.execute_case(&attempt, true, &cleanup);
-            drop(cancel_before_join);
-            let (stops, acknowledgements, reaped) = server.join().unwrap();
-            (result, stops, acknowledgements, reaped)
-        });
+            })
+            .unwrap();
+        let cancel_before_join = CancelOnDrop(server_budget.clone());
+        let cleanup = Budget::new(Duration::from_secs(3));
+        let result = harness.execute_case(&attempt, true, &cleanup);
+        drop(cancel_before_join);
+        let (stops, acknowledgements, reaped) = server.join().unwrap();
         let elapsed = started.elapsed();
         let error = result.unwrap_err();
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}: {error}");

@@ -1,4 +1,4 @@
-//! Build/image helpers, Docker resource utilities, and telemetry census.
+//! Immutable binary, wheel, image, and deployment-artifact preparation.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -7,12 +7,16 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use swactor_engine::BlockingWorkSender;
 
-use crate::budget::{Budget, record_execution_identity, record_execution_stage};
+use crate::budget::{
+    Budget, ExecutionStage, WorkKind, execution_span, record_execution_identity,
+    record_execution_stage,
+};
+use crate::harness::WorkloadBackend;
 
 const TRANSIENT_ACTOR_TYPES: [&str; 5] = [
     "swactor_process::",
@@ -84,9 +88,9 @@ pub fn private_fixture_dir(artifacts: &Path) -> Result<std::path::PathBuf, Strin
 pub struct BuiltBinaries {
     pub orchestrator: PathBuf,
     pub worker: PathBuf,
+    pub native: PathBuf,
     pub input_digest: String,
     pub executable_digests: BTreeMap<String, String>,
-    verified_files: BTreeMap<String, FileIdentity>,
 }
 
 /// The exact resolver-selected inputs and bytes qualified by ordered local gates.
@@ -94,9 +98,11 @@ pub struct BuiltBinaries {
 #[serde(deny_unknown_fields)]
 pub struct PreparedArtifactIdentity {
     pub schema_version: u32,
+    pub workload_backend: WorkloadBackend,
     pub source_build_input_digest: String,
     pub executables: BTreeMap<String, String>,
-    pub wheel_input_digest: String,
+    pub wheel_input_digest: Option<String>,
+    pub python_launcher_digest: Option<String>,
     pub wheels: BTreeMap<String, String>,
     pub payload: BTreeMap<String, String>,
 }
@@ -114,7 +120,19 @@ pub fn require_prepared_artifacts(
     expected: &PreparedArtifactIdentity,
     budget: &Budget,
 ) -> Result<(), String> {
-    if expected.schema_version != 2 || expected.wheels.is_empty() {
+    let complete = match expected.workload_backend {
+        WorkloadBackend::Native => {
+            expected.wheel_input_digest.is_none()
+                && expected.python_launcher_digest.is_none()
+                && expected.wheels.is_empty()
+        }
+        WorkloadBackend::PythonConformance => {
+            expected.wheel_input_digest.is_some()
+                && expected.python_launcher_digest.is_some()
+                && !expected.wheels.is_empty()
+        }
+    };
+    if expected.schema_version != 3 || !complete {
         return Err("qualified deployment artifacts are incomplete or incompatible".to_owned());
     }
     {
@@ -125,26 +143,40 @@ pub fn require_prepared_artifacts(
         *required = Some(expected.clone());
     }
     let binaries = resolve_myelin_binaries(workspace, budget)?;
-    let cache_root = workspace.join("target/myelin-e2e-cache");
-    let key = wheel_input_digest(
-        &binaries,
-        &cache_root.join("maturin-venv/bin/maturin"),
-        budget,
-    )?;
-    if key != expected.wheel_input_digest {
-        return Err(
-            "wheel compiler, interpreter or build inputs changed since qualification".to_owned(),
-        );
-    }
-    let wheel_dir = cache_root.join("wheels").join(&key);
-    for (name, digest) in &expected.wheels {
-        validate_artifact_filename(name, ".whl")?;
-        if sha256_hex_budget(&wheel_dir.join(name), budget)? != *digest {
-            return Err(format!("qualified wheel changed: {name}"));
+    if let Some(expected_key) = &expected.wheel_input_digest {
+        let cache_root = workspace.join("target/myelin-e2e-cache");
+        let key = wheel_input_digest(
+            &binaries,
+            &cache_root.join("maturin-venv/bin/maturin"),
+            budget,
+        )?;
+        if &key != expected_key {
+            return Err(
+                "wheel compiler, interpreter or build inputs changed since qualification"
+                    .to_owned(),
+            );
+        }
+        let wheel_dir = cache_root.join("wheels").join(&key);
+        for (name, digest) in &expected.wheels {
+            validate_artifact_filename(name, ".whl")?;
+            if sha256_hex_budget(&wheel_dir.join(name), budget)? != *digest {
+                return Err(format!("qualified wheel changed: {name}"));
+            }
+        }
+        let launcher = cache_root
+            .join("python-launchers")
+            .join(&key)
+            .join("myelin-e2e-python");
+        if Some(sha256_hex_budget(&launcher, budget)?) != expected.python_launcher_digest {
+            return Err("qualified Python launcher changed".to_owned());
         }
     }
-    let actual =
-        prepared_artifact_identity(workspace, &binaries, key, expected.wheels.clone(), budget)?;
+    let actual = prepared_artifact_identity(
+        &binaries,
+        expected.wheel_input_digest.clone(),
+        expected.wheels.clone(),
+        expected.python_launcher_digest.clone(),
+    );
     if &actual != expected {
         return Err("qualified deployment payload changed".to_owned());
     }
@@ -164,71 +196,48 @@ fn validate_artifact_filename(name: &str, suffix: &str) -> Result<(), String> {
 }
 
 fn prepared_artifact_identity(
-    workspace: &Path,
     binaries: &BuiltBinaries,
-    wheel_input_digest: String,
+    wheel_input_digest: Option<String>,
     wheels: BTreeMap<String, String>,
-    budget: &Budget,
-) -> Result<PreparedArtifactIdentity, String> {
+    python_launcher_digest: Option<String>,
+) -> PreparedArtifactIdentity {
     let mut payload = BTreeMap::from([
         (
             "bin/myelin-worker".to_owned(),
             binaries.executable_digests["myelin-worker"].clone(),
         ),
         (
-            "bin/myelin-e2e-python".to_owned(),
-            sha256_hex_budget(
-                &workspace.join("apps/myelin/node-image/e2e_python_launcher.py"),
-                budget,
-            )?,
+            "bin/myelin-e2e-native".to_owned(),
+            binaries.executable_digests["myelin-e2e-native"].clone(),
         ),
     ]);
+    if let Some(digest) = &python_launcher_digest {
+        payload.insert("bin/myelin-e2e-python".to_owned(), digest.clone());
+    }
     payload.extend(
         wheels
             .iter()
             .map(|(name, digest)| (format!("python/{name}"), digest.clone())),
     );
-    Ok(PreparedArtifactIdentity {
-        schema_version: 2,
+    PreparedArtifactIdentity {
+        schema_version: 3,
+        workload_backend: if python_launcher_digest.is_some() {
+            WorkloadBackend::PythonConformance
+        } else {
+            WorkloadBackend::Native
+        },
         source_build_input_digest: binaries.input_digest.clone(),
         executables: binaries.executable_digests.clone(),
         wheel_input_digest,
+        python_launcher_digest,
         wheels,
         payload,
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    length: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-fn file_identity(path: &Path) -> Result<FileIdentity, String> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "immutable executable is not a regular file: {}",
-            path.display()
-        ));
     }
-    Ok(FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        length: metadata.len(),
-        modified: (metadata.mtime(), metadata.mtime_nsec()),
-        changed: (metadata.ctime(), metadata.ctime_nsec()),
-    })
 }
 
 static BINARIES: LazyLock<Mutex<BTreeMap<PathBuf, BuiltBinaries>>> = LazyLock::new(Mutex::default);
 
 pub fn resolve_myelin_binaries(workspace: &Path, budget: &Budget) -> Result<BuiltBinaries, String> {
-    let started = Instant::now();
     let workspace = workspace
         .canonicalize()
         .map_err(|error| error.to_string())?;
@@ -242,17 +251,18 @@ pub fn resolve_myelin_binaries(workspace: &Path, budget: &Budget) -> Result<Buil
             return Err("cached executable identity differs from qualified artifacts".to_owned());
         }
         verify_binaries(binaries, budget)?;
-        record_execution_stage("build.binary.cache_hit", started.elapsed(), 0, 1);
         return Ok(binaries.clone());
     }
     // Freeze source inputs once for this invocation; later fixture rounds use
     // these accepted executable references, never a mutable Cargo output.
     let input_digest = build_input_digest(&workspace, budget)?;
-    if required
-        .as_ref()
-        .is_some_and(|expected| expected.source_build_input_digest != input_digest)
+    if let Some(expected) = required.as_ref()
+        && expected.source_build_input_digest != input_digest
     {
-        return Err("compiler, toolchain or build inputs changed since qualification".to_owned());
+        return Err(format!(
+            "compiler, toolchain or build inputs changed since qualification: expected {}, observed {input_digest}",
+            expected.source_build_input_digest
+        ));
     }
     let directory = workspace
         .join("target/myelin-e2e-cache/binaries")
@@ -260,29 +270,26 @@ pub fn resolve_myelin_binaries(workspace: &Path, budget: &Budget) -> Result<Buil
     fs::create_dir_all(&directory).map_err(|error| format!("create binary cache: {error}"))?;
     let manifest = directory.join("digests.json");
     let mut binaries = BuiltBinaries {
-        orchestrator: directory.join("myelin-orchestrator"),
+        orchestrator: directory.join("myelin-fixture-orchestrator"),
         worker: directory.join("myelin-worker"),
+        native: directory.join("myelin-e2e-native"),
         input_digest: input_digest.clone(),
         executable_digests: BTreeMap::new(),
-        verified_files: BTreeMap::new(),
     };
-    if let Ok(file) = fs::File::open(&manifest) {
-        if let Ok(digests) = serde_json::from_reader(BufReader::new(file)) {
-            binaries.executable_digests = digests;
-            if required
-                .as_ref()
-                .is_some_and(|expected| expected.executables != binaries.executable_digests)
-            {
-                return Err(
-                    "resolver-selected executables differ from qualified artifacts".to_owned(),
-                );
-            }
-            if verify_binaries(&mut binaries, budget).is_ok() {
-                record_binary_identity(&binaries, "disk_hit");
-                cache.insert(workspace, binaries.clone());
-                record_execution_stage("build.binary.disk_cache_hit", started.elapsed(), 0, 1);
-                return Ok(binaries);
-            }
+    if let Ok(file) = fs::File::open(&manifest)
+        && let Ok(digests) = serde_json::from_reader(BufReader::new(file))
+    {
+        binaries.executable_digests = digests;
+        if required
+            .as_ref()
+            .is_some_and(|expected| expected.executables != binaries.executable_digests)
+        {
+            return Err("resolver-selected executables differ from qualified artifacts".to_owned());
+        }
+        if verify_binaries(&binaries, budget).is_ok() {
+            record_binary_identity(&binaries, "disk_hit");
+            cache.insert(workspace, binaries.clone());
+            return Ok(binaries);
         }
     }
     if required.is_some() {
@@ -294,13 +301,40 @@ pub fn resolve_myelin_binaries(workspace: &Path, budget: &Budget) -> Result<Buil
         Command::new("cargo")
             .current_dir(&workspace)
             .env("CARGO_TARGET_DIR", workspace.join("target"))
-            .args(["build", "--release", "--locked", "-p", "myelin", "--bins"]),
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "myelin",
+                "--bin",
+                "myelin-worker",
+            ]),
         "build Myelin binaries",
         budget,
     )?;
+    run_checked(
+        Command::new("cargo")
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", workspace.join("target"))
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "myelin-e2e-fuzz",
+                "--bin",
+                "myelin-e2e-native",
+                "--bin",
+                "myelin-fixture-orchestrator",
+            ]),
+        "build fixture orchestrator and native protocol workload",
+        budget,
+    )?;
     for (name, destination) in [
-        ("myelin-orchestrator", &binaries.orchestrator),
+        ("myelin-fixture-orchestrator", &binaries.orchestrator),
         ("myelin-worker", &binaries.worker),
+        ("myelin-e2e-native", &binaries.native),
     ] {
         budget.check("stage immutable executable")?;
         copy_atomic(&workspace.join("target/release").join(name), destination)?;
@@ -315,10 +349,9 @@ pub fn resolve_myelin_binaries(workspace: &Path, budget: &Budget) -> Result<Buil
             .insert(name.to_owned(), sha256_hex_budget(destination, budget)?);
     }
     write_json_atomic(&manifest, &binaries.executable_digests)?;
-    verify_binaries(&mut binaries, budget)?;
+    verify_binaries(&binaries, budget)?;
     record_binary_identity(&binaries, "built");
     cache.insert(workspace, binaries.clone());
-    record_execution_stage("build.binary.miss", started.elapsed(), 0, 1);
     Ok(binaries)
 }
 
@@ -332,21 +365,25 @@ fn record_binary_identity(binaries: &BuiltBinaries, cache_state: &str) {
     );
 }
 
-fn verify_binaries(binaries: &mut BuiltBinaries, budget: &Budget) -> Result<(), String> {
+fn verify_binaries(binaries: &BuiltBinaries, budget: &Budget) -> Result<(), String> {
     for (name, path) in [
-        ("myelin-orchestrator", &binaries.orchestrator),
+        ("myelin-fixture-orchestrator", &binaries.orchestrator),
         ("myelin-worker", &binaries.worker),
+        ("myelin-e2e-native", &binaries.native),
     ] {
         budget.check("verify immutable executable identity")?;
-        let identity = file_identity(path)?;
-        if binaries.verified_files.get(name) == Some(&identity) {
-            continue;
+        if !fs::symlink_metadata(path)
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err(format!(
+                "immutable executable is not a regular file: {name}"
+            ));
         }
         let actual = sha256_hex_budget(path, budget)?;
         if binaries.executable_digests.get(name) != Some(&actual) {
             return Err(format!("immutable executable digest mismatch: {name}"));
         }
-        binaries.verified_files.insert(name.to_owned(), identity);
     }
     Ok(())
 }
@@ -368,11 +405,10 @@ fn budget_lock<'a, T>(
     }
 }
 
-fn build_input_digest(workspace: &Path, budget: &Budget) -> Result<String, String> {
+pub(crate) fn build_input_digest(workspace: &Path, budget: &Budget) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let started = Instant::now();
     let mut digest = Sha256::new();
-    digest.update(b"myelin-e2e-build-v2\0release\0locked\0myelin-bins\0");
+    digest.update(b"myelin-e2e-build-v3\0release\0locked\0myelin-bins\0native-workload\0");
     for name in [
         "Cargo.toml",
         "Cargo.lock",
@@ -444,9 +480,6 @@ fn build_input_digest(workspace: &Path, budget: &Budget) -> Result<String, Strin
                 || name.starts_with("CXX")
                 || name.starts_with("AR")
                 || name.starts_with("LD")
-                || name.starts_with("PYO3_")
-                || name.starts_with("PYTHON")
-                || name.starts_with("MATURIN_")
                 || name.starts_with("PKG_CONFIG")
                 || matches!(
                     name.as_ref(),
@@ -459,8 +492,6 @@ fn build_input_digest(workspace: &Path, budget: &Budget) -> Result<String, Strin
                         | "CPATH"
                         | "C_INCLUDE_PATH"
                         | "CPLUS_INCLUDE_PATH"
-                        | "VIRTUAL_ENV"
-                        | "CONDA_PREFIX"
                 )
         })
         .collect::<BTreeMap<_, _>>();
@@ -478,7 +509,6 @@ fn build_input_digest(workspace: &Path, budget: &Budget) -> Result<String, Strin
             || name.starts_with("LD")
             || name.starts_with("RUSTC")
             || name.ends_with("_LINKER")
-            || name == "PYO3_PYTHON"
         {
             for argument in value.to_string_lossy().split_whitespace() {
                 let path = Path::new(argument);
@@ -494,7 +524,6 @@ fn build_input_digest(workspace: &Path, budget: &Budget) -> Result<String, Strin
         }
     }
     let value = format!("{:x}", digest.finalize());
-    record_execution_stage("build.input_digest", started.elapsed(), 0, 1);
     Ok(value)
 }
 
@@ -529,12 +558,32 @@ fn wheel_input_digest(
         budget,
     )?;
     let mut digest = Sha256::new();
-    digest.update(b"myelin-e2e-wheel-v2\0");
+    digest.update(b"myelin-e2e-wheel-v3\0python-launcher\0");
     digest.update(&binaries.input_digest);
     digest.update(python_output.as_bytes());
     digest.update(sha256_hex_budget(Path::new(interpreter), budget)?.as_bytes());
     digest.update(builder.stdout);
     digest.update(sha256_hex_budget(maturin, budget)?.as_bytes());
+    for (name, value) in std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            name.starts_with("PYO3_")
+                || name.starts_with("PYTHON")
+                || name.starts_with("MATURIN_")
+                || matches!(name.as_ref(), "VIRTUAL_ENV" | "CONDA_PREFIX")
+        })
+        .collect::<BTreeMap<_, _>>()
+    {
+        digest.update(name.as_encoded_bytes());
+        digest.update([0]);
+        digest.update(value.as_encoded_bytes());
+        digest.update([0]);
+        if name == "PYO3_PYTHON"
+            && let Some(path) = resolve_tool(&value.to_string_lossy())
+        {
+            digest.update(sha256_hex_budget(&path, budget)?.as_bytes());
+        }
+    }
     Ok(format!("{:x}", digest.finalize()))
 }
 
@@ -543,6 +592,25 @@ fn hash_tree(
     path: &Path,
     digest: &mut sha2::Sha256,
     budget: &Budget,
+) -> Result<(), String> {
+    hash_tree_inner(root, path, digest, budget, true)
+}
+
+fn hash_payload_tree(
+    root: &Path,
+    path: &Path,
+    digest: &mut sha2::Sha256,
+    budget: &Budget,
+) -> Result<(), String> {
+    hash_tree_inner(root, path, digest, budget, false)
+}
+
+fn hash_tree_inner(
+    root: &Path,
+    path: &Path,
+    digest: &mut sha2::Sha256,
+    budget: &Budget,
+    source_inputs: bool,
 ) -> Result<(), String> {
     use sha2::Digest;
     use std::os::unix::fs::MetadataExt;
@@ -557,6 +625,12 @@ fn hash_tree(
     );
     digest.update([0]);
     if metadata.is_symlink() {
+        if !source_inputs {
+            return Err(format!(
+                "deployment payload contains a symlink: {}",
+                path.display()
+            ));
+        }
         let target = path
             .canonicalize()
             .map_err(|error| format!("resolve {}: {error}", path.display()))?;
@@ -580,6 +654,7 @@ fn hash_tree(
     }
     if metadata.is_dir() {
         digest.update(b"directory\0");
+        digest.update((metadata.mode() & 0o777).to_le_bytes());
         let mut children = fs::read_dir(path)
             .map_err(|error| error.to_string())?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -587,13 +662,15 @@ fn hash_tree(
             .map_err(|error| error.to_string())?;
         children.sort();
         for child in children {
-            if matches!(
-                child.file_name().and_then(|name| name.to_str()),
-                Some("target" | ".git" | ".venv" | "__pycache__" | "node_modules")
-            ) {
+            if source_inputs
+                && matches!(
+                    child.file_name().and_then(|name| name.to_str()),
+                    Some("target" | ".git" | ".venv" | "__pycache__" | "node_modules")
+                )
+            {
                 continue;
             }
-            hash_tree(root, &child, digest, budget)?;
+            hash_tree_inner(root, &child, digest, budget, source_inputs)?;
         }
     } else if metadata.is_file() {
         digest.update(b"file\0");
@@ -640,6 +717,810 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<(), S
     Ok(())
 }
 
+pub(crate) fn run_checked(
+    command: &mut Command,
+    label: &str,
+    budget: &Budget,
+) -> Result<(), String> {
+    run_output_budget(command, label, budget).map(|_| ())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GateImageIdentity {
+    pub id: String,
+    pub os: String,
+    pub architecture: String,
+    pub variant: String,
+    pub repo_digests: BTreeSet<String>,
+    pub provenance_version: u32,
+    pub source_build_input_digest: String,
+    pub image_role: String,
+    pub parent_image_id: Option<String>,
+}
+
+/// Compressed layer bytes pulled by one remote node.
+pub fn runtime_image_transfer_bytes(
+    name: &str,
+    budget: &Budget,
+    scripted_manifest: Option<&Path>,
+) -> Result<u64, String> {
+    let bytes = if let Some(path) = scripted_manifest {
+        fs::read(path).map_err(|error| format!("read scripted runtime image manifest: {error}"))?
+    } else {
+        run_output_budget(
+            Command::new("docker").args(["manifest", "inspect", name]),
+            "inspect remote runtime image transfer size",
+            budget,
+        )?
+        .stdout
+    };
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode remote runtime image manifest: {error}"))?;
+    if manifest["schemaVersion"].as_u64() != Some(2) || manifest.get("manifests").is_some() {
+        return Err(
+            "paid runtime requires one platform-specific registry manifest for transfer accounting"
+                .to_owned(),
+        );
+    }
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or("remote runtime image manifest omitted layers")?;
+    let bytes = layers.iter().try_fold(0_u64, |total, layer| {
+        let size = layer["size"]
+            .as_u64()
+            .ok_or("remote runtime image layer omitted its transfer size")?;
+        total
+            .checked_add(size)
+            .ok_or("remote runtime image transfer size overflowed")
+    })?;
+    if bytes == 0 {
+        return Err("remote runtime image transfer size is zero".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn validate_cached_platform_manifest(
+    name: &str,
+    image: &Value,
+    manifest: &Value,
+) -> Result<(), String> {
+    let requested_digest = name
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .unwrap_or_default();
+    let media_type = manifest["mediaType"].as_str().unwrap_or_default();
+    let platform_manifest = manifest["schemaVersion"].as_u64() == Some(2)
+        && manifest.get("manifests").is_none()
+        && matches!(
+            media_type,
+            "application/vnd.docker.distribution.manifest.v2+json"
+                | "application/vnd.oci.image.manifest.v1+json"
+        );
+    let descriptor = image.get("Descriptor").filter(|value| !value.is_null());
+    let cached_image_matches = descriptor.map_or_else(
+        || manifest["config"]["digest"].as_str() == image["Id"].as_str(),
+        |descriptor| {
+            descriptor["digest"].as_str() == Some(requested_digest)
+                && descriptor["mediaType"].as_str() == Some(media_type)
+        },
+    );
+    if platform_manifest && cached_image_matches {
+        Ok(())
+    } else {
+        Err(
+            "paid runtime requires a cached platform-specific registry manifest matching the tested local image"
+                .to_owned(),
+        )
+    }
+}
+
+pub fn runtime_image_identity(name: &str, budget: &Budget) -> Result<GateImageIdentity, String> {
+    let image = run_output_budget(
+        Command::new("docker").args(["image", "inspect", name]),
+        "inspect qualified local runtime image",
+        budget,
+    )?;
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&image.stdout)
+        .map_err(|error| format!("decode runtime image identity: {error}"))?;
+    let value = values
+        .first()
+        .ok_or("Docker omitted runtime image identity")?;
+    if immutable_registry_reference(name) {
+        let manifest = run_output_budget(
+            Command::new("docker").args(["manifest", "inspect", name]),
+            "inspect qualified registry manifest",
+            budget,
+        )?;
+        let manifest: Value = serde_json::from_slice(&manifest.stdout)
+            .map_err(|error| format!("decode qualified registry manifest: {error}"))?;
+        validate_cached_platform_manifest(name, value, &manifest)?;
+    }
+    let field = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+    let labels = &value["Config"]["Labels"];
+    if labels["org.swactor.myelin.e2e.provenance-version"].as_str() != Some("1") {
+        return Err(format!(
+            "runtime image {name} lacks build-time source provenance; rebuild it"
+        ));
+    }
+    Ok(GateImageIdentity {
+        id: field("Id"),
+        os: field("Os"),
+        architecture: field("Architecture"),
+        variant: field("Variant"),
+        repo_digests: value["RepoDigests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        provenance_version: 1,
+        source_build_input_digest: labels["org.swactor.myelin.e2e.source-build-input-digest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        image_role: labels["org.swactor.myelin.e2e.image-role"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        parent_image_id: labels["org.swactor.myelin.e2e.parent-image-id"]
+            .as_str()
+            .map(str::to_owned),
+    })
+}
+
+pub fn immutable_registry_reference(reference: &str) -> bool {
+    reference
+        .split_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.is_empty()
+                && !repository.contains('@')
+                && !repository.bytes().any(|byte| byte.is_ascii_whitespace())
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Capture into files, not pipes: no reader thread can outlive the owner, and a
+/// grandchild holding stdout open cannot prevent process reaping on expiry.
+pub(crate) fn run_output_budget(
+    command: &mut Command,
+    label: &str,
+    budget: &Budget,
+) -> Result<std::process::Output, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    let (stage, work) = match command.get_program().to_str() {
+        Some("docker") => (ExecutionStage::ExternalInspection, WorkKind::RemoteWait),
+        Some("tar") => (
+            ExecutionStage::DeploymentTransferActivation,
+            WorkKind::RunnerOverhead,
+        ),
+        _ => (
+            ExecutionStage::PreparationAdmission,
+            WorkKind::RunnerOverhead,
+        ),
+    };
+    let mut span = execution_span(stage, work);
+    budget.check(label)?;
+    let mut stdout = tempfile::tempfile().map_err(|error| format!("{label}: {error}"))?;
+    let mut stderr = tempfile::tempfile().map_err(|error| format!("{label}: {error}"))?;
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            stdout.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().map_err(|error| error.to_string())?,
+        ));
+    let mut child =
+        swactor_process::command_spawn(command).map_err(|error| format!("{label}: {error}"))?;
+    let pid = child.id() as libc::pid_t;
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
+    let pidfd = (descriptor >= 0).then(|| unsafe { OwnedFd::from_raw_fd(descriptor) });
+    let outcome = loop {
+        match swactor_process::child_try_wait(&mut child) {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(format!("{label}: observe child: {error}")),
+        }
+        let remaining = match budget.remaining(label) {
+            Ok(remaining) => remaining,
+            Err(error) => break Err(error),
+        };
+        if let Some(pidfd) = &pidfd {
+            let mut poll = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout =
+                remaining.min(Duration::from_millis(50)).as_millis().max(1) as libc::c_int;
+            if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    break Err(format!("{label}: await child exit: {error}"));
+                }
+            }
+        } else if let Err(error) = budget.wait(Duration::from_millis(10), label) {
+            // Compatibility for kernels without pidfd_open; ownership and
+            // cancellation remain bounded, unlike a blocking child.wait().
+            break Err(error);
+        }
+    };
+    if outcome.is_err() {
+        // SIGKILL the whole owned group, then reap the actual child. There are
+        // no detached helper threads or inherited-output pipe joins.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = swactor_process::child_kill(&mut child);
+        swactor_process::child_wait(&mut child)
+            .map_err(|error| format!("{label}: reap cancelled child: {error}"))?;
+    }
+    span.add_records(1);
+    let status = outcome?;
+    stdout.rewind().map_err(|error| error.to_string())?;
+    stderr.rewind().map_err(|error| error.to_string())?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout
+        .read_to_end(&mut out)
+        .map_err(|error| error.to_string())?;
+    stderr
+        .read_to_end(&mut err)
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!(
+            "{label} exited {status}: {}",
+            String::from_utf8_lossy(&err)
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    })
+}
+
+/// A versioned deployment bundle: outer tar path plus the deployment
+/// identity it declares.
+#[derive(Clone, Debug)]
+pub struct DeploymentBundle {
+    pub tar_path: std::path::PathBuf,
+    pub artifact_digest: String,
+    pub executable_digest: String,
+    pub deployment_generation: String,
+}
+
+fn sha256_hex_budget(path: &Path, budget: &Budget) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut span = execution_span(
+        ExecutionStage::PreparationAdmission,
+        WorkKind::RunnerOverhead,
+    );
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("hash {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 65536];
+    let mut bytes = 0_u64;
+    loop {
+        budget.check("verify immutable artifact digest")?;
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        bytes += count as u64;
+    }
+    span.add_bytes(bytes);
+    span.add_records(1);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Stage native protocol artifacts without inspecting or building Python bindings.
+pub fn stage_deployment_payload(
+    workspace: &Path,
+    artifacts: &Path,
+    budget: &Budget,
+) -> Result<PathBuf, String> {
+    stage_payload(workspace, artifacts, WorkloadBackend::Native, budget)
+}
+
+/// Explicit binding-conformance preparation, including the native readiness executor.
+pub fn stage_python_conformance_payload(
+    workspace: &Path,
+    artifacts: &Path,
+    budget: &Budget,
+) -> Result<PathBuf, String> {
+    stage_payload(
+        workspace,
+        artifacts,
+        WorkloadBackend::PythonConformance,
+        budget,
+    )
+}
+
+struct PreparedPythonArtifacts {
+    key: String,
+    wheel_dir: PathBuf,
+    wheels: BTreeMap<String, String>,
+    launcher: PathBuf,
+    launcher_digest: String,
+}
+
+fn prepare_python_artifacts(
+    workspace: &Path,
+    binaries: &BuiltBinaries,
+    required: Option<&PreparedArtifactIdentity>,
+    budget: &Budget,
+) -> Result<PreparedPythonArtifacts, String> {
+    let cache_root = workspace
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .join("target/myelin-e2e-cache");
+    let venv = cache_root.join("maturin-venv");
+    let maturin = venv.join("bin/maturin");
+    if !maturin.is_file() {
+        if required.is_some() {
+            return Err(
+                "qualified wheel builder is missing; installation is prohibited".to_owned(),
+            );
+        }
+        run_checked(
+            Command::new("python3").args(["-m", "venv"]).arg(&venv),
+            "create maturin virtualenv",
+            budget,
+        )?;
+        run_checked(
+            Command::new(venv.join("bin/pip"))
+                .args(["install", "--quiet", "maturin>=1.7,<2"])
+                .current_dir(workspace),
+            "install maturin",
+            budget,
+        )?;
+    }
+    let key = wheel_input_digest(binaries, &maturin, budget)?;
+    if required.is_some_and(|expected| expected.wheel_input_digest.as_ref() != Some(&key)) {
+        return Err("qualified wheel build inputs changed; rebuilding is prohibited".to_owned());
+    }
+    let wheel_dir = cache_root.join("wheels").join(&key);
+    fs::create_dir_all(&wheel_dir).map_err(|error| format!("create wheel cache: {error}"))?;
+    let manifest = wheel_dir.join("digests.json");
+    let cached: Option<BTreeMap<String, String>> = fs::File::open(&manifest)
+        .ok()
+        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok());
+    let mut wheels = BTreeMap::new();
+    if let Some(cached) = cached {
+        for (name, digest) in cached {
+            validate_artifact_filename(&name, ".whl")?;
+            if sha256_hex_budget(&wheel_dir.join(&name), budget)
+                .ok()
+                .as_ref()
+                == Some(&digest)
+            {
+                wheels.insert(name, digest);
+            } else {
+                wheels.clear();
+                break;
+            }
+        }
+    }
+    if wheels.is_empty() {
+        if required.is_some() {
+            return Err(
+                "qualified wheel cache is missing or corrupt; rebuilding is prohibited".to_owned(),
+            );
+        }
+        let temporary = tempfile::tempdir_in(&wheel_dir).map_err(|error| error.to_string())?;
+        run_checked(
+            Command::new(&maturin)
+                .args([
+                    "build",
+                    "--release",
+                    "--locked",
+                    "--manifest-path",
+                    "crates/bindings/python/Cargo.toml",
+                    "--out",
+                ])
+                .arg(temporary.path())
+                .args(["--interpreter", "python3"])
+                .current_dir(workspace),
+            "build Swactor wheel",
+            budget,
+        )?;
+        for entry in fs::read_dir(temporary.path()).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".whl") {
+                let digest = sha256_hex_budget(&entry.path(), budget)?;
+                copy_atomic(&entry.path(), &wheel_dir.join(&name))?;
+                wheels.insert(name, digest);
+            }
+        }
+        if wheels.is_empty() {
+            return Err("maturin produced no wheel".to_owned());
+        }
+        write_json_atomic(&manifest, &wheels)?;
+    }
+    let launcher_dir = cache_root.join("python-launchers").join(&key);
+    let launcher = launcher_dir.join("myelin-e2e-python");
+    let launcher_manifest = launcher_dir.join("digest.json");
+    let cached_launcher: Option<String> = fs::File::open(&launcher_manifest)
+        .ok()
+        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok());
+    let launcher_digest = match cached_launcher {
+        Some(digest) if sha256_hex_budget(&launcher, budget).as_ref() == Ok(&digest) => digest,
+        _ => {
+            if required.is_some() {
+                return Err(
+                    "qualified Python launcher is missing or corrupt; rebuilding is prohibited"
+                        .to_owned(),
+                );
+            }
+            run_checked(
+                Command::new("cargo")
+                    .current_dir(workspace)
+                    .env("CARGO_TARGET_DIR", workspace.join("target"))
+                    .args([
+                        "build",
+                        "--release",
+                        "--locked",
+                        "-p",
+                        "python",
+                        "--no-default-features",
+                        "--features",
+                        "launcher",
+                        "--bin",
+                        "myelin-e2e-python",
+                    ]),
+                "build Python conformance launcher",
+                budget,
+            )?;
+            fs::create_dir_all(&launcher_dir).map_err(|error| error.to_string())?;
+            copy_atomic(
+                &workspace.join("target/release/myelin-e2e-python"),
+                &launcher,
+            )?;
+            set_executable(&launcher)?;
+            let mut permissions = fs::metadata(&launcher)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&launcher, permissions).map_err(|error| error.to_string())?;
+            let digest = sha256_hex_budget(&launcher, budget)?;
+            write_json_atomic(&launcher_manifest, &digest)?;
+            digest
+        }
+    };
+    if required.is_some_and(|expected| {
+        expected.python_launcher_digest.as_ref() != Some(&launcher_digest)
+            || expected.wheels != wheels
+    }) {
+        return Err("Python conformance artifacts differ from qualification".to_owned());
+    }
+    record_execution_identity(
+        &format!("wheel:{key}"),
+        json!({
+            "schema_version": 1, "source_build_input_digest": binaries.input_digest,
+            "wheel_input_digest": key, "wheels": wheels, "python_launcher_digest": launcher_digest,
+        }),
+    );
+    Ok(PreparedPythonArtifacts {
+        key,
+        wheel_dir,
+        wheels,
+        launcher,
+        launcher_digest,
+    })
+}
+
+fn stage_payload(
+    workspace: &Path,
+    artifacts: &Path,
+    backend: WorkloadBackend,
+    budget: &Budget,
+) -> Result<PathBuf, String> {
+    let required = required_artifacts(budget)?;
+    if required
+        .as_ref()
+        .is_some_and(|expected| expected.workload_backend != backend)
+    {
+        return Err("requested workload backend differs from qualified artifacts".to_owned());
+    }
+    let binaries = resolve_myelin_binaries(workspace, budget)?;
+    let python = match backend {
+        WorkloadBackend::Native => None,
+        WorkloadBackend::PythonConformance => Some(prepare_python_artifacts(
+            workspace,
+            &binaries,
+            required.as_ref(),
+            budget,
+        )?),
+    };
+    let identity = prepared_artifact_identity(
+        &binaries,
+        python.as_ref().map(|python| python.key.clone()),
+        python
+            .as_ref()
+            .map(|python| python.wheels.clone())
+            .unwrap_or_default(),
+        python.as_ref().map(|python| python.launcher_digest.clone()),
+    );
+    if required
+        .as_ref()
+        .is_some_and(|expected| expected != &identity)
+    {
+        return Err("staged payload differs from qualified artifacts".to_owned());
+    }
+    // Each caller receives an independent mutable staging tree: generation
+    // marker appends must never mutate the immutable cache or another round.
+    fs::create_dir_all(artifacts).map_err(|error| error.to_string())?;
+    let payload = tempfile::Builder::new()
+        .prefix("payload-")
+        .tempdir_in(artifacts)
+        .map_err(|error| error.to_string())?;
+    let payload_bin = payload.path().join("bin");
+    fs::create_dir_all(&payload_bin).map_err(|error| error.to_string())?;
+    for (source, name) in [
+        (&binaries.worker, "myelin-worker"),
+        (&binaries.native, "myelin-e2e-native"),
+    ] {
+        budget.check("stage native deployment executable")?;
+        copy_atomic(source, &payload_bin.join(name))?;
+        set_executable(&payload_bin.join(name))?;
+    }
+    if let Some(python) = &python {
+        let payload_python = payload.path().join("python");
+        fs::create_dir_all(&payload_python).map_err(|error| error.to_string())?;
+        copy_atomic(&python.launcher, &payload_bin.join("myelin-e2e-python"))?;
+        set_executable(&payload_bin.join("myelin-e2e-python"))?;
+        for name in python.wheels.keys() {
+            budget.check("stage Swactor wheel")?;
+            copy_atomic(&python.wheel_dir.join(name), &payload_python.join(name))?;
+        }
+    }
+    // Hash the copied bytes as well: cache/source changes during staging cannot pass.
+    for (name, expected) in &identity.payload {
+        if sha256_hex_budget(&payload.path().join(name), budget)? != *expected {
+            return Err(format!("deployment payload changed during staging: {name}"));
+        }
+    }
+    write_json_atomic(&artifacts.join("build-identity.json"), &identity)?;
+    Ok(payload.keep())
+}
+
+/// Produces a byte-distinct but executable-compatible worker artifact. ELF
+/// loaders ignore trailing bytes; the marker is therefore part of the tested
+/// executable digest without introducing a second build configuration.
+pub fn distinguish_deployment_payload(
+    payload: &Path,
+    deployment_generation: &str,
+) -> Result<(), String> {
+    let worker = payload.join("bin").join("myelin-worker");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&worker)
+        .map_err(|error| format!("open {} for deployment marker: {error}", worker.display()))?;
+    file.write_all(format!("\nMYELIN_DEPLOYMENT_ARTIFACT={deployment_generation}\n").as_bytes())
+        .map_err(|error| format!("mark {} as distinct deployment: {error}", worker.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync deployment marker in {}: {error}", worker.display()))
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|error| format!("mark {} executable: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedArchive {
+    input_digest: String,
+    archive_digest: String,
+}
+
+fn payload_tree_identity(payload: &Path, budget: &Budget) -> Result<(Vec<String>, String), String> {
+    use sha2::{Digest, Sha256};
+    let mut roots = fs::read_dir(payload)
+        .map_err(|error| error.to_string())?
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "non-UTF-8 payload root")?;
+            if !matches!(name.as_str(), "bin" | "python" | "support") {
+                return Err(format!("unknown deployment payload root: {name}"));
+            }
+            Ok(name)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    roots.sort();
+    if !roots.iter().any(|name| name == "bin") {
+        return Err("deployment payload requires executable content".to_owned());
+    }
+    let _span = execution_span(
+        ExecutionStage::DeploymentTransferActivation,
+        WorkKind::RunnerOverhead,
+    );
+    let mut key = Sha256::new();
+    key.update(b"myelin-e2e-payload-gzip-ustar-v4\0");
+    for name in &roots {
+        hash_payload_tree(payload, &payload.join(name), &mut key, budget)?;
+    }
+    Ok((roots, format!("{:x}", key.finalize())))
+}
+
+/// Deterministic compressed payload tar: identical payload bytes hash
+/// identically across invocations while avoiding repeated full-size transfer.
+fn write_payload_tar(
+    artifacts: &Path,
+    payload: &Path,
+    budget: &Budget,
+) -> Result<(PathBuf, String), String> {
+    let (roots, key) = payload_tree_identity(payload, budget)?;
+    let cache = artifacts
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .join("deployment-cache")
+        .join(&key);
+    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+    let payload_tar = cache.join("payload.tar");
+    let manifest = cache.join("digest.json");
+    if let Ok(file) = fs::File::open(&manifest)
+        && let Ok(expected) = serde_json::from_reader::<_, CachedArchive>(BufReader::new(file))
+        && expected.input_digest == key
+        && sha256_hex_budget(&payload_tar, budget).ok().as_ref() == Some(&expected.archive_digest)
+    {
+        return Ok((payload_tar, expected.archive_digest));
+    }
+    let temporary = tempfile::NamedTempFile::new_in(&cache).map_err(|error| error.to_string())?;
+    run_checked(
+        Command::new("tar")
+            .args([
+                "--format=ustar",
+                "--sort=name",
+                "--mtime=@0",
+                "--owner=0",
+                "--group=0",
+                "--numeric-owner",
+                "--use-compress-program=gzip -1n",
+                "-cf",
+            ])
+            .arg(temporary.path())
+            .args(&roots)
+            .current_dir(payload),
+        "pack deployment payload",
+        budget,
+    )?;
+    if payload_tree_identity(payload, budget)?.1 != key {
+        return Err("deployment payload changed while packaging".to_owned());
+    }
+    let digest = sha256_hex_budget(temporary.path(), budget)?;
+    temporary
+        .persist(&payload_tar)
+        .map_err(|error| error.to_string())?;
+    write_json_atomic(
+        &manifest,
+        &CachedArchive {
+            input_digest: key,
+            archive_digest: digest.clone(),
+        },
+    )?;
+    Ok((payload_tar, digest))
+}
+
+/// Assembles `deployment.tar` (descriptor + payload) for one generation.
+/// The digest covers the payload only, so a new generation with identical
+/// binaries keeps the digest and still forces a node refresh.
+pub fn assemble_deployment_bundle(
+    artifacts: &Path,
+    payload: &Path,
+    deployment_generation: &str,
+    budget: &Budget,
+) -> Result<DeploymentBundle, String> {
+    use sha2::{Digest, Sha256};
+    if deployment_generation.is_empty()
+        || !deployment_generation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("deployment generation must be a nonempty filename-safe identity".to_owned());
+    }
+    let (payload_tar, digest) = write_payload_tar(artifacts, payload, budget)?;
+    let executable_digest = format!(
+        "sha256:{}",
+        sha256_hex_budget(&payload.join("bin/myelin-worker"), budget)?
+    );
+    let descriptor = json!({
+        "artifact_digest": format!("sha256:{digest}"),
+        "deployment_generation": deployment_generation,
+        "executable_digest": executable_digest,
+    });
+    let descriptor_bytes = serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?;
+    let descriptor_digest = format!("{:x}", Sha256::digest(&descriptor_bytes));
+    let artifacts = artifacts
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let bundle_tar = artifacts.join(format!(
+        "deployment-{deployment_generation}-{descriptor_digest}.tar"
+    ));
+    let manifest = bundle_tar.with_extension("digest.json");
+    let valid_cached = fs::File::open(&manifest)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, CachedArchive>(BufReader::new(file)).ok())
+        .is_some_and(|expected| {
+            expected.input_digest == descriptor_digest
+                && sha256_hex_budget(&bundle_tar, budget).ok().as_ref()
+                    == Some(&expected.archive_digest)
+        });
+    if !valid_cached {
+        let descriptor_dir = tempfile::tempdir_in(&artifacts).map_err(|error| error.to_string())?;
+        fs::write(
+            descriptor_dir.path().join("deployment.json"),
+            descriptor_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        let temporary =
+            tempfile::NamedTempFile::new_in(&artifacts).map_err(|error| error.to_string())?;
+        run_checked(
+            Command::new("tar")
+                .args([
+                    "--format=ustar",
+                    "--sort=name",
+                    "--mtime=@0",
+                    "--owner=0",
+                    "--group=0",
+                    "--numeric-owner",
+                    "-cf",
+                ])
+                .arg(temporary.path())
+                .arg("-C")
+                .arg(descriptor_dir.path())
+                .arg("deployment.json")
+                .arg("-C")
+                .arg(
+                    payload_tar
+                        .parent()
+                        .ok_or_else(|| "payload cache has no parent".to_owned())?,
+                )
+                .arg("payload.tar"),
+            "pack deployment bundle",
+            budget,
+        )?;
+        let bundle_digest = sha256_hex_budget(temporary.path(), budget)?;
+        temporary
+            .persist(&bundle_tar)
+            .map_err(|error| error.to_string())?;
+        write_json_atomic(
+            &manifest,
+            &CachedArchive {
+                input_digest: descriptor_digest,
+                archive_digest: bundle_digest,
+            },
+        )?;
+    }
+    Ok(DeploymentBundle {
+        tar_path: bundle_tar,
+        artifact_digest: format!("sha256:{digest}"),
+        executable_digest,
+        deployment_generation: deployment_generation.to_owned(),
+    })
+}
 static WORKLOAD_IMAGES: LazyLock<Mutex<BTreeMap<String, String>>> = LazyLock::new(Mutex::default);
 
 pub(crate) fn docker_image_identity(image: &str, budget: &Budget) -> Result<String, String> {
@@ -667,11 +1548,23 @@ pub(crate) fn build_workload_image(
     image: &str,
     budget: &Budget,
 ) -> Result<(), String> {
+    build_backend_image(workspace, image, WorkloadBackend::Native, budget)
+}
+
+fn build_backend_image(
+    workspace: &Path,
+    image: &str,
+    backend: WorkloadBackend,
+    budget: &Budget,
+) -> Result<(), String> {
     let started = Instant::now();
     let source = resolve_myelin_binaries(workspace, budget)?.input_digest;
     let mut cache = budget_lock(&WORKLOAD_IMAGES, budget, "workload image cache")?;
     let base = docker_image_identity("nvidia/cuda:12.6.3-runtime-ubuntu24.04", budget).ok();
-    let key = format!("{source}/{}", base.as_deref().unwrap_or("unresolved"));
+    let key = format!(
+        "{backend:?}/{source}/{}",
+        base.as_deref().unwrap_or("unresolved")
+    );
     if let Some(identity) = cache.get(&key) {
         if docker_image_identity(identity, budget).as_ref() == Ok(identity) {
             run_checked(
@@ -683,6 +1576,7 @@ pub(crate) fn build_workload_image(
                 &format!("image:{identity}"),
                 json!({
                     "schema_version": 1, "source_build_input_digest": source,
+                    "workload_backend": backend,
                     "image_digest": identity, "base_image_digest": base, "cache_state": "invocation_hit",
                 }),
             );
@@ -690,20 +1584,28 @@ pub(crate) fn build_workload_image(
             return Ok(());
         }
     }
-    let mut parent: Option<String> = None;
-    for (role, dockerfile, name) in [
+    let native_image = format!("myelin-e2e-native:{source}");
+    let native_tag = match backend {
+        WorkloadBackend::Native => image,
+        WorkloadBackend::PythonConformance => &native_image,
+    };
+    let mut stages = vec![
         (
             "base",
             "apps/myelin/node-image/Dockerfile.base",
             "myelin-node-base:cuda12.6",
         ),
-        (
-            "node",
-            "apps/myelin/node-image/Dockerfile",
-            "myelin-node:latest",
-        ),
-        ("e2e", "apps/myelin/node-image/Dockerfile.e2e", image),
-    ] {
+        ("e2e", "apps/myelin/node-image/Dockerfile.e2e", native_tag),
+    ];
+    if backend == WorkloadBackend::PythonConformance {
+        stages.push((
+            "e2e-python",
+            "apps/myelin/node-image/Dockerfile.e2e-python",
+            image,
+        ));
+    }
+    let mut parent: Option<String> = None;
+    for (role, dockerfile, name) in stages {
         let parent_tag = parent.as_ref().map(|identity| {
             format!(
                 "myelin-e2e-parent:{}",
@@ -760,200 +1662,13 @@ pub(crate) fn build_workload_image(
         &format!("image:{identity}"),
         json!({
             "schema_version": 1, "source_build_input_digest": source,
+            "workload_backend": backend,
             "image_digest": identity, "base_image_digest": base, "cache_state": "built",
         }),
     );
-    cache.insert(format!("{source}/{base}"), identity);
+    cache.insert(format!("{backend:?}/{source}/{base}"), identity);
     record_execution_stage("build.image.miss", started.elapsed(), 0, 1);
     Ok(())
-}
-
-pub(crate) fn run_checked(
-    command: &mut Command,
-    label: &str,
-    budget: &Budget,
-) -> Result<(), String> {
-    run_output_budget(command, label, budget).map(|_| ())
-}
-
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct GateImageIdentity {
-    pub id: String,
-    pub os: String,
-    pub architecture: String,
-    pub variant: String,
-    pub repo_digests: BTreeSet<String>,
-    pub provenance_version: u32,
-    pub source_build_input_digest: String,
-    pub image_role: String,
-    pub parent_image_id: Option<String>,
-}
-
-pub fn runtime_image_identity(name: &str, budget: &Budget) -> Result<GateImageIdentity, String> {
-    let image = run_output_budget(
-        Command::new("docker").args(["image", "inspect", name]),
-        "inspect qualified local runtime image",
-        budget,
-    )?;
-    let values: Vec<serde_json::Value> = serde_json::from_slice(&image.stdout)
-        .map_err(|error| format!("decode runtime image identity: {error}"))?;
-    let value = values
-        .first()
-        .ok_or("Docker omitted runtime image identity")?;
-    if immutable_registry_reference(name) {
-        let manifest = run_output_budget(
-            Command::new("docker").args(["manifest", "inspect", name]),
-            "inspect qualified registry manifest",
-            budget,
-        )?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest.stdout)
-            .map_err(|error| format!("decode qualified registry manifest: {error}"))?;
-        if manifest["schemaVersion"].as_u64() != Some(2)
-            || manifest.get("manifests").is_some()
-            || manifest["config"]["digest"].as_str() != value["Id"].as_str()
-        {
-            return Err("paid runtime requires a platform-specific registry manifest whose config digest matches the tested local image".to_owned());
-        }
-    }
-    let field = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
-    let labels = &value["Config"]["Labels"];
-    if labels["org.swactor.myelin.e2e.provenance-version"].as_str() != Some("1") {
-        return Err(format!(
-            "runtime image {name} lacks build-time source provenance; rebuild it"
-        ));
-    }
-    Ok(GateImageIdentity {
-        id: field("Id"),
-        os: field("Os"),
-        architecture: field("Architecture"),
-        variant: field("Variant"),
-        repo_digests: value["RepoDigests"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        provenance_version: 1,
-        source_build_input_digest: labels["org.swactor.myelin.e2e.source-build-input-digest"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        image_role: labels["org.swactor.myelin.e2e.image-role"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        parent_image_id: labels["org.swactor.myelin.e2e.parent-image-id"]
-            .as_str()
-            .map(str::to_owned),
-    })
-}
-
-pub fn immutable_registry_reference(reference: &str) -> bool {
-    reference
-        .split_once("@sha256:")
-        .is_some_and(|(repository, digest)| {
-            !repository.is_empty()
-                && !repository.contains('@')
-                && !repository.bytes().any(|byte| byte.is_ascii_whitespace())
-                && digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-}
-
-/// Capture into files, not pipes: no reader thread can outlive the owner, and a
-/// grandchild holding stdout open cannot prevent process reaping on expiry.
-fn run_output_budget(
-    command: &mut Command,
-    label: &str,
-    budget: &Budget,
-) -> Result<std::process::Output, String> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::process::CommandExt;
-    let started = Instant::now();
-    budget.check(label)?;
-    let mut stdout = tempfile::tempfile().map_err(|error| format!("{label}: {error}"))?;
-    let mut stderr = tempfile::tempfile().map_err(|error| format!("{label}: {error}"))?;
-    command
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(
-            stdout.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(
-            stderr.try_clone().map_err(|error| error.to_string())?,
-        ));
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("{label}: {error}"))?;
-    let pid = child.id() as libc::pid_t;
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
-    let pidfd = (descriptor >= 0).then(|| unsafe { OwnedFd::from_raw_fd(descriptor) });
-    let outcome = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {}
-            Err(error) => break Err(format!("{label}: observe child: {error}")),
-        }
-        let remaining = match budget.remaining(label) {
-            Ok(remaining) => remaining,
-            Err(error) => break Err(error),
-        };
-        if let Some(pidfd) = &pidfd {
-            let mut poll = libc::pollfd {
-                fd: pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout =
-                remaining.min(Duration::from_millis(50)).as_millis().max(1) as libc::c_int;
-            if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    break Err(format!("{label}: await child exit: {error}"));
-                }
-            }
-        } else if let Err(error) = budget.wait(Duration::from_millis(10), label) {
-            // Compatibility for kernels without pidfd_open; ownership and
-            // cancellation remain bounded, unlike a blocking child.wait().
-            break Err(error);
-        }
-    };
-    if outcome.is_err() {
-        // SIGKILL the whole owned group, then reap the actual child. There are
-        // no detached helper threads or inherited-output pipe joins.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-        let _ = child.kill();
-        child
-            .wait()
-            .map_err(|error| format!("{label}: reap cancelled child: {error}"))?;
-    }
-    record_execution_stage(&format!("subprocess:{label}"), started.elapsed(), 0, 1);
-    let status = outcome?;
-    stdout.rewind().map_err(|error| error.to_string())?;
-    stderr.rewind().map_err(|error| error.to_string())?;
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    stdout
-        .read_to_end(&mut out)
-        .map_err(|error| error.to_string())?;
-    stderr
-        .read_to_end(&mut err)
-        .map_err(|error| error.to_string())?;
-    if !status.success() {
-        return Err(format!(
-            "{label} exited {status}: {}",
-            String::from_utf8_lossy(&err)
-        ));
-    }
-    Ok(std::process::Output {
-        status,
-        stdout: out,
-        stderr: err,
-    })
 }
 
 pub(crate) fn reserve_port() -> Result<u16, String> {
@@ -966,18 +1681,21 @@ pub(crate) fn reserve_port() -> Result<u16, String> {
 }
 
 pub(crate) fn capture_lines(
+    blocking: &BlockingWorkSender,
     reader: impl std::io::Read + Send + 'static,
     lines: Arc<Mutex<VecDeque<String>>>,
-) {
-    thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            let mut lines = lines.lock().unwrap_or_else(|error| error.into_inner());
-            if lines.len() == 512 {
-                lines.pop_front();
+) -> Result<(), String> {
+    blocking
+        .submit_owned((reader, lines), |(reader, lines)| {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                let mut lines = lines.lock().unwrap_or_else(|error| error.into_inner());
+                if lines.len() == 512 {
+                    lines.pop_front();
+                }
+                lines.push_back(line);
             }
-            lines.push_back(line);
-        }
-    });
+        })
+        .map_err(|_| "engine stopped before accepting orchestrator output reader".to_owned())
 }
 
 /// One bounded control transaction. Each attempt uses a fresh socket so a
@@ -1311,6 +2029,7 @@ fn read_chunked(
         cursor = end;
     }
 }
+
 #[derive(Default)]
 pub(crate) struct TelemetryResourceCensus {
     offset: u64,
@@ -1325,6 +2044,7 @@ pub(crate) struct TelemetryResourceCensus {
     telemetry_gaps: Vec<String>,
     resource_snapshots: BTreeMap<u64, Value>,
     orchestrator_snapshot: Option<(String, Value)>,
+    stream_lifetimes: BTreeMap<String, u64>,
 }
 
 impl TelemetryResourceCensus {
@@ -1538,6 +2258,21 @@ impl TelemetryResourceCensus {
                 .get("stream")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let (producer, lifetime) = stream
+                .rsplit_once('#')
+                .ok_or_else(|| format!("invalid telemetry stream identity {stream}"))?;
+            let lifetime = lifetime
+                .parse::<u64>()
+                .map_err(|error| format!("invalid telemetry stream lifetime {stream}: {error}"))?;
+            if let Some(previous) = self.stream_lifetimes.get(producer).copied() {
+                if lifetime < previous {
+                    continue;
+                }
+                if lifetime > previous {
+                    self.forget_stream(&format!("{producer}#{previous}"));
+                }
+            }
+            self.stream_lifetimes.insert(producer.to_owned(), lifetime);
             let archived_payload = frame.pointer("/payload/value").ok_or_else(|| {
                 format!("telemetry frame {} has no decoded payload", self.next_line)
             })?;
@@ -1905,401 +2640,87 @@ pub(crate) fn remove_containers(prefix: &str, budget: &Budget) -> Result<(), Str
     )
 }
 
-/// A versioned deployment bundle: outer tar path plus the deployment
-/// identity it declares.
-#[derive(Clone, Debug)]
-pub struct DeploymentBundle {
-    pub tar_path: std::path::PathBuf,
-    pub artifact_digest: String,
-    pub executable_digest: String,
-    pub deployment_generation: String,
-}
-
-fn sha256_hex_budget(path: &Path, budget: &Budget) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let started = Instant::now();
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("hash {}: {error}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 65536];
-    let mut bytes = 0_u64;
-    loop {
-        budget.check("verify immutable artifact digest")?;
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-        bytes += count as u64;
-    }
-    record_execution_stage("artifact.digest", started.elapsed(), bytes, 1);
-    Ok(format!("{:x}", digest.finalize()))
-}
-
-/// One-time payload staging: release binaries plus the Swactor wheel. The
-/// same payload backs multiple bundle generations; only the descriptor
-/// changes between them.
-pub fn stage_deployment_payload(
-    workspace: &Path,
-    artifacts: &Path,
-    budget: &Budget,
-) -> Result<PathBuf, String> {
-    let required = required_artifacts(budget)?;
-    let started = Instant::now();
-    let binaries = resolve_myelin_binaries(workspace, budget)?;
-    let cache_root = workspace
-        .canonicalize()
-        .map_err(|error| error.to_string())?
-        .join("target/myelin-e2e-cache");
-    let venv = cache_root.join("maturin-venv");
-    let maturin = venv.join("bin/maturin");
-    if !maturin.is_file() {
-        if required.is_some() {
-            return Err(
-                "qualified wheel builder is missing; installation is prohibited".to_owned(),
-            );
-        }
-        run_checked(
-            Command::new("python3").args(["-m", "venv"]).arg(&venv),
-            "create maturin virtualenv",
-            budget,
-        )?;
-        run_checked(
-            Command::new(venv.join("bin/pip"))
-                .args(["install", "--quiet", "maturin>=1.7,<2"])
-                .current_dir(workspace),
-            "install maturin",
-            budget,
-        )?;
-    }
-    let key = wheel_input_digest(&binaries, &maturin, budget)?;
-    if required
-        .as_ref()
-        .is_some_and(|expected| expected.wheel_input_digest != key)
-    {
-        return Err("qualified wheel build inputs changed; rebuilding is prohibited".to_owned());
-    }
-    let wheel_dir = cache_root.join("wheels").join(&key);
-    fs::create_dir_all(&wheel_dir).map_err(|error| format!("create wheel cache: {error}"))?;
-    let manifest = wheel_dir.join("digests.json");
-    let cached: Option<BTreeMap<String, String>> = fs::File::open(&manifest)
-        .ok()
-        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok());
-    let mut wheels = BTreeMap::new();
-    if let Some(cached) = cached {
-        for (name, digest) in cached {
-            validate_artifact_filename(&name, ".whl")?;
-            if sha256_hex_budget(&wheel_dir.join(&name), budget)
-                .ok()
-                .as_ref()
-                == Some(&digest)
-            {
-                wheels.insert(name, digest);
-            } else {
-                wheels.clear();
-                break;
-            }
-        }
-    }
-    if wheels.is_empty() {
-        if required.is_some() {
-            return Err(
-                "qualified wheel cache is missing or corrupt; rebuilding is prohibited".to_owned(),
-            );
-        }
-        let temporary = tempfile::tempdir_in(&wheel_dir).map_err(|error| error.to_string())?;
-        run_checked(
-            Command::new(&maturin)
-                .args([
-                    "build",
-                    "--release",
-                    "--locked",
-                    "--interpreter",
-                    "python3",
-                    "--manifest-path",
-                    "crates/bindings/python/Cargo.toml",
-                    "--out",
-                ])
-                .arg(temporary.path())
-                .current_dir(workspace),
-            "build Swactor wheel",
-            budget,
-        )?;
-        for entry in fs::read_dir(temporary.path()).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".whl") {
-                let digest = sha256_hex_budget(&entry.path(), budget)?;
-                copy_atomic(&entry.path(), &wheel_dir.join(&name))?;
-                wheels.insert(name, digest);
-            }
-        }
-        if wheels.is_empty() {
-            return Err("maturin produced no wheel".to_owned());
-        }
-        write_json_atomic(&manifest, &wheels)?;
-        record_execution_stage(
-            "build.wheel.miss",
-            started.elapsed(),
-            0,
-            wheels.len() as u64,
-        );
-    } else {
-        record_execution_stage(
-            "build.wheel.cache_hit",
-            started.elapsed(),
-            0,
-            wheels.len() as u64,
-        );
-    }
-    let identity =
-        prepared_artifact_identity(workspace, &binaries, key.clone(), wheels.clone(), budget)?;
-    if required
-        .as_ref()
-        .is_some_and(|expected| expected != &identity)
-    {
-        return Err("staged payload differs from qualified artifacts".to_owned());
-    }
-    record_execution_identity(
-        &format!("wheel:{key}"),
-        json!({
-            "schema_version": 1, "source_build_input_digest": binaries.input_digest,
-            "wheel_input_digest": key, "wheels": wheels,
-        }),
-    );
-    // Each caller receives an independent mutable staging tree: generation
-    // marker appends must never mutate the immutable cache or another round.
-    fs::create_dir_all(artifacts).map_err(|error| error.to_string())?;
-    let payload = tempfile::Builder::new()
-        .prefix("payload-")
-        .tempdir_in(artifacts)
-        .map_err(|error| error.to_string())?;
-    let payload_bin = payload.path().join("bin");
-    let payload_python = payload.path().join("python");
-    fs::create_dir_all(&payload_bin).map_err(|error| error.to_string())?;
-    fs::create_dir_all(&payload_python).map_err(|error| error.to_string())?;
-    copy_atomic(&binaries.worker, &payload_bin.join("myelin-worker"))?;
-    set_executable(&payload_bin.join("myelin-worker"))?;
-    copy_atomic(
-        &workspace.join("apps/myelin/node-image/e2e_python_launcher.py"),
-        &payload_bin.join("myelin-e2e-python"),
-    )?;
-    set_executable(&payload_bin.join("myelin-e2e-python"))?;
-    for name in wheels.keys() {
-        budget.check("stage Swactor wheel")?;
-        copy_atomic(&wheel_dir.join(name), &payload_python.join(name))?;
-    }
-    // Hash the copied bytes as well: cache/source changes during staging cannot pass.
-    for (name, expected) in &identity.payload {
-        if sha256_hex_budget(&payload.path().join(name), budget)? != *expected {
-            return Err(format!("deployment payload changed during staging: {name}"));
-        }
-    }
-    write_json_atomic(&artifacts.join("build-identity.json"), &identity)?;
-    record_execution_stage("deployment.stage", started.elapsed(), 0, 1);
-    Ok(payload.keep())
-}
-
-/// Produces a byte-distinct but executable-compatible worker artifact. ELF
-/// loaders ignore trailing bytes; the marker is therefore part of the tested
-/// executable digest without introducing a second build configuration.
-pub fn distinguish_deployment_payload(
-    payload: &Path,
-    deployment_generation: &str,
-) -> Result<(), String> {
-    let worker = payload.join("bin").join("myelin-worker");
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&worker)
-        .map_err(|error| format!("open {} for deployment marker: {error}", worker.display()))?;
-    file.write_all(format!("\nMYELIN_DEPLOYMENT_ARTIFACT={deployment_generation}\n").as_bytes())
-        .map_err(|error| format!("mark {} as distinct deployment: {error}", worker.display()))?;
-    file.sync_all()
-        .map_err(|error| format!("sync deployment marker in {}: {error}", worker.display()))
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata =
-        std::fs::metadata(path).map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions)
-        .map_err(|error| format!("mark {} executable: {error}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-/// Deterministic payload tar: identical payload bytes hash identically
-/// across invocations.
-fn write_payload_tar(
-    artifacts: &Path,
-    payload: &Path,
-    budget: &Budget,
-) -> Result<(PathBuf, String), String> {
-    use sha2::{Digest, Sha256};
-    let started = Instant::now();
-    let mut key = Sha256::new();
-    key.update(b"myelin-e2e-payload-ustar-v1\0");
-    for name in ["bin", "python"] {
-        hash_tree(payload, &payload.join(name), &mut key, budget)?;
-    }
-    let key = format!("{:x}", key.finalize());
-    let cache = artifacts
-        .canonicalize()
-        .map_err(|error| error.to_string())?
-        .join("deployment-cache")
-        .join(key);
-    fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    let payload_tar = cache.join("payload.tar");
-    let manifest = cache.join("digest.json");
-    if let Ok(file) = fs::File::open(&manifest) {
-        if let Ok(expected) = serde_json::from_reader::<_, String>(BufReader::new(file)) {
-            if sha256_hex_budget(&payload_tar, budget).ok().as_ref() == Some(&expected) {
-                record_execution_stage("deployment.payload.cache_hit", started.elapsed(), 0, 1);
-                return Ok((payload_tar, expected));
-            }
-        }
-    }
-    let temporary = tempfile::NamedTempFile::new_in(&cache).map_err(|error| error.to_string())?;
-    run_checked(
-        Command::new("tar")
-            .args([
-                "--format=ustar",
-                "--sort=name",
-                "--mtime=@0",
-                "--owner=0",
-                "--group=0",
-                "--numeric-owner",
-                "-cf",
-            ])
-            .arg(temporary.path())
-            .args(["bin", "python"])
-            .current_dir(payload),
-        "pack deployment payload",
-        budget,
-    )?;
-    let digest = sha256_hex_budget(temporary.path(), budget)?;
-    temporary
-        .persist(&payload_tar)
-        .map_err(|error| error.to_string())?;
-    write_json_atomic(&manifest, &digest)?;
-    record_execution_stage(
-        "deployment.payload.miss",
-        started.elapsed(),
-        fs::metadata(&payload_tar)
-            .map_err(|error| error.to_string())?
-            .len(),
-        1,
-    );
-    Ok((payload_tar, digest))
-}
-
-/// Assembles `deployment.tar` (descriptor + payload) for one generation.
-/// The digest covers the payload only, so a new generation with identical
-/// binaries keeps the digest and still forces a node refresh.
-pub fn assemble_deployment_bundle(
-    artifacts: &Path,
-    payload: &Path,
-    deployment_generation: &str,
-    budget: &Budget,
-) -> Result<DeploymentBundle, String> {
-    use sha2::{Digest, Sha256};
-    let started = Instant::now();
-    if deployment_generation.is_empty()
-        || !deployment_generation
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err("deployment generation must be a nonempty filename-safe identity".to_owned());
-    }
-    let (payload_tar, digest) = write_payload_tar(artifacts, payload, budget)?;
-    let executable_digest = format!(
-        "sha256:{}",
-        sha256_hex_budget(&payload.join("bin/myelin-worker"), budget)?
-    );
-    let descriptor = json!({
-        "artifact_digest": format!("sha256:{digest}"),
-        "deployment_generation": deployment_generation,
-        "executable_digest": executable_digest,
+#[test]
+fn platform_manifest_binding_supports_classic_and_containerd_image_stores() {
+    let manifest_digest = format!("sha256:{}", "1".repeat(64));
+    let config_digest = format!("sha256:{}", "2".repeat(64));
+    let name = format!("registry.example/myelin@{manifest_digest}");
+    let media_type = "application/vnd.oci.image.manifest.v1+json";
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": media_type,
+        "config": {"digest": config_digest},
+        "layers": [],
     });
-    let descriptor_bytes = serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?;
-    let descriptor_digest = format!("{:x}", Sha256::digest(&descriptor_bytes));
-    let artifacts = artifacts
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let bundle_tar = artifacts.join(format!(
-        "deployment-{deployment_generation}-{descriptor_digest}.tar"
-    ));
-    let manifest = bundle_tar.with_extension("digest.json");
-    let valid_cached = fs::File::open(&manifest)
-        .ok()
-        .and_then(|file| serde_json::from_reader::<_, String>(BufReader::new(file)).ok())
-        .is_some_and(|expected| {
-            sha256_hex_budget(&bundle_tar, budget).ok().as_ref() == Some(&expected)
-        });
-    if !valid_cached {
-        let descriptor_dir = tempfile::tempdir_in(&artifacts).map_err(|error| error.to_string())?;
-        fs::write(
-            descriptor_dir.path().join("deployment.json"),
-            descriptor_bytes,
-        )
-        .map_err(|error| error.to_string())?;
-        let temporary =
-            tempfile::NamedTempFile::new_in(&artifacts).map_err(|error| error.to_string())?;
-        run_checked(
-            Command::new("tar")
-                .args([
-                    "--format=ustar",
-                    "--sort=name",
-                    "--mtime=@0",
-                    "--owner=0",
-                    "--group=0",
-                    "--numeric-owner",
-                    "-cf",
-                ])
-                .arg(temporary.path())
-                .arg("-C")
-                .arg(descriptor_dir.path())
-                .arg("deployment.json")
-                .arg("-C")
-                .arg(
-                    payload_tar
-                        .parent()
-                        .ok_or_else(|| "payload cache has no parent".to_owned())?,
-                )
-                .arg("payload.tar"),
-            "pack deployment bundle",
-            budget,
-        )?;
-        let bundle_digest = sha256_hex_budget(temporary.path(), budget)?;
-        temporary
-            .persist(&bundle_tar)
-            .map_err(|error| error.to_string())?;
-        write_json_atomic(&manifest, &bundle_digest)?;
-    }
-    record_execution_stage(
-        if valid_cached {
-            "deployment.bundle.cache_hit"
-        } else {
-            "deployment.bundle.miss"
+    let containerd = json!({
+        "Id": manifest_digest,
+        "Descriptor": {"digest": manifest_digest, "mediaType": media_type},
+    });
+    let classic = json!({"Id": config_digest});
+    assert!(validate_cached_platform_manifest(&name, &containerd, &manifest).is_ok());
+    assert!(validate_cached_platform_manifest(&name, &classic, &manifest).is_ok());
+
+    let unrelated = json!({
+        "Id": manifest_digest,
+        "Descriptor": {
+            "digest": format!("sha256:{}", "3".repeat(64)),
+            "mediaType": media_type,
         },
-        started.elapsed(),
-        fs::metadata(&bundle_tar)
-            .map_err(|error| error.to_string())?
-            .len(),
-        1,
-    );
-    Ok(DeploymentBundle {
-        tar_path: bundle_tar,
-        artifact_digest: format!("sha256:{digest}"),
-        executable_digest,
-        deployment_generation: deployment_generation.to_owned(),
-    })
+    });
+    assert!(validate_cached_platform_manifest(&name, &unrelated, &manifest).is_err());
+}
+
+#[test]
+fn payload_cache_preserves_generation_and_executable_identity() {
+    let artifacts = tempfile::tempdir().unwrap();
+    let payload = artifacts.path().join("payload");
+    fs::create_dir_all(payload.join("bin")).unwrap();
+    fs::write(payload.join("bin/myelin-worker"), b"executable-a").unwrap();
+    fs::write(payload.join("bin/myelin-e2e-native"), b"native-a").unwrap();
+    let budget = Budget::new(Duration::from_secs(10));
+    let first =
+        assemble_deployment_bundle(artifacts.path(), &payload, "generation-a", &budget).unwrap();
+    let second =
+        assemble_deployment_bundle(artifacts.path(), &payload, "generation-b", &budget).unwrap();
+    assert_eq!(first.artifact_digest, second.artifact_digest);
+    assert_ne!(first.tar_path, second.tar_path);
+    let (cached_payload, _) = write_payload_tar(artifacts.path(), &payload, &budget).unwrap();
+    fs::write(&cached_payload, b"interrupted transfer").unwrap();
+    let repaired =
+        assemble_deployment_bundle(artifacts.path(), &payload, "generation-repaired", &budget)
+            .unwrap();
+    assert_eq!(repaired.artifact_digest, first.artifact_digest);
+    fs::write(payload.join("bin/myelin-e2e-native"), b"native-b").unwrap();
+    let native_changed =
+        assemble_deployment_bundle(artifacts.path(), &payload, "native-changed", &budget).unwrap();
+    assert_ne!(native_changed.artifact_digest, first.artifact_digest);
+    assert_eq!(native_changed.executable_digest, first.executable_digest);
+    fs::create_dir_all(payload.join("support/.venv")).unwrap();
+    fs::write(payload.join("support/.venv/runtime"), b"support-a").unwrap();
+    let support_a =
+        assemble_deployment_bundle(artifacts.path(), &payload, "support-a", &budget).unwrap();
+    fs::write(payload.join("support/.venv/runtime"), b"support-b").unwrap();
+    let support_b =
+        assemble_deployment_bundle(artifacts.path(), &payload, "support-b", &budget).unwrap();
+    assert_ne!(support_a.artifact_digest, support_b.artifact_digest);
+    assert_eq!(support_a.executable_digest, support_b.executable_digest);
+    distinguish_deployment_payload(&payload, "generation-c").unwrap();
+    let third =
+        assemble_deployment_bundle(artifacts.path(), &payload, "generation-c", &budget).unwrap();
+    assert_ne!(first.artifact_digest, third.artifact_digest);
+    assert_ne!(first.executable_digest, third.executable_digest);
+    let original = run_output_budget(
+        Command::new("tar")
+            .arg("-xOf")
+            .arg(&first.tar_path)
+            .arg("deployment.json"),
+        "inspect first immutable descriptor",
+        &budget,
+    )
+    .unwrap();
+    let descriptor: Value = serde_json::from_slice(&original.stdout).unwrap();
+    assert_eq!(descriptor["deployment_generation"], "generation-a");
+    assert_eq!(descriptor["artifact_digest"], first.artifact_digest);
 }
 
 #[cfg(test)]
@@ -2313,10 +2734,22 @@ pub(crate) mod resource_deadline_tests {
         BuiltBinaries {
             orchestrator: PathBuf::new(),
             worker: PathBuf::new(),
+            native: PathBuf::new(),
             input_digest: String::new(),
             executable_digests: BTreeMap::new(),
-            verified_files: BTreeMap::new(),
         }
+    }
+
+    fn test_blocking_work() -> (swactor_engine::Engine, BlockingWorkSender) {
+        let backend =
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap();
+        let engine = swactor_engine::Engine::new(
+            swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+            backend,
+        )
+        .unwrap();
+        let blocking_work = engine.handle().blocking_work_sender();
+        (engine, blocking_work)
     }
 
     fn accept_with_deadline(listener: &TcpListener) -> (TcpStream, SocketAddr) {
@@ -2352,14 +2785,17 @@ pub(crate) mod resource_deadline_tests {
 
     #[test]
     fn withheld_dashboard_response_expires_and_releases_connection() {
+        let (_engine, blocking_work) = test_blocking_work();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = accept_with_deadline(&listener);
-            read_request(&mut stream);
-            let _ = stopped.recv_timeout(Duration::from_secs(3));
-        });
+        let server = blocking_work
+            .submit_joinable(move || {
+                let (mut stream, _) = accept_with_deadline(&listener);
+                read_request(&mut stream);
+                let _ = stopped.recv_timeout(Duration::from_secs(3));
+            })
+            .unwrap();
         let started = Instant::now();
         let error = http_json_budget(
             "GET",
@@ -2380,24 +2816,27 @@ pub(crate) mod resource_deadline_tests {
 
     #[test]
     fn trickle_response_cannot_renew_total_deadline() {
+        let (_engine, blocking_work) = test_blocking_work();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = accept_with_deadline(&listener);
-            read_request(&mut stream);
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n")
-                .unwrap();
-            for _ in 0..200 {
-                if stream.write_all(b" ").is_err() {
-                    break;
+        let server = blocking_work
+            .submit_joinable(move || {
+                let (mut stream, _) = accept_with_deadline(&listener);
+                read_request(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n")
+                    .unwrap();
+                for _ in 0..200 {
+                    if stream.write_all(b" ").is_err() {
+                        break;
+                    }
+                    if stopped.recv_timeout(Duration::from_millis(10)).is_ok() {
+                        break;
+                    }
                 }
-                if stopped.recv_timeout(Duration::from_millis(10)).is_ok() {
-                    break;
-                }
-            }
-        });
+            })
+            .unwrap();
         let started = Instant::now();
         let error = http_json_budget(
             "GET",
@@ -2418,6 +2857,7 @@ pub(crate) mod resource_deadline_tests {
 
     #[test]
     fn framed_response_finishes_without_waiting_for_peer_close() {
+        let (_engine, blocking_work) = test_blocking_work();
         for response in [
             b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\n{\"ok\":true}\r\n0\r\n\r\n"
@@ -2426,12 +2866,14 @@ pub(crate) mod resource_deadline_tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let address = listener.local_addr().unwrap();
             let (stop, stopped) = mpsc::channel();
-            let server = thread::spawn(move || {
-                let (mut stream, _) = accept_with_deadline(&listener);
-                read_request(&mut stream);
-                stream.write_all(response).unwrap();
-                let _ = stopped.recv_timeout(Duration::from_secs(3));
-            });
+            let server = blocking_work
+                .submit_joinable(move || {
+                    let (mut stream, _) = accept_with_deadline(&listener);
+                    read_request(&mut stream);
+                    stream.write_all(response).unwrap();
+                    let _ = stopped.recv_timeout(Duration::from_secs(3));
+                })
+                .unwrap();
             let reply = http_json_budget(
                 "GET",
                 &format!("http://{address}/framed"),
@@ -2446,24 +2888,27 @@ pub(crate) mod resource_deadline_tests {
 
     #[test]
     fn control_restart_reconciles_with_new_connection() {
+        let (_engine, blocking_work) = test_blocking_work();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut disconnected, _) = accept_with_deadline(&listener);
-            read_request(&mut disconnected);
-            drop(disconnected);
-            for generation in [2, 3] {
-                let (mut stream, _) = accept_with_deadline(&listener);
-                read_request(&mut stream);
-                let body = json!({"generation": generation}).to_string();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
+        let server = blocking_work
+            .submit_joinable(move || {
+                let (mut disconnected, _) = accept_with_deadline(&listener);
+                read_request(&mut disconnected);
+                drop(disconnected);
+                for generation in [2, 3] {
+                    let (mut stream, _) = accept_with_deadline(&listener);
+                    read_request(&mut stream);
+                    let body = json!({"generation": generation}).to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            })
+            .unwrap();
         let budget = Budget::new(Duration::from_secs(2));
         assert_eq!(
             http_json_budget("GET", &format!("http://{address}/status"), None, &budget).unwrap(),
@@ -2478,17 +2923,20 @@ pub(crate) mod resource_deadline_tests {
 
     #[test]
     fn ambiguous_post_is_not_duplicated_by_transport() {
+        let (_engine, blocking_work) = test_blocking_work();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = accept_with_deadline(&listener);
-            read_request(&mut stream);
-            drop(stream);
-            let _ = stopped.recv_timeout(Duration::from_secs(2));
-            listener.set_nonblocking(true).unwrap();
-            assert!(listener.accept().is_err(), "ambiguous mutation was retried");
-        });
+        let server = blocking_work
+            .submit_joinable(move || {
+                let (mut stream, _) = accept_with_deadline(&listener);
+                read_request(&mut stream);
+                drop(stream);
+                let _ = stopped.recv_timeout(Duration::from_secs(2));
+                listener.set_nonblocking(true).unwrap();
+                assert!(listener.accept().is_err(), "ambiguous mutation was retried");
+            })
+            .unwrap();
         let result = http_json_budget(
             "POST",
             &format!("http://{address}/spawn"),
@@ -2502,24 +2950,27 @@ pub(crate) mod resource_deadline_tests {
 
     #[test]
     fn retained_resource_post_retries_gateway_timeout() {
+        let (_engine, blocking_work) = test_blocking_work();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            for (status, body) in [
-                ("504 Gateway Timeout", json!({"error": "deadline"})),
-                ("200 OK", json!({"ok": true})),
-            ] {
-                let (mut stream, _) = accept_with_deadline(&listener);
-                read_request(&mut stream);
-                let body = body.to_string();
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
+        let server = blocking_work
+            .submit_joinable(move || {
+                for (status, body) in [
+                    ("504 Gateway Timeout", json!({"error": "deadline"})),
+                    ("200 OK", json!({"ok": true})),
+                ] {
+                    let (mut stream, _) = accept_with_deadline(&listener);
+                    read_request(&mut stream);
+                    let body = body.to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            })
+            .unwrap();
         let result = http_json_budget(
             "POST",
             &format!("http://{address}/api/control/contextual/retained-blobs"),
@@ -2534,10 +2985,12 @@ pub(crate) mod resource_deadline_tests {
         json!({
             "schema_version": 1, "request_id": request, "logical_node_id": 1,
             "generation": 2, "sample_sequence": sequence, "iroh_node_id": "node-1",
-            "artifact_digest": null, "deployment_generation": null, "collection_elapsed_us": 1,
-            "actors": [], "arena": {
+            "artifact_digest": null, "deployment_generation": null,
+            "actors": [],
+            "execution_ownership": {"tasks": 0, "actor_timers": 0, "blocking": 0},
+            "arena": {
                 "live_bytes": live_bytes, "active_leases": 0, "pending_leases": 0,
-                "seq": sequence, "sample_unix_ms": 1, "capacity_bytes": 1024, "free_bytes": 1024-live_bytes,
+                "seq": sequence, "capacity_bytes": 1024, "free_bytes": 1024-live_bytes,
                 "largest_free_range_bytes": 1024-live_bytes, "allocation_failures_total": 0, "release_failures_total": 0,
             },
             "transport": {

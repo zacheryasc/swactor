@@ -1,7 +1,6 @@
 //! Cluster convergence: dashboard, provisioning, and pairwise functional proof.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -14,7 +13,7 @@ use crate::ir::{
 };
 use crate::resources::http_json_budget;
 
-use super::POLL_INTERVAL;
+use super::{POLL_INTERVAL, WorkloadBackend};
 
 impl ClusterHarness {
     pub(super) fn wait_for_dashboard(&mut self) -> Result<(), String> {
@@ -86,6 +85,12 @@ impl ClusterHarness {
     }
 
     pub(super) fn dispatch_provision(&self) -> Result<(), String> {
+        let search_id = if matches!(&self.config.provider, super::HarnessProvider::LocalMock) {
+            let results = crate::remote::decode_offer_results(self.search_offers(json!({}))?)?;
+            Some(results.search_id)
+        } else {
+            self.config.offer_search_id
+        };
         let response = http_json_budget(
             "POST",
             &format!("{}/api/control/provision", self.base_url),
@@ -93,7 +98,7 @@ impl ClusterHarness {
                 "command_id": format!("e2e-provision-{}", self.config.seed),
                 "count": self.config.node_count,
                 "selected_offer_ids": self.config.selected_offer_ids,
-                "search_id": self.config.offer_search_id,
+                "search_id": search_id,
             })),
             &self.operation_budget().child(self.config.deadline),
         )?;
@@ -227,58 +232,61 @@ impl ClusterHarness {
             ));
         }
         let generation = self.next_observation_generation();
-        thread::scope(|scope| {
-            let requests = nodes
-                .iter()
-                .map(|&node| {
-                    let base_url = &self.base_url;
-                    scope.spawn(move || {
-                        let mut attempt = 0_u64;
-                        loop {
-                            budget.check(&format!("contextual health for node {node}"))?;
-                            let request_id =
-                                format!("health-{}-{generation}-{node}-{attempt}", self.config.seed);
-                            let request_budget = budget.child(Duration::from_secs(5));
-                            match http_json_budget(
-                                "GET",
-                                &format!(
-                                    "{base_url}/api/control/contextual/nodes/{node}?control_request_id={request_id}"
-                                ),
-                                None,
-                                &request_budget,
-                            ) {
-                                Ok(response) => {
-                                    return validate_contextual_reply(&response, node, &request_id);
-                                }
-                                Err(error) => {
-                                    attempt = attempt.saturating_add(1);
-                                    budget.wait(
-                                        POLL_INTERVAL,
-                                        &format!(
-                                            "contextual health for node {node}; retry after {error}"
-                                        ),
-                                    )?;
-                                }
-                            }
+        let mut requests = Vec::with_capacity(nodes.len());
+        for &node in nodes {
+            let base_url = self.base_url.clone();
+            let seed = self.config.seed;
+            let budget = budget.clone();
+            let submitted = self.blocking_work()?.submit_joinable(move || {
+                let mut attempt = 0_u64;
+                loop {
+                    budget.check(&format!("contextual health for node {node}"))?;
+                    let request_id = format!("health-{seed}-{generation}-{node}-{attempt}");
+                    let request_budget = budget.child(Duration::from_secs(5));
+                    match http_json_budget(
+                        "GET",
+                        &format!(
+                            "{base_url}/api/control/contextual/nodes/{node}?control_request_id={request_id}"
+                        ),
+                        None,
+                        &request_budget,
+                    ) {
+                        Ok(response) => {
+                            return validate_contextual_reply(&response, node, &request_id);
                         }
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mut responses = Vec::with_capacity(requests.len());
-            let mut errors = Vec::new();
-            for request in requests {
-                match request.join() {
+                        Err(error) => {
+                            attempt = attempt.saturating_add(1);
+                            budget.wait(
+                                POLL_INTERVAL,
+                                &format!(
+                                    "contextual health for node {node}; retry after {error}"
+                                ),
+                            )?;
+                        }
+                    }
+                }
+            });
+            requests.push(submitted);
+        }
+        let mut responses = Vec::with_capacity(requests.len());
+        let mut errors = Vec::new();
+        for request in requests {
+            match request {
+                Ok(request) => match request.join() {
                     Ok(Ok(response)) => responses.push(response),
                     Ok(Err(error)) => errors.push(error),
                     Err(_) => errors.push("contextual readiness collector panicked".to_owned()),
+                },
+                Err(error) => {
+                    errors.push(format!("submit contextual readiness collector: {error}"))
                 }
             }
-            if errors.is_empty() {
-                Ok(responses)
-            } else {
-                Err(errors.join("; "))
-            }
-        })
+        }
+        if errors.is_empty() {
+            Ok(responses)
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// Prove functional communication across every ordered node pair.
@@ -295,7 +303,12 @@ impl ClusterHarness {
             .map_err(|error| format!("system clock precedes epoch: {error}"))?
             .as_millis();
         let case = Self::convergence_case(&self.node_ids, run_nonce)?;
-        self.run_case(&case).map(|_| ())
+        // Fixture readiness is protocol proof, independent of any selected
+        // binding-conformance workload.
+        let selected = std::mem::replace(&mut self.workload_backend, WorkloadBackend::Native);
+        let result = self.run_case(&case).map(|_| ());
+        self.workload_backend = selected;
+        result
     }
 
     pub(crate) fn convergence_case(nodes: &[u64], run_nonce: u128) -> Result<BehaviorCase, String> {

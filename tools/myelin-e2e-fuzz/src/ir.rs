@@ -69,24 +69,6 @@ pub enum DescriptorFinish {
     AbortTwice,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PythonException {
-    BufferError,
-    ValueError,
-    StreamError,
-}
-
-impl PythonException {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::BufferError => "BufferError",
-            Self::ValueError => "ValueError",
-            Self::StreamError => "StreamError",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionOp {
@@ -174,10 +156,6 @@ pub enum ActionOp {
         offset: u64,
         finish: DescriptorFinish,
     },
-    MappingExportClose {
-        path: String,
-        length: u64,
-    },
 }
 
 impl ActionOp {
@@ -197,9 +175,7 @@ impl ActionOp {
             }
             Self::Rename { .. } => ActionClass::Rename,
             Self::Unlink { .. } => ActionClass::Unlink,
-            Self::DescriptorWrite { .. }
-            | Self::DescriptorRead { .. }
-            | Self::MappingExportClose { .. } => ActionClass::Descriptor,
+            Self::DescriptorWrite { .. } | Self::DescriptorRead { .. } => ActionClass::Descriptor,
         }
     }
 
@@ -219,8 +195,7 @@ impl ActionOp {
             | Self::WaitForQuiescent { path }
             | Self::Unlink { path }
             | Self::DescriptorWrite { path, .. }
-            | Self::DescriptorRead { path, .. }
-            | Self::MappingExportClose { path, .. } => path,
+            | Self::DescriptorRead { path, .. } => path,
             Self::Rename { source, .. } => source,
         }
     }
@@ -269,8 +244,7 @@ impl ActionOp {
             Self::ReadBlob { .. }
             | Self::Lookup { .. }
             | Self::AwaitEntry { .. }
-            | Self::WaitForQuiescent { .. }
-            | Self::MappingExportClose { .. } => [None, None],
+            | Self::WaitForQuiescent { .. } => [None, None],
             Self::DescriptorRead { flags, path, .. } => [
                 (matches!(*flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
                     || *flags & (libc::O_CREAT | libc::O_TRUNC) != 0)
@@ -307,8 +281,7 @@ impl ActionOp {
             | Self::WaitForQuiescent { path }
             | Self::Unlink { path }
             | Self::DescriptorWrite { path, .. }
-            | Self::DescriptorRead { path, .. }
-            | Self::MappingExportClose { path, .. } => path,
+            | Self::DescriptorRead { path, .. } => path,
             Self::Rename { source, .. } => source,
         }
     }
@@ -319,7 +292,6 @@ impl ActionOp {
 pub enum ExpectedOutcome {
     Ok,
     Error(i32),
-    Exception(PythonException),
     Linearized {
         group: u32,
         successes: u8,
@@ -331,13 +303,11 @@ pub enum ExpectedOutcome {
 pub struct Action {
     pub operation: ActionOp,
     pub expected: ExpectedOutcome,
-    /// Opaque corpus-authored evidence labels threaded into rendered emits.
+    /// Opaque corpus-authored evidence labels carried by action observations.
     ///
-    /// Codegen never interprets hint semantics; it only forwards the known
-    /// keys ([`EVIDENCE_HINT_TOKEN`], [`EVIDENCE_HINT_LAP`],
-    /// [`EVIDENCE_HINT_EDGE_INDEX`], [`EVIDENCE_HINT_BARRIER`]) into the
-    /// generated Python emit calls so scenarios can label token-ring traffic
-    /// without codegen parsing corpus semantics.
+    /// Executors forward the known keys ([`EVIDENCE_HINT_TOKEN`],
+    /// [`EVIDENCE_HINT_LAP`], [`EVIDENCE_HINT_EDGE_INDEX`],
+    /// [`EVIDENCE_HINT_BARRIER`]) without interpreting scenario semantics.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub evidence_hints: BTreeMap<String, String>,
 }
@@ -355,14 +325,6 @@ impl Action {
         Self {
             operation,
             expected: ExpectedOutcome::Error(errno),
-            evidence_hints: BTreeMap::new(),
-        }
-    }
-
-    pub fn exception(operation: ActionOp, exception: PythonException) -> Self {
-        Self {
-            operation,
-            expected: ExpectedOutcome::Exception(exception),
             evidence_hints: BTreeMap::new(),
         }
     }
@@ -433,19 +395,16 @@ pub enum LaunchFailureKind {
     EmptyCommand,
     MissingExecutable,
     MalformedExecutionIdentity,
-    PythonSyntax,
-    PythonRuntime,
 }
 
-pub const CASE_SCHEMA_VERSION: u32 = 1;
-pub const GENERATOR_VERSION: u32 = 6;
+pub const CASE_SCHEMA_VERSION: u32 = 2;
+pub const GENERATOR_VERSION: u32 = 7;
 
 /// Hard admission cap, including zero-length logical frames.
 pub const MAX_STREAM_FRAMES: usize = 65_536;
 
 // The public data-plane host opens every stream endpoint with this capacity
-// (crates/data-plane/src/host.rs::STREAM_RING_CAPACITY). Python read() also
-// allocates a capacity-sized Rust Vec and copies it into Python bytes.
+// (crates/data-plane/src/host.rs::STREAM_RING_CAPACITY).
 const STREAM_ENDPOINT_CAPACITY: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -565,7 +524,8 @@ pub enum FailureInjection {
     StopProcess {
         process: String,
         phase: ProcessStopPhase,
-        kill_after_ms: Option<u64>,
+        #[serde(default)]
+        force: bool,
     },
     LaunchFailure {
         process: String,
@@ -815,6 +775,29 @@ impl BehaviorCase {
                 }
             }
         }
+        for path in self.routes.iter().flat_map(|route| {
+            route
+                .edges
+                .iter()
+                .map(|edge| &edge.path)
+                .chain(route.join_inputs.iter())
+        }) {
+            if path.starts_with("/cases/") && !self.read_only_fixture_paths.contains(path) {
+                owned.insert(path.clone());
+            }
+        }
+        if let FailureInjection::SlowProcess {
+            parked_path,
+            release_path,
+            ..
+        } = &self.failure
+        {
+            for path in [parked_path, release_path] {
+                if path.starts_with("/cases/") && !self.read_only_fixture_paths.contains(path) {
+                    owned.insert(path.clone());
+                }
+            }
+        }
         owned
     }
 
@@ -936,8 +919,8 @@ impl BehaviorCase {
                     ..
                 } => {
                     let payload = size(bytes.len())?;
-                    // The reservation and Python payload coexist. write()
-                    // copies into Rust; writefrom() and map() borrow the bytes.
+                    // The reservation and input payload coexist. Copying writes
+                    // need an additional buffer; borrowed writes and mappings do not.
                     let copies = 1 + u64::from(*method == DescriptorWriteMethod::Write);
                     (
                         payload,
@@ -968,7 +951,6 @@ impl BehaviorCase {
                     };
                     (length, buffered_allocation(0, length, copies)?, 1)
                 }
-                ActionOp::MappingExportClose { length, .. } => (0, *length, 1),
                 ActionOp::Lookup { .. }
                 | ActionOp::AwaitEntry { .. }
                 | ActionOp::WaitForQuiescent { .. } => (0, 0, 1),
@@ -1595,7 +1577,7 @@ pub enum DescriptorObservation {
         terminal_results: Vec<DescriptorTerminalResult>,
     },
 }
-/// Evidence-hint keys understood by codegen. Values are opaque corpus
+/// Evidence-hint keys understood by executors. Values are opaque corpus
 /// labels; `lap`/`edge_index` values must be decimal `u32` text.
 pub const EVIDENCE_HINT_TOKEN: &str = "token";
 pub const EVIDENCE_HINT_LAP: &str = "lap";
@@ -1607,16 +1589,15 @@ pub const BARRIER_TOKEN_RECEIVED: &str = "token_received";
 pub const BARRIER_TOKEN_FORWARDED: &str = "token_forwarded";
 pub const BARRIER_LAP_COMPLETED: &str = "lap_completed";
 
-/// A causal milestone record emitted by a binding operation that actually
+/// A causal milestone record emitted by a data-plane operation that actually
 /// occurred. Barrier records reuse [`ActionObservation`] with
 /// `outcome == "barrier"`, the owning action's `step`/`action`/`path`, and
 /// the milestone payload in [`ActionObservation::barrier`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BarrierObservation {
-    /// A `write_stream` context was entered or `read_stream` returned a
-    /// reader. `incarnation` is the binding-assigned nonzero namespace
-    /// revision identifying the attached stream, not a pre-open lookup.
+    /// A stream endpoint attached. `incarnation` is the authority-assigned
+    /// nonzero namespace revision identifying that stream, not a pre-open lookup.
     StreamOpened { incarnation: u64 },
     /// One completely sent or decoded logical frame. The observation action
     /// identifies stream_write versus stream_read, including round trips.
@@ -1647,14 +1628,14 @@ pub enum BarrierObservation {
     },
     /// A labeled ring lap completed at this action.
     LapCompleted { token: String, lap: u32 },
-    /// Reserved for harness-side lifecycle evidence (not emitted by codegen).
+    /// Reserved for harness-side lifecycle evidence, not workload emissions.
     ProcessStopped { process: String },
-    /// Reserved for harness-side lifecycle evidence (not emitted by codegen).
+    /// Reserved for harness-side lifecycle evidence, not workload emissions.
     ProcessSpawned { process: String },
-    /// Reserved for harness-side lifecycle evidence (not emitted by codegen).
+    /// Reserved for harness-side lifecycle evidence, not workload emissions.
     FailureObserved { process: String },
     /// A namespace mutation committed: `to_revision` is the revision the
-    /// binding returned; `from_revision` is the pre-mutation lookup revision
+    /// data plane returned; `from_revision` is the pre-mutation lookup revision
     /// when the entry already existed.
     MutationApplied {
         from_revision: Option<u64>,
@@ -1753,14 +1734,20 @@ mod tests {
 
     #[test]
     fn configured_resource_bounds_cannot_raise_hard_case_ceilings() {
-        let mut input = case(ActionOp::MappingExportClose {
-            path: "/models/fixture".to_owned(),
-            length: 64 * 1024 * 1024,
+        let mut input = case(ActionOp::DescriptorWrite {
+            path: "/cases/bounds/blob".to_owned(),
+            flags: libc::O_WRONLY | libc::O_CREAT,
+            length: Some(64 * 1024 * 1024),
+            bytes: Vec::new(),
+            method: DescriptorWriteMethod::Mapping,
+            finish: DescriptorFinish::Abort,
         });
         input.resource_bounds.max_allocation_bytes = u64::MAX;
         input.validate().unwrap();
-        if let ActionOp::MappingExportClose { length, .. } =
-            &mut input.processes[0].actions[0].operation
+        if let ActionOp::DescriptorWrite {
+            length: Some(length),
+            ..
+        } = &mut input.processes[0].actions[0].operation
         {
             *length += 1;
         }
@@ -2029,11 +2016,6 @@ mod tests {
             bytes: vec![],
             method: DescriptorWriteMethod::Write,
             finish: DescriptorFinish::Abort,
-        };
-        assert!(input.validate().is_err());
-        input.processes[0].actions[0].operation = ActionOp::MappingExportClose {
-            path: "/cases/test/blob".to_owned(),
-            length: 1 << 40,
         };
         assert!(input.validate().is_err());
     }
