@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use swactor::runtime::Runtime;
 use swactor_engine::SteppingBackend;
 
@@ -7,11 +5,6 @@ pub(crate) fn drive_steps(backend: &SteppingBackend, count: usize) {
     for _ in 0..count {
         backend.step();
     }
-}
-
-pub(crate) fn advance_and_drive(backend: &SteppingBackend, duration: Duration, count: usize) {
-    backend.advance_time(duration);
-    drive_steps(backend, count);
 }
 
 pub(crate) fn actor_census(runtime: &Runtime) -> String {

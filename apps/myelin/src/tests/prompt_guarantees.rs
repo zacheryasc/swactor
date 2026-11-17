@@ -16,7 +16,6 @@ fn event_terminal_state_is_explicit() {
         request_id: 1,
         final_text: "a".to_owned(),
         tokens_generated: 1,
-        elapsed_ms: 2,
     }));
     assert!(is_terminal(&PromptEvent::Fault {
         request_id: 1,

@@ -1,19 +1,17 @@
 // VastAI provider adapter. Actors own provider lifecycle policy; the
 // swactor-vastai and swactor-process crates own API and process mechanics.
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use provisioning::{
-    PaidAdmissionMode, PaidAdmissionSnapshot, PaidFixtureAdmission, PaidNodeAdmission,
-};
+use parking_lot::Mutex;
+
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
-use swactor_engine::EngineHandle;
+use swactor_engine::{BlockingWorkSender, TaskSpawner};
 use swactor_vastai::{
-    BlockingVastClient, CreateInstanceRequest, LifecyclePolicy, Offer, OfferBrowseCriteria,
-    ProviderInstanceStatus, ProvisionRequest, ProvisionedInstance, SelectionPolicy, VastClient,
-    VastLogStreamEvent, VastTaskCancellation, classify_vastai_error, spawn_instance_status_task,
+    BlockingVastClient, CreateInstanceRequest, Offer, OfferBrowseCriteria, ProviderInstanceStatus,
+    ProvisionedInstance, SelectionPolicy, VastClient, VastLogStreamEvent, classify_vastai_error,
     spawn_log_stream_task,
 };
 use telemetry::TelemetryProducer;
@@ -26,21 +24,45 @@ use super::ssh_bootstrap::{
 use super::ssh_bootstrap::{
     SshBootstrapLauncher as VastAiBootstrapLauncher, SshEndpoint as VastAiSshEndpoint,
 };
-#[cfg(test)]
-use crate::observability::provisioning_logs::BootstrapTelemetryBridge;
 use crate::orchestration::manual_control::{OfferSearchRequest, OfferSearchRequestExt};
+#[cfg(test)]
+use crate::orchestration::provisioning_logs::BootstrapTelemetryBridge;
 use crate::provisioning::{
     AdoptedNode, NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink,
     ProvisionPlugin,
 };
 
+mod ownership;
+pub mod webhooks;
+use ownership::{LeaseJournal, LeaseOwnership};
+use webhooks::{VastAiWebhookSubscription, VastAiWebhooks};
+
+/// A lease request contains no provider pacing policy.
 #[derive(Clone, Debug)]
-pub(crate) struct VastAiProvisioningConfig {
+pub struct ProvisionRequest {
+    pub count: u32,
+    pub image: String,
+    pub label: Option<String>,
+    pub disk_gb: u32,
+    pub env: BTreeMap<String, String>,
+    pub per_instance_env: Vec<BTreeMap<String, String>>,
+    pub preferred_offer_id: Option<u64>,
+    pub onstart: Option<String>,
+    pub selection: SelectionPolicy,
+    pub confirm_lease: bool,
+}
+
+pub type SnapshotObserver =
+    Arc<dyn Fn(u64, Option<ProviderInstanceStatus>) -> Result<bool, String> + Send + Sync>;
+pub type CleanupObserver = Arc<dyn Fn(u64) -> Result<(), String> + Send + Sync>;
+pub type OwnershipRecorder = Arc<dyn Fn(u64, bool) -> Result<bool, String> + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub struct VastAiProvisioningConfig {
     pub label_prefix: String,
     pub disk_gb: u32,
     pub ssh_user: String,
     pub selection: SelectionPolicy,
-    pub lifecycle: LifecyclePolicy,
     pub confirm_lease: bool,
     pub onstart: Option<String>,
     pub ssh_public_key: Option<String>,
@@ -53,7 +75,6 @@ impl Default for VastAiProvisioningConfig {
             disk_gb: 50,
             ssh_user: "root".to_owned(),
             selection: SelectionPolicy::default(),
-            lifecycle: LifecyclePolicy::default(),
             confirm_lease: false,
             onstart: None,
             ssh_public_key: None,
@@ -61,14 +82,32 @@ impl Default for VastAiProvisioningConfig {
     }
 }
 
-pub(crate) struct VastAiProviderMonitor {
+pub struct VastAiProviderMonitor {
     runtime: Runtime,
     actor: ActorAddress,
+    _subscription: Option<VastAiWebhookSubscription>,
+    invalidation_queued: Arc<AtomicBool>,
 }
 
 impl VastAiProviderMonitor {
-    fn new(runtime: Runtime, actor: ActorAddress) -> Self {
-        Self { runtime, actor }
+    fn new(runtime: Runtime, actor: ActorAddress, invalidation_queued: Arc<AtomicBool>) -> Self {
+        Self {
+            runtime,
+            actor,
+            _subscription: None,
+            invalidation_queued,
+        }
+    }
+
+    fn refresh(&self) {
+        if !self.invalidation_queued.swap(true, Ordering::AcqRel)
+            && self
+                .runtime
+                .send_to(self.actor, VastAiProviderMonitorMsg::Poll)
+                .is_err()
+        {
+            self.invalidation_queued.store(false, Ordering::Release);
+        }
     }
 
     fn stop(&mut self) {
@@ -90,7 +129,7 @@ impl Drop for VastAiProviderMonitor {
     }
 }
 
-pub(crate) trait VastAiLeaseClient: Send {
+pub trait VastAiLeaseClient: Send {
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String>;
 
     fn provision_exact(
@@ -104,88 +143,117 @@ pub(crate) trait VastAiLeaseClient: Send {
         ))
     }
 
-    /// The paid path is separate from generic vanished-offer retry policy.
-    fn provision_paid(
+    /// Acquire or recover a lease for one logical node.
+    fn provision_node(
         &mut self,
-        _request: ProvisionRequest,
+        request: ProvisionRequest,
         _spec: &NodeProvisionSpec,
-        _selected_offer_id: Option<u64>,
-        _criteria: Option<OfferBrowseCriteria>,
-    ) -> Result<ProvisionedInstance, String> {
-        Err("VastAI lease client does not implement durable paid admission".to_owned())
+        selected_offer_id: Option<u64>,
+        criteria: Option<OfferBrowseCriteria>,
+    ) -> Result<Option<ProvisionedInstance>, String> {
+        match (selected_offer_id, criteria) {
+            (Some(offer_id), Some(criteria)) => self.provision_exact(request, offer_id, criteria),
+            (None, None) => self.provision_one(request),
+            _ => Err("selected offer and search criteria must be paired".to_owned()),
+        }
+        .map(Some)
     }
 
     /// Resolves the live contract id carrying `label`, if any.
     fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String>;
 
-    fn contract_by_label_with_retry(
-        &mut self,
-        label: &str,
-        attempts: usize,
-        _pace: Duration,
-    ) -> Result<Option<u64>, String> {
-        for _ in 0..attempts.max(1) {
-            let contract = self.contract_by_label(label)?;
-            if contract.is_some() {
-                return Ok(contract);
-            }
-        }
-        Ok(None)
-    }
-
     fn ssh_endpoint(
         &mut self,
         contract_id: u64,
         label: &str,
-        lifecycle: &LifecyclePolicy,
         ssh_user: &str,
-    ) -> Result<VastAiSshEndpoint, String>;
+    ) -> Result<Option<VastAiSshEndpoint>, String>;
     fn spawn_provider_monitor(
         &mut self,
-        _contract_id: u64,
+        _contract_id: Option<u64>,
         _label: String,
-        _lifecycle: LifecyclePolicy,
         _spec: NodeProvisionSpec,
         _sink: PluginSink,
+        _observe_snapshot: SnapshotObserver,
+        _cleanup_completed: CleanupObserver,
     ) -> Option<VastAiProviderMonitor> {
         None
     }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String>;
+
+    fn record_contract(&mut self, _label: &str, _contract_id: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn cancel_ownership(&mut self, _label: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ownership_cancelled(&self, _label: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn ownership_destroyed(&self, _label: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn ensure_event_source(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn record_destroyed_contract(&mut self, _label: &str, _contract_id: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ownership_callbacks(&self, _label: &str) -> (OwnershipRecorder, CleanupObserver) {
+        (Arc::new(|_, cancelled| Ok(cancelled)), Arc::new(|_| Ok(())))
+    }
+
+    fn bootstrap_environment(&self, _label: &str) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
+
+    fn destroy_owned_contract(&mut self, _label: &str, contract_id: u64) -> Result<(), String> {
+        self.destroy_contract(contract_id)
+    }
 }
 
-pub(crate) struct ToolsVastAiLeaseClient {
+pub struct ToolsVastAiLeaseClient {
     client: BlockingVastClient,
     async_client: VastClient,
-    actor_host: Option<(Runtime, EngineHandle)>,
-    paid_admission_path: Option<PathBuf>,
+    actor_host: Option<(Runtime, VastAiTaskPort, Arc<VastAiWebhooks>)>,
+    ownership: Option<Arc<Mutex<LeaseJournal>>>,
 }
 
 impl ToolsVastAiLeaseClient {
-    pub(crate) fn new(client: VastClient) -> Result<Self, String> {
-        let client =
-            client.with_execution_deadline(crate::provisioning::execution_owner_deadline()?);
+    pub fn new(client: VastClient) -> Result<Self, String> {
         Ok(Self {
             client: BlockingVastClient::new(client.clone())?,
             async_client: client,
             actor_host: None,
-            paid_admission_path: configured_paid_admission_path(),
+            ownership: None,
         })
     }
 
-    pub(crate) fn with_actor_host(mut self, runtime: Runtime, engine: EngineHandle) -> Self {
-        self.actor_host = Some((runtime, engine));
+    pub fn with_actor_host(
+        mut self,
+        runtime: Runtime,
+        tasks: VastAiTaskPort,
+        webhooks: Arc<VastAiWebhooks>,
+    ) -> Self {
+        self.ownership = Some(Arc::new(Mutex::new(LeaseJournal::new(
+            webhooks.state_dir(),
+        ))));
+        self.actor_host = Some((runtime, tasks, webhooks));
         self
     }
 
-    pub(crate) fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
+    pub fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
         Self::new(swactor_vastai::VastClient::new(api_key))
     }
 
-    pub(crate) fn browse_offers(
-        &mut self,
-        criteria: &OfferBrowseCriteria,
-    ) -> Result<Vec<Offer>, String> {
+    pub fn browse_offers(&mut self, criteria: &OfferBrowseCriteria) -> Result<Vec<Offer>, String> {
         self.client.browse_offers(criteria)
     }
 
@@ -219,80 +287,388 @@ impl ToolsVastAiLeaseClient {
         &mut self,
         request: &ProvisionRequest,
         offer: &Offer,
-        paid_spec: Option<&NodeProvisionSpec>,
     ) -> Result<ProvisionedInstance, String> {
-        let admission = self
-            .paid_admission_path
-            .as_ref()
-            .map(PaidFixtureAdmission::open)
-            .transpose()?;
-        if let Some(admission) = &admission {
-            let spec = paid_spec.ok_or_else(|| {
-                "paid VastAI create requires run-scoped admission context".to_owned()
-            })?;
-            let snapshot = admission.snapshot()?;
-            let expected = paid_node_for_spec(
-                &snapshot,
-                spec,
-                request.label.as_deref().unwrap_or_default(),
-                Some(offer.id),
-            )?;
-            if offer.host_id != Some(expected.host_id) {
-                return Err("paid VastAI offer host differs from selected topology".to_owned());
-            }
-            admission.reserve_create(
-                spec.run_id,
-                spec.node_id,
-                spec.attempt_id,
-                offer.id,
-                &expected.label,
-            )?;
-        } else if paid_spec.is_some() {
-            return Err("paid VastAI create has no configured admission record".to_owned());
+        self.create_selected_offer(request, offer.id, offer.host_id, Some(offer))
+    }
+
+    fn create_selected_offer(
+        &mut self,
+        request: &ProvisionRequest,
+        offer_id: u64,
+        host_id: Option<u64>,
+        observed_offer: Option<&Offer>,
+    ) -> Result<ProvisionedInstance, String> {
+        let create = Self::create_request_for_offer(request, offer_id);
+        if let (Some(journal), Some(label)) = (&self.ownership, request.label.as_deref()) {
+            journal.lock().reserve_creation(label)?;
         }
-        let create = Self::create_request_for_offer(request, offer.id);
-        let info = self.client.create_instance(&create).map_err(|error| {
-            if error.is_definitive_rejection()
-                && let Some(admission) = &admission
-                && let Err(record_error) = admission.record_create_rejection(
-                    paid_spec
-                        .expect("paid admission context was checked")
-                        .node_id,
-                )
-            {
-                return format!("{error}; record definitive create rejection: {record_error}");
+        let info = match self.client.create_instance(&create) {
+            Ok(info) => info,
+            Err(error) => {
+                if error.is_definitive_rejection()
+                    && let (Some(journal), Some(label)) =
+                        (&self.ownership, request.label.as_deref())
+                {
+                    journal.lock().reject_creation(label)?;
+                }
+                return Err(error.to_string());
             }
-            error.to_string()
-        })?;
-        if let Some(admission) = &admission {
-            admission.record_contract(
-                paid_spec
-                    .expect("paid admission context was checked")
-                    .node_id,
-                info.contract_id,
-            )?;
+        };
+        if let Some(label) = request.label.as_deref() {
+            self.record_contract(label, info.contract_id)?;
         }
+        let (gpu_name, gpu_ram, dph_total) = observed_offer.map_or_else(
+            || ("selected".to_owned(), None, f64::NAN),
+            |offer| (offer.gpu_name.clone(), offer.gpu_ram, offer.dph_total),
+        );
         Ok(ProvisionedInstance {
             index: 0,
             contract_id: info.contract_id,
-            offer_id: offer.id,
-            host_id: offer.host_id,
-            gpu_name: offer.gpu_name.clone(),
-            gpu_ram: offer.gpu_ram,
-            dph_total: offer.dph_total,
+            offer_id,
+            host_id,
+            gpu_name,
+            gpu_ram,
+            dph_total,
         })
     }
 }
 
-const STARTUP_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_LOG_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_LOG_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
 
+/// Actor-facing commands only. Task authority lives in the external owner future.
+#[derive(Clone)]
+pub struct VastAiTaskPort {
+    commands: tokio::sync::mpsc::UnboundedSender<VastAiTaskRequest>,
+}
+
+struct VastAiTaskLease(tokio::sync::watch::Sender<bool>);
+
+impl VastAiTaskLease {
+    fn cancel(self) {
+        let _ = self.0.send(true);
+    }
+}
+
+struct VastAiTaskReply {
+    sender: ExternalSender,
+    actor: ActorAddress,
+    generation: u64,
+    poll: Option<u64>,
+    settled: bool,
+}
+
+impl VastAiTaskReply {
+    fn status(&mut self, result: Result<ProviderInstanceStatus, String>) {
+        self.settled = true;
+        let _ = self.sender.send_to(
+            self.actor,
+            VastAiProviderMonitorMsg::StatusCompleted {
+                generation: self.generation,
+                poll: self.poll.expect("status request carries a poll"),
+                result,
+            },
+        );
+    }
+
+    fn cleanup_completed(&mut self) {
+        self.settled = true;
+        let _ = self.sender.send_to(
+            self.actor,
+            VastAiProviderMonitorMsg::CleanupCompleted {
+                generation: self.generation,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn resolved_status(&mut self, contract_id: u64, status: ProviderInstanceStatus) {
+        let _ = self.sender.send_to(
+            self.actor,
+            VastAiProviderMonitorMsg::ContractResolved {
+                generation: self.generation,
+                contract_id,
+            },
+        );
+        self.status(Ok(status));
+    }
+
+    fn resolution_pending(&mut self) {
+        self.settled = true;
+        let _ = self.sender.send_to(
+            self.actor,
+            VastAiProviderMonitorMsg::ResolutionPending {
+                generation: self.generation,
+            },
+        );
+    }
+
+    fn log(&mut self, event: VastLogStreamEvent) -> bool {
+        let message = match event {
+            VastLogStreamEvent::Chunk(bytes) => VastAiProviderMonitorMsg::LogChunk {
+                generation: self.generation,
+                bytes,
+            },
+            VastLogStreamEvent::Finished {
+                accepted_bytes,
+                truncated,
+                error,
+            } => {
+                self.settled = true;
+                VastAiProviderMonitorMsg::LogFinished {
+                    generation: self.generation,
+                    accepted_bytes,
+                    truncated,
+                    error,
+                }
+            }
+        };
+        self.sender.send_to(self.actor, message).is_ok()
+    }
+}
+
+impl Drop for VastAiTaskReply {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let error = "provider_task_owner_lost".to_owned();
+        if self.poll.is_some() {
+            self.status(Err(error));
+        } else {
+            self.log(VastLogStreamEvent::Finished {
+                accepted_bytes: 0,
+                truncated: false,
+                error: Some(error),
+            });
+        }
+    }
+}
+
+struct VastAiTaskRequest {
+    client: VastClient,
+    contract_id: Option<u64>,
+    label: String,
+    reply: VastAiTaskReply,
+    cancelled: tokio::sync::watch::Receiver<bool>,
+    callbacks: Option<SnapshotCallbacks>,
+}
+
+#[derive(Clone)]
+struct SnapshotCallbacks {
+    observe: SnapshotObserver,
+    cleanup_completed: CleanupObserver,
+}
+
+enum SnapshotOutcome {
+    Pending,
+    Observed(ProviderInstanceStatus),
+    Cleaned,
+}
+
+async fn blocking_provider_work<T: Send + 'static>(
+    blocking: &BlockingWorkSender,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (reply, completion) = tokio::sync::oneshot::channel();
+    blocking
+        .submit(Box::new(move || {
+            let _ = reply.send(work());
+        }))
+        .map_err(|_| "provider blocking owner stopped".to_owned())?;
+    completion
+        .await
+        .map_err(|_| "provider blocking owner lost".to_owned())?
+}
+
+async fn apply_snapshot(
+    blocking: &BlockingWorkSender,
+    client: &VastClient,
+    callbacks: &Option<SnapshotCallbacks>,
+    contract: u64,
+    status: Option<ProviderInstanceStatus>,
+    cancelled: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, String> {
+    let Some(callbacks) = callbacks else {
+        return Ok(true);
+    };
+    let observe = Arc::clone(&callbacks.observe);
+    let continue_running = blocking_provider_work(blocking, move || {
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Err("provider observation cancelled".to_owned());
+        }
+        observe(contract, status)
+    })
+    .await?;
+    if continue_running {
+        return Ok(true);
+    }
+    client.destroy_instance(contract).await?;
+    let completed = Arc::clone(&callbacks.cleanup_completed);
+    blocking_provider_work(blocking, move || completed(contract)).await?;
+    Ok(false)
+}
+
+async fn fetch_provider_snapshot(
+    client: &VastClient,
+    contract_id: u64,
+    label: &str,
+) -> Result<ProviderInstanceStatus, String> {
+    let status = client.instance_status(contract_id).await;
+    if status
+        .as_ref()
+        .is_ok_and(|status| status.ssh_endpoint().is_some())
+    {
+        return status;
+    }
+    let instances = client.list_by_label(label).await?;
+    if let Some(instance) = instances
+        .iter()
+        .find(|instance| instance.contract_id == contract_id)
+    {
+        let host = if instance.ssh_host.trim().is_empty() {
+            instance.public_ipaddr.trim()
+        } else {
+            instance.ssh_host.trim()
+        };
+        if !host.is_empty() && instance.ssh_port != 0 {
+            let mut status = status.unwrap_or_else(|_| ProviderInstanceStatus {
+                actual_status: instance.actual_status.clone(),
+                intended_status: String::new(),
+                status_msg: None,
+                public_ipaddr: None,
+                ssh_port: None,
+                disk_usage: None,
+            });
+            status.public_ipaddr = Some(host.to_owned());
+            status.ssh_port = Some(instance.ssh_port);
+            return Ok(status);
+        }
+    }
+    status
+}
+
+impl VastAiTaskPort {
+    pub fn new(tasks: &TaskSpawner, blocking: BlockingWorkSender) -> Self {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel::<VastAiTaskRequest>();
+        let owner_tasks = tasks.clone();
+        tasks.spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let VastAiTaskRequest { client, contract_id, label, mut reply, mut cancelled, callbacks } = request;
+                if *cancelled.borrow() || cancelled.has_changed().is_err() { continue; }
+                if reply.poll.is_some() {
+                    let blocking = blocking.clone();
+                    owner_tasks.spawn(async move {
+                        let resolution_sender = reply.sender.clone();
+                        let resolution_actor = reply.actor;
+                        let resolution_generation = reply.generation;
+                        let cancellation = cancelled.clone();
+                        let snapshot = async {
+                            let contract = match contract_id {
+                                Some(contract) => contract,
+                                None => {
+                                    let instances = client.list_by_label(&label).await?;
+                                    match instances.as_slice() {
+                                        [] => return Ok(SnapshotOutcome::Pending),
+                                        [instance] => {
+                                            let contract_id = instance.contract_id;
+                                            let _ = resolution_sender.send_to(resolution_actor,
+                                                VastAiProviderMonitorMsg::ContractResolved {
+                                                    generation: resolution_generation, contract_id,
+                                                });
+                                            contract_id
+                                        }
+                                        _ => return Err(format!("multiple VastAI contracts share stable label {label}")),
+                                    }
+                                }
+                            };
+                            if !apply_snapshot(&blocking, &client, &callbacks, contract, None, cancellation.clone()).await? {
+                                return Ok(SnapshotOutcome::Cleaned);
+                            }
+                            let status = fetch_provider_snapshot(&client, contract, &label).await?;
+                            if !apply_snapshot(&blocking, &client, &callbacks, contract, Some(status.clone()), cancellation).await? {
+                                return Ok(SnapshotOutcome::Cleaned);
+                            }
+                            Ok(SnapshotOutcome::Observed(status))
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = cancelled.changed() => {}
+                            result = snapshot => match result {
+                                Ok(SnapshotOutcome::Observed(status)) => reply.status(Ok(status)),
+                                Ok(SnapshotOutcome::Pending) => reply.resolution_pending(),
+                                Ok(SnapshotOutcome::Cleaned) => reply.cleanup_completed(),
+                                Err(error) => reply.status(Err(error)),
+                            },
+                        }
+                    });
+                } else {
+                    let cancel = spawn_log_stream_task(
+                        &owner_tasks, client,
+                        contract_id.expect("log requests require a resolved contract"),
+                        MAX_LOG_RESPONSE_BYTES, MAX_LOG_MESSAGE_BYTES,
+                        move |event| reply.log(event),
+                    );
+                    owner_tasks.spawn(async move {
+                        let _ = cancelled.changed().await;
+                        cancel.cancel();
+                    });
+                }
+            }
+        });
+        Self { commands }
+    }
+
+    fn submit(
+        &self,
+        client: VastClient,
+        contract_id: Option<u64>,
+        label: String,
+        reply: VastAiTaskReply,
+        callbacks: Option<SnapshotCallbacks>,
+    ) -> VastAiTaskLease {
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        // A rejected or abandoned request resolves through its reply's Drop.
+        let _ = self.commands.send(VastAiTaskRequest {
+            client,
+            contract_id,
+            label,
+            reply,
+            cancelled,
+            callbacks,
+        });
+        VastAiTaskLease(cancel)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderMonitorPhase {
+    Ready,
+    Polling,
+    Closed,
+    Failed,
+}
+
+impl ProviderMonitorPhase {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Closed | Self::Failed)
+    }
+}
 #[derive(Clone)]
 enum VastAiProviderMonitorMsg {
     StopLogs,
     Poll,
+    ContractResolved {
+        generation: u64,
+        contract_id: u64,
+    },
+    ResolutionPending {
+        generation: u64,
+    },
+    CleanupCompleted {
+        generation: u64,
+    },
     StatusCompleted {
         generation: u64,
         poll: u64,
@@ -313,16 +689,19 @@ enum VastAiProviderMonitorMsg {
 
 struct VastAiProviderMonitorActor {
     client: VastClient,
-    contract_id: u64,
+    contract_id: Option<u64>,
     label: String,
-    lifecycle: LifecyclePolicy,
     spec: NodeProvisionSpec,
     sink: PluginSink,
     sender: ExternalSender,
-    engine: EngineHandle,
-    last_state: Option<String>,
+    tasks: VastAiTaskPort,
+    observe_snapshot: Option<SnapshotObserver>,
+    cleanup_completed: Option<CleanupObserver>,
+    invalidation_queued: Arc<AtomicBool>,
+    dirty: bool,
+    log_dirty: bool,
+
     last_reported_status: Option<(String, Option<String>)>,
-    state_since: Instant,
     log_enabled: bool,
     last_log_snapshot: Vec<u8>,
     current_log_snapshot: Vec<u8>,
@@ -332,23 +711,26 @@ struct VastAiProviderMonitorActor {
     poll: u64,
     generation: u64,
     status_generation: Option<u64>,
-    status_cancel: Option<VastTaskCancellation>,
+    status_cancel: Option<VastAiTaskLease>,
     log_generation: Option<u64>,
-    log_cancel: Option<VastTaskCancellation>,
+    log_cancel: Option<VastAiTaskLease>,
     #[cfg(test)]
     scripted_status: Option<Result<ProviderInstanceStatus, String>>,
-    stopped: bool,
+    phase: ProviderMonitorPhase,
 }
 
 struct VastAiProviderMonitorConfig {
     client: VastClient,
-    contract_id: u64,
+    contract_id: Option<u64>,
     label: String,
-    lifecycle: LifecyclePolicy,
     spec: NodeProvisionSpec,
     sink: PluginSink,
     sender: ExternalSender,
-    engine: EngineHandle,
+    tasks: VastAiTaskPort,
+    observe_snapshot: Option<SnapshotObserver>,
+    cleanup_completed: Option<CleanupObserver>,
+    invalidation_queued: Arc<AtomicBool>,
+
     #[cfg(test)]
     scripted_status: Option<Result<ProviderInstanceStatus, String>>,
 }
@@ -359,11 +741,14 @@ impl VastAiProviderMonitorActor {
             client,
             contract_id,
             label,
-            lifecycle,
             spec,
             sink,
             sender,
-            engine,
+            tasks,
+            observe_snapshot,
+            cleanup_completed,
+            invalidation_queued,
+
             #[cfg(test)]
             scripted_status,
         } = config;
@@ -371,14 +756,17 @@ impl VastAiProviderMonitorActor {
             client,
             contract_id,
             label,
-            lifecycle,
             spec,
             sink,
             sender,
-            engine,
-            last_state: None,
+            tasks,
+            observe_snapshot,
+            cleanup_completed,
+            invalidation_queued,
+            dirty: false,
+            log_dirty: false,
+
             last_reported_status: None,
-            state_since: Instant::now(),
             log_enabled: false,
             last_log_snapshot: Vec::new(),
             current_log_snapshot: Vec::new(),
@@ -393,8 +781,24 @@ impl VastAiProviderMonitorActor {
             log_cancel: None,
             #[cfg(test)]
             scripted_status,
-            stopped: false,
+            phase: ProviderMonitorPhase::Ready,
         }
+    }
+
+    fn enter_phase(&mut self, next: ProviderMonitorPhase) {
+        self.phase = next;
+    }
+
+    fn finish(&mut self, ctx: &Ctx, next: ProviderMonitorPhase, failure: Option<String>) {
+        if self.phase.terminal() {
+            return;
+        }
+        if let Some(failure) = failure {
+            self.observe_failed(failure);
+        }
+        self.phase = next;
+        self.cancel_tasks();
+        ctx.stop_self();
     }
 
     fn with_remote_logs(mut self) -> Self {
@@ -423,22 +827,26 @@ impl VastAiProviderMonitorActor {
         self.generation
     }
 
-    fn schedule_next_poll(&self, ctx: &Ctx, running: bool) {
-        let delay = if running {
-            self.lifecycle.poll_interval
+    fn invalidate(&mut self, ctx: &Ctx) {
+        if self.phase.terminal() {
+            return;
+        }
+        if self.status_generation.is_some() {
+            self.dirty = true;
         } else {
-            STARTUP_STATUS_POLL_INTERVAL
-        };
-        self.engine.send_after(
-            delay,
-            self.sender.clone(),
-            ctx.self_addr(),
-            VastAiProviderMonitorMsg::Poll,
-        );
+            self.poll_provider(ctx);
+        }
+    }
+
+    fn reconcile_dirty(&mut self, ctx: &Ctx) {
+        self.enter_phase(ProviderMonitorPhase::Ready);
+        if std::mem::take(&mut self.dirty) {
+            self.poll_provider(ctx);
+        }
     }
 
     fn poll_provider(&mut self, ctx: &Ctx) {
-        if self.stopped || self.status_generation.is_some() {
+        if self.phase.terminal() || self.status_generation.is_some() {
             return;
         }
         self.poll = self.poll.saturating_add(1);
@@ -447,6 +855,7 @@ impl VastAiProviderMonitorActor {
         let sender = self.sender.clone();
         let actor = ctx.self_addr();
         self.status_generation = Some(generation);
+        self.enter_phase(ProviderMonitorPhase::Polling);
         #[cfg(test)]
         if let Some(result) = self.scripted_status.clone() {
             let _ = sender.send_to(
@@ -459,25 +868,35 @@ impl VastAiProviderMonitorActor {
             );
             return;
         }
-        self.status_cancel = Some(spawn_instance_status_task(
-            &self.engine,
-            self.client.clone(),
-            self.contract_id,
-            move |result| {
-                let _ = sender.send_to(
+        self.status_cancel = Some(
+            self.tasks.submit(
+                self.client.clone(),
+                self.contract_id,
+                self.label.clone(),
+                VastAiTaskReply {
+                    sender,
                     actor,
-                    VastAiProviderMonitorMsg::StatusCompleted {
-                        generation,
-                        poll,
-                        result,
-                    },
-                );
-            },
-        ));
+                    generation,
+                    poll: Some(poll),
+                    settled: false,
+                },
+                self.observe_snapshot
+                    .as_ref()
+                    .zip(self.cleanup_completed.as_ref())
+                    .map(|(observe, cleanup)| SnapshotCallbacks {
+                        observe: Arc::clone(observe),
+                        cleanup_completed: Arc::clone(cleanup),
+                    }),
+            ),
+        );
     }
 
     fn start_log_stream(&mut self, ctx: &Ctx) {
-        if self.stopped || !self.log_enabled || self.log_generation.is_some() {
+        if self.phase.terminal() || !self.log_enabled {
+            return;
+        }
+        if self.log_generation.is_some() {
+            self.log_dirty = true;
             return;
         }
         let generation = self.next_generation();
@@ -488,30 +907,18 @@ impl VastAiProviderMonitorActor {
         self.log_emit_cursor = self.last_log_snapshot.len();
         self.log_prefix_matches = true;
         self.log_line_buffer.clear();
-        self.log_cancel = Some(spawn_log_stream_task(
-            &self.engine,
+        self.log_cancel = Some(self.tasks.submit(
             self.client.clone(),
             self.contract_id,
-            MAX_LOG_RESPONSE_BYTES,
-            MAX_LOG_MESSAGE_BYTES,
-            move |event| {
-                let message = match event {
-                    VastLogStreamEvent::Chunk(bytes) => {
-                        VastAiProviderMonitorMsg::LogChunk { generation, bytes }
-                    }
-                    VastLogStreamEvent::Finished {
-                        accepted_bytes,
-                        truncated,
-                        error,
-                    } => VastAiProviderMonitorMsg::LogFinished {
-                        generation,
-                        accepted_bytes,
-                        truncated,
-                        error,
-                    },
-                };
-                sender.send_to(actor, message).is_ok()
+            self.label.clone(),
+            VastAiTaskReply {
+                sender,
+                actor,
+                generation,
+                poll: None,
+                settled: false,
             },
+            None,
         ));
     }
 
@@ -572,6 +979,7 @@ impl VastAiProviderMonitorActor {
 
     fn handle_log_finished(
         &mut self,
+        ctx: &Ctx,
         generation: u64,
         accepted_bytes: usize,
         truncated: bool,
@@ -614,6 +1022,9 @@ impl VastAiProviderMonitorActor {
                 .to_string(),
             );
         }
+        if std::mem::take(&mut self.log_dirty) {
+            self.start_log_stream(ctx);
+        }
     }
 
     fn handle_status_completed(
@@ -623,7 +1034,7 @@ impl VastAiProviderMonitorActor {
         poll: u64,
         result: Result<ProviderInstanceStatus, String>,
     ) {
-        if self.status_generation != Some(generation) || self.stopped {
+        if self.status_generation != Some(generation) || self.phase.terminal() {
             return;
         }
         self.status_generation = None;
@@ -632,10 +1043,11 @@ impl VastAiProviderMonitorActor {
             Ok(status) => status,
             Err(error)
                 if error.contains("not found while fetching provider status")
-                    || error.contains("parse failed") =>
+                    || error.contains("parse failed")
+                    || error == "provider_task_owner_lost" =>
             {
                 let reason = classified_start_error(format!(
-                    "vastai provider monitor node {} contract {}: {error}",
+                    "vastai provider monitor node {} contract {:?}: {error}",
                     self.spec.node_id, self.contract_id
                 ));
                 self.observe_provider_line(
@@ -650,9 +1062,7 @@ impl VastAiProviderMonitorActor {
                     })
                     .to_string(),
                 );
-                self.observe_failed(reason);
-                self.cancel_tasks();
-                ctx.stop_self();
+                self.finish(ctx, ProviderMonitorPhase::Failed, Some(reason));
                 return;
             }
             Err(error) => {
@@ -668,16 +1078,12 @@ impl VastAiProviderMonitorActor {
                     })
                     .to_string(),
                 );
-                self.schedule_next_poll(ctx, false);
+                self.reconcile_dirty(ctx);
                 return;
             }
         };
 
         let actual = status.actual_status.as_str();
-        if self.last_state.as_deref() != Some(actual) {
-            self.state_since = Instant::now();
-            self.last_state = Some(actual.to_owned());
-        }
         let reported = (status.actual_status.clone(), status.status_msg.clone());
         if self.last_reported_status.as_ref() != Some(&reported) {
             let detail = status
@@ -689,7 +1095,6 @@ impl VastAiProviderMonitorActor {
             self.observe_provider_line(format!("Vast.ai {actual}{detail}"));
             self.last_reported_status = Some(reported);
         }
-        let in_state_ms = self.state_since.elapsed().as_millis();
         self.observe_provider_line(
             serde_json::json!({
                 "type": "VastAiProviderStatusObserved",
@@ -702,13 +1107,20 @@ impl VastAiProviderMonitorActor {
                 "intended_status": &status.intended_status,
                 "status_msg": &status.status_msg,
                 "disk_usage": status.disk_usage,
-                "in_state_ms": in_state_ms,
             })
             .to_string(),
         );
 
+        let Some(contract_id) = self.contract_id else {
+            self.finish(
+                ctx,
+                ProviderMonitorPhase::Failed,
+                Some("provider status has no resolved ownership".to_owned()),
+            );
+            return;
+        };
         if let Some(error) = provider_terminal_start_error(
-            self.contract_id,
+            contract_id,
             &status.actual_status,
             &status.intended_status,
             status.status_msg.as_deref(),
@@ -728,9 +1140,7 @@ impl VastAiProviderMonitorActor {
                 })
                 .to_string(),
             );
-            self.observe_failed(reason);
-            self.cancel_tasks();
-            ctx.stop_self();
+            self.finish(ctx, ProviderMonitorPhase::Failed, Some(reason));
             return;
         }
 
@@ -738,11 +1148,12 @@ impl VastAiProviderMonitorActor {
         if running {
             self.start_log_stream(ctx);
         }
-        self.schedule_next_poll(ctx, running);
+        self.reconcile_dirty(ctx);
     }
 
     fn stop_logs(&mut self) {
         self.log_enabled = false;
+        self.log_dirty = false;
         if let Some(cancel) = self.log_cancel.take() {
             cancel.cancel();
         }
@@ -757,6 +1168,8 @@ impl VastAiProviderMonitorActor {
             cancel.cancel();
         }
         self.status_generation = None;
+        self.dirty = false;
+        self.invalidation_queued.store(false, Ordering::Release);
         self.stop_logs();
     }
 }
@@ -766,12 +1179,46 @@ impl ActorInterface for VastAiProviderMonitorActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        let _ = ctx.send(ctx.self_addr(), VastAiProviderMonitorMsg::Poll);
+        self.invalidate(ctx);
     }
 
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
         match msg {
-            VastAiProviderMonitorMsg::Poll => self.poll_provider(ctx),
+            VastAiProviderMonitorMsg::Poll => {
+                self.invalidation_queued.store(false, Ordering::Release);
+                self.invalidate(ctx);
+            }
+            VastAiProviderMonitorMsg::ContractResolved {
+                generation,
+                contract_id,
+            } => {
+                if self.status_generation == Some(generation) && !self.phase.terminal() {
+                    if self.contract_id.is_some_and(|known| known != contract_id) {
+                        self.finish(
+                            ctx,
+                            ProviderMonitorPhase::Failed,
+                            Some("provider contract changed within one attempt".to_owned()),
+                        );
+                    } else {
+                        self.contract_id = Some(contract_id);
+                    }
+                }
+            }
+            VastAiProviderMonitorMsg::CleanupCompleted { generation } => {
+                if self.status_generation == Some(generation) && !self.phase.terminal() {
+                    self.finish(ctx, ProviderMonitorPhase::Closed, None);
+                }
+            }
+            VastAiProviderMonitorMsg::ResolutionPending { generation } => {
+                if self.status_generation == Some(generation) && !self.phase.terminal() {
+                    self.status_generation = None;
+                    self.status_cancel = None;
+                    self.observe_provider_line(
+                        "VastAI contract resolution pending; awaiting provider notification",
+                    );
+                    self.reconcile_dirty(ctx);
+                }
+            }
             VastAiProviderMonitorMsg::StatusCompleted {
                 generation,
                 poll,
@@ -785,14 +1232,19 @@ impl ActorInterface for VastAiProviderMonitorActor {
                 accepted_bytes,
                 truncated,
                 error,
-            } => self.handle_log_finished(generation, accepted_bytes, truncated, error),
+            } => self.handle_log_finished(ctx, generation, accepted_bytes, truncated, error),
             VastAiProviderMonitorMsg::StopLogs => self.stop_logs(),
-            VastAiProviderMonitorMsg::Stop => {
-                self.stopped = true;
-                self.cancel_tasks();
-                ctx.stop_self();
-            }
+            VastAiProviderMonitorMsg::Stop => self.finish(ctx, ProviderMonitorPhase::Closed, None),
         }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx) {
+        self.finish(
+            ctx,
+            ProviderMonitorPhase::Failed,
+            Some("provider_monitor_parent_stopped".to_owned()),
+        );
+        self.cancel_tasks();
     }
 }
 
@@ -802,7 +1254,7 @@ impl Clone for ToolsVastAiLeaseClient {
             client: self.client.clone(),
             async_client: self.async_client.clone(),
             actor_host: self.actor_host.clone(),
-            paid_admission_path: self.paid_admission_path.clone(),
+            ownership: self.ownership.clone(),
         }
     }
 }
@@ -819,52 +1271,201 @@ fn adopted_instance(contract_id: u64) -> ProvisionedInstance {
     }
 }
 
+fn record_owned_contract(
+    journal: &LeaseJournal,
+    label: &str,
+    contract: u64,
+    cancel: bool,
+) -> Result<bool, String> {
+    let _transaction = journal.acquire_lock()?;
+    let mut record = journal.load(label)?.unwrap_or(LeaseOwnership {
+        label: label.to_owned(),
+        contract_id: None,
+        cancelled: false,
+        destroyed: false,
+    });
+    if contract == 0
+        || record.contract_id.is_some_and(|known| known != contract)
+        || (record.destroyed && record.contract_id != Some(contract))
+    {
+        return Err(format!(
+            "VastAI contract identity conflicts with durable ownership for {label}"
+        ));
+    }
+    if record.contract_id != Some(contract) || (cancel && !record.cancelled) {
+        record.contract_id = Some(contract);
+        record.cancelled |= cancel;
+        journal.store(&record)?;
+    }
+    Ok(record.cancelled)
+}
+
+fn commit_owned_cleanup(
+    journal: Option<&Mutex<LeaseJournal>>,
+    webhooks: Option<&VastAiWebhooks>,
+    label: &str,
+    contract: u64,
+) -> Result<(), String> {
+    if let Some(journal) = journal {
+        let journal = journal.lock();
+        let _transaction = journal.acquire_lock()?;
+        let mut record = journal
+            .load(label)?
+            .ok_or("cleanup completion has no durable ownership")?;
+        if record.contract_id.is_some_and(|known| known != contract) {
+            return Err("cleanup completion conflicts with durable contract identity".to_owned());
+        }
+        record.contract_id = Some(contract);
+        record.cancelled = true;
+        record.destroyed = true;
+        journal.store(&record)?;
+    }
+    if let Some(webhooks) = webhooks {
+        webhooks.revoke_bootstrap(label)?;
+    }
+    Ok(())
+}
+
 impl VastAiLeaseClient for ToolsVastAiLeaseClient {
-    fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String> {
-        let instances = if let Some(path) = &self.paid_admission_path {
-            let snapshot = PaidFixtureAdmission::open(path)?.snapshot()?;
-            let census = self.client.owned_census(
-                &snapshot.cleanup_labels(),
-                &snapshot.known_contract_ids(),
-                Instant::now(),
-                VastClient::REQUEST_TIMEOUT * 4 + Duration::from_secs(180),
-            )?;
-            census
-                .instances
-                .into_iter()
-                .filter(|instance| {
-                    census
-                        .contract_labels
-                        .get(&instance.contract_id)
-                        .is_some_and(|owned| owned == label)
-                })
-                .collect()
-        } else {
-            self.client.list_by_label(label)?
+    fn provision_node(
+        &mut self,
+        request: ProvisionRequest,
+        _spec: &NodeProvisionSpec,
+        selected_offer_id: Option<u64>,
+        criteria: Option<OfferBrowseCriteria>,
+    ) -> Result<Option<ProvisionedInstance>, String> {
+        let label = request.label.clone();
+        let result = match (selected_offer_id, criteria) {
+            (Some(offer), Some(criteria)) => self.provision_exact(request, offer, criteria),
+            (None, None) => self.provision_one(request),
+            _ => return Err("selected offer and search criteria must be paired".to_owned()),
         };
-        match instances.as_slice() {
-            [] => Ok(None),
-            [instance] => Ok(Some(instance.contract_id)),
-            _ => Err(format!(
-                "multiple VastAI contracts share stable label {label}: {}",
-                instances
-                    .iter()
-                    .map(|instance| instance.contract_id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
+        match result {
+            Ok(instance) => Ok(Some(instance)),
+            Err(error) => {
+                if let (Some(journal), Some(label)) = (&self.ownership, label)
+                    && journal
+                        .lock()
+                        .load(&label)?
+                        .is_some_and(|record| !record.destroyed)
+                {
+                    return Ok(None);
+                }
+                Err(error)
+            }
         }
     }
 
-    fn contract_by_label_with_retry(
-        &mut self,
-        label: &str,
-        attempts: usize,
-        pace: Duration,
-    ) -> Result<Option<u64>, String> {
-        let instances = self
-            .client
-            .list_by_label_with_retry(label, attempts, pace)?;
+    fn record_contract(&mut self, label: &str, contract_id: u64) -> Result<(), String> {
+        if let Some(journal) = &self.ownership {
+            record_owned_contract(&journal.lock(), label, contract_id, false)?;
+        }
+        Ok(())
+    }
+
+    fn ownership_callbacks(&self, label: &str) -> (OwnershipRecorder, CleanupObserver) {
+        let journal = self.ownership.clone();
+        let record_label = label.to_owned();
+        let recorder: OwnershipRecorder = Arc::new(move |contract, cancelled| {
+            journal.as_ref().map_or(Ok(cancelled), |journal| {
+                record_owned_contract(&journal.lock(), &record_label, contract, cancelled)
+            })
+        });
+        let journal = self.ownership.clone();
+        let webhooks = self
+            .actor_host
+            .as_ref()
+            .map(|(_, _, webhooks)| Arc::clone(webhooks));
+        let label = label.to_owned();
+        let completed: CleanupObserver = Arc::new(move |contract| {
+            commit_owned_cleanup(journal.as_deref(), webhooks.as_deref(), &label, contract)
+        });
+        (recorder, completed)
+    }
+
+    fn record_destroyed_contract(&mut self, label: &str, contract: u64) -> Result<(), String> {
+        commit_owned_cleanup(
+            self.ownership.as_deref(),
+            self.actor_host
+                .as_ref()
+                .map(|(_, _, webhooks)| webhooks.as_ref()),
+            label,
+            contract,
+        )
+    }
+
+    fn cancel_ownership(&mut self, label: &str) -> Result<(), String> {
+        if let Some(journal) = &self.ownership {
+            let journal = journal.lock();
+            let _transaction = journal.acquire_lock()?;
+            let mut record = journal.load(label)?.unwrap_or(LeaseOwnership {
+                label: label.to_owned(),
+                contract_id: None,
+                cancelled: false,
+                destroyed: false,
+            });
+            record.cancelled = true;
+            journal.store(&record)?;
+        }
+        Ok(())
+    }
+    fn ownership_cancelled(&self, label: &str) -> Result<bool, String> {
+        self.ownership.as_ref().map_or(Ok(false), |journal| {
+            journal
+                .lock()
+                .load(label)
+                .map(|record| record.is_some_and(|record| record.cancelled))
+        })
+    }
+
+    fn ownership_destroyed(&self, label: &str) -> Result<bool, String> {
+        self.ownership.as_ref().map_or(Ok(false), |journal| {
+            journal
+                .lock()
+                .load(label)
+                .map(|record| record.is_some_and(|record| record.destroyed))
+        })
+    }
+
+    fn ensure_event_source(&self) -> Result<(), String> {
+        self.actor_host
+            .as_ref()
+            .map(|_| ())
+            .ok_or_else(|| "VastAI lifecycle requires a configured webhook event source".to_owned())
+    }
+
+    fn bootstrap_environment(&self, label: &str) -> Result<Vec<(String, String)>, String> {
+        self.actor_host.as_ref().map_or_else(
+            || Err("VastAI lifecycle requires a configured webhook event source".to_owned()),
+            |(_, _, webhooks)| webhooks.bootstrap_environment(label),
+        )
+    }
+
+    fn destroy_owned_contract(&mut self, label: &str, contract_id: u64) -> Result<(), String> {
+        self.cancel_ownership(label)?;
+        let already_destroyed = if let Some(journal) = &self.ownership {
+            journal
+                .lock()
+                .load(label)?
+                .is_some_and(|record| record.destroyed && record.contract_id == Some(contract_id))
+        } else {
+            false
+        };
+        if !already_destroyed {
+            self.destroy_contract(contract_id)?;
+        }
+        self.record_destroyed_contract(label, contract_id)
+    }
+
+    fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String> {
+        if let Some(journal) = &self.ownership
+            && let Some(record) = journal.lock().load(label)?
+        {
+            if record.destroyed || record.contract_id.is_some() {
+                return Ok(record.contract_id);
+            }
+        }
+        let instances = self.client.list_by_label(label)?;
         match instances.as_slice() {
             [] => Ok(None),
             [instance] => Ok(Some(instance.contract_id)),
@@ -880,11 +1481,6 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
     }
 
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String> {
-        if self.paid_admission_path.is_some() {
-            return Err(
-                "paid VastAI provisioning cannot use generic acquisition or retries".to_owned(),
-            );
-        }
         if request.count != 1 {
             return Err(format!(
                 "vastai provision_one expected count=1, got {}",
@@ -916,7 +1512,7 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
             }) {
                 continue;
             }
-            match self.create_from_offer(&request, &offer, None) {
+            match self.create_from_offer(&request, &offer) {
                 Ok(instance) => return Ok(instance),
                 Err(error) => {
                     if let Some(label) = request.label.as_deref()
@@ -951,11 +1547,6 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         offer_id: u64,
         criteria: OfferBrowseCriteria,
     ) -> Result<ProvisionedInstance, String> {
-        if self.paid_admission_path.is_some() {
-            return Err(
-                "paid VastAI provisioning requires run-scoped admission context".to_owned(),
-            );
-        }
         if request.count != 1 {
             return Err(format!(
                 "vastai provision_exact expected count=1, got {}",
@@ -977,7 +1568,7 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
                     "selected offer {offer_id} is no longer available; refresh offers and select again"
                 )
             })?;
-        match self.create_from_offer(&request, &offer, None) {
+        match self.create_from_offer(&request, &offer) {
             Ok(instance) => Ok(instance),
             Err(error) => {
                 if let Some(label) = request.label.as_deref()
@@ -990,148 +1581,114 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         }
     }
 
-    fn provision_paid(
-        &mut self,
-        request: ProvisionRequest,
-        spec: &NodeProvisionSpec,
-        selected_offer_id: Option<u64>,
-        criteria: Option<OfferBrowseCriteria>,
-    ) -> Result<ProvisionedInstance, String> {
-        if request.count != 1 {
-            return Err("paid VastAI provisioning requires exactly one logical node".to_owned());
-        }
-        let path = self.paid_admission_path.as_ref().ok_or_else(|| {
-            "paid VastAI provisioning has no configured admission record".to_owned()
-        })?;
-        let admission = PaidFixtureAdmission::open(path)?;
-        let snapshot = admission.snapshot()?;
-        let label = request.label.as_deref().unwrap_or_default();
-        let expected = paid_node_for_spec(&snapshot, spec, label, selected_offer_id)?;
-        if snapshot.mode == PaidAdmissionMode::CleanupOnly {
-            return Err("paid VastAI fixture is cleanup-only".to_owned());
-        }
-        let existing = self.contract_by_label(label)?;
-        if let Some(&contract_id) = snapshot.contracts.get(&spec.node_id) {
-            if existing != Some(contract_id) {
-                return Err("paid VastAI retained contract disappeared or changed".to_owned());
-            }
-            return Ok(ProvisionedInstance {
-                offer_id: expected.offer_id,
-                host_id: Some(expected.host_id),
-                ..adopted_instance(contract_id)
-            });
-        }
-        if snapshot.create_reservations.contains_key(&spec.node_id) {
-            if let Some(contract_id) = existing {
-                admission.record_contract(spec.node_id, contract_id)?;
-            }
-            return Err(
-                "paid VastAI create slot was already consumed; cleanup is required".to_owned(),
-            );
-        }
-        if existing.is_some() {
-            return Err("paid VastAI label exists without a create reservation".to_owned());
-        }
-        let criteria = criteria
-            .filter(|_| selected_offer_id == Some(expected.offer_id))
-            .ok_or_else(|| {
-                "paid VastAI acquisition requires the exact selected offer and criteria".to_owned()
-            })?;
-        let offer = self
-            .client
-            .browse_offers(&criteria)?
-            .into_iter()
-            .find(|offer| offer.id == expected.offer_id)
-            .ok_or_else(|| {
-                format!(
-                    "selected paid offer {} is no longer available",
-                    expected.offer_id
-                )
-            })?;
-        match self.create_from_offer(&request, &offer, Some(spec)) {
-            Ok(instance) => Ok(instance),
-            Err(error) => {
-                // Discovery only: an ambiguous create never becomes a retry or
-                // a successful preparation. Preserve any discovered exact id
-                // for the independent cleanup owner before returning failure.
-                if admission
-                    .snapshot()?
-                    .create_reservations
-                    .contains_key(&spec.node_id)
-                    && let Some(contract_id) = self.contract_by_label(label)?
-                {
-                    admission.record_contract(spec.node_id, contract_id)?;
-                }
-                Err(error)
-            }
-        }
-    }
-
     fn ssh_endpoint(
         &mut self,
         contract_id: u64,
         label: &str,
-        lifecycle: &LifecyclePolicy,
         ssh_user: &str,
-    ) -> Result<VastAiSshEndpoint, String> {
-        let labels = self
-            .paid_admission_path
-            .as_ref()
-            .map(PaidFixtureAdmission::open)
-            .transpose()?
-            .map(|admission| {
-                admission
-                    .snapshot()
-                    .map(|snapshot| snapshot.cleanup_labels())
-            })
-            .transpose()?
-            .unwrap_or_else(|| BTreeSet::from([label.to_owned()]));
-        let endpoint = self
-            .client
-            .wait_for_ssh_endpoint(contract_id, &labels, lifecycle)?;
-        let host = endpoint.ip;
-        let port = endpoint.port;
-        if host.is_empty() || host == "unknown" {
-            return Err(format!("vastai contract {contract_id} has no SSH host"));
+    ) -> Result<Option<VastAiSshEndpoint>, String> {
+        let status = self.client.instance_status(contract_id);
+        if let Ok(status) = &status
+            && let Some(endpoint) = status.ssh_endpoint()
+        {
+            return Ok(Some(VastAiSshEndpoint {
+                host: endpoint.ip,
+                port: endpoint.port,
+                user: ssh_user.to_owned(),
+            }));
         }
-        if port == 0 {
-            return Err(format!("vastai contract {contract_id} has no SSH port"));
+        let instances = self.client.list_by_label(label)?;
+        if let Some(instance) = instances
+            .iter()
+            .find(|instance| instance.contract_id == contract_id)
+        {
+            let host = if instance.ssh_host.trim().is_empty() {
+                instance.public_ipaddr.trim()
+            } else {
+                instance.ssh_host.trim()
+            };
+            if !host.is_empty() && instance.ssh_port != 0 {
+                return Ok(Some(VastAiSshEndpoint {
+                    host: host.to_owned(),
+                    port: instance.ssh_port,
+                    user: ssh_user.to_owned(),
+                }));
+            }
         }
-        Ok(VastAiSshEndpoint {
-            host,
-            port,
-            user: ssh_user.to_owned(),
-        })
+        let status = status?;
+        if let Some(error) = provider_terminal_start_error(
+            contract_id,
+            &status.actual_status,
+            &status.intended_status,
+            status.status_msg.as_deref(),
+        ) {
+            return Err(error);
+        }
+        Ok(None)
     }
 
     fn spawn_provider_monitor(
         &mut self,
-        contract_id: u64,
+        contract_id: Option<u64>,
         label: String,
-        lifecycle: LifecyclePolicy,
         spec: NodeProvisionSpec,
         sink: PluginSink,
+        observe_snapshot: SnapshotObserver,
+        cleanup_completed: CleanupObserver,
     ) -> Option<VastAiProviderMonitor> {
-        let (runtime, engine) = self.actor_host.as_ref()?.clone();
+        let (runtime, tasks, webhooks) = self.actor_host.as_ref()?.clone();
         let sender = runtime.create_sender();
-        let actor = runtime
-            .spawn(
-                VastAiProviderMonitorActor::new(VastAiProviderMonitorConfig {
-                    client: self.async_client.clone(),
-                    contract_id,
-                    label,
-                    lifecycle,
-                    spec,
-                    sink,
-                    sender,
-                    engine,
-                    #[cfg(test)]
-                    scripted_status: None,
-                })
-                .with_remote_logs(),
-            )
-            .ok()?;
-        Some(VastAiProviderMonitor::new(runtime, actor))
+        let invalidation_queued = Arc::new(AtomicBool::new(false));
+        let actor = match runtime.spawn(
+            VastAiProviderMonitorActor::new(VastAiProviderMonitorConfig {
+                client: self.async_client.clone(),
+                contract_id,
+                label: label.clone(),
+                spec: spec.clone(),
+                sink: sink.clone(),
+                sender,
+                tasks,
+                observe_snapshot: Some(observe_snapshot),
+                cleanup_completed: Some(cleanup_completed),
+                invalidation_queued: Arc::clone(&invalidation_queued),
+
+                #[cfg(test)]
+                scripted_status: None,
+            })
+            .with_remote_logs(),
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                sink.observe(PluginObservation::Failed {
+                    run_id: spec.run_id,
+                    node_id: spec.node_id,
+                    reason: format!("VastAI provider event owner unavailable: {error}"),
+                });
+                return None;
+            }
+        };
+        let target = runtime.create_sender();
+        let queued = Arc::clone(&invalidation_queued);
+        let subscription = webhooks.subscribe(
+            &label,
+            Arc::new(move || {
+                if queued.swap(true, Ordering::AcqRel) {
+                    return true;
+                }
+                if target
+                    .send_to(actor, VastAiProviderMonitorMsg::Poll)
+                    .is_ok()
+                {
+                    true
+                } else {
+                    queued.store(false, Ordering::Release);
+                    false
+                }
+            }),
+        );
+        let mut monitor = VastAiProviderMonitor::new(runtime, actor, invalidation_queued);
+        monitor._subscription = Some(subscription);
+        Some(monitor)
     }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
@@ -1183,60 +1740,32 @@ fn emit_node_line(sink: &PluginSink, run_id: u64, node_id: u64, line: impl Into<
     });
 }
 
-fn configured_paid_admission_path() -> Option<PathBuf> {
-    // Capture configuration, not a snapshot: offer search precedes authorization.
-    // A missing/invalid configured record is an error at every work boundary.
-    std::env::var_os("MYELIN_PAID_FIXTURE_ADMISSION").map(PathBuf::from)
-}
-
-fn paid_node_for_spec<'a>(
-    snapshot: &'a PaidAdmissionSnapshot,
-    spec: &NodeProvisionSpec,
-    label: &str,
-    selected_offer_id: Option<u64>,
-) -> Result<&'a PaidNodeAdmission, String> {
-    // The orchestrator provisions the initial attempt with attempt_id 0
-    // (admission labels reserve `...-attempt-0`); zero is a valid identity
-    // and only a run mismatch invalidates the spec.
-    if snapshot.run_id != spec.run_id {
-        return Err("paid VastAI run identity mismatch".to_owned());
-    }
-    let expected = snapshot
-        .nodes
-        .iter()
-        .find(|node| node.node_id == spec.node_id)
-        .ok_or_else(|| "paid VastAI node was not selected".to_owned())?;
-    if expected.label != label
-        || selected_offer_id.is_some_and(|offer_id| offer_id != expected.offer_id)
-        || snapshot
-            .create_reservations
-            .get(&spec.node_id)
-            .is_some_and(|reservation| reservation.attempt_id != spec.attempt_id)
-    {
-        return Err("paid VastAI node identity differs from selected topology".to_owned());
-    }
-    Ok(expected)
-}
-
-pub(crate) struct VastAiProvisioningPlugin<C, B>
+pub struct VastAiProvisioningPlugin<C, B>
 where
     C: VastAiLeaseClient,
     B: VastAiBootstrapLauncher,
 {
     client: C,
-    bootstrap: B,
+    bootstrap: Arc<Mutex<B>>,
     config: VastAiProvisioningConfig,
     bootstrap_producer: Option<TelemetryProducer>,
-    paid_admission_path: Option<PathBuf>,
     leased_host_ids: BTreeSet<u64>,
     failed_host_ids: BTreeSet<u64>,
     next_handle_id: u64,
     nodes: BTreeMap<u64, VastAiNode<B::Handle>>,
 }
 
+enum VastAiNodeBootstrap<H> {
+    Dormant,
+    Pending,
+    Running(H),
+    Ready(Option<H>),
+    Cancelled,
+}
+
 struct VastAiNode<H> {
-    contract_id: u64,
-    bootstrap: Option<H>,
+    contract_id: Arc<Mutex<Option<u64>>>,
+    bootstrap: Arc<Mutex<VastAiNodeBootstrap<H>>>,
     provider_monitor: Option<VastAiProviderMonitor>,
     host_id: Option<u64>,
     run_id: u64,
@@ -1244,21 +1773,20 @@ struct VastAiNode<H> {
     label: String,
     sink: PluginSink,
     spec: NodeProvisionSpec,
-    endpoint: Option<VastAiSshEndpoint>,
 }
 
 impl<C, B> VastAiProvisioningPlugin<C, B>
 where
-    C: VastAiLeaseClient,
-    B: VastAiBootstrapLauncher,
+    C: VastAiLeaseClient + Clone + 'static,
+    B: VastAiBootstrapLauncher + 'static,
+    B::Handle: 'static,
 {
-    pub(crate) fn new(client: C, bootstrap: B, config: VastAiProvisioningConfig) -> Self {
+    pub fn new(client: C, bootstrap: B, config: VastAiProvisioningConfig) -> Self {
         Self {
             client,
-            bootstrap,
+            bootstrap: Arc::new(Mutex::new(bootstrap)),
             config,
             bootstrap_producer: None,
-            paid_admission_path: configured_paid_admission_path(),
             next_handle_id: 1,
             leased_host_ids: BTreeSet::new(),
             failed_host_ids: BTreeSet::new(),
@@ -1304,7 +1832,6 @@ where
             preferred_offer_id: None,
             onstart: self.config.onstart.clone(),
             selection,
-            lifecycle: self.config.lifecycle.clone(),
             confirm_lease: self.config.confirm_lease,
         }
     }
@@ -1354,16 +1881,10 @@ where
             return Err("vastai provider does not support host file mounts".to_owned());
         }
         let label = self.label_for(&spec);
-        let paid_admission = self
-            .paid_admission_path
-            .as_ref()
-            .map(PaidFixtureAdmission::open)
-            .transpose()?;
-        if let Some(admission) = &paid_admission {
-            paid_node_for_spec(&admission.snapshot()?, &spec, &label, selected_offer_id)?;
-        }
-
-        let request = self.build_request(&spec, label.clone());
+        let mut request = self.build_request(&spec, label.clone());
+        request
+            .env
+            .extend(self.client.bootstrap_environment(&label)?);
         let exact_criteria = selected_offer_id
             .map(|offer_id| {
                 let criteria_json = spec.offer_criteria_json.as_deref().ok_or_else(|| {
@@ -1380,53 +1901,113 @@ where
             spec.node_id,
             "requesting Vast.ai contract".to_owned(),
         );
-        let instance = if paid_admission.is_some() {
-            self.client
-                .provision_paid(request, &spec, selected_offer_id, exact_criteria)
-        } else {
-            match (selected_offer_id, exact_criteria) {
-                (Some(offer_id), Some(criteria)) => {
-                    self.client.provision_exact(request, offer_id, criteria)
+        let instance = self
+            .client
+            .provision_node(request, &spec, selected_offer_id, exact_criteria)
+            .map_err(|error| {
+                classified_start_error(format!("vastai provision node {}: {error}", spec.node_id))
+            })?;
+        self.register_owned_node(spec, sink, label, instance)
+    }
+
+    fn register_owned_node(
+        &mut self,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+        label: String,
+        instance: Option<ProvisionedInstance>,
+    ) -> Result<PluginNodeHandle, String> {
+        self.client.ensure_event_source()?;
+        let ownership_destroyed = self.client.ownership_destroyed(&label)?;
+        let contract = instance.as_ref().map(|instance| instance.contract_id);
+        let contract_id = Arc::new(Mutex::new(contract));
+        emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+            "type": if ownership_destroyed { "VastAiLeaseReleased" } else if contract.is_some() { "VastAiLeaseReady" } else { "VastAiLeaseResolutionPending" },
+            "run_id": spec.run_id, "node_id": spec.node_id, "label": &label,
+            "contract_id": contract,
+            "offer_id": instance.as_ref().map(|instance| instance.offer_id),
+            "host_id": instance.as_ref().and_then(|instance| instance.host_id),
+        }).to_string());
+        let bootstrap_state = Arc::new(Mutex::new(
+            if ownership_destroyed || self.client.ownership_cancelled(&label)? {
+                VastAiNodeBootstrap::Cancelled
+            } else {
+                VastAiNodeBootstrap::Dormant
+            },
+        ));
+        let bootstrap = Arc::clone(&self.bootstrap);
+        let state = Arc::clone(&bootstrap_state);
+        let bootstrap_spec = spec.clone();
+        let bootstrap_sink = sink.clone();
+        let producer = self.bootstrap_producer.clone();
+        let ssh_user = self.config.ssh_user.clone();
+        let resolved_contract = Arc::clone(&contract_id);
+        let (record_ownership, commit_cleanup) = self.client.ownership_callbacks(&label);
+        let cleanup_sink = sink.clone();
+        let cleanup_run = spec.run_id;
+        let cleanup_node = spec.node_id;
+        let cleanup_completed: CleanupObserver = Arc::new(move |contract| {
+            commit_cleanup(contract)?;
+            cleanup_sink.observe(PluginObservation::PhaseChanged {
+                run_id: cleanup_run,
+                node_id: cleanup_node,
+                phase: crate::provisioning::ProvisionEventKind::NodeStopped,
+            });
+            Ok(())
+        });
+        let observe_snapshot: SnapshotObserver = Arc::new(move |contract, status| {
+            let locally_cancelled = matches!(*state.lock(), VastAiNodeBootstrap::Cancelled);
+            let cancelled = record_ownership(contract, locally_cancelled)?;
+            *resolved_contract.lock() = Some(contract);
+            if cancelled {
+                if let VastAiNodeBootstrap::Running(mut owned_bootstrap)
+                | VastAiNodeBootstrap::Ready(Some(mut owned_bootstrap)) =
+                    std::mem::replace(&mut *state.lock(), VastAiNodeBootstrap::Cancelled)
+                {
+                    bootstrap.lock().stop_bootstrap(&mut owned_bootstrap);
                 }
-                (None, None) => self.client.provision_one(request),
-                _ => unreachable!("selected offer and exact criteria are paired"),
+                return Ok(false);
             }
-        }
-        .map_err(|error| {
-            classified_start_error(format!("vastai provision node {}: {error}", spec.node_id))
-        })?;
-        emit_node_line(
-            &sink,
-            spec.run_id,
-            spec.node_id,
-            format!("Vast.ai contract {} created", instance.contract_id),
-        );
-        emit_node_line(
-            &sink,
-            spec.run_id,
-            spec.node_id,
-            serde_json::json!({
-                "type": "VastAiLeaseReady",
-                "run_id": spec.run_id,
-                "node_id": spec.node_id,
-                "label": &label,
-                "image": &spec.image,
-                "contract_id": instance.contract_id,
-                "offer_id": instance.offer_id,
-                "host_id": instance.host_id,
-                "gpu_name": &instance.gpu_name,
-                "gpu_ram": instance.gpu_ram,
-                "dph_total": instance.dph_total,
-            })
-            .to_string(),
-        );
-        let provider_monitor = self.client.spawn_provider_monitor(
-            instance.contract_id,
-            label.clone(),
-            self.config.lifecycle.clone(),
-            spec.clone(),
-            sink.clone(),
-        );
+            let Some(status) = status else {
+                return Ok(true);
+            };
+            if provider_terminal_start_error(
+                contract,
+                &status.actual_status,
+                &status.intended_status,
+                status.status_msg.as_deref(),
+            )
+            .is_some()
+            {
+                return Ok(true);
+            }
+            let endpoint = status.ssh_endpoint().map(|endpoint| VastAiSshEndpoint {
+                host: endpoint.ip,
+                port: endpoint.port,
+                user: ssh_user.clone(),
+            });
+            reconcile_bootstrap(
+                &bootstrap,
+                &state,
+                &bootstrap_spec,
+                &bootstrap_sink,
+                producer.clone(),
+                endpoint,
+            )?;
+            Ok(true)
+        });
+        let provider_monitor = if ownership_destroyed {
+            None
+        } else {
+            self.client.spawn_provider_monitor(
+                contract,
+                label.clone(),
+                spec.clone(),
+                sink.clone(),
+                observe_snapshot,
+                cleanup_completed,
+            )
+        };
         emit_node_line(
             &sink,
             spec.run_id,
@@ -1434,7 +2015,7 @@ where
             "Vast.ai contract ownership ready for persistence".to_owned(),
         );
 
-        let host_id = instance.host_id;
+        let host_id = instance.as_ref().and_then(|instance| instance.host_id);
         if let Some(host_id) = host_id {
             self.leased_host_ids.insert(host_id);
         }
@@ -1446,8 +2027,8 @@ where
         self.nodes.insert(
             handle.id,
             VastAiNode {
-                contract_id: instance.contract_id,
-                bootstrap: None,
+                contract_id,
+                bootstrap: bootstrap_state,
                 provider_monitor,
                 host_id,
                 run_id: spec.run_id,
@@ -1455,10 +2036,68 @@ where
                 label,
                 sink,
                 spec,
-                endpoint: None,
             },
         );
         Ok(handle)
+    }
+}
+
+fn reconcile_bootstrap<B: VastAiBootstrapLauncher>(
+    launcher: &Mutex<B>,
+    state: &Mutex<VastAiNodeBootstrap<B::Handle>>,
+    spec: &NodeProvisionSpec,
+    sink: &PluginSink,
+    producer: Option<TelemetryProducer>,
+    endpoint: Option<VastAiSshEndpoint>,
+) -> Result<(), String> {
+    let mut state = state.lock();
+    match &mut *state {
+        VastAiNodeBootstrap::Dormant
+        | VastAiNodeBootstrap::Ready(_)
+        | VastAiNodeBootstrap::Cancelled => Ok(()),
+        VastAiNodeBootstrap::Running(handle) => launcher.lock().refresh_bootstrap(handle),
+        VastAiNodeBootstrap::Pending => {
+            let Some(endpoint) = endpoint else {
+                emit_node_line(
+                    sink,
+                    spec.run_id,
+                    spec.node_id,
+                    "Vast.ai SSH endpoint pending; awaiting provider notification",
+                );
+                return Ok(());
+            };
+            emit_node_line(
+                sink,
+                spec.run_id,
+                spec.node_id,
+                format!(
+                    "Vast.ai SSH endpoint ready: {}:{}",
+                    endpoint.host, endpoint.port
+                ),
+            );
+            match launcher
+                .lock()
+                .start_bootstrap(spec.clone(), endpoint, sink.clone(), producer)
+            {
+                Ok(handle) => {
+                    *state = VastAiNodeBootstrap::Running(handle);
+                    Ok(())
+                }
+                Err(error) => {
+                    *state = VastAiNodeBootstrap::Cancelled;
+                    let reason = classified_start_error(format!(
+                        "vastai bootstrap node {}: {error}",
+                        spec.node_id
+                    ));
+                    sink.observe(PluginObservation::Failed {
+                        run_id: spec.run_id,
+                        node_id: spec.node_id,
+                        reason: reason.clone(),
+                    });
+                    Err(reason)
+                }
+            }
+        }
     }
 }
 
@@ -1471,6 +2110,7 @@ impl<C, B> ProvisionPlugin for VastAiProvisioningPlugin<C, B>
 where
     C: VastAiLeaseClient + Clone + 'static,
     B: VastAiBootstrapLauncher + 'static,
+    B::Handle: 'static,
 {
     fn create_node(
         &mut self,
@@ -1493,138 +2133,56 @@ where
             .nodes
             .get_mut(&handle.id)
             .ok_or_else(|| format!("vastai node handle {} is absent", handle.id))?;
-        if node.bootstrap.is_some() {
+        {
+            let mut state = node.bootstrap.lock();
+            match &*state {
+                VastAiNodeBootstrap::Running(_) | VastAiNodeBootstrap::Ready(_) => return Ok(()),
+                VastAiNodeBootstrap::Cancelled => {
+                    return Err("bootstrap_cancelled: VastAI node attempt was retired".to_owned());
+                }
+                VastAiNodeBootstrap::Dormant | VastAiNodeBootstrap::Pending => {
+                    *state = VastAiNodeBootstrap::Pending;
+                }
+            }
+        }
+        if let Some(monitor) = &node.provider_monitor {
+            monitor.refresh();
             return Ok(());
         }
-        if node.endpoint.is_none() {
-            emit_node_line(
-                &node.sink,
-                node.run_id,
-                node.node_id,
-                serde_json::json!({
-                    "type": "VastAiSshEndpointDiscoveryStarted",
-                    "run_id": node.run_id,
-                    "node_id": node.node_id,
-                    "contract_id": node.contract_id,
-                    "label": &node.label,
-                })
-                .to_string(),
-            );
-            let endpoint = self
-                .client
-                .ssh_endpoint(
-                    node.contract_id,
-                    &node.label,
-                    &self.config.lifecycle,
-                    &self.config.ssh_user,
-                )
-                .map_err(|error| {
-                    if let Some(host_id) = node.host_id {
-                        self.failed_host_ids.insert(host_id);
-                    }
-                    classified_start_error(format!(
-                        "vastai SSH endpoint node {}: {error}",
-                        node.node_id
-                    ))
-                })?;
-            emit_node_line(
-                &node.sink,
-                node.run_id,
-                node.node_id,
-                serde_json::json!({
-                    "type": "VastAiSshEndpointReady",
-                    "run_id": node.run_id,
-                    "node_id": node.node_id,
-                    "contract_id": node.contract_id,
-                    "host": &endpoint.host,
-                    "port": endpoint.port,
-                    "user": &endpoint.user,
-                })
-                .to_string(),
-            );
-            node.endpoint = Some(endpoint);
-        }
-        let endpoint = node
-            .endpoint
-            .clone()
-            .expect("Vast.ai endpoint was discovered above");
-        if let Some(path) = &self.paid_admission_path {
-            let admission = PaidFixtureAdmission::open(path)?;
-            let snapshot = admission.snapshot()?;
-            paid_node_for_spec(&snapshot, &node.spec, &node.label, None)?;
-            if snapshot.contracts.get(&node.node_id) != Some(&node.contract_id) {
-                return Err("paid VastAI bootstrap contract identity mismatch".to_owned());
+        let contract_id = *node.contract_id.lock();
+        let endpoint = match contract_id {
+            Some(contract_id) => {
+                self.client
+                    .ssh_endpoint(contract_id, &node.label, &self.config.ssh_user)?
             }
-            if snapshot.mode == PaidAdmissionMode::Prepared {
-                let deployment = node.spec.deployment.as_ref().ok_or(
-                    "prepared paid fixture denies bootstrap without an explicit deployment",
-                )?;
-                admission.reserve_retained_bootstrap(
-                    node.run_id,
-                    node.node_id,
-                    node.contract_id,
-                    deployment,
-                )?;
-            } else {
-                admission.reserve_bootstrap(node.run_id, node.node_id)?;
-            }
-        }
-        emit_node_line(
+            None => None,
+        };
+        let result = reconcile_bootstrap(
+            &self.bootstrap,
+            &node.bootstrap,
+            &node.spec,
             &node.sink,
-            node.run_id,
-            node.node_id,
-            serde_json::json!({
-                "type": "VastAiBootstrapObservationStarted",
-                "run_id": node.run_id,
-                "node_id": node.node_id,
-                "contract_id": node.contract_id,
-                "host": &endpoint.host,
-                "port": endpoint.port,
-                "user": &endpoint.user,
-            })
-            .to_string(),
-        );
-        match self.bootstrap.start_bootstrap(
-            node.spec.clone(),
-            endpoint,
-            node.sink.clone(),
             self.bootstrap_producer.clone(),
-            self.config.lifecycle.clone(),
-        ) {
-            Ok(bootstrap) => {
-                node.bootstrap = Some(bootstrap);
-                Ok(())
-            }
-            Err(error) => {
-                if let Some(host_id) = node.host_id {
-                    self.failed_host_ids.insert(host_id);
-                }
-                let reason = classified_start_error(format!(
-                    "vastai bootstrap node {}: {error}",
-                    node.node_id
-                ));
-                emit_node_line(
-                    &node.sink,
-                    node.run_id,
-                    node.node_id,
-                    format!("Vast.ai bootstrap failed: {reason}"),
-                );
-                node.sink.observe(PluginObservation::Failed {
-                    run_id: node.run_id,
-                    node_id: node.node_id,
-                    reason: reason.clone(),
-                });
-                Err(reason)
-            }
+            endpoint,
+        );
+        if result.is_err()
+            && let Some(host_id) = node.host_id
+        {
+            self.failed_host_ids.insert(host_id);
         }
+        result
     }
 
     fn cancel_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
         let Some(node) = self.nodes.get_mut(&handle.id) else {
             return Ok(());
         };
-        if let Some(mut bootstrap) = node.bootstrap.take() {
-            self.bootstrap.stop_bootstrap(&mut bootstrap);
+        self.client.cancel_ownership(&node.label)?;
+        if let VastAiNodeBootstrap::Running(mut bootstrap)
+        | VastAiNodeBootstrap::Ready(Some(mut bootstrap)) =
+            std::mem::replace(&mut *node.bootstrap.lock(), VastAiNodeBootstrap::Cancelled)
+        {
+            self.bootstrap.lock().stop_bootstrap(&mut bootstrap);
         }
         Ok(())
     }
@@ -1633,6 +2191,20 @@ where
         let Some(node) = self.nodes.get_mut(&handle.id) else {
             return Ok(());
         };
+        let mut state = node.bootstrap.lock();
+        if matches!(
+            *state,
+            VastAiNodeBootstrap::Ready(_) | VastAiNodeBootstrap::Cancelled
+        ) {
+            return Ok(());
+        }
+        if let VastAiNodeBootstrap::Running(mut bootstrap) =
+            std::mem::replace(&mut *state, VastAiNodeBootstrap::Ready(None))
+        {
+            self.bootstrap.lock().complete_bootstrap(&mut bootstrap);
+            *state = VastAiNodeBootstrap::Ready(Some(bootstrap));
+        }
+        drop(state);
         emit_node_line(
             &node.sink,
             node.run_id,
@@ -1642,7 +2214,7 @@ where
                 "run_id": node.run_id,
                 "node_id": node.node_id,
                 "label": &node.label,
-                "contract_id": node.contract_id,
+                "contract_id": *node.contract_id.lock(),
                 "classification": "runtime_ready_over_provider_staleness",
             })
             .to_string(),
@@ -1657,13 +2229,24 @@ where
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
-        if let Some(mut monitor) = node.provider_monitor.take() {
-            monitor.stop();
+        if let Err(error) = self.client.cancel_ownership(&node.label) {
+            self.nodes.insert(handle.id, node);
+            return Err(error);
         }
-        if let Some(mut bootstrap) = node.bootstrap.take() {
-            self.bootstrap.stop_bootstrap(&mut bootstrap);
+        if let VastAiNodeBootstrap::Running(mut bootstrap)
+        | VastAiNodeBootstrap::Ready(Some(mut bootstrap)) =
+            std::mem::replace(&mut *node.bootstrap.lock(), VastAiNodeBootstrap::Cancelled)
+        {
+            self.bootstrap.lock().stop_bootstrap(&mut bootstrap);
         }
-        let result = self.client.destroy_contract(node.contract_id);
+        let contract_id = *node.contract_id.lock();
+        let result = match contract_id {
+            Some(contract_id) => self.client.destroy_owned_contract(&node.label, contract_id),
+            None => self.client.ownership_destroyed(&node.label).and_then(|destroyed| {
+                if destroyed { Ok(()) }
+                else { Err("cleanup_pending: VastAI create outcome is unresolved; cancellation remains owned".to_owned()) }
+            }),
+        };
         emit_node_line(
             &node.sink,
             node.run_id,
@@ -1673,7 +2256,7 @@ where
                 "run_id": node.run_id,
                 "node_id": node.node_id,
                 "label": &node.label,
-                "contract_id": node.contract_id,
+                "contract_id": contract_id,
                 "result": if result.is_ok() { "ok" } else { "failed" },
                 "error": result.as_ref().err(),
             })
@@ -1681,12 +2264,18 @@ where
         );
         match result {
             Ok(()) => {
+                if let Some(mut monitor) = node.provider_monitor.take() {
+                    monitor.stop();
+                }
                 if let Some(host_id) = node.host_id {
                     self.leased_host_ids.remove(&host_id);
                 }
                 Ok(())
             }
             Err(error) => {
+                if let Some(monitor) = &node.provider_monitor {
+                    monitor.refresh();
+                }
                 self.nodes.insert(handle.id, node);
                 Err(error)
             }
@@ -1699,37 +2288,27 @@ where
         sink: PluginSink,
     ) -> Result<Option<AdoptedNode>, String> {
         let label = self.label_for(spec);
-        if let Some(path) = &self.paid_admission_path {
-            let snapshot = PaidFixtureAdmission::open(path)?.snapshot()?;
-            paid_node_for_spec(&snapshot, spec, &label, None)?;
-            if snapshot.mode == PaidAdmissionMode::CleanupOnly {
-                return Err("paid VastAI fixture is cleanup-only".to_owned());
+
+        let contract = match self.client.contract_by_label(&label) {
+            Ok(contract) => contract,
+            Err(error) => {
+                emit_node_line(
+                    &sink,
+                    spec.run_id,
+                    spec.node_id,
+                    format!("VastAI recovery resolution pending: {error}"),
+                );
+                None
             }
-            // The one create/adopt path below makes the fresh provider check.
-            // Do not precede it with ten redundant account scans. Ambiguous
-            // reservations still enter that path and remain cleanup-only errors.
-            if !snapshot.contracts.contains_key(&spec.node_id)
-                && !snapshot.create_reservations.contains_key(&spec.node_id)
-            {
-                return Ok(None);
-            }
-            let handle = self.create_node(spec.clone(), sink)?;
-            return Ok(Some(AdoptedNode {
-                handle,
-                provider_ref: label,
-            }));
-        }
-        let contract = self.client.contract_by_label_with_retry(
-            &label,
-            10,
-            self.config.lifecycle.lease_pace,
+        };
+        // Absence from one eventually-consistent listing is not permission to
+        // create another rental. The handle retains pending resolution instead.
+        let handle = self.register_owned_node(
+            spec.clone(),
+            sink,
+            label.clone(),
+            contract.map(adopted_instance),
         )?;
-        if contract.is_none() {
-            return Ok(None);
-        }
-        // Reattach monitoring to the existing lease. The recovery state machine
-        // re-enters the idempotent bootstrap only for pre-joining snapshots.
-        let handle = self.create_node(spec.clone(), sink)?;
         Ok(Some(AdoptedNode {
             handle,
             provider_ref: label,
@@ -1742,10 +2321,15 @@ where
 
     fn stop_by_spec(&mut self, spec: &NodeProvisionSpec, sink: PluginSink) -> Result<bool, String> {
         let label = self.label_for(spec);
-        let Some(contract_id) = self.client.contract_by_label(&label)? else {
+        self.client.cancel_ownership(&label)?;
+        if self.client.ownership_destroyed(&label)? {
             return Ok(false);
+        }
+        let Some(contract_id) = self.client.contract_by_label(&label)? else {
+            let handle = self.register_owned_node(spec.clone(), sink, label, None)?;
+            return self.stop_node(&handle).map(|()| true);
         };
-        let result = self.client.destroy_contract(contract_id);
+        let result = self.client.destroy_owned_contract(&label, contract_id);
         emit_node_line(
             &sink,
             spec.run_id,
@@ -1776,12 +2360,14 @@ mod tests {
     use swactor_engine::{Engine, SteppingBackend};
     use swactor_vastai::test_http::{TestHttpRoute, TestHttpServer};
 
-    use crate::tests::fuzz_support::{actor_census, advance_and_drive, drive_steps};
+    use crate::tests::fuzz_support::{actor_census, drive_steps};
 
     use super::*;
 
     #[test]
     fn bootstrap_command_has_stable_remote_idempotency_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = directory.path().join("result");
         let spec = NodeProvisionSpec {
             deployment: None,
             run_id: 5,
@@ -1792,20 +2378,52 @@ mod tests {
             env: vec![
                 ("PLAIN".to_owned(), "value".to_owned()),
                 ("QUOTED".to_owned(), "it's ready".to_owned()),
+                ("RESULT".to_owned(), result.display().to_string()),
             ],
-            args: vec!["exec /usr/local/bin/myelin-node".to_owned()],
+            args: vec![format!(
+                "# {}\nprintf 'ready\\n'; read released; printf '%s\\n' \"$PLAIN\" \"$QUOTED\" >> \"$RESULT\"",
+                directory.path().display()
+            )],
             offer_criteria_json: None,
             mounts: Vec::new(),
         };
 
         let command = idempotent_ssh_bootstrap_command(&spec, &[]);
 
-        assert!(command.contains("/tmp/myelin-bootstrap-5-7-9"));
-        assert!(command.contains("kill -0"));
-        assert!(command.contains("myelin bootstrap already running"));
-        assert!(command.contains("export 'PLAIN=value' 'QUOTED=it'\"'\"'s ready';"));
-        assert!(command.contains("sh -lc \"$command\""));
-        assert!(command.contains("exec /usr/local/bin/myelin-node"));
+        let driver = r#"
+import pathlib, shutil, subprocess, sys
+command, lock, result = sys.argv[1:]
+first = subprocess.Popen(['sh', '-c', command], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    assert first.stdout.readline() == b'ready\n'
+    duplicate = subprocess.run(['sh', '-c', command], capture_output=True)
+    assert duplicate.returncode == 0, duplicate.stderr
+    assert not pathlib.Path(result).exists(), 'duplicate activation ran while owner was live'
+    stdout, stderr = first.communicate(b'release\n')
+    assert first.returncode == 0, stderr
+    assert pathlib.Path(result).read_text() == "value\nit's ready\n"
+    completed = subprocess.run(['sh', '-c', command], capture_output=True)
+    assert completed.returncode == 0, completed.stderr
+    assert pathlib.Path(result).read_text() == "value\nit's ready\n", 'completed command ran twice'
+finally:
+    if first.poll() is None:
+        first.kill()
+    first.wait()
+    shutil.rmtree(lock, ignore_errors=True)
+"#;
+        let output = swactor_process::command_output(
+            std::process::Command::new("python3")
+                .args(["-c", driver])
+                .arg(command)
+                .arg(ssh_bootstrap_lock(&spec))
+                .arg(result),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1877,21 +2495,25 @@ mod tests {
 
     #[test]
     fn provision_one_adopts_stable_label_before_offer_search() {
-        let server = TestHttpServer::start(vec![TestHttpRoute::json(
-            "GET",
-            "/api/v0/instances/",
-            200,
-            json!({
-                "instances": [{
-                    "id": 73,
-                    "label": "run-5-node-7-attempt-9",
-                    "actual_status": "loading",
-                    "ssh_host": "",
-                    "ssh_port": 0,
-                    "public_ipaddr": ""
-                }]
-            }),
-        )])
+        let engine = http_engine();
+        let server = TestHttpServer::start(
+            &engine.handle().blocking_work_sender(),
+            vec![TestHttpRoute::json(
+                "GET",
+                "/api/v0/instances/",
+                200,
+                json!({
+                    "instances": [{
+                        "id": 73,
+                        "label": "run-5-node-7-attempt-9",
+                        "actual_status": "loading",
+                        "ssh_host": "",
+                        "ssh_port": 0,
+                        "public_ipaddr": ""
+                    }]
+                }),
+            )],
+        )
         .unwrap();
         let client = swactor_vastai::VastClient::with_base_url(server.uri(), "secret");
         let mut client = ToolsVastAiLeaseClient::new(client).unwrap();
@@ -1906,7 +2528,6 @@ mod tests {
                 preferred_offer_id: None,
                 onstart: None,
                 selection: SelectionPolicy::default(),
-                lifecycle: LifecyclePolicy::default(),
                 confirm_lease: false,
             })
             .unwrap();
@@ -1960,15 +2581,14 @@ mod tests {
             &mut self,
             _contract_id: u64,
             _label: &str,
-            _lifecycle: &LifecyclePolicy,
             ssh_user: &str,
-        ) -> Result<VastAiSshEndpoint, String> {
+        ) -> Result<Option<VastAiSshEndpoint>, String> {
             self.ssh_endpoint_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(VastAiSshEndpoint {
+            Ok(Some(VastAiSshEndpoint {
                 host: "host".to_owned(),
                 port: 22,
                 user: ssh_user.to_owned(),
-            })
+            }))
         }
 
         fn destroy_contract(&mut self, _contract_id: u64) -> Result<(), String> {
@@ -2001,7 +2621,6 @@ mod tests {
             _endpoint: VastAiSshEndpoint,
             _sink: PluginSink,
             _producer: Option<TelemetryProducer>,
-            _lifecycle: LifecyclePolicy,
         ) -> Result<Self::Handle, String> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -2010,6 +2629,362 @@ mod tests {
         fn stop_bootstrap(&mut self, _handle: &mut Self::Handle) {
             self.stops.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn complete_bootstrap(&mut self, _handle: &mut Self::Handle) {}
+        fn refresh_bootstrap(&mut self, _handle: &mut Self::Handle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct PendingLeaseClient {
+        observer: Arc<Mutex<Option<SnapshotObserver>>>,
+        cleanup_completed: Arc<Mutex<Option<CleanupObserver>>>,
+        destroyed: Arc<AtomicUsize>,
+    }
+
+    impl VastAiLeaseClient for PendingLeaseClient {
+        fn provision_one(
+            &mut self,
+            _request: ProvisionRequest,
+        ) -> Result<ProvisionedInstance, String> {
+            panic!("ambiguous recovery must never create another contract")
+        }
+
+        fn contract_by_label(&mut self, _label: &str) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
+
+        fn ssh_endpoint(
+            &mut self,
+            _contract: u64,
+            _label: &str,
+            _user: &str,
+        ) -> Result<Option<VastAiSshEndpoint>, String> {
+            panic!("unresolved ownership has no endpoint to query")
+        }
+
+        fn spawn_provider_monitor(
+            &mut self,
+            _contract: Option<u64>,
+            _label: String,
+            _spec: NodeProvisionSpec,
+            _sink: PluginSink,
+            observer: SnapshotObserver,
+            cleanup_completed: CleanupObserver,
+        ) -> Option<VastAiProviderMonitor> {
+            *self.observer.lock() = Some(observer);
+            *self.cleanup_completed.lock() = Some(cleanup_completed);
+            None
+        }
+
+        fn destroy_contract(&mut self, contract: u64) -> Result<(), String> {
+            assert_eq!(contract, 73);
+            self.destroyed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancel_unresolved_recovery_waits_for_cleanup_completion_without_bootstrapping() {
+        let observer = Arc::new(Mutex::new(None));
+        let cleanup_completed = Arc::new(Mutex::new(None));
+        let destroyed = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let recording = Arc::new(RecordingSink::default());
+        let mut plugin = VastAiProvisioningPlugin::new(
+            PendingLeaseClient {
+                observer: Arc::clone(&observer),
+                destroyed: Arc::clone(&destroyed),
+                cleanup_completed: Arc::clone(&cleanup_completed),
+            },
+            CountingBootstrap {
+                starts: Arc::clone(&starts),
+                stops: Arc::new(AtomicUsize::new(0)),
+            },
+            VastAiProvisioningConfig::default(),
+        );
+        let adopted = plugin
+            .adopt_by_spec(&monitor_spec(5, 7), PluginSink::new(recording.clone()))
+            .unwrap()
+            .expect("pending ownership needs a retained handle");
+        plugin.start_bootstrap(&adopted.handle).unwrap();
+        assert!(
+            plugin
+                .stop_node(&adopted.handle)
+                .unwrap_err()
+                .contains("cleanup_pending")
+        );
+        assert!(plugin.nodes.contains_key(&adopted.handle.id));
+        assert_eq!(destroyed.load(Ordering::SeqCst), 0);
+        let callback = observer.lock().clone().unwrap();
+        assert!(!callback(73, None).unwrap());
+        assert_eq!(
+            destroyed.load(Ordering::SeqCst),
+            0,
+            "observation must not issue blocking HTTP"
+        );
+        assert!(!observations(&recording).iter().any(|observation| matches!(
+            observation,
+            PluginObservation::PhaseChanged {
+                phase: crate::provisioning::ProvisionEventKind::NodeStopped,
+                ..
+            },
+        )));
+        plugin.client.destroy_contract(73).unwrap();
+        cleanup_completed.lock().as_ref().unwrap()(73).unwrap();
+        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert!(observations(&recording).iter().any(|observation| matches!(
+            observation,
+            PluginObservation::PhaseChanged {
+                run_id: 5,
+                node_id: 7,
+                phase: crate::provisioning::ProvisionEventKind::NodeStopped
+            },
+        )));
+    }
+
+    #[test]
+    fn owned_task_port_resolves_cancelled_lease_and_commits_actual_deletion() {
+        struct CompletionSink(std::sync::mpsc::Sender<PluginObservation>);
+        impl crate::provisioning::PluginObservationSink for CompletionSink {
+            fn observe(&self, observation: PluginObservation) {
+                self.0.send(observation).unwrap();
+            }
+        }
+
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let engine = Engine::new(
+            parts,
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let tasks = VastAiTaskPort::new(
+            &engine.task_spawner(),
+            engine.handle().blocking_work_sender(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let webhooks = VastAiWebhooks::open(
+            webhooks::VastAiWebhookConfig {
+                public_url: "https://receiver.example/api/providers/vastai/webhook".to_owned(),
+                event_types: vec!["client:instance_started".to_owned()],
+                state_dir: directory.path().to_owned(),
+                signing_secret: Some("fixture-secret".to_owned()),
+                user_id: Some(17),
+                register: false,
+            },
+            "secret",
+        )
+        .unwrap();
+        let label = "run-5-node-7-attempt-9";
+        let server = TestHttpServer::start(
+            &engine.handle().blocking_work_sender(),
+            vec![
+                TestHttpRoute::json(
+                    "GET",
+                    "/api/v0/instances/",
+                    200,
+                    json!({
+                        "instances": [{
+                            "id": 73, "label": label, "actual_status": "loading",
+                            "ssh_host": "", "ssh_port": 0, "public_ipaddr": ""
+                        }]
+                    }),
+                ),
+                TestHttpRoute::json(
+                    "DELETE",
+                    "/api/v0/instances/73/",
+                    200,
+                    json!({"success": true}),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut client =
+            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret"))
+                .unwrap()
+                .with_actor_host(runtime, tasks, webhooks);
+        client.cancel_ownership(label).unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut plugin = VastAiProvisioningPlugin::new(
+            client,
+            CountingBootstrap {
+                starts: starts.clone(),
+                stops: Arc::new(AtomicUsize::new(0)),
+            },
+            VastAiProvisioningConfig::default(),
+        );
+        let (completed, observations) = std::sync::mpsc::channel();
+        let _handle = plugin
+            .register_owned_node(
+                monitor_spec(5, 7),
+                PluginSink::new(Arc::new(CompletionSink(completed))),
+                label.to_owned(),
+                None,
+            )
+            .unwrap();
+        loop {
+            match observations.recv().unwrap() {
+                PluginObservation::PhaseChanged {
+                    run_id: 5,
+                    node_id: 7,
+                    phase: crate::provisioning::ProvisionEventKind::NodeStopped,
+                } => break,
+                PluginObservation::PhaseChanged {
+                    phase: crate::provisioning::ProvisionEventKind::ProvisionFailed,
+                    ..
+                } => panic!("owned cleanup failed instead of confirming provider deletion"),
+                _ => {}
+            }
+        }
+        let record = LeaseJournal::new(directory.path())
+            .load(label)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.contract_id, Some(73));
+        assert!(
+            record.cancelled && record.destroyed,
+            "stop acknowledgement must follow durable cleanup"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "cancelled lease must never bootstrap"
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.method == "DELETE")
+                .count(),
+            1
+        );
+        drop(plugin);
+    }
+
+    #[test]
+    fn cancelling_owned_snapshot_closes_blocked_http_without_committing_cleanup() {
+        use std::io::{BufRead, Read};
+        struct Replies(std::sync::mpsc::Sender<VastAiProviderMonitorMsg>);
+        impl ActorInterface for Replies {
+            type Incoming = VastAiProviderMonitorMsg;
+            type Response = ();
+            fn handle(&mut self, _: &Ctx, reply: Self::Incoming) {
+                self.0.send(reply).unwrap();
+            }
+        }
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let engine = Engine::new(
+            parts,
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, request_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = engine
+            .handle()
+            .blocking_work_sender()
+            .spawn_owned_thread("provider-http-cancel", move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                accepted.send(()).unwrap();
+                let _ = released.recv();
+                let mut byte = [0];
+                reader.read(&mut byte).unwrap()
+            })
+            .unwrap();
+        let (observed, replies) = std::sync::mpsc::channel();
+        let actor = runtime.spawn(Replies(observed)).unwrap();
+        let port = VastAiTaskPort::new(
+            &engine.task_spawner(),
+            engine.handle().blocking_work_sender(),
+        );
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let observed_callbacks = callback_count.clone();
+        let cleanup_callbacks = callback_count.clone();
+        let lease = port.submit(
+            VastClient::with_base_url(format!("http://{address}"), "secret"),
+            None,
+            "pending".to_owned(),
+            VastAiTaskReply {
+                sender: runtime.create_sender(),
+                actor,
+                generation: 7,
+                poll: Some(3),
+                settled: false,
+            },
+            Some(SnapshotCallbacks {
+                observe: Arc::new(move |_, _| {
+                    observed_callbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok(false)
+                }),
+                cleanup_completed: Arc::new(move |_| {
+                    cleanup_callbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            }),
+        );
+        request_started.recv().unwrap();
+        lease.cancel();
+        assert!(matches!(
+            replies.recv().unwrap(),
+            VastAiProviderMonitorMsg::StatusCompleted {
+                generation: 7,
+                poll: 3,
+                result: Err(_),
+            }
+        ));
+        release.send(()).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            0,
+            "cancellation must close the pending HTTP connection"
+        );
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            0,
+            "cancelled request cannot commit an observation or cleanup"
+        );
+    }
+
+    #[test]
+    fn durable_create_intent_cannot_be_reserved_twice_and_cancel_survives_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = LeaseJournal::new(directory.path());
+        journal.reserve_creation("pending-lease").unwrap();
+        assert!(
+            LeaseJournal::new(directory.path())
+                .reserve_creation("pending-lease")
+                .is_err()
+        );
+        let mut client =
+            ToolsVastAiLeaseClient::new(VastClient::with_base_url("http://127.0.0.1:1", "unused"))
+                .unwrap();
+        client.ownership = Some(Arc::new(Mutex::new(journal)));
+        client.cancel_ownership("pending-lease").unwrap();
+        client.record_contract("pending-lease", 73).unwrap();
+        assert!(client.record_contract("pending-lease", 74).is_err());
+        drop(client);
+        let restored = LeaseJournal::new(directory.path())
+            .load("pending-lease")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.contract_id, Some(73));
+        assert!(restored.cancelled);
+        assert!(!restored.destroyed);
     }
 
     #[test]
@@ -2066,6 +3041,43 @@ mod tests {
         assert_eq!(destroy_calls.load(Ordering::SeqCst), 2);
         assert_eq!(stops.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn readiness_before_or_after_launch_keeps_bootstrap_and_cleanup_idempotent() {
+        for launch in [false, true] {
+            let starts = Arc::new(AtomicUsize::new(0));
+            let stops = Arc::new(AtomicUsize::new(0));
+            let destroys = Arc::new(AtomicUsize::new(0));
+            let mut plugin = VastAiProvisioningPlugin::new(
+                RetryDestroyClient {
+                    destroy_calls: Arc::clone(&destroys),
+                    destroy_failures: Arc::new(AtomicUsize::new(0)),
+                    existing_contract: None,
+                    ssh_endpoint_calls: Arc::new(AtomicUsize::new(0)),
+                },
+                CountingBootstrap {
+                    starts: Arc::clone(&starts),
+                    stops: Arc::clone(&stops),
+                },
+                VastAiProvisioningConfig::default(),
+            );
+            let handle = plugin
+                .create_node(monitor_spec(5, 7), PluginSink::new(Arc::new(NullSink)))
+                .unwrap();
+            if launch {
+                plugin.start_bootstrap(&handle).unwrap();
+            }
+            plugin.complete_bootstrap(&handle).unwrap();
+            plugin.complete_bootstrap(&handle).unwrap();
+            plugin.start_bootstrap(&handle).unwrap();
+            assert_eq!(starts.load(Ordering::SeqCst), usize::from(launch));
+            assert_eq!(stops.load(Ordering::SeqCst), 0);
+            plugin.stop_node(&handle).unwrap();
+            plugin.stop_node(&handle).unwrap();
+            assert_eq!(stops.load(Ordering::SeqCst), usize::from(launch));
+            assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        }
+    }
     #[test]
     fn plugin_adopts_existing_contract_without_starting_bootstrap() {
         let starts = Arc::new(AtomicUsize::new(0));
@@ -2118,295 +3130,36 @@ mod tests {
                 drop_cheap_frac: 0.0,
                 ..SelectionPolicy::default()
             },
-            lifecycle: LifecyclePolicy::default(),
             confirm_lease: false,
         }
     }
 
-    #[cfg(unix)]
-    fn paid_test_admission() -> (
-        tempfile::TempDir,
-        PaidFixtureAdmission,
-        provisioning::PaidCleanupOwner,
-    ) {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let nodes = (1..=5)
-            .map(|node_id| PaidNodeAdmission {
-                node_id,
-                offer_id: 40 + node_id,
-                host_id: node_id,
-                label: format!("myelin-5-{node_id}-attempt-9"),
-            })
-            .collect();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let admission = PaidFixtureAdmission::create(
-            directory.path().join("admission.json"),
-            5,
-            nodes,
-            u64::try_from(now.as_millis()).unwrap()
-                + provisioning::paid_admission::PAID_CLEANUP_RESERVE_MS
-                + 60_000,
-        )
-        .unwrap();
-        admission
-            .install_cleanup_ownership(
-                provisioning::PaidProcessIdentity::current().unwrap(),
-                provisioning::PaidCleanupLimits {
-                    maximum_cost_microusd: 1_000_000,
-                    hourly_price_microusd: 1_000_000,
-                },
-            )
-            .unwrap();
-        let owner = admission.claim_cleanup_owner().unwrap();
-        admission.bind_orchestrator(std::process::id()).unwrap();
-        (directory, admission, owner)
-    }
-
-    #[cfg(unix)]
-    fn paid_test_request() -> ProvisionRequest {
-        ProvisionRequest {
-            label: Some("myelin-5-2-attempt-9".to_owned()),
-            ..exact_request()
-        }
-    }
-
-    #[cfg(unix)]
-    fn paid_test_routes(status: u16, response: serde_json::Value) -> Vec<TestHttpRoute> {
-        vec![
-            TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
-            TestHttpRoute::json(
+    #[test]
+    fn offer_search_is_read_only() {
+        let engine = http_engine();
+        let server = TestHttpServer::start(
+            &engine.handle().blocking_work_sender(),
+            vec![TestHttpRoute::json(
                 "GET",
                 "/api/v0/bundles/",
                 200,
                 json!({
-                    "offers": [
-                        {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
-                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
-                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
-                         "geolocation": "US"},
-                        {"id": 42, "gpu_name": "B", "dph_total": 0.3, "host_id": 2,
-                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
-                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
-                         "geolocation": "US"}
-                    ]
+                    "offers": [{
+                        "id": 41,
+                        "gpu_name": "A",
+                        "dph_total": 0.2,
+                        "internet_down_cost_per_tb": 0.0,
+                        "internet_up_cost_per_tb": 0.0,
+                        "host_id": 1,
+                        "compute_cap": 800,
+                        "reliability2": 0.99,
+                        "inet_down": 500.0,
+                        "inet_up": 500.0,
+                        "geolocation": "US"
+                    }]
                 }),
-            ),
-            TestHttpRoute::json("PUT", "/api/v0/asks/42/", status, response),
-        ]
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn configured_missing_admission_never_reaches_provider_acquisition() {
-        let directory = tempfile::tempdir().unwrap();
-        let server = TestHttpServer::start(Vec::new()).unwrap();
-        let mut client =
-            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
-        client.paid_admission_path = Some(directory.path().join("not-authorized.json"));
-        assert!(client.provision_one(paid_test_request()).is_err());
-        assert!(
-            client
-                .provision_exact(paid_test_request(), 42, OfferBrowseCriteria::default())
-                .is_err()
-        );
-        assert!(
-            client
-                .provision_paid(
-                    paid_test_request(),
-                    &monitor_spec(5, 2),
-                    Some(42),
-                    Some(OfferBrowseCriteria::default())
-                )
-                .is_err()
-        );
-        assert!(server.requests().is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn paid_create_is_durable_before_return_and_missing_contract_cannot_be_replaced() {
-        let (directory, admission, _owner) = paid_test_admission();
-        let server =
-            TestHttpServer::start(paid_test_routes(200, json!({"new_contract": 700}))).unwrap();
-        let mut client =
-            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
-        client.paid_admission_path = Some(directory.path().join("admission.json"));
-        let instance = client
-            .provision_paid(
-                paid_test_request(),
-                &monitor_spec(5, 2),
-                Some(42),
-                Some(OfferBrowseCriteria::default()),
-            )
-            .unwrap();
-        assert_eq!(instance.contract_id, 700);
-        assert_eq!(
-            admission.snapshot().unwrap().contracts,
-            BTreeMap::from([(2, 700)])
-        );
-        // The provider now reports absence. Even a fresh client must not replace it.
-        let mut reopened = client.clone();
-        assert!(
-            reopened
-                .provision_paid(
-                    paid_test_request(),
-                    &monitor_spec(5, 2),
-                    Some(42),
-                    Some(OfferBrowseCriteria::default())
-                )
-                .is_err()
-        );
-        let creates = server
-            .requests()
-            .into_iter()
-            .filter(|request| request.method == "PUT")
-            .map(|request| request.path)
-            .collect::<Vec<_>>();
-        assert_eq!(creates, ["/api/v0/asks/42/"]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn paid_ambiguous_rate_limit_never_retries_or_substitutes_an_offer() {
-        let (directory, admission, _owner) = paid_test_admission();
-        let server =
-            TestHttpServer::start(paid_test_routes(429, json!({"error": "rate limited"}))).unwrap();
-        let mut client =
-            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
-        client.paid_admission_path = Some(directory.path().join("admission.json"));
-        assert!(
-            client
-                .provision_paid(
-                    paid_test_request(),
-                    &monitor_spec(5, 2),
-                    Some(42),
-                    Some(OfferBrowseCriteria::default())
-                )
-                .is_err()
-        );
-        assert!(
-            client
-                .clone()
-                .provision_paid(
-                    paid_test_request(),
-                    &monitor_spec(5, 2),
-                    Some(42),
-                    Some(OfferBrowseCriteria::default())
-                )
-                .is_err()
-        );
-        assert!(client.provision_one(paid_test_request()).is_err());
-        let creates = server
-            .requests()
-            .into_iter()
-            .filter(|request| request.method == "PUT")
-            .map(|request| request.path)
-            .collect::<Vec<_>>();
-        assert_eq!(creates, ["/api/v0/asks/42/"]);
-        let snapshot = admission.snapshot().unwrap();
-        assert!(snapshot.contracts.is_empty());
-        assert_eq!(
-            snapshot
-                .create_reservations
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            [2]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn paid_offer_host_mismatch_is_rejected_before_create() {
-        let (directory, admission, _owner) = paid_test_admission();
-        let server = TestHttpServer::start(Vec::new()).unwrap();
-        let mut client =
-            ToolsVastAiLeaseClient::new(VastClient::with_base_url(server.uri(), "secret")).unwrap();
-        client.paid_admission_path = Some(directory.path().join("admission.json"));
-        let wrong_host: Offer = serde_json::from_value(json!({
-            "id": 42, "host_id": 999, "gpu_name": "B", "dph_total": 0.3,
-            "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
-        }))
-        .unwrap();
-        assert!(
-            client
-                .create_from_offer(&paid_test_request(), &wrong_host, Some(&monitor_spec(5, 2)))
-                .is_err()
-        );
-        assert!(server.requests().is_empty());
-        assert!(admission.snapshot().unwrap().create_reservations.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn paid_bootstrap_active_session_is_idempotent_but_cancel_does_not_reauthorize() {
-        let (directory, admission, _owner) = paid_test_admission();
-        let starts = Arc::new(AtomicUsize::new(0));
-        let mut plugin = VastAiProvisioningPlugin::new(
-            RetryDestroyClient {
-                destroy_calls: Arc::new(AtomicUsize::new(0)),
-                destroy_failures: Arc::new(AtomicUsize::new(0)),
-                existing_contract: Some(73),
-                ssh_endpoint_calls: Arc::new(AtomicUsize::new(0)),
-            },
-            CountingBootstrap {
-                starts: starts.clone(),
-                stops: Arc::new(AtomicUsize::new(0)),
-            },
-            VastAiProvisioningConfig::default(),
-        );
-        let spec = monitor_spec(5, 2);
-        let handle = plugin
-            .create_node(spec, PluginSink::new(Arc::new(NullSink)))
-            .unwrap();
-        admission
-            .reserve_create(5, 2, 9, 42, "myelin-5-2-attempt-9")
-            .unwrap();
-        admission.record_contract(2, 73).unwrap();
-        plugin.paid_admission_path = Some(directory.path().join("admission.json"));
-        plugin.start_bootstrap(&handle).unwrap();
-        plugin.start_bootstrap(&handle).unwrap();
-        plugin.cancel_bootstrap(&handle).unwrap();
-        assert!(plugin.start_bootstrap(&handle).is_err());
-        assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            admission
-                .snapshot()
-                .unwrap()
-                .initial_bootstraps
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            [2]
-        );
-    }
-
-    #[test]
-    fn offer_search_is_read_only() {
-        let server = TestHttpServer::start(vec![TestHttpRoute::json(
-            "GET",
-            "/api/v0/bundles/",
-            200,
-            json!({
-                "offers": [{
-                    "id": 41,
-                    "gpu_name": "A",
-                    "dph_total": 0.2,
-                    "internet_down_cost_per_tb": 0.0,
-                    "internet_up_cost_per_tb": 0.0,
-                    "host_id": 1,
-                    "compute_cap": 800,
-                    "reliability2": 0.99,
-                    "inet_down": 500.0,
-                    "inet_up": 500.0,
-                    "geolocation": "US"
-                }]
-            }),
-        )])
+            )],
+        )
         .unwrap();
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
@@ -2430,27 +3183,31 @@ mod tests {
 
     #[test]
     fn exact_offer_creation_never_requests_an_alternative() {
-        let server = TestHttpServer::start(vec![
-            TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
-            TestHttpRoute::json(
-                "GET",
-                "/api/v0/bundles/",
-                200,
-                json!({
-                    "offers": [
-                        {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
-                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
-                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
-                         "geolocation": "US"},
-                        {"id": 42, "gpu_name": "B", "dph_total": 0.3, "host_id": 2,
-                         "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
-                         "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
-                         "geolocation": "US"}
-                    ]
-                }),
-            ),
-            TestHttpRoute::json("PUT", "/api/v0/asks/42/", 200, json!({"new_contract": 700})),
-        ])
+        let engine = http_engine();
+        let server = TestHttpServer::start(
+            &engine.handle().blocking_work_sender(),
+            vec![
+                TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
+                TestHttpRoute::json(
+                    "GET",
+                    "/api/v0/bundles/",
+                    200,
+                    json!({
+                        "offers": [
+                            {"id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                             "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+                             "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                             "geolocation": "US"},
+                            {"id": 42, "gpu_name": "B", "dph_total": 0.3, "host_id": 2,
+                             "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+                             "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                             "geolocation": "US"}
+                        ]
+                    }),
+                ),
+                TestHttpRoute::json("PUT", "/api/v0/asks/42/", 200, json!({"new_contract": 700})),
+            ],
+        )
         .unwrap();
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
@@ -2475,22 +3232,26 @@ mod tests {
 
     #[test]
     fn unavailable_exact_offer_fails_without_any_create_request() {
-        let server = TestHttpServer::start(vec![
-            TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
-            TestHttpRoute::json(
-                "GET",
-                "/api/v0/bundles/",
-                200,
-                json!({
-                    "offers": [{
-                        "id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
-                        "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
-                        "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
-                        "geolocation": "US"
-                    }]
-                }),
-            ),
-        ])
+        let engine = http_engine();
+        let server = TestHttpServer::start(
+            &engine.handle().blocking_work_sender(),
+            vec![
+                TestHttpRoute::json("GET", "/api/v0/instances/", 200, json!({"instances": []})),
+                TestHttpRoute::json(
+                    "GET",
+                    "/api/v0/bundles/",
+                    200,
+                    json!({
+                        "offers": [{
+                            "id": 41, "gpu_name": "A", "dph_total": 0.2, "host_id": 1,
+                            "internet_down_cost_per_tb": 0.0, "internet_up_cost_per_tb": 0.0,
+                            "compute_cap": 800, "reliability2": 0.99, "inet_down": 500.0,
+                            "geolocation": "US"
+                        }]
+                    }),
+                ),
+            ],
+        )
         .unwrap();
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
@@ -2598,20 +3359,31 @@ mod tests {
         Rejected(String),
     }
 
-    fn browse_offer_fixture(route: TestHttpRoute) -> (OfferBrowseOutcome, usize) {
-        let server = TestHttpServer::start(vec![route]).expect("start offer HTTP fixture");
+    fn http_engine() -> Engine {
+        Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn browse_offer_fixture(
+        blocking: &swactor_engine::BlockingWorkSender,
+        route: TestHttpRoute,
+    ) -> OfferBrowseOutcome {
+        let server =
+            TestHttpServer::start(blocking, vec![route]).expect("start offer HTTP fixture");
         let mut client = ToolsVastAiLeaseClient::new(swactor_vastai::VastClient::with_base_url(
             server.uri(),
             "secret",
         ))
         .expect("blocking VastAI client");
-        let outcome = match client.browse_offers(&OfferBrowseCriteria::default()) {
+        match client.browse_offers(&OfferBrowseCriteria::default()) {
             Ok(offers) => {
                 OfferBrowseOutcome::Offers(offers.into_iter().map(|offer| offer.id).collect())
             }
             Err(error) => OfferBrowseOutcome::Rejected(error),
-        };
-        (outcome, server.requests().len())
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2621,16 +3393,10 @@ mod tests {
             node_id: u64,
             reason: String,
         },
-        BootstrapStopped {
-            run_id: u64,
-            node_id: u64,
-            attempt: u64,
-        },
     }
 
     #[derive(Debug, PartialEq, Eq)]
     enum TerminalInvariantError {
-        MalformedTerminal(String),
         DuplicateTerminal {
             first: TerminalOutcome,
             duplicate: TerminalOutcome,
@@ -2652,40 +3418,6 @@ mod tests {
                     node_id: *node_id,
                     reason: reason.clone(),
                 }),
-                PluginObservation::ProviderLine {
-                    run_id: observed_run_id,
-                    node_id: observed_node_id,
-                    line,
-                } => {
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                        continue;
-                    };
-                    if value.get("type").and_then(serde_json::Value::as_str)
-                        != Some("VastAiBootstrapStopped")
-                    {
-                        continue;
-                    }
-                    let run_id = value
-                        .get("run_id")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| TerminalInvariantError::MalformedTerminal(line.clone()))?;
-                    let node_id = value
-                        .get("node_id")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| TerminalInvariantError::MalformedTerminal(line.clone()))?;
-                    let attempt = value
-                        .get("attempt")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| TerminalInvariantError::MalformedTerminal(line.clone()))?;
-                    if run_id != *observed_run_id || node_id != *observed_node_id {
-                        return Err(TerminalInvariantError::MalformedTerminal(line.clone()));
-                    }
-                    Some(TerminalOutcome::BootstrapStopped {
-                        run_id,
-                        node_id,
-                        attempt,
-                    })
-                }
                 _ => None,
             };
             let Some(candidate) = candidate else {
@@ -2810,6 +3542,38 @@ mod tests {
     }
 
     fn monitor_harness(contract_id: u64, spec: NodeProvisionSpec, kind: u8) -> MonitorHarness {
+        monitor_harness_with_port(
+            contract_id,
+            spec,
+            Some(scripted_monitor_status(kind)),
+            VastAiTaskPort {
+                commands: tokio::sync::mpsc::unbounded_channel().0,
+            },
+        )
+    }
+
+    fn monitor_harness_with_port(
+        contract_id: u64,
+        spec: NodeProvisionSpec,
+        scripted_status: Option<Result<ProviderInstanceStatus, String>>,
+        tasks: VastAiTaskPort,
+    ) -> MonitorHarness {
+        monitor_harness_with_optional_contract(
+            Some(contract_id),
+            spec,
+            scripted_status,
+            tasks,
+            None,
+        )
+    }
+
+    fn monitor_harness_with_optional_contract(
+        contract_id: Option<u64>,
+        spec: NodeProvisionSpec,
+        scripted_status: Option<Result<ProviderInstanceStatus, String>>,
+        tasks: VastAiTaskPort,
+        observe_snapshot: Option<SnapshotObserver>,
+    ) -> MonitorHarness {
         let client = VastClient::with_base_url("http://127.0.0.1:1", "secret");
         let parts = RuntimeParts::new(RuntimeConfig::default());
         let runtime = parts.runtime().clone();
@@ -2826,16 +3590,15 @@ mod tests {
                         "run-{}-node-{}-attempt-{}",
                         spec.run_id, spec.node_id, spec.attempt_id
                     ),
-                    lifecycle: LifecyclePolicy {
-                        lease_pace: Duration::ZERO,
-                        poll_interval: Duration::from_millis(1),
-                        state_timeout: Duration::from_millis(10),
-                    },
                     spec,
                     sink: PluginSink::new(recording.clone()),
                     sender: runtime.create_sender(),
-                    engine: engine.handle(),
-                    scripted_status: Some(scripted_monitor_status(kind)),
+                    tasks,
+                    observe_snapshot,
+                    cleanup_completed: None,
+                    invalidation_queued: Arc::new(AtomicBool::new(false)),
+
+                    scripted_status,
                 },
             ))
             .expect("spawn VastAI monitor");
@@ -2847,6 +3610,246 @@ mod tests {
             baseline,
             recording,
         }
+    }
+
+    #[test]
+    fn provider_invalidations_coalesce_while_snapshot_is_in_flight() {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let harness =
+            monitor_harness_with_port(73, monitor_spec(5, 7), None, VastAiTaskPort { commands });
+        drive_steps(&harness.backend, 8);
+        let mut first = requests.try_recv().unwrap();
+        for _ in 0..8 {
+            harness
+                .runtime
+                .send_to(harness.actor, VastAiProviderMonitorMsg::Poll)
+                .unwrap();
+        }
+        drive_steps(&harness.backend, 8);
+        assert!(
+            requests.try_recv().is_err(),
+            "in-flight snapshot duplicated"
+        );
+        first.reply.status(scripted_monitor_status(0));
+        drop(first);
+        drive_steps(&harness.backend, 8);
+        let mut follow_up = requests.try_recv().expect("dirty snapshot must reconcile");
+        assert!(
+            requests.try_recv().is_err(),
+            "dirty events did not coalesce"
+        );
+        follow_up.reply.status(scripted_monitor_status(0));
+        drop(follow_up);
+        drive_steps(&harness.backend, 8);
+        assert!(
+            requests.try_recv().is_err(),
+            "completion must not self-poll"
+        );
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Stop)
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
+    }
+
+    #[test]
+    fn repeated_reconciliation_error_consumes_only_one_real_notification() {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let harness = monitor_harness_with_optional_contract(
+            None,
+            monitor_spec(5, 7),
+            None,
+            VastAiTaskPort { commands },
+            None,
+        );
+        drive_steps(&harness.backend, 8);
+        let mut first = requests.try_recv().unwrap();
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Poll)
+            .unwrap();
+        harness
+            .runtime
+            .send_to(
+                harness.actor,
+                VastAiProviderMonitorMsg::ContractResolved {
+                    generation: first.reply.generation,
+                    contract_id: 73,
+                },
+            )
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        assert!(
+            requests.try_recv().is_err(),
+            "resolution must not duplicate in-flight work"
+        );
+        first
+            .reply
+            .status(Err("ownership journal unavailable".to_owned()));
+        drop(first);
+        drive_steps(&harness.backend, 8);
+        let mut next = requests
+            .try_recv()
+            .expect("accepted notification must survive resolution failure");
+        assert_eq!(next.contract_id, Some(73));
+        next.reply
+            .status(Err("ownership journal unavailable".to_owned()));
+        drop(next);
+        drive_steps(&harness.backend, 8);
+        assert!(
+            requests.try_recv().is_err(),
+            "completion must not invent another notification"
+        );
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Stop)
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
+    }
+
+    #[test]
+    fn unresolved_contract_waits_for_notification_without_fabricating_absence() {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let harness = monitor_harness_with_optional_contract(
+            None,
+            monitor_spec(5, 7),
+            None,
+            VastAiTaskPort { commands },
+            None,
+        );
+        drive_steps(&harness.backend, 8);
+        let mut first = requests.try_recv().unwrap();
+        assert_eq!(first.contract_id, None);
+        first.reply.resolution_pending();
+        drop(first);
+        drive_steps(&harness.backend, 8);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(None)
+        );
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Poll)
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        let mut resolved = requests.try_recv().unwrap();
+        resolved
+            .reply
+            .resolved_status(73, scripted_monitor_status(0).unwrap());
+        drop(resolved);
+        drive_steps(&harness.backend, 8);
+        assert_eq!(monitor_poll_count(&harness.recording), 1);
+        assert_eq!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(None)
+        );
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Stop)
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
+    }
+
+    #[test]
+    fn provider_owner_loss_resolves_queued_poll_once() {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let harness =
+            monitor_harness_with_port(73, monitor_spec(5, 7), None, VastAiTaskPort { commands });
+        drive_steps(&harness.backend, 8);
+        let request = requests
+            .try_recv()
+            .expect("accepted provider poll retains its reply");
+        assert_eq!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(None)
+        );
+        let generation = request.reply.generation;
+        let poll = request.reply.poll.unwrap();
+        drop(request);
+        harness
+            .runtime
+            .send_to(
+                harness.actor,
+                VastAiProviderMonitorMsg::StatusCompleted {
+                    generation,
+                    poll,
+                    result: Err("duplicate terminal".to_owned()),
+                },
+            )
+            .unwrap();
+        drive_steps(&harness.backend, 16);
+        assert!(matches!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(Some(TerminalOutcome::MonitorRejected { .. }))
+        ));
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn provider_stale_status_cannot_discharge_new_poll() {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let harness =
+            monitor_harness_with_port(73, monitor_spec(5, 7), None, VastAiTaskPort { commands });
+        drive_steps(&harness.backend, 8);
+        let mut first = requests.try_recv().unwrap();
+        let generation = first.reply.generation;
+        let poll = first.reply.poll.unwrap();
+        first.reply.status(scripted_monitor_status(0));
+        drop(first);
+        drive_steps(&harness.backend, 8);
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Poll)
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        let next = requests.try_recv().expect("next poll accepted");
+        harness
+            .runtime
+            .send_to(
+                harness.actor,
+                VastAiProviderMonitorMsg::StatusCompleted {
+                    generation,
+                    poll,
+                    result: Err("provider_task_owner_lost".to_owned()),
+                },
+            )
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        assert_eq!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(None)
+        );
+        drop(next);
+        drive_steps(&harness.backend, 16);
+        assert!(matches!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(Some(TerminalOutcome::MonitorRejected { .. }))
+        ));
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
+    }
+
+    #[test]
+    fn provider_parent_stop_cancels_pending_owner() {
+        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let harness =
+            monitor_harness_with_port(73, monitor_spec(5, 7), None, VastAiTaskPort { commands });
+        drive_steps(&harness.backend, 8);
+        let request = requests.try_recv().unwrap();
+        harness.runtime.stop_actor(harness.actor).unwrap();
+        drive_steps(&harness.backend, 16);
+        assert!(request.cancelled.has_changed().is_err() || *request.cancelled.borrow());
+        drop(request);
+        drive_steps(&harness.backend, 8);
+        assert!(matches!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(Some(TerminalOutcome::MonitorRejected { .. }))
+        ));
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
     }
 
     struct SshHarness {
@@ -2862,7 +3865,6 @@ mod tests {
     enum SshHarnessMode {
         Idle,
         OpenStreams,
-        PendingChild,
     }
 
     fn ssh_harness_with_mode(mode: SshHarnessMode) -> SshHarness {
@@ -2892,7 +3894,6 @@ mod tests {
         let actor = match mode {
             SshHarnessMode::Idle => actor.with_attempt_spawn_disabled(),
             SshHarnessMode::OpenStreams => actor.with_open_test_streams(),
-            SshHarnessMode::PendingChild => actor.with_pending_test_child(),
         };
         let actor = runtime.spawn(actor).expect("spawn SSH bootstrap actor");
         drive_steps(&backend, 8);
@@ -2908,6 +3909,116 @@ mod tests {
 
     fn ssh_harness() -> SshHarness {
         ssh_harness_with_mode(SshHarnessMode::Idle)
+    }
+
+    #[test]
+    fn ssh_completion_keeps_transport_observation_owned_until_stop() {
+        let harness = ssh_harness_with_mode(SshHarnessMode::OpenStreams);
+        harness
+            .runtime
+            .send_to(harness.actor, SshBootstrapMsg::Complete)
+            .unwrap();
+        harness
+            .runtime
+            .send_to(harness.actor, SshBootstrapMsg::Complete)
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        harness
+            .runtime
+            .send_to(
+                harness.actor,
+                SshBootstrapMsg::OutputLine {
+                    attempt: 1,
+                    stream: SshBootstrapStream::Stdout,
+                    line: "after readiness".to_owned(),
+                },
+            )
+            .unwrap();
+        drive_steps(&harness.backend, 8);
+        assert!(observations(&harness.recording).iter().any(|event| matches!(event, PluginObservation::StdoutLine { line, .. } if line == "after readiness")));
+        harness
+            .runtime
+            .send_to(harness.actor, SshBootstrapMsg::Stop)
+            .unwrap();
+        drive_steps(&harness.backend, 16);
+        assert_eq!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(None)
+        );
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
+    }
+
+    #[test]
+    fn ssh_duplicate_exit_and_stale_streams_do_not_steal_retry_ownership() {
+        use std::os::unix::process::ExitStatusExt;
+        let harness = ssh_harness_with_mode(SshHarnessMode::OpenStreams);
+        harness
+            .runtime
+            .send_to(
+                harness.actor,
+                SshBootstrapMsg::ChildExited {
+                    attempt: 1,
+                    result: Ok(std::process::ExitStatus::from_raw(1 << 8)),
+                },
+            )
+            .unwrap();
+        harness
+            .runtime
+            .send_to(
+                harness.actor,
+                SshBootstrapMsg::ChildExited {
+                    attempt: 1,
+                    result: Err("duplicate".to_owned()),
+                },
+            )
+            .unwrap();
+        for stream in [SshBootstrapStream::Stdout, SshBootstrapStream::Stderr] {
+            harness
+                .runtime
+                .send_to(
+                    harness.actor,
+                    SshBootstrapMsg::ReaderClosed { attempt: 1, stream },
+                )
+                .unwrap();
+        }
+        drive_steps(&harness.backend, 8);
+        harness
+            .runtime
+            .send_to(harness.actor, SshBootstrapMsg::Refresh)
+            .unwrap();
+        drive_steps(&harness.backend, 16);
+        for (attempt, line) in [(1, "stale output"), (2, "current output")] {
+            harness
+                .runtime
+                .send_to(
+                    harness.actor,
+                    SshBootstrapMsg::OutputLine {
+                        attempt,
+                        stream: SshBootstrapStream::Stdout,
+                        line: line.to_owned(),
+                    },
+                )
+                .unwrap();
+        }
+        drive_steps(&harness.backend, 8);
+        let lines = observations(&harness.recording)
+            .into_iter()
+            .filter_map(|event| match event {
+                PluginObservation::StdoutLine { line, .. } => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines, ["current output"]);
+        harness
+            .runtime
+            .send_to(harness.actor, SshBootstrapMsg::Stop)
+            .unwrap();
+        drive_steps(&harness.backend, 16);
+        assert!(matches!(
+            single_terminal_outcome(&observations(&harness.recording)),
+            Ok(Some(TerminalOutcome::MonitorRejected { .. }))
+        ));
+        assert!(runtime_is_clean(&harness.runtime, harness.baseline, 0));
     }
 
     fn malformed_protocol_line(kind: u8, nonce: u16) -> String {
@@ -2962,7 +4073,7 @@ mod tests {
     enum SshOrderingAction {
         Stdout(String),
         ReaderError(bool),
-        Advance(u16),
+        Refresh,
         Stop,
     }
 
@@ -2971,7 +4082,7 @@ mod tests {
             prop_oneof![
                 "[ -~]{0,16}".prop_map(SshOrderingAction::Stdout),
                 any::<bool>().prop_map(SshOrderingAction::ReaderError),
-                (0_u16..=1_000).prop_map(SshOrderingAction::Advance),
+                Just(SshOrderingAction::Refresh),
                 Just(SshOrderingAction::Stop),
             ],
             0..=32,
@@ -2979,14 +4090,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_status_polls_quickly_and_deduplicates_visible_progress() {
+    fn startup_status_refreshes_only_on_invalidation_and_deduplicates_visible_progress() {
         let harness = monitor_harness(73, monitor_spec(5, 7), 6);
         drive_steps(&harness.backend, 8);
         assert_eq!(monitor_poll_count(&harness.recording), 1);
         assert_eq!(visible_status_count(&harness.recording), 1);
-        advance_and_drive(&harness.backend, Duration::from_millis(1), 8);
+        drive_steps(&harness.backend, 8);
         assert_eq!(monitor_poll_count(&harness.recording), 1);
-        advance_and_drive(&harness.backend, Duration::from_secs(1), 16);
+        harness
+            .runtime
+            .send_to(harness.actor, VastAiProviderMonitorMsg::Poll)
+            .unwrap();
+        drive_steps(&harness.backend, 16);
         assert_eq!(monitor_poll_count(&harness.recording), 2);
         assert_eq!(visible_status_count(&harness.recording), 1);
         let lines = observations(&harness.recording);
@@ -3021,7 +4136,8 @@ mod tests {
             } else {
                 vec![offer_fixture(41)]
             };
-            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
+            let engine = http_engine();
+            let outcome = browse_offer_fixture(&engine.handle().blocking_work_sender(), TestHttpRoute::json(
                 "GET",
                 "/api/v0/bundles/",
                 status,
@@ -3053,13 +4169,6 @@ mod tests {
                     outcome,
                 );
             }
-            prop_assert_eq!(
-                request_count,
-                1,
-                "status={}, outcome={:?}",
-                status,
-                outcome,
-            );
         }
 
         #[test]
@@ -3093,7 +4202,8 @@ mod tests {
                     body
                 }
             };
-            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::raw(
+            let engine = http_engine();
+            let outcome = browse_offer_fixture(&engine.handle().blocking_work_sender(), TestHttpRoute::raw(
                 "GET",
                 "/api/v0/bundles/",
                 200,
@@ -3101,14 +4211,6 @@ mod tests {
             ));
             prop_assert!(
                 matches!(&outcome, OfferBrowseOutcome::Rejected(error) if !error.trim().is_empty()),
-                "kind={}, fuzz={:?}, outcome={:?}",
-                kind,
-                fuzz,
-                outcome,
-            );
-            prop_assert_eq!(
-                request_count,
-                1,
                 "kind={}, fuzz={:?}, outcome={:?}",
                 kind,
                 fuzz,
@@ -3134,7 +4236,8 @@ mod tests {
                     offer["internet_up_cost_per_tb"] = json!(0.0);
                 }
             }
-            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
+            let engine = http_engine();
+            let outcome = browse_offer_fixture(&engine.handle().blocking_work_sender(), TestHttpRoute::json(
                 "GET",
                 "/api/v0/bundles/",
                 200,
@@ -3142,13 +4245,6 @@ mod tests {
             ));
             prop_assert!(
                 matches!(&outcome, OfferBrowseOutcome::Rejected(error) if !error.trim().is_empty()),
-                "wrong-field kind={}, outcome={:?}",
-                kind,
-                outcome,
-            );
-            prop_assert_eq!(
-                request_count,
-                1,
                 "wrong-field kind={}, outcome={:?}",
                 kind,
                 outcome,
@@ -3161,7 +4257,8 @@ mod tests {
             repetitions in 2_usize..=32,
         ) {
             let repeated = (0..repetitions).map(|_| offer_fixture(id)).collect::<Vec<_>>();
-            let (outcome, request_count) = browse_offer_fixture(TestHttpRoute::json(
+            let engine = http_engine();
+            let outcome = browse_offer_fixture(&engine.handle().blocking_work_sender(), TestHttpRoute::json(
                 "GET",
                 "/api/v0/bundles/",
                 200,
@@ -3170,13 +4267,6 @@ mod tests {
             prop_assert_eq!(
                 outcome,
                 OfferBrowseOutcome::Offers(vec![id; repetitions]),
-                "id={}, repetitions={}",
-                id,
-                repetitions,
-            );
-            prop_assert_eq!(
-                request_count,
-                1,
                 "id={}, repetitions={}",
                 id,
                 repetitions,
@@ -3251,7 +4341,7 @@ mod tests {
             let _ = harness
                 .runtime
                 .send_to(harness.actor, VastAiProviderMonitorMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            drive_steps(&harness.backend, 64);
             let final_outcomes = observations(&harness.recording);
             prop_assert!(
                 runtime_is_clean(&harness.runtime, harness.baseline, 0),
@@ -3278,7 +4368,7 @@ mod tests {
             }
             drive_steps(&harness.backend, 64);
             let first_request_count = monitor_poll_count(&harness.recording);
-            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            drive_steps(&harness.backend, 64);
             let second_request_count = monitor_poll_count(&harness.recording);
             let outcomes = observations(&harness.recording);
             let terminal = single_terminal_outcome(&outcomes);
@@ -3343,11 +4433,7 @@ mod tests {
                             .send_to(harness.actor, VastAiProviderMonitorMsg::Poll);
                         drive_steps(&harness.backend, 8);
                     }
-                    1 => advance_and_drive(
-                        &harness.backend,
-                        Duration::from_millis(1),
-                        8,
-                    ),
+                    1 => drive_steps(&harness.backend, 8),
                     _ => {
                         let _ = harness
                             .runtime
@@ -3381,9 +4467,9 @@ mod tests {
             let _ = harness
                 .runtime
                 .send_to(harness.actor, VastAiProviderMonitorMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            drive_steps(&harness.backend, 64);
             let settled_requests = monitor_poll_count(&harness.recording);
-            advance_and_drive(&harness.backend, Duration::from_secs(1), 64);
+            drive_steps(&harness.backend, 64);
             let outcomes = observations(&harness.recording);
             prop_assert_eq!(
                 monitor_poll_count(&harness.recording),
@@ -3404,46 +4490,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn duplicate_terminal_detector_rejects_controlled_fault(
-            run_id in any::<u64>(),
-            node_id in any::<u64>(),
-        ) {
-            let injected = vec![
-                PluginObservation::ProviderLine {
-                    run_id,
-                    node_id,
-                    line: json!({
-                        "type": "VastAiBootstrapStopped",
-                        "run_id": run_id,
-                        "node_id": node_id,
-                        "attempt": 1,
-                    })
-                    .to_string(),
-                },
-                PluginObservation::ProviderLine {
-                    run_id,
-                    node_id,
-                    line: json!({
-                        "type": "VastAiBootstrapStopped",
-                        "run_id": run_id,
-                        "node_id": node_id,
-                        "attempt": 2,
-                    })
-                    .to_string(),
-                },
-            ];
-            let detected = single_terminal_outcome(&injected);
-            prop_assert!(
-                matches!(
-                    &detected,
-                    Err(TerminalInvariantError::DuplicateTerminal { .. })
-                ),
-                "controlled duplicate terminal escaped detector; actions=[inject_first, inject_duplicate], outcomes={:?}, detected={:?}",
-                injected,
-                detected,
-            );
-        }
 
         #[test]
         fn ssh_bootstrap_output_lines_preserve_stream_and_protocol(actions in ssh_output_actions()) {
@@ -3459,14 +4505,17 @@ mod tests {
             for action in &actions {
                 let message = match action {
                     SshOutputAction::Stdout(line) => SshBootstrapMsg::OutputLine {
+                        attempt: 1,
                         stream: SshBootstrapStream::Stdout,
                         line: line.clone(),
                     },
                     SshOutputAction::Stderr(line) => SshBootstrapMsg::OutputLine {
+                        attempt: 1,
                         stream: SshBootstrapStream::Stderr,
                         line: line.clone(),
                     },
                     SshOutputAction::Protocol(nonce) => SshBootstrapMsg::OutputLine {
+                        attempt: 1,
                         stream: SshBootstrapStream::Stdout,
                         line: json!({
                             "myelin_stdio_event": 1,
@@ -3490,7 +4539,7 @@ mod tests {
                 drive_steps(&harness.backend, 4);
             }
             let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            drive_steps(&harness.backend, 128);
             let outcomes = observations(&harness.recording);
             let expected_stdout = actions
                 .iter()
@@ -3539,7 +4588,7 @@ mod tests {
             );
             let terminal = single_terminal_outcome(&outcomes);
             prop_assert!(
-                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. }))),
+                matches!(&terminal, Ok(Some(TerminalOutcome::MonitorRejected { .. }))),
                 "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
                 actions,
                 terminal,
@@ -3567,6 +4616,7 @@ mod tests {
                     .send_to(
                         harness.actor,
                         SshBootstrapMsg::OutputLine {
+                            attempt: 1,
                             stream: SshBootstrapStream::Stdout,
                             line: malformed_protocol_line(*kind, *nonce),
                         },
@@ -3581,7 +4631,7 @@ mod tests {
                 drive_steps(&harness.backend, 4);
             }
             let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            drive_steps(&harness.backend, 128);
             let outcomes = observations(&harness.recording);
             prop_assert_eq!(
                 outcomes
@@ -3607,7 +4657,7 @@ mod tests {
             );
             let terminal = single_terminal_outcome(&outcomes);
             prop_assert!(
-                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                matches!(&terminal, Ok(Some(TerminalOutcome::MonitorRejected { .. })))
                     && runtime_is_clean(&harness.runtime, harness.baseline, 0),
                 "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
                 actions,
@@ -3631,6 +4681,7 @@ mod tests {
                     .send_to(
                         harness.actor,
                         SshBootstrapMsg::ReaderClosed {
+                            attempt: 1,
                             stream: if *stderr {
                                 SshBootstrapStream::Stderr
                             } else {
@@ -3648,11 +4699,11 @@ mod tests {
                 drive_steps(&harness.backend, 4);
             }
             let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            drive_steps(&harness.backend, 128);
             let outcomes = observations(&harness.recording);
             let terminal = single_terminal_outcome(&outcomes);
             prop_assert!(
-                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                matches!(&terminal, Ok(Some(TerminalOutcome::MonitorRejected { .. })))
                     && runtime_is_clean(&harness.runtime, harness.baseline, 0),
                 "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
                 actions,
@@ -3662,75 +4713,13 @@ mod tests {
             );
         }
 
-        #[test]
-        fn ssh_bootstrap_child_failures_have_typed_attempt_outcomes(
-            actions in prop::collection::vec(1_i32..=255, 1..=32),
-        ) {
-            let harness = ssh_harness();
-            for status in &actions {
-                harness
-                    .runtime
-                    .send_to(
-                        harness.actor,
-                        SshBootstrapMsg::ScriptedAttemptFinished {
-                            result: Ok(*status),
-                        },
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "queue SSH child failure failed: error={error}, action={status}, actions={actions:?}, outcomes={:?}, census={}",
-                            observations(&harness.recording),
-                            actor_census(&harness.runtime),
-                        )
-                    });
-                drive_steps(&harness.backend, 4);
-            }
-            let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
-            let outcomes = observations(&harness.recording);
-            let completions = outcomes
-                .iter()
-                .filter_map(|outcome| match outcome {
-                    PluginObservation::ProviderLine { line, .. } => {
-                        serde_json::from_str::<serde_json::Value>(line).ok()
-                    }
-                    _ => None,
-                })
-                .filter(|value| {
-                    value.get("type").and_then(serde_json::Value::as_str)
-                        == Some("VastAiBootstrapAttemptCompleted")
-                        && value
-                            .get("classification")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("not ready before runtime ready")
-                })
-                .count();
-            prop_assert_eq!(
-                completions,
-                actions.len(),
-                "actions={:?}, outcomes={:?}, census={}",
-                actions,
-                outcomes,
-                actor_census(&harness.runtime),
-            );
-            let terminal = single_terminal_outcome(&outcomes);
-            prop_assert!(
-                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
-                    && runtime_is_clean(&harness.runtime, harness.baseline, 0),
-                "actions={:?}, terminal={:?}, outcomes={:?}, census={}",
-                actions,
-                terminal,
-                outcomes,
-                actor_census(&harness.runtime),
-            );
-        }
 
         #[test]
-        fn ssh_bootstrap_timeout_is_typed_and_stops_polling(
-            advances in prop::collection::vec(0_u16..=1_000, 0..=31),
+        fn ssh_bootstrap_failure_waits_for_refresh_and_stop_is_terminal(
+            advances in prop::collection::vec(any::<bool>(), 0..=31),
         ) {
-            let harness = ssh_harness_with_mode(SshHarnessMode::PendingChild);
-            advance_and_drive(&harness.backend, Duration::from_millis(100), 8);
+            let harness = ssh_harness_with_mode(SshHarnessMode::OpenStreams);
+            drive_steps(&harness.backend, 8);
             let initial_outcomes = observations(&harness.recording);
             prop_assert!(
                 harness.runtime.stats().actors.len() == harness.baseline + 2
@@ -3749,7 +4738,8 @@ mod tests {
                 .runtime
                 .send_to(
                     harness.actor,
-                    SshBootstrapMsg::ScriptedAttemptFinished {
+                    SshBootstrapMsg::ChildExited {
+                        attempt: 1,
                         result: Err("bootstrap timeout".to_owned()),
                     },
                 )
@@ -3760,22 +4750,24 @@ mod tests {
                         actor_census(&harness.runtime),
                     )
                 });
+            for stream in [SshBootstrapStream::Stdout, SshBootstrapStream::Stderr] {
+                harness.runtime.send_to(harness.actor, SshBootstrapMsg::ReaderClosed { attempt: 1, stream }).unwrap();
+            }
             drive_steps(&harness.backend, 4);
-            for millis in &advances {
-                advance_and_drive(
-                    &harness.backend,
-                    Duration::from_millis(u64::from(*millis)),
-                    4,
-                );
+            for refresh in &advances {
+                if *refresh {
+                    let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Refresh);
+                }
+                drive_steps(&harness.backend, 4);
             }
             let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            drive_steps(&harness.backend, 128);
             let outcomes = observations(&harness.recording);
             prop_assert!(
                 outcomes.iter().any(|outcome| matches!(
                     outcome,
                     PluginObservation::ProviderLine { line, .. }
-                        if line.contains("bootstrap timeout") && line.contains("retrying")
+                        if line.contains("bootstrap timeout")
                 )),
                 "actions=[timeout, {:?}, stop], outcomes={:?}, census={}",
                 advances,
@@ -3790,7 +4782,7 @@ mod tests {
                         if line.contains("VastAI SSH bootstrap attempt")
                 ))
                 .count();
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            drive_steps(&harness.backend, 128);
             let final_outcomes = observations(&harness.recording);
             let final_attempts = final_outcomes
                 .iter()
@@ -3811,7 +4803,7 @@ mod tests {
                 actor_census(&harness.runtime),
             );
             prop_assert!(
-                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. })))
+                matches!(&terminal, Ok(Some(TerminalOutcome::MonitorRejected { .. })))
                     && runtime_is_clean(&harness.runtime, harness.baseline, 0),
                 "actions=[timeout, {:?}, stop], terminal={:?}, outcomes={:?}, census={}",
                 advances,
@@ -3833,6 +4825,7 @@ mod tests {
                         let _ = harness.runtime.send_to(
                             harness.actor,
                             SshBootstrapMsg::OutputLine {
+                                attempt: 1,
                                 stream: SshBootstrapStream::Stdout,
                                 line: line.clone(),
                             },
@@ -3843,6 +4836,7 @@ mod tests {
                         let _ = harness.runtime.send_to(
                             harness.actor,
                             SshBootstrapMsg::ReaderError {
+                                attempt: 1,
                                 stream: if *stderr {
                                     SshBootstrapStream::Stderr
                                 } else {
@@ -3853,11 +4847,10 @@ mod tests {
                         );
                         drive_steps(&harness.backend, 4);
                     }
-                    SshOrderingAction::Advance(millis) => advance_and_drive(
-                        &harness.backend,
-                        Duration::from_millis(u64::from(*millis)),
-                        4,
-                    ),
+                    SshOrderingAction::Refresh => {
+                        let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Refresh);
+                        drive_steps(&harness.backend, 4);
+                    }
                     SshOrderingAction::Stop => {
                         let _ = harness
                             .runtime
@@ -3877,11 +4870,11 @@ mod tests {
                 );
             }
             let _ = harness.runtime.send_to(harness.actor, SshBootstrapMsg::Stop);
-            advance_and_drive(&harness.backend, Duration::from_secs(31), 128);
+            drive_steps(&harness.backend, 128);
             let outcomes = observations(&harness.recording);
             let terminal = single_terminal_outcome(&outcomes);
             prop_assert!(
-                matches!(&terminal, Ok(Some(TerminalOutcome::BootstrapStopped { .. }))),
+                matches!(&terminal, Ok(Some(TerminalOutcome::MonitorRejected { .. }))),
                 "actions={:?}, stopped={}, terminal={:?}, outcomes={:?}, census={}",
                 actions,
                 stopped,

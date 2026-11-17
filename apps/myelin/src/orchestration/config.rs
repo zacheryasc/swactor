@@ -6,9 +6,8 @@ use serde::Deserialize;
 pub(crate) const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct VastAiConfig {
-    pub provisioning_mode: Option<String>,
     pub api_key: Option<String>,
     pub image: Option<String>,
     pub relay_url: Option<String>,
@@ -24,7 +23,6 @@ pub(crate) struct VastAiConfig {
     pub min_reliability: Option<f64>,
     pub require_verified: Option<bool>,
     pub blacklist_hosts: Vec<u64>,
-    pub poll_interval_secs: Option<u64>,
     pub onstart: Option<String>,
     pub ssh_identity: Option<String>,
 }
@@ -111,7 +109,6 @@ pub(crate) struct DockerConfigOverlay {
 pub(crate) struct ObservabilityConfigOverlay {
     pub dump_logs: Option<bool>,
     pub dump_log_path: Option<String>,
-    pub telemetry_frame_log: Option<String>,
 }
 
 impl TomlConfigOverlay {

@@ -3,7 +3,7 @@
 //! The core owns durable command/node state and emits explicit effects. It never
 //! performs provider, filesystem, network, or process work itself.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use myelin_control_contract::MAX_PROVISION_COUNT;
@@ -22,18 +22,16 @@ use swactor_vastai::OfferBrowseCriteria;
 
 use crate::node_actor::NodeAgentMsg;
 use crate::orchestration::actor::OrchestratorMsg;
-use crate::orchestration::daemon::{
-    ClusterSnapshot, RuntimeFacts, SnapshotNode, StateDir, unix_ms_now,
-};
+use crate::orchestration::daemon::{ClusterSnapshot, RuntimeFacts, SnapshotNode, StateDir};
 use crate::provisioning::{
-    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionEventKind,
-    ProvisionPlugin,
+    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
+    ProvisionEventKind, ProvisionPlugin,
 };
 
 pub(crate) const CONTROL_REGISTRY_NAME: &str = "myelin.manual-control";
 pub(crate) const SELECTED_OFFER_ID_ENV: &str = "MYELIN_SELECTED_OFFER_ID";
 pub(crate) const READ_MODEL_COMMAND_LIMIT: usize = 256;
-const OFFER_SEARCH_RECEIPT_TTL_MS: u64 = 5 * 60 * 1_000;
+const MAX_OFFER_SEARCH_RECEIPTS: usize = 256;
 
 fn provision_event_kind_for_phase(phase: NodePhase) -> Option<ProvisionEventKind> {
     match phase {
@@ -51,7 +49,7 @@ fn provision_event_kind_for_phase(phase: NodePhase) -> Option<ProvisionEventKind
     }
 }
 
-pub(crate) trait OfferSearchRequestExt {
+pub trait OfferSearchRequestExt {
     fn browse_criteria(&self) -> OfferBrowseCriteria;
 }
 
@@ -145,8 +143,9 @@ pub(crate) enum ManualAction {
         facts: RuntimeFacts,
     },
     SendRejoinReply {
+        request_id: u64,
         reply_to: ActorAddress,
-        binding: RejoinBinding,
+        result: Result<RejoinBinding, String>,
     },
 }
 
@@ -168,6 +167,7 @@ enum AfterPersist {
     Stop(u64),
     SendRuntimeReadyAck(u64),
     SendRejoinReply {
+        request_id: u64,
         reply_to: ActorAddress,
         binding: RejoinBinding,
     },
@@ -205,6 +205,55 @@ impl ManualControl {
         }
     }
 
+    pub(crate) fn reconcile_active_deployment_intent(
+        &mut self,
+        active: Option<&crate::provisioning::DeploymentIdentity>,
+    ) -> Vec<u64> {
+        let Some(active) = active else {
+            return Vec::new();
+        };
+        let mut stale_nodes = Vec::new();
+        for node in &mut self.snapshot.nodes {
+            if matches!(node.phase, NodePhase::Stopped | NodePhase::Orphan) {
+                continue;
+            }
+            let Some(spec) = node.spec.as_mut() else {
+                continue;
+            };
+            let intent_matches = spec.deployment.as_ref() == Some(active);
+            let runtime_matches = node
+                .runtime
+                .as_ref()
+                .and_then(RuntimeFacts::deployment_identity)
+                .as_ref()
+                == Some(active);
+            if intent_matches && runtime_matches {
+                continue;
+            }
+            spec.deployment = Some(active.clone());
+            spec.env.retain(|(key, _)| {
+                key != "MYELIN_ARTIFACT_DIGEST" && key != "MYELIN_DEPLOYMENT_GENERATION"
+            });
+            spec.env.push((
+                "MYELIN_ARTIFACT_DIGEST".to_owned(),
+                active.artifact_digest.clone(),
+            ));
+            spec.env.push((
+                "MYELIN_DEPLOYMENT_GENERATION".to_owned(),
+                active.deployment_generation.clone(),
+            ));
+            node.runtime = None;
+            if matches!(
+                node.phase,
+                NodePhase::Joining | NodePhase::Acknowledging | NodePhase::Running
+            ) {
+                node.phase = NodePhase::Bootstrapping;
+            }
+            stale_nodes.push(node.logical_node_id);
+        }
+        stale_nodes
+    }
+
     pub(crate) fn snapshot(&self) -> &ClusterSnapshot {
         &self.snapshot
     }
@@ -215,6 +264,12 @@ impl ManualControl {
     }
     fn persistence_idle(&self) -> bool {
         self.pending_persists.is_empty()
+    }
+
+    fn insert_command(&mut self, command: CommandRecord) {
+        self.snapshot
+            .commands
+            .insert(command.command_id.clone(), command);
     }
 
     pub(crate) fn provider(&self) -> &ProviderReadiness {
@@ -316,21 +371,18 @@ impl ManualControl {
             return Err("runtime image must not be empty".to_owned());
         }
         if self.provider.kind != ProviderReadinessKind::Ready {
-            self.snapshot.commands.insert(
-                command_id.to_owned(),
-                CommandRecord {
-                    command_id: command_id.to_owned(),
-                    kind: CommandKind::Provision,
-                    state: CommandState::Failed,
-                    node_ids: Vec::new(),
-                    error: Some(
-                        self.provider
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "provider is not ready".to_owned()),
-                    ),
-                },
-            );
+            self.insert_command(CommandRecord {
+                command_id: command_id.to_owned(),
+                kind: CommandKind::Provision,
+                state: CommandState::Failed,
+                node_ids: Vec::new(),
+                error: Some(
+                    self.provider
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "provider is not ready".to_owned()),
+                ),
+            });
             self.queue_persist(AfterPersist::None);
             return Ok(self
                 .snapshot
@@ -366,16 +418,13 @@ impl ManualControl {
             .iter()
             .map(|(node_id, _, _)| *node_id)
             .collect::<Vec<_>>();
-        self.snapshot.commands.insert(
-            command_id.to_owned(),
-            CommandRecord {
-                command_id: command_id.to_owned(),
-                kind: CommandKind::Provision,
-                state: CommandState::Persisting,
-                node_ids: node_ids.clone(),
-                error: None,
-            },
-        );
+        self.insert_command(CommandRecord {
+            command_id: command_id.to_owned(),
+            kind: CommandKind::Provision,
+            state: CommandState::Persisting,
+            node_ids: node_ids.clone(),
+            error: None,
+        });
 
         for (node_id, spec, selected_offer_id) in intents {
             let allocated = self.snapshot.allocate_node_id();
@@ -388,7 +437,6 @@ impl ManualControl {
                 phase: NodePhase::Requested,
                 runtime: None,
                 last_error: None,
-                last_seen_unix_ms: unix_ms_now(),
             });
         }
         self.queue_persist(AfterPersist::CreateMany(node_ids));
@@ -424,22 +472,18 @@ impl ManualControl {
                 node.last_error = Some("provision cancelled by Kill".to_owned());
             }
             node.phase = NodePhase::KillRequested;
-            node.last_seen_unix_ms = unix_ms_now();
         }
-        self.snapshot.commands.insert(
-            command_id.to_owned(),
-            CommandRecord {
-                command_id: command_id.to_owned(),
-                kind: CommandKind::Kill,
-                state: if already_stopped {
-                    CommandState::Succeeded
-                } else {
-                    CommandState::Persisting
-                },
-                node_ids: vec![request.logical_node_id],
-                error: None,
+        self.insert_command(CommandRecord {
+            command_id: command_id.to_owned(),
+            kind: CommandKind::Kill,
+            state: if already_stopped {
+                CommandState::Succeeded
+            } else {
+                CommandState::Persisting
             },
-        );
+            node_ids: vec![request.logical_node_id],
+            error: None,
+        });
         let wait_for_in_flight = self.in_flight.contains_key(&request.logical_node_id);
         self.queue_persist(if already_stopped || wait_for_in_flight {
             AfterPersist::None
@@ -466,9 +510,24 @@ impl ManualControl {
             .pop_front()
             .expect("in-flight persistence has queue entry");
         self.persistence_in_flight = None;
+
         if let Err(error) = result {
-            self.fail_all_nonterminal(format!("persist control state: {error}"));
-            self.pending_persists.clear();
+            let error = format!("persist control state: {error}");
+            self.fail_all_nonterminal(error.clone());
+            for pending in std::iter::once(pending).chain(self.pending_persists.drain(..)) {
+                if let AfterPersist::SendRejoinReply {
+                    request_id,
+                    reply_to,
+                    ..
+                } = pending.after
+                {
+                    self.actions.push_back(ManualAction::SendRejoinReply {
+                        request_id,
+                        reply_to,
+                        result: Err(error.clone()),
+                    });
+                }
+            }
             return Ok(());
         }
         self.after_persist(pending.after)?;
@@ -555,7 +614,6 @@ impl ManualControl {
             ));
         }
         node.runtime = Some(facts);
-        node.last_seen_unix_ms = unix_ms_now();
         self.queue_persist(AfterPersist::None);
         Ok(())
     }
@@ -572,7 +630,6 @@ impl ManualControl {
             ));
         }
         node.phase = NodePhase::Acknowledging;
-        node.last_seen_unix_ms = unix_ms_now();
         self.queue_persist(AfterPersist::SendRuntimeReadyAck(node_id));
         Ok(())
     }
@@ -612,7 +669,6 @@ impl ManualControl {
         }
         node.phase = NodePhase::KillRequested;
         node.last_error = Some(error);
-        node.last_seen_unix_ms = unix_ms_now();
         self.queue_persist(if self.in_flight.contains_key(&node_id) {
             AfterPersist::None
         } else {
@@ -626,6 +682,7 @@ impl ManualControl {
         hello: &RejoinHello,
         orchestrator_actor: ActorAddress,
         control_generation: u64,
+        request_id: u64,
         reply_to: ActorAddress,
     ) -> Result<RejoinBinding, String> {
         let node = self
@@ -704,13 +761,13 @@ impl ManualControl {
         });
         node.phase = NodePhase::Running;
         node.last_error = None;
-        node.last_seen_unix_ms = unix_ms_now();
         self.succeed_commands(hello.logical_node_id, CommandKind::Provision);
         let binding = RejoinBinding {
             orchestrator_actor,
             control_generation,
         };
         self.queue_persist(AfterPersist::SendRejoinReply {
+            request_id,
             reply_to,
             binding: binding.clone(),
         });
@@ -729,6 +786,7 @@ impl ManualControl {
             snapshot: self.snapshot.clone(),
             after,
         });
+
         self.start_next_persist();
     }
 
@@ -812,9 +870,16 @@ impl ManualControl {
                     .push_back(ManualAction::SendRuntimeReadyAck { node_id, facts });
                 Ok(())
             }
-            AfterPersist::SendRejoinReply { reply_to, binding } => {
-                self.actions
-                    .push_back(ManualAction::SendRejoinReply { reply_to, binding });
+            AfterPersist::SendRejoinReply {
+                request_id,
+                reply_to,
+                binding,
+            } => {
+                self.actions.push_back(ManualAction::SendRejoinReply {
+                    request_id,
+                    reply_to,
+                    result: Ok(binding),
+                });
                 Ok(())
             }
         }
@@ -832,7 +897,6 @@ impl ManualControl {
             ));
         }
         node.phase = NodePhase::Creating;
-        node.last_seen_unix_ms = unix_ms_now();
         let spec = node
             .spec
             .clone()
@@ -867,7 +931,6 @@ impl ManualControl {
         }
         let cancel_bootstrap = node.provider_ref.is_some();
         node.phase = NodePhase::Stopping;
-        node.last_seen_unix_ms = unix_ms_now();
         self.dispatch(node_id, EffectKind::Stop)?;
         self.set_commands_running(node_id);
         self.actions.push_back(ManualAction::Stop {
@@ -905,7 +968,6 @@ impl ManualControl {
                 } else {
                     NodePhase::Bootstrapping
                 };
-                node.last_seen_unix_ms = unix_ms_now();
                 self.queue_persist(if kill_requested {
                     AfterPersist::Stop(node_id)
                 } else {
@@ -915,9 +977,10 @@ impl ManualControl {
             }
             Ok(other) => Err(format!("create returned unexpected outcome {other:?}")),
             Err(error) => {
-                self.fail_provision(node_id, error);
-                self.succeed_commands(node_id, CommandKind::Kill);
-                self.queue_persist(AfterPersist::None);
+                // A lost create response does not prove that no resource was
+                // allocated. Reconcile the durable intent before declaring it stopped.
+                self.mark_provision_failure_for_cleanup(node_id, error);
+                self.queue_persist(AfterPersist::Stop(node_id));
                 Ok(())
             }
         }
@@ -935,7 +998,6 @@ impl ManualControl {
                     self.queue_persist(AfterPersist::Stop(node_id));
                 } else {
                     node.phase = NodePhase::Joining;
-                    node.last_seen_unix_ms = unix_ms_now();
                     self.queue_persist(AfterPersist::None);
                 }
                 Ok(())
@@ -964,7 +1026,6 @@ impl ManualControl {
                 } else {
                     node.phase = NodePhase::Running;
                     node.last_error = None;
-                    node.last_seen_unix_ms = unix_ms_now();
                     self.succeed_commands(node_id, CommandKind::Provision);
                     self.queue_persist(AfterPersist::None);
                 }
@@ -1001,7 +1062,6 @@ impl ManualControl {
                             node.phase = NodePhase::Stopped;
                             node.provider_ref = None;
                             node.last_error = Some(reason.clone());
-                            node.last_seen_unix_ms = unix_ms_now();
                             self.fail_commands(node_id, CommandKind::Provision, reason);
                             self.queue_persist(AfterPersist::None);
                         }
@@ -1013,7 +1073,6 @@ impl ManualControl {
                             let node = self.snapshot.node_mut(node_id).expect("effect node exists");
                             node.phase = NodePhase::Stopped;
                             node.provider_ref = None;
-                            node.last_seen_unix_ms = unix_ms_now();
                             self.succeed_commands(node_id, CommandKind::Kill);
                             if let Some(error) = provision_error {
                                 self.fail_commands(node_id, CommandKind::Provision, error);
@@ -1033,7 +1092,6 @@ impl ManualControl {
                 };
                 let node = self.snapshot.node_mut(node_id).expect("effect node exists");
                 node.provider_ref = Some(provider_ref);
-                node.last_seen_unix_ms = unix_ms_now();
                 let deployment_stale = node
                     .spec
                     .as_ref()
@@ -1084,6 +1142,25 @@ impl ManualControl {
         }
     }
 
+    fn provider_stopped(&mut self, run_id: u64, node_id: u64, attempt_id: u64) -> bool {
+        if self.in_flight.contains_key(&node_id) {
+            return false;
+        }
+        let Some(node) = self.snapshot.node_mut(node_id) else {
+            return false;
+        };
+        if !matches!(node.phase, NodePhase::Stopping | NodePhase::StopFailed)
+            || !node
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.run_id == run_id && spec.attempt_id == attempt_id)
+        {
+            return false;
+        }
+        node.last_error = None;
+        self.stopped(node_id, Ok(EffectOutcome::Stopped)).is_ok()
+    }
+
     fn stopped(
         &mut self,
         node_id: u64,
@@ -1097,7 +1174,6 @@ impl ManualControl {
                     .and_then(|node| node.last_error.clone());
                 let node = self.snapshot.node_mut(node_id).expect("effect node exists");
                 node.phase = NodePhase::Stopped;
-                node.last_seen_unix_ms = unix_ms_now();
                 self.succeed_commands(node_id, CommandKind::Kill);
                 if let Some(error) = provision_error {
                     self.fail_commands(node_id, CommandKind::Provision, error);
@@ -1110,7 +1186,6 @@ impl ManualControl {
                 let node = self.snapshot.node_mut(node_id).expect("effect node exists");
                 node.phase = NodePhase::StopFailed;
                 node.last_error = Some(error.clone());
-                node.last_seen_unix_ms = unix_ms_now();
                 self.fail_commands(node_id, CommandKind::Kill, error.clone());
                 self.fail_commands(
                     node_id,
@@ -1127,7 +1202,6 @@ impl ManualControl {
         if let Some(node) = self.snapshot.node_mut(node_id) {
             node.phase = NodePhase::Stopped;
             node.last_error = Some(error.clone());
-            node.last_seen_unix_ms = unix_ms_now();
         }
         self.fail_commands(node_id, CommandKind::Provision, error);
     }
@@ -1136,7 +1210,6 @@ impl ManualControl {
         if let Some(node) = self.snapshot.node_mut(node_id) {
             node.phase = NodePhase::KillRequested;
             node.last_error = Some(error);
-            node.last_seen_unix_ms = unix_ms_now();
         }
     }
 
@@ -1263,6 +1336,9 @@ pub(crate) enum ManualControlMsg {
     Shutdown {
         reply_to: ActorAddress,
     },
+    Cancel {
+        reply_to: ActorAddress,
+    },
     PersistenceFinished {
         generation: u64,
         error: Option<String>,
@@ -1279,12 +1355,19 @@ pub(crate) enum ManualControlMsg {
         facts: RuntimeFacts,
     },
     Rejoin {
+        request_id: u64,
         hello: RejoinHello,
         reply_to: ActorAddress,
     },
     ProviderTerminalFailure {
         node_id: u64,
         error: String,
+    },
+    ProviderStopped {
+        run_id: u64,
+        node_id: u64,
+        attempt_id: u64,
+        observation_generation: u64,
     },
 }
 
@@ -1295,11 +1378,12 @@ pub(crate) enum ManualControlReply {
     Status(ManualReadModel),
     FleetStatus(FleetReadModel),
     Offers(OfferSearchResults),
-    Rejoined(RejoinBinding),
+    RejoinResolved {
+        request_id: u64,
+        result: Result<RejoinBinding, String>,
+    },
     Flushed,
     Rejected(String),
-    #[serde(skip)]
-    TimedOut,
 }
 
 pub(crate) type ProviderFactory =
@@ -1354,6 +1438,43 @@ struct NodeLane {
 
 type SharedLane = Arc<Mutex<Option<NodeLane>>>;
 
+struct LaneObservationSink {
+    sink: PluginSink,
+    sender: ExternalSender,
+    actor: ActorAddress,
+    run_id: u64,
+    node_id: u64,
+    attempt_id: u64,
+    generation: u64,
+}
+
+impl PluginObservationSink for LaneObservationSink {
+    fn observe(&self, observation: PluginObservation) {
+        if let PluginObservation::PhaseChanged {
+            run_id,
+            node_id,
+            phase: ProvisionEventKind::NodeStopped,
+        } = &observation
+        {
+            if *run_id == self.run_id && *node_id == self.node_id {
+                let _ = self.sender.send_to(
+                    self.actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::ProviderStopped {
+                        run_id: self.run_id,
+                        node_id: self.node_id,
+                        attempt_id: self.attempt_id,
+                        observation_generation: self.generation,
+                    }),
+                );
+            }
+            // Only the control owner's fenced state transition publishes a
+            // terminal stop to the application; stale lanes cannot clear it.
+            return;
+        }
+        self.sink.observe(observation);
+    }
+}
+
 type ManualActorWork = Box<dyn FnOnce() + Send + 'static>;
 type ManualWorkFailure = Box<dyn FnOnce(String) + Send + 'static>;
 
@@ -1367,6 +1488,21 @@ impl Clone for ManualWork {
         Self {
             work: Arc::clone(&self.work),
             failure: Arc::clone(&self.failure),
+        }
+    }
+}
+
+impl Drop for ManualWork {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.work) != 1 {
+            return;
+        }
+        let abandoned = self.work.lock().take();
+        if abandoned.is_some() {
+            let report = self.failure.lock().take();
+            if let Some(report) = report {
+                report("manual control work owner stopped before execution".to_owned());
+            }
         }
     }
 }
@@ -1414,6 +1550,8 @@ pub(crate) struct ManualActorControl {
     config_validator: Option<ConfigValidator>,
     offer_searcher: Option<OfferSearcher>,
     lanes: BTreeMap<u64, SharedLane>,
+    lane_generations: BTreeMap<u64, u64>,
+    confirmed_stops: BTreeSet<u64>,
     active_effect_ids: BTreeMap<u64, u64>,
     reported_phases: BTreeMap<u64, NodePhase>,
     persistence_queue: VecDeque<(u64, ClusterSnapshot)>,
@@ -1424,9 +1562,10 @@ pub(crate) struct ManualActorControl {
     pending_command_replies: BTreeMap<u64, (ActorAddress, String)>,
     pending_validations: BTreeMap<u64, Option<ActorAddress>>,
     latest_validation_id: Option<u64>,
-    pending_offer_searches: BTreeMap<u64, (ActorAddress, OfferSearchRequest)>,
+    pending_offer_searches: BTreeMap<u64, (Option<ActorAddress>, OfferSearchRequest)>,
     offer_search_receipts: BTreeMap<u64, OfferSearchReceipt>,
     next_work_id: u64,
+    next_lane_generation: u64,
     control_generation: u64,
 }
 
@@ -1434,7 +1573,6 @@ pub(crate) struct ManualActorControl {
 struct OfferSearchReceipt {
     request: OfferSearchRequest,
     offer_ids: Vec<u64>,
-    expires_unix_ms: u64,
 }
 
 pub(crate) struct ManualActorControlConfig {
@@ -1479,6 +1617,8 @@ impl ManualActorControl {
             config_validator,
             offer_searcher,
             lanes: BTreeMap::new(),
+            lane_generations: BTreeMap::new(),
+            confirmed_stops: BTreeSet::new(),
             active_effect_ids: BTreeMap::new(),
             reported_phases: BTreeMap::new(),
             persistence_queue: VecDeque::new(),
@@ -1492,6 +1632,7 @@ impl ManualActorControl {
             latest_validation_id: None,
             pending_offer_searches: BTreeMap::new(),
             next_work_id: 0,
+            next_lane_generation: 0,
             control_generation,
         }
     }
@@ -1535,17 +1676,12 @@ impl ManualActorControl {
         if request.selected_offer_ids.is_empty() {
             return Ok(None);
         }
-        if self.core.provider().provisioning_mode == "mock" {
-            return Ok(None);
-        }
-        let now = unix_ms_now();
-        self.offer_search_receipts
-            .retain(|_, receipt| receipt.expires_unix_ms > now);
         let search_id = request.search_id.ok_or_else(|| {
             "selected Vast.ai offers require the search_id returned with the offer list".to_owned()
         })?;
         let receipt = self.offer_search_receipts.get(&search_id).ok_or_else(|| {
-            "selected Vast.ai offer search expired; refresh offers and select again".to_owned()
+            "selected Vast.ai offer search is unavailable; refresh offers and select again"
+                .to_owned()
         })?;
         if let Some(offer_id) = request
             .selected_offer_ids
@@ -1578,10 +1714,48 @@ impl ManualActorControl {
                     let _ = ctx.send(*reply_to, ManualControlReply::Rejected(error));
                     return;
                 }
+                ManualControlMsg::Rejoin {
+                    request_id,
+                    reply_to,
+                    ..
+                } => {
+                    let _ = ctx.send(
+                        *reply_to,
+                        ManualControlReply::RejoinResolved {
+                            request_id: *request_id,
+                            result: Err(error),
+                        },
+                    );
+                    return;
+                }
                 _ => {}
             }
         }
         match msg {
+            ManualControlMsg::Cancel { reply_to } => {
+                self.flush_waiters.retain(|actor| *actor != reply_to);
+                self.pending_command_replies
+                    .retain(|_, (actor, _)| *actor != reply_to);
+                for (actor, _) in self.pending_offer_searches.values_mut() {
+                    if *actor == Some(reply_to) {
+                        *actor = None;
+                    }
+                }
+                for actor in self.pending_validations.values_mut() {
+                    if *actor == Some(reply_to) {
+                        *actor = None;
+                    }
+                }
+                for pending in &mut self.core.pending_persists {
+                    if matches!(&pending.after, AfterPersist::SendRejoinReply { reply_to: actor, .. } if *actor == reply_to)
+                    {
+                        pending.after = AfterPersist::None;
+                    }
+                }
+                self.core.actions.retain(|action| {
+                    !matches!(action, ManualAction::SendRejoinReply { reply_to: actor, .. } if *actor == reply_to)
+                });
+            }
             ManualControlMsg::Shutdown { reply_to } => {
                 self.shutting_down = true;
                 self.flush_waiters.push(reply_to);
@@ -1690,6 +1864,7 @@ impl ManualActorControl {
                             ),
                         );
                     }
+                    self.finish_flush_waiters(ctx);
                     return;
                 }
                 self.latest_validation_id = None;
@@ -1723,7 +1898,7 @@ impl ManualActorControl {
                 } else if let Some(searcher) = self.offer_searcher.clone() {
                     let work_id = self.allocate_work_id();
                     self.pending_offer_searches
-                        .insert(work_id, (reply_to, request.clone()));
+                        .insert(work_id, (Some(reply_to), request.clone()));
                     let sender = self.sender.clone();
                     let failed_sender = self.sender.clone();
                     let actor = ctx.self_addr();
@@ -1761,19 +1936,22 @@ impl ManualActorControl {
                 let Some((reply_to, request)) = self.pending_offer_searches.remove(&work_id) else {
                     return;
                 };
+                let Some(reply_to) = reply_to else {
+                    self.finish_flush_waiters(ctx);
+                    return;
+                };
                 let reply = match result {
                     Ok(offers) => {
-                        let now = unix_ms_now();
-                        self.offer_search_receipts
-                            .retain(|_, receipt| receipt.expires_unix_ms > now);
                         self.offer_search_receipts.insert(
                             work_id,
                             OfferSearchReceipt {
                                 request,
                                 offer_ids: offers.iter().map(|offer| offer.offer_id).collect(),
-                                expires_unix_ms: now.saturating_add(OFFER_SEARCH_RECEIPT_TTL_MS),
                             },
                         );
+                        if self.offer_search_receipts.len() > MAX_OFFER_SEARCH_RECEIPTS {
+                            self.offer_search_receipts.pop_first();
+                        }
                         ManualControlReply::Offers(OfferSearchResults {
                             search_id: work_id,
                             offers,
@@ -1842,7 +2020,9 @@ impl ManualActorControl {
                 outcome,
                 error,
             } => {
-                if self.active_effect_ids.get(&node_id).copied() != Some(effect_id) {
+                if self.active_effect_ids.get(&node_id).copied() != Some(effect_id)
+                    || self.core.in_flight.get(&node_id).copied() != Some(kind)
+                {
                     return;
                 }
                 self.active_effect_ids.remove(&node_id);
@@ -1863,6 +2043,23 @@ impl ManualActorControl {
                 let _ = self.core.effect_finished(node_id, kind, result);
                 if releases_lane {
                     self.lanes.remove(&node_id);
+                    self.lane_generations.remove(&node_id);
+                    self.confirmed_stops.remove(&node_id);
+                }
+                if self.confirmed_stops.remove(&node_id)
+                    && let Some(generation) = self.lane_generations.get(&node_id).copied()
+                    && let Some(spec) = self
+                        .core
+                        .snapshot()
+                        .node(node_id)
+                        .and_then(|node| node.spec.as_ref())
+                {
+                    self.observe_provider_stopped(
+                        spec.run_id,
+                        node_id,
+                        spec.attempt_id,
+                        generation,
+                    );
                 }
             }
             ManualControlMsg::JoinBarrierSatisfied { node_id, mut facts } => {
@@ -1878,12 +2075,25 @@ impl ManualActorControl {
                     let _ = self.core.join_barrier_satisfied(node_id);
                 }
             }
-            ManualControlMsg::Rejoin { hello, reply_to } => {
-                if let Err(error) =
-                    self.core
-                        .rejoin(&hello, ctx.self_addr(), self.control_generation, reply_to)
-                {
-                    let _ = ctx.send(reply_to, ManualControlReply::Rejected(error));
+            ManualControlMsg::Rejoin {
+                request_id,
+                hello,
+                reply_to,
+            } => {
+                if let Err(error) = self.core.rejoin(
+                    &hello,
+                    ctx.self_addr(),
+                    self.control_generation,
+                    request_id,
+                    reply_to,
+                ) {
+                    let _ = ctx.send(
+                        reply_to,
+                        ManualControlReply::RejoinResolved {
+                            request_id,
+                            result: Err(error),
+                        },
+                    );
                 }
             }
             ManualControlMsg::Flush { reply_to } => {
@@ -1891,6 +2101,14 @@ impl ManualActorControl {
             }
             ManualControlMsg::ProviderTerminalFailure { node_id, error } => {
                 let _ = self.core.terminal_failure(node_id, error);
+            }
+            ManualControlMsg::ProviderStopped {
+                run_id,
+                node_id,
+                attempt_id,
+                observation_generation,
+            } => {
+                self.observe_provider_stopped(run_id, node_id, attempt_id, observation_generation);
             }
         }
         self.dispatch_actions(ctx.self_addr());
@@ -1916,6 +2134,52 @@ impl ManualActorControl {
         }
         let _ = self.core.node_ack(node_id, readiness_id);
         self.dispatch_actions(actor);
+    }
+
+    fn lane_sink(&mut self, actor: ActorAddress, spec: &NodeProvisionSpec) -> PluginSink {
+        let generation = self.next_lane_generation;
+        self.next_lane_generation = generation
+            .checked_add(1)
+            .expect("lane generation exhausted");
+        self.lane_generations.insert(spec.node_id, generation);
+        self.confirmed_stops.remove(&spec.node_id);
+        PluginSink::new(Arc::new(LaneObservationSink {
+            sink: self.sink.clone(),
+            sender: self.sender.clone(),
+            actor,
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            attempt_id: spec.attempt_id,
+            generation,
+        }))
+    }
+
+    fn observe_provider_stopped(
+        &mut self,
+        run_id: u64,
+        node_id: u64,
+        attempt_id: u64,
+        generation: u64,
+    ) {
+        if self.lane_generations.get(&node_id).copied() != Some(generation)
+            || !self.core.snapshot().node(node_id).is_some_and(|node| {
+                matches!(node.phase, NodePhase::Stopping | NodePhase::StopFailed)
+                    && node
+                        .spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.run_id == run_id && spec.attempt_id == attempt_id)
+            })
+        {
+            return;
+        }
+        if self.active_effect_ids.contains_key(&node_id) {
+            self.confirmed_stops.insert(node_id);
+            return;
+        }
+        if self.core.provider_stopped(run_id, node_id, attempt_id) {
+            self.lanes.remove(&node_id);
+            self.lane_generations.remove(&node_id);
+        }
     }
 
     fn emit_phase_changes(&mut self) {
@@ -1956,7 +2220,7 @@ impl ManualActorControl {
                     let lane = Arc::new(Mutex::new(None));
                     self.lanes.insert(node_id, Arc::clone(&lane));
                     let factory = Arc::clone(&self.provider_factory);
-                    let sink = self.sink.clone();
+                    let sink = self.lane_sink(actor, &spec);
                     self.spawn_effect(actor, node_id, EffectKind::Create, move || {
                         let mut plugin = factory()?;
                         let provider_ref = plugin.provider_ref_for(&spec);
@@ -1970,7 +2234,7 @@ impl ManualActorControl {
                     let lane = Arc::new(Mutex::new(None));
                     self.lanes.insert(node_id, Arc::clone(&lane));
                     let factory = Arc::clone(&self.provider_factory);
-                    let sink = self.sink.clone();
+                    let sink = self.lane_sink(actor, &spec);
                     let spec_builder = Arc::clone(&self.spec_builder);
                     let phase = self.core.snapshot().node(node_id).map(|node| node.phase);
                     self.spawn_effect(actor, node_id, EffectKind::Recover, move || {
@@ -2021,30 +2285,48 @@ impl ManualActorControl {
                     node_id,
                     cancel_bootstrap,
                 } => {
-                    let lane = self.lanes.get(&node_id).cloned();
+                    let lane = Arc::clone(
+                        self.lanes
+                            .entry(node_id)
+                            .or_insert_with(|| Arc::new(Mutex::new(None))),
+                    );
                     let factory = Arc::clone(&self.provider_factory);
-                    let sink = self.sink.clone();
                     let spec = self
                         .core
                         .snapshot()
                         .node(node_id)
                         .and_then(|node| node.spec.clone());
+                    let sink = if lane.lock().is_none() {
+                        spec.as_ref().map(|spec| self.lane_sink(actor, spec))
+                    } else {
+                        None
+                    };
                     self.spawn_effect(actor, node_id, EffectKind::Stop, move || {
-                        if let Some(lane) = lane {
-                            let mut guard = lane.lock();
-                            let lane = guard.as_mut().ok_or_else(|| {
-                                format!("node {node_id} provider lane is uninitialized")
-                            })?;
-                            if cancel_bootstrap {
-                                lane.plugin.cancel_bootstrap(&lane.handle)?;
-                            }
-                            lane.plugin.stop_node(&lane.handle)?;
-                        } else {
+                        let mut guard = lane.lock();
+                        if guard.is_none() {
                             let spec = spec
                                 .ok_or_else(|| format!("node {node_id} has no durable intent"))?;
                             let mut plugin = factory()?;
-                            let _ = plugin.stop_by_spec(&spec, sink)?;
+                            let sink =
+                                sink.expect("durable stop intent has a fenced observation sink");
+                            match plugin.adopt_by_spec(&spec, sink.clone())? {
+                                Some(adopted) => {
+                                    *guard = Some(NodeLane {
+                                        plugin,
+                                        handle: adopted.handle,
+                                    });
+                                }
+                                None => {
+                                    let _ = plugin.stop_by_spec(&spec, sink)?;
+                                    return Ok(EffectOutcome::Stopped);
+                                }
+                            }
                         }
+                        let lane = guard.as_mut().expect("adopted provider stop lane");
+                        if cancel_bootstrap {
+                            lane.plugin.cancel_bootstrap(&lane.handle)?;
+                        }
+                        lane.plugin.stop_node(&lane.handle)?;
                         Ok(EffectOutcome::Stopped)
                     });
                 }
@@ -2059,10 +2341,15 @@ impl ManualActorControl {
                         },
                     );
                 }
-                ManualAction::SendRejoinReply { reply_to, binding } => {
-                    let _ = self
-                        .runtime
-                        .send_to(reply_to, ManualControlReply::Rejoined(binding));
+                ManualAction::SendRejoinReply {
+                    request_id,
+                    reply_to,
+                    result,
+                } => {
+                    let _ = self.runtime.send_to(
+                        reply_to,
+                        ManualControlReply::RejoinResolved { request_id, result },
+                    );
                 }
             }
         }
@@ -2106,6 +2393,9 @@ impl ManualActorControl {
         if self.persistence_in_flight.is_some()
             || !self.persistence_queue.is_empty()
             || !self.core.persistence_idle()
+            || !self.active_effect_ids.is_empty()
+            || !self.pending_validations.is_empty()
+            || !self.pending_offer_searches.is_empty()
         {
             return;
         }
@@ -2650,7 +2940,6 @@ mod tests {
                 phase,
                 runtime: None,
                 last_error: None,
-                last_seen_unix_ms: 0,
             });
             let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
             core.begin_recovery();
@@ -2702,7 +2991,6 @@ mod tests {
                 phase,
                 runtime: None,
                 last_error: None,
-                last_seen_unix_ms: 0,
             });
             let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
             core.begin_recovery();
@@ -2736,7 +3024,6 @@ mod tests {
             phase: NodePhase::Stopping,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         });
         let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
         core.begin_recovery();
@@ -2762,7 +3049,6 @@ mod tests {
             phase: NodePhase::Joining,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         });
         snapshot.commands.insert(
             "provision".to_owned(),
@@ -2793,6 +3079,7 @@ mod tests {
                 },
                 current,
                 12,
+                31,
                 ActorAddress([6; 32]),
             )
             .unwrap();
@@ -2806,8 +3093,9 @@ mod tests {
         assert!(matches!(
             core.take_actions().collect::<Vec<_>>().as_slice(),
             [ManualAction::SendRejoinReply {
+                request_id: 31,
                 reply_to,
-                binding: persisted_binding,
+                result: Ok(persisted_binding),
             }] if *reply_to == ActorAddress([6; 32]) && persisted_binding == &binding
         ));
         let node = core.snapshot().node(1).unwrap();
@@ -2837,6 +3125,7 @@ mod tests {
                 },
                 current,
                 12,
+                32,
                 ActorAddress([6; 32]),
             )
             .is_err()
@@ -3463,11 +3752,594 @@ mod tests {
         }
 
         fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
-            if let OrchestratorMsg::Manual(message) = message {
-                self.control.handle(ctx, message);
-                self.record_evidence();
+            match message {
+                OrchestratorMsg::Manual(message) => self.control.handle(ctx, message),
+                OrchestratorMsg::ObserveNodeRuntimeReadyAck {
+                    run_id,
+                    node_id,
+                    stage_index,
+                    readiness_id,
+                } => self.control.observe_node_ack(
+                    ctx.self_addr(),
+                    run_id,
+                    stage_index,
+                    node_id,
+                    readiness_id,
+                ),
+                _ => {}
             }
+            self.record_evidence();
         }
+    }
+
+    fn spawn_manual_harness(
+        core: ManualControl,
+        runtime: &Runtime,
+        engine: &Engine,
+        state_dir: StateDir,
+        provider_factory: ProviderFactory,
+    ) -> ActorAddress {
+        let control = ManualActorControl::new(
+            core,
+            runtime.clone(),
+            engine.handle().blocking_work_sender(),
+            ManualActorControlConfig {
+                state_dir,
+                sink: PluginSink::new(Arc::new(DiscardObservations)),
+                provider_factory,
+                spec_builder: Arc::new(|node_id, _| Ok(spec(node_id))),
+                config_validator: None,
+                offer_searcher: None,
+                control_generation: 42,
+            },
+        );
+        runtime
+            .spawn(ManualHarnessActor {
+                control,
+                evidence: Arc::new(Mutex::new(ManualActorEvidence::default())),
+            })
+            .unwrap()
+    }
+
+    struct DeferredStopPlugin {
+        observer: Arc<Mutex<Vec<PluginSink>>>,
+        resources: Arc<Mutex<BTreeSet<u64>>>,
+        complete_before_return: bool,
+        fail_create: bool,
+        dropped: Arc<Mutex<usize>>,
+    }
+
+    impl ProvisionPlugin for DeferredStopPlugin {
+        fn create_node(
+            &mut self,
+            spec: NodeProvisionSpec,
+            sink: PluginSink,
+        ) -> Result<PluginNodeHandle, String> {
+            self.observer.lock().push(sink);
+            assert!(self.resources.lock().insert(spec.node_id));
+            if self.fail_create {
+                return Err("rental response unavailable".to_owned());
+            }
+            Ok(PluginNodeHandle {
+                id: spec.node_id,
+                provider_process_id: None,
+            })
+        }
+
+        fn adopt_by_spec(
+            &mut self,
+            spec: &NodeProvisionSpec,
+            sink: PluginSink,
+        ) -> Result<Option<crate::provisioning::AdoptedNode>, String> {
+            self.observer.lock().push(sink);
+            if !self.resources.lock().contains(&spec.node_id) {
+                return Ok(None);
+            }
+            Ok(Some(crate::provisioning::AdoptedNode {
+                handle: PluginNodeHandle {
+                    id: spec.node_id,
+                    provider_process_id: None,
+                },
+                provider_ref: self.provider_ref_for(spec),
+            }))
+        }
+
+        fn start_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+            if self.complete_before_return {
+                assert!(self.resources.lock().remove(&handle.id));
+                self.observer
+                    .lock()
+                    .last()
+                    .unwrap()
+                    .observe(PluginObservation::PhaseChanged {
+                        run_id: 7,
+                        node_id: handle.id,
+                        phase: ProvisionEventKind::NodeStopped,
+                    });
+            }
+            Err("provider cleanup is pending".to_owned())
+        }
+    }
+
+    impl Drop for DeferredStopPlugin {
+        fn drop(&mut self) {
+            *self.dropped.lock() += 1;
+        }
+    }
+
+    #[test]
+    fn provider_stop_confirmation_survives_both_effect_completion_orders() {
+        for (complete_before_return, fail_create) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let parts = RuntimeParts::new(RuntimeConfig::default());
+            let runtime = parts.runtime().clone();
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let state_dir = StateDir::new(temp.path());
+            let observer = Arc::new(Mutex::new(Vec::<PluginSink>::new()));
+            let provider_observer = Arc::clone(&observer);
+            let dropped = Arc::new(Mutex::new(0));
+            let provider_dropped = Arc::clone(&dropped);
+            let resources = Arc::new(Mutex::new(BTreeSet::new()));
+            let provider_resources = Arc::clone(&resources);
+            let actor = spawn_manual_harness(
+                ready_core(),
+                &runtime,
+                &engine,
+                state_dir.clone(),
+                Arc::new(move || {
+                    Ok(Box::new(DeferredStopPlugin {
+                        observer: Arc::clone(&provider_observer),
+                        resources: Arc::clone(&provider_resources),
+                        complete_before_return,
+                        fail_create,
+                        dropped: Arc::clone(&provider_dropped),
+                    }))
+                }),
+            );
+            send_manual(
+                &runtime,
+                actor,
+                ManualControlMsg::Provision {
+                    request: ProvisionRequest {
+                        command_id: "provision".to_owned(),
+                        count: 1,
+                        selected_offer_ids: Vec::new(),
+                        search_id: None,
+                        image: None,
+                    },
+                    reply_to: None,
+                },
+            );
+            settle_manual_work(&backend);
+            send_manual(
+                &runtime,
+                actor,
+                ManualControlMsg::Kill {
+                    request: KillRequest {
+                        command_id: "kill".to_owned(),
+                        logical_node_id: 1,
+                    },
+                    reply_to: None,
+                },
+            );
+            settle_manual_work(&backend);
+            if !complete_before_return {
+                let snapshot = state_dir.load_snapshot().unwrap();
+                assert_eq!(snapshot.node(1).unwrap().phase, NodePhase::StopFailed);
+                assert_eq!(
+                    *dropped.lock(),
+                    usize::from(fail_create),
+                    "pending cleanup retains its provider owner"
+                );
+                assert!(
+                    resources.lock().contains(&1),
+                    "unconfirmed cleanup must not lose the rental"
+                );
+                let mut control = ManualControl::new(snapshot, ProviderReadiness::ready());
+                assert!(!control.provider_stopped(7, 1, spec(1).attempt_id + 1));
+                assert_eq!(
+                    control.snapshot().node(1).unwrap().phase,
+                    NodePhase::StopFailed
+                );
+                if fail_create {
+                    // The failed create's observer names the same run/node/attempt,
+                    // but cannot stop the owner subsequently adopted for cleanup.
+                    observer
+                        .lock()
+                        .first()
+                        .unwrap()
+                        .observe(PluginObservation::PhaseChanged {
+                            run_id: 7,
+                            node_id: 1,
+                            phase: ProvisionEventKind::NodeStopped,
+                        });
+                    settle_manual_work(&backend);
+                    assert_eq!(
+                        state_dir.load_snapshot().unwrap().node(1).unwrap().phase,
+                        NodePhase::StopFailed
+                    );
+                }
+                observer
+                    .lock()
+                    .last()
+                    .unwrap()
+                    .observe(PluginObservation::PhaseChanged {
+                        run_id: 8,
+                        node_id: 1,
+                        phase: ProvisionEventKind::NodeStopped,
+                    });
+                settle_manual_work(&backend);
+                assert_eq!(
+                    state_dir.load_snapshot().unwrap().node(1).unwrap().phase,
+                    NodePhase::StopFailed
+                );
+                assert!(resources.lock().remove(&1));
+                observer
+                    .lock()
+                    .last()
+                    .unwrap()
+                    .observe(PluginObservation::PhaseChanged {
+                        run_id: 7,
+                        node_id: 1,
+                        phase: ProvisionEventKind::NodeStopped,
+                    });
+                settle_manual_work(&backend);
+            }
+            let durable = state_dir.load_snapshot().unwrap();
+            let stopped = durable.node(1).unwrap();
+            assert_eq!(stopped.phase, NodePhase::Stopped);
+            assert_eq!(stopped.last_error, None);
+            assert_eq!(
+                *dropped.lock(),
+                1 + usize::from(fail_create),
+                "confirmed destruction releases its provider owner"
+            );
+            assert!(resources.lock().is_empty());
+            observer
+                .lock()
+                .last()
+                .unwrap()
+                .observe(PluginObservation::PhaseChanged {
+                    run_id: 7,
+                    node_id: 1,
+                    phase: ProvisionEventKind::NodeStopped,
+                });
+            settle_manual_work(&backend);
+            assert_eq!(
+                serde_json::to_value(state_dir.load_snapshot().unwrap()).unwrap(),
+                serde_json::to_value(durable).unwrap(),
+            );
+            runtime.stop_actor(actor).unwrap();
+            drive_steps(&backend, 16);
+        }
+    }
+
+    #[test]
+    fn manual_progress_and_replays_preserve_effects() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::new(temp.path());
+        let resources = Arc::new(Mutex::new(BTreeSet::new()));
+        let provider_resources = resources.clone();
+        let owner = Arc::new(Mutex::new(None::<ActorAddress>));
+        let callback_owner = owner.clone();
+        let callback_runtime = runtime.clone();
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.next_node_id = 2; // The existing scripted fixture succeeds on node two.
+        let actor = spawn_manual_harness(
+            ManualControl::new(snapshot, ProviderReadiness::ready()),
+            &runtime,
+            &engine,
+            state_dir.clone(),
+            Arc::new(move || {
+                // Same effect id, wrong operation kind arrives before the
+                // real Create result. It must not consume the live admission.
+                send_manual(
+                    &callback_runtime,
+                    (*callback_owner.lock()).expect("owner spawned"),
+                    ManualControlMsg::EffectFinished {
+                        node_id: 2,
+                        kind: EffectKind::Stop,
+                        effect_id: 0,
+                        outcome: Some(EffectOutcome::Stopped),
+                        error: None,
+                    },
+                );
+                Ok(Box::new(ScriptedPlugin {
+                    resources: provider_resources.clone(),
+                }))
+            }),
+        );
+        *owner.lock() = Some(actor);
+        let request = ManualControlMsg::Provision {
+            request: ProvisionRequest {
+                command_id: "provision".to_owned(),
+                count: 1,
+                selected_offer_ids: Vec::new(),
+                search_id: None,
+                image: None,
+            },
+            reply_to: None,
+        };
+        send_duplicate_manual(&runtime, actor, request);
+        settle_manual_work(&backend);
+        assert_eq!(
+            state_dir.load_snapshot().unwrap().node(2).unwrap().phase,
+            NodePhase::Joining
+        );
+        assert!(resources.lock().contains(&2));
+        send_duplicate_manual(
+            &runtime,
+            actor,
+            ManualControlMsg::JoinBarrierSatisfied {
+                node_id: 2,
+                facts: facts(2, 91),
+            },
+        );
+        settle_manual_work(&backend);
+        for readiness_id in [90, 91, 91] {
+            runtime
+                .send_to(
+                    actor,
+                    OrchestratorMsg::ObserveNodeRuntimeReadyAck {
+                        run_id: 7,
+                        node_id: 2,
+                        stage_index: 0,
+                        readiness_id,
+                    },
+                )
+                .unwrap();
+        }
+        settle_manual_work(&backend);
+        assert_eq!(
+            state_dir.load_snapshot().unwrap().node(2).unwrap().phase,
+            NodePhase::Running
+        );
+        let kill = ManualControlMsg::Kill {
+            request: KillRequest {
+                command_id: "kill".to_owned(),
+                logical_node_id: 2,
+            },
+            reply_to: None,
+        };
+        send_duplicate_manual(&runtime, actor, kill.clone());
+        settle_manual_work(&backend);
+        let durable = state_dir.load_snapshot().unwrap();
+        assert_eq!(durable.node(2).unwrap().phase, NodePhase::Stopped);
+        assert_eq!(durable.commands["provision"].state, CommandState::Succeeded);
+        assert_eq!(durable.commands["kill"].state, CommandState::Succeeded);
+        assert!(resources.lock().is_empty());
+        send_manual(&runtime, actor, kill);
+        send_duplicate_manual(
+            &runtime,
+            actor,
+            ManualControlMsg::EffectFinished {
+                node_id: 2,
+                kind: EffectKind::Stop,
+                effect_id: 3,
+                outcome: Some(EffectOutcome::Stopped),
+                error: None,
+            },
+        );
+        send_duplicate_manual(
+            &runtime,
+            actor,
+            ManualControlMsg::PersistenceFinished {
+                generation: 1,
+                error: None,
+            },
+        );
+        send_manual(
+            &runtime,
+            actor,
+            ManualControlMsg::ProviderTerminalFailure {
+                node_id: 2,
+                error: "late failure".to_owned(),
+            },
+        );
+        settle_manual_work(&backend);
+        let replayed = state_dir.load_snapshot().unwrap();
+        assert_eq!(replayed.node(2).unwrap().phase, NodePhase::Stopped);
+        assert_eq!(replayed.commands, durable.commands);
+        assert!(resources.lock().is_empty());
+        runtime.stop_actor(actor).unwrap();
+        drive_steps(&backend, 16);
+        assert_no_poison(&runtime);
+    }
+
+    #[test]
+    fn cancellation_before_first_persist_never_dispatches_provider_work() {
+        let mut core = ready_core();
+        request_one(&mut core, "provision", None);
+        core.request_kill(KillRequest {
+            command_id: "cancel".to_owned(),
+            logical_node_id: 1,
+        })
+        .unwrap();
+        assert!(settle_persistence(&mut core).is_empty());
+        assert_eq!(core.snapshot().node(1).unwrap().phase, NodePhase::Stopped);
+        assert_eq!(
+            core.snapshot().commands["provision"].state,
+            CommandState::Failed
+        );
+        assert_eq!(
+            core.snapshot().commands["cancel"].state,
+            CommandState::Succeeded
+        );
+    }
+
+    #[test]
+    fn manual_redeployment_failure_and_cleanup_retry_finish_once() {
+        let mut node_spec = spec(1);
+        node_spec.attempt_id = 23;
+        node_spec.deployment = Some(crate::provisioning::DeploymentIdentity {
+            artifact_digest: "sha256:new".to_owned(),
+            deployment_generation: "deployment-2".to_owned(),
+        });
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.upsert_node(SnapshotNode {
+            logical_node_id: 1,
+            spec: Some(node_spec),
+            selected_offer_id: None,
+            provider_ref: Some("resource".to_owned()),
+            phase: NodePhase::Running,
+            runtime: Some(facts(1, 9)),
+            last_error: None,
+        });
+        let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
+        let active = core
+            .snapshot()
+            .node(1)
+            .unwrap()
+            .spec
+            .as_ref()
+            .unwrap()
+            .deployment
+            .clone()
+            .unwrap();
+        assert_eq!(core.reconcile_active_deployment_intent(Some(&active)), [1]);
+        core.begin_recovery();
+        assert!(matches!(
+            core.take_actions().collect::<Vec<_>>().as_slice(),
+            [ManualAction::Recover { node_id: 1, .. }]
+        ));
+        core.effect_finished(
+            1,
+            EffectKind::Recover,
+            Ok(EffectOutcome::Recovered {
+                provider_ref: Some("resource".to_owned()),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            settle_persistence(&mut core).as_slice(),
+            [ManualAction::StartBootstrap { node_id: 1 }]
+        ));
+        core.effect_finished(
+            1,
+            EffectKind::StartBootstrap,
+            Err("redeploy failed".to_owned()),
+        )
+        .unwrap();
+        assert!(matches!(
+            settle_persistence(&mut core).as_slice(),
+            [ManualAction::Stop { node_id: 1, .. }]
+        ));
+        core.effect_finished(1, EffectKind::Stop, Err("cleanup failed".to_owned()))
+            .unwrap();
+        settle_persistence(&mut core);
+        core.request_kill(KillRequest {
+            command_id: "retry-cleanup".to_owned(),
+            logical_node_id: 1,
+        })
+        .unwrap();
+        assert!(matches!(
+            settle_persistence(&mut core).as_slice(),
+            [ManualAction::Stop { node_id: 1, .. }]
+        ));
+        core.effect_finished(1, EffectKind::Stop, Ok(EffectOutcome::Stopped))
+            .unwrap();
+        settle_persistence(&mut core);
+        assert!(
+            core.effect_finished(1, EffectKind::Stop, Ok(EffectOutcome::Stopped))
+                .is_err()
+        );
+        core.terminal_failure(1, "stale failure".to_owned())
+            .unwrap();
+        assert_eq!(core.snapshot().node(1).unwrap().phase, NodePhase::Stopped);
+        assert_eq!(
+            core.snapshot().commands["retry-cleanup"].state,
+            CommandState::Succeeded
+        );
+        assert!(core.take_actions().next().is_none());
+    }
+
+    #[test]
+    fn manual_recovery_failure_allows_cleanup_without_repeating_completion() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::new(temp.path());
+        let resources = Arc::new(Mutex::new(BTreeSet::from([2])));
+        let provider_resources = resources.clone();
+        let attempts = AtomicUsize::new(0);
+        let mut snapshot = ClusterSnapshot::fresh(7, "test");
+        snapshot.upsert_node(SnapshotNode {
+            logical_node_id: 2,
+            spec: Some(spec(2)),
+            selected_offer_id: None,
+            provider_ref: Some("resource".to_owned()),
+            phase: NodePhase::Running,
+            runtime: Some(facts(2, 9)),
+            last_error: None,
+        });
+        let actor = spawn_manual_harness(
+            ManualControl::new(snapshot, ProviderReadiness::ready()),
+            &runtime,
+            &engine,
+            state_dir.clone(),
+            Arc::new(move || {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return Err("adoption unavailable".to_owned());
+                }
+                Ok(Box::new(ScriptedPlugin {
+                    resources: provider_resources.clone(),
+                }))
+            }),
+        );
+        settle_manual_work(&backend);
+        assert_eq!(
+            state_dir.load_snapshot().unwrap().node(2).unwrap().phase,
+            NodePhase::Running
+        );
+        assert!(resources.lock().contains(&2));
+        send_duplicate_manual(
+            &runtime,
+            actor,
+            ManualControlMsg::EffectFinished {
+                node_id: 2,
+                kind: EffectKind::Recover,
+                effect_id: 0,
+                outcome: None,
+                error: Some("late adoption failure".to_owned()),
+            },
+        );
+        send_manual(
+            &runtime,
+            actor,
+            ManualControlMsg::Kill {
+                request: KillRequest {
+                    command_id: "cleanup".to_owned(),
+                    logical_node_id: 2,
+                },
+                reply_to: None,
+            },
+        );
+        settle_manual_work(&backend);
+        assert!(resources.lock().is_empty());
+        assert_eq!(
+            state_dir.load_snapshot().unwrap().node(2).unwrap().phase,
+            NodePhase::Stopped
+        );
+        runtime.stop_actor(actor).unwrap();
+        drive_steps(&backend, 16);
+        assert_no_poison(&runtime);
     }
 
     struct ReplySlot {
@@ -3967,6 +4839,7 @@ mod tests {
                             &runtime,
                             actor,
                             ManualControlMsg::Rejoin {
+                                request_id: request_serial,
                                 hello: RejoinHello {
                                     artifact_digest: None,
                                     deployment_generation: None,
@@ -4317,7 +5190,6 @@ mod tests {
             phase: NodePhase::Joining,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         });
         let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
 
@@ -4348,7 +5220,6 @@ mod tests {
             phase: NodePhase::Running,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         };
         node.runtime = Some({
             let mut facts = facts(1, 0);
@@ -4368,6 +5239,7 @@ mod tests {
                 &stale_hello,
                 ActorAddress::default(),
                 0,
+                1,
                 ActorAddress::default(),
             )
             .unwrap_err();
@@ -4382,6 +5254,7 @@ mod tests {
                 &fresh_hello,
                 ActorAddress::default(),
                 0,
+                2,
                 ActorAddress::default(),
             )
             .is_err()
@@ -4391,6 +5264,7 @@ mod tests {
             &fresh_hello,
             ActorAddress::default(),
             0,
+            3,
             ActorAddress::default(),
         )
         .unwrap();
@@ -4411,7 +5285,6 @@ mod tests {
             phase: NodePhase::Running,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         };
         // The persisted worker still runs generation one.
         node.runtime = Some({

@@ -297,8 +297,6 @@ impl OrchestratorRun {
         }
     }
 
-    pub(crate) fn advance_time_ms(&mut self, _delta: u64) {}
-
     pub(crate) fn commands(&self) -> &[RunCommand] {
         &self.commands
     }

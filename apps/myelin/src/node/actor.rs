@@ -13,12 +13,14 @@ use crate::run_plan;
 use crate::staging as stage;
 
 use crate::orchestration::actor::OrchestratorMsg;
+// TODO: We shall use am ore efficient codec
 use swactor_transport::JsonCodec;
 
 /// Error text for contextual commands on a node whose controller is absent
 /// (for example, a non-agent node); the event kind stays command-specific.
 const CONTROL_UNAVAILABLE: &str = "contextual process control is unavailable on this node";
 
+// TODO: We shall eliminate direct references to 'staging' and placement
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum StageEdgeKindWire {
     TokenIn,
@@ -135,6 +137,7 @@ impl StageProvisionWire {
     }
 }
 
+// TODO: Node agent should not be handling prompts and weights like this
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum NodeAgentMsg {
     ProvisionStage(Box<StageProvisionWire>),
@@ -472,52 +475,76 @@ impl NodeAgentActor {
                 None
             }
             NodeAgentMsg::Contextual(command) => {
-                if let Some(controller) = self.contextual_controller {
-                    let _ = ctx.send(controller, ContextualProcessControllerIn::Command(command));
-                } else {
-                    let (request_id, reply_to, event) = match command {
-                        ContextualNodeCommand::Spawn {
-                            request_id,
-                            reply_to,
-                            ..
-                        } => (
-                            request_id,
-                            reply_to,
-                            ContextualProcessEventKind::SpawnRejected {
-                                error: CONTROL_UNAVAILABLE.to_owned(),
-                            },
-                        ),
-                        ContextualNodeCommand::Stop {
-                            request_id,
-                            reply_to,
-                            ..
-                        } => (
-                            request_id,
-                            reply_to,
-                            ContextualProcessEventKind::StopRejected {
-                                error: CONTROL_UNAVAILABLE.to_owned(),
-                            },
-                        ),
-                        ContextualNodeCommand::Query {
-                            request_id,
-                            reply_to,
-                        } => (
-                            request_id,
-                            reply_to,
-                            ContextualProcessEventKind::ControlUnavailable {
-                                error: CONTROL_UNAVAILABLE.to_owned(),
-                            },
-                        ),
-                    };
-                    let _ = ctx.send(
+                let (request_id, reply_to, event) = match command {
+                    ContextualNodeCommand::AcknowledgeEvent {
+                        delivery_owner,
                         reply_to,
-                        OrchestratorMsg::ContextualEvent(ContextualProcessEvent {
+                        sequence,
+                    } => {
+                        let _ = ctx.send(
+                            delivery_owner,
+                            crate::contextual_process::ContextualEventDeliveryIn::Acknowledge {
+                                reply_to,
+                                sequence,
+                            },
+                        );
+                        return None;
+                    }
+                    command if self.contextual_controller.is_some() => {
+                        let _ = ctx.send(
+                            self.contextual_controller
+                                .expect("controller presence checked"),
+                            ContextualProcessControllerIn::Command(command),
+                        );
+                        return None;
+                    }
+                    // No controller means there is no pending operation to release.
+                    ContextualNodeCommand::Cancel { .. } => return None,
+                    ContextualNodeCommand::Spawn {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (
+                        request_id,
+                        reply_to,
+                        ContextualProcessEventKind::SpawnRejected {
+                            error: CONTROL_UNAVAILABLE.to_owned(),
+                        },
+                    ),
+                    ContextualNodeCommand::Stop {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (
+                        request_id,
+                        reply_to,
+                        ContextualProcessEventKind::StopRejected {
+                            error: CONTROL_UNAVAILABLE.to_owned(),
+                        },
+                    ),
+                    ContextualNodeCommand::Query {
+                        request_id,
+                        reply_to,
+                    } => (
+                        request_id,
+                        reply_to,
+                        ContextualProcessEventKind::ControlUnavailable {
+                            error: CONTROL_UNAVAILABLE.to_owned(),
+                        },
+                    ),
+                };
+                let _ = ctx.send(
+                    reply_to,
+                    OrchestratorMsg::ContextualEvent {
+                        observation: ContextualProcessEvent {
                             request_id,
                             logical_node_id: self.logical_node_id,
                             event,
-                        }),
-                    );
-                }
+                        },
+                        delivery_owner: None,
+                        sequence: 0,
+                    },
+                );
                 None
             }
             other => Some(other),

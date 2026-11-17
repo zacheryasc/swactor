@@ -263,7 +263,6 @@ mod run_fsm {
         );
 
         // No additional injection may happen without consuming sequence 1.
-        harness.advance_time_ms(10);
         assert_eq!(harness.injected_sequences(), vec![0, 1]);
 
         // EOS stops further injection after the consumed sequence.

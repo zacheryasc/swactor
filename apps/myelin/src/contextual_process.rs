@@ -3,7 +3,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use data_plane::blob_transfer::{
     BlobTransferEvent, BlobTransferId, BlobTransferOffer, BlobTransferReceiver, BlobTransferSender,
@@ -22,12 +21,13 @@ use iroh_driver::ConnectionObserver;
 use myelin_control_contract::{
     ContextualExitStatus, ContextualProcessEvent, ContextualProcessEventKind,
     ContextualProcessSpec, DeploymentIdentity, ExecutionIdentity, LiveContextualExecution,
-    ResourceActor, ResourceArena, ResourceTransport, SCHEMA_VERSION, WorkerResourceSnapshot,
+    ResourceActor, ResourceArena, ResourceExecutionOwnership, ResourceTransport, SCHEMA_VERSION,
+    WorkerResourceSnapshot,
 };
 use swactor::actor::ActorAddress;
 use swactor::admin::{ListActorsRequest, ListActorsResponse};
 use swactor::runtime::Runtime;
-use swactor_engine::{ActorTimer, EngineHandle};
+use swactor_engine::EngineHandle;
 use swactor_process::{ExitStatus, ProcessOutput, ProcessSpec};
 use swactor_process_context::{
     BootstrapFailure, ContextualProcessCommand, ContextualProcessOutput,
@@ -42,6 +42,7 @@ pub struct MyelinChildRouteRegistrar {
     route_view: RouteView,
     pinned_routes: RouteView,
     route_binder: Arc<OutboxRouteBinder>,
+    // TODO: Almost always, a mutex is a result of sloppy thinking. Identify all mutexes and lets decide the proper protocol and data structure
     retained_sources: Mutex<HashMap<ActorAddress, (NodeId, u64)>>,
     runtime: Runtime,
     directory: ActorAddress,
@@ -209,6 +210,8 @@ impl HostRouteRegistrar for MyelinChildRouteRegistrar {
     }
 }
 
+// TODO: Why these dyn objects? Seems sloppy
+// TODO: Also, shouldnt contextual process logic go in that crate and not here?
 pub struct MyelinContextualProcessConfig {
     pub runtime: Runtime,
     pub engine: EngineHandle,
@@ -241,6 +244,7 @@ pub fn build_contextual_process_spawner(
             source_publisher: config.source_publisher,
             route_registrar: Some(config.route_registrar),
             stream_transport: config.stream_transport,
+            transitions: None,
             routing: Arc::new(move |_| Ok(routing.clone())),
         })?);
     Ok(ContextualProcessSpawner::new(config.engine, provisioner))
@@ -254,21 +258,20 @@ fn into_runtime_spec(spec: ContextualProcessSpec) -> Result<RuntimeContextualPro
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
     };
-    Ok(RuntimeContextualProcessSpec {
-        process: ProcessSpec {
+    Ok(RuntimeContextualProcessSpec::event_driven(
+        ProcessSpec {
             command: spec.command,
             args: spec.args,
             env: spec.env.into_iter().collect(),
             working_dir: spec.working_dir.map(PathBuf::from),
             label: spec.label,
         },
-        access: data_plane::path::SessionAccess {
+        data_plane::path::SessionAccess {
             execution_id: spec.execution_id,
             read_prefixes: parse_paths(spec.read_prefixes)?,
             write_prefixes: parse_paths(spec.write_prefixes)?,
         },
-        attach_deadline: Duration::from_millis(spec.attach_timeout_ms),
-    })
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -281,12 +284,22 @@ pub(crate) enum ContextualNodeCommand {
     Stop {
         request_id: String,
         target_request_id: String,
-        kill_after_ms: Option<u64>,
+        #[serde(default)]
+        force: bool,
         reply_to: ActorAddress,
     },
     Query {
         request_id: String,
         reply_to: ActorAddress,
+    },
+    Cancel {
+        request_id: String,
+        reply_to: ActorAddress,
+    },
+    AcknowledgeEvent {
+        delivery_owner: ActorAddress,
+        reply_to: ActorAddress,
+        sequence: u64,
     },
 }
 
@@ -310,28 +323,37 @@ pub(crate) enum ContextualProcessControllerIn {
     Command(ContextualNodeCommand),
     Observed {
         request_id: String,
+        operation: u64,
         output: ContextualProcessOutput,
+    },
+    OutputObserverLost {
+        request_id: String,
+        operation: u64,
+    },
+    OutputDrained {
+        request_id: String,
+        operation: u64,
     },
     ProgramResolved {
         request_id: String,
         result: Result<BlobBinding, String>,
+        operation: u64,
     },
     ProgramPrepared {
         request_id: String,
         result: Result<PathBuf, String>,
+        operation: u64,
     },
     ResourceCensusObserved {
         sample_sequence: u64,
         response: ListActorsResponse,
     },
-    ResourceCensusDeadline {
-        sample_sequence: u64,
-    },
 }
 
 struct ContextualOutputRelay {
     request_id: String,
-    controller: ActorAddress,
+    operation: u64,
+    controller: Option<ActorAddress>,
 }
 
 impl swactor::actor::ActorInterface for ContextualOutputRelay {
@@ -339,6 +361,9 @@ impl swactor::actor::ActorInterface for ContextualOutputRelay {
     type Response = ();
 
     fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, output: Self::Incoming) {
+        let Some(controller) = self.controller else {
+            return;
+        };
         let terminal = matches!(
             output,
             ContextualProcessOutput::Process(
@@ -347,28 +372,50 @@ impl swactor::actor::ActorInterface for ContextualOutputRelay {
                     | ProcessOutput::Error { .. }
             )
         );
-        let _ = ctx.send(
-            self.controller,
-            ContextualProcessControllerIn::Observed {
-                request_id: self.request_id.clone(),
-                output,
-            },
-        );
+        if matches!(
+            &output,
+            ContextualProcessOutput::Process(ProcessOutput::Stdout(_) | ProcessOutput::Stderr(_))
+        ) {
+            let _ = ctx.send(
+                controller,
+                ContextualProcessControllerIn::Observed {
+                    request_id: self.request_id.clone(),
+                    operation: self.operation,
+                    output,
+                },
+            );
+        }
         if terminal {
+            let _ = ctx.send(
+                controller,
+                ContextualProcessControllerIn::OutputDrained {
+                    request_id: self.request_id.clone(),
+                    operation: self.operation,
+                },
+            );
+            self.controller = None;
             ctx.stop_self();
         }
     }
-}
 
-const PROGRAM_TRANSFER_RETRY: Duration = Duration::from_millis(100);
-const PROGRAM_TRANSFER_RETRY_LIMIT: u16 = 300;
+    fn on_stop(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        if let Some(controller) = self.controller.take() {
+            let _ = ctx.send(
+                controller,
+                ContextualProcessControllerIn::OutputObserverLost {
+                    request_id: self.request_id.clone(),
+                    operation: self.operation,
+                },
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ContextualProgramMaterializer {
     pub namespace_proxy: ActorAddress,
     pub receiver: Arc<dyn BlobTransferReceiver>,
     pub routes: Arc<dyn HostRouteRegistrar>,
-    pub engine: EngineHandle,
     pub sender: swactor::runtime::ExternalSender,
     pub root: PathBuf,
 }
@@ -376,6 +423,15 @@ pub(crate) struct ContextualProgramMaterializer {
 struct PendingProgramSpawn {
     spec: ContextualProcessSpec,
     reply_to: ActorAddress,
+    operation: u64,
+    phase: ProgramLaunchPhase,
+    child: ActorAddress,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgramLaunchPhase {
+    Resolving,
+    Transferring,
 }
 
 struct ProgramNamespaceResolver {
@@ -383,6 +439,8 @@ struct ProgramNamespaceResolver {
     source_path: data_plane::path::DataPath,
     request_id: String,
     controller: ActorAddress,
+    operation: u64,
+    completed: bool,
 }
 
 impl swactor::actor::ActorInterface for ProgramNamespaceResolver {
@@ -402,11 +460,13 @@ impl swactor::actor::ActorInterface for ProgramNamespaceResolver {
             )
             .is_err()
         {
+            self.completed = true;
             let _ = ctx.send(
                 self.controller,
                 ContextualProcessControllerIn::ProgramResolved {
                     request_id: self.request_id.clone(),
                     result: Err("uploaded program namespace is unavailable".to_owned()),
+                    operation: self.operation,
                 },
             );
             ctx.stop_self();
@@ -414,6 +474,10 @@ impl swactor::actor::ActorInterface for ProgramNamespaceResolver {
     }
 
     fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, reply: Self::Incoming) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
         let result = match reply {
             DataDirectoryOut::Resolved { result, .. } => {
                 result.map_err(|error| format!("resolve uploaded program: {error}"))
@@ -427,30 +491,58 @@ impl swactor::actor::ActorInterface for ProgramNamespaceResolver {
             ContextualProcessControllerIn::ProgramResolved {
                 request_id: self.request_id.clone(),
                 result,
+                operation: self.operation,
             },
         );
         ctx.stop_self();
     }
+
+    fn on_stop(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        let _ = ctx.send(
+            self.namespace_proxy,
+            NamespaceClientIn::Cancel {
+                reply_to: ctx.self_addr(),
+            },
+        );
+        if !self.completed {
+            self.completed = true;
+            let _ = ctx.send(
+                self.controller,
+                ContextualProcessControllerIn::ProgramResolved {
+                    request_id: self.request_id.clone(),
+                    operation: self.operation,
+                    result: Err("uploaded program resolver stopped before completion".to_owned()),
+                },
+            );
+        }
+    }
 }
 
+// TODO: I know what this does, but why is it *here* in this file?
+// TODO: And it even specifies specific behavior to the blob treansfer? Thats the job of the data-plane
 struct ProgramFileTransfer {
     request_id: String,
     controller: ActorAddress,
+    operation: u64,
     source: ActorAddress,
     length: u64,
     transfer_id: BlobTransferId,
     receiver: Arc<dyn BlobTransferReceiver>,
     routes: Arc<dyn HostRouteRegistrar>,
-    engine: EngineHandle,
     sender: swactor::runtime::ExternalSender,
     file: Option<File>,
     path: PathBuf,
     offer: Option<BlobTransferOffer>,
     written: u64,
-    source_confirmed: bool,
-    route_attempts: u16,
+    phase: ProgramTransferPhase,
     route_watch: Option<HostRouteWatch>,
-    route_retry: Option<ActorTimer>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgramTransferPhase {
+    AwaitingRoute,
+    Receiving,
+    Completed,
 }
 
 impl Drop for ProgramFileTransfer {
@@ -469,9 +561,6 @@ impl Drop for ProgramFileTransfer {
 impl ProgramFileTransfer {
     fn stop_route_wait(&mut self) {
         self.route_watch = None;
-        if let Some(timer) = self.route_retry.take() {
-            timer.cancel();
-        }
     }
 
     fn fail(&mut self, ctx: &swactor::runtime::Ctx<'_>, error: impl Into<String>) {
@@ -479,6 +568,10 @@ impl ProgramFileTransfer {
     }
 
     fn finish(&mut self, ctx: &swactor::runtime::Ctx<'_>, result: Result<PathBuf, String>) {
+        if self.phase == ProgramTransferPhase::Completed {
+            return;
+        }
+        self.phase = ProgramTransferPhase::Completed;
         self.stop_route_wait();
         if let Some(offer) = self.offer.take() {
             self.receiver.cancel(&offer);
@@ -487,26 +580,25 @@ impl ProgramFileTransfer {
         if result.is_err() {
             remove_program_tree(&self.path);
         }
-        let _ = ctx.send(
-            self.controller,
-            ContextualProcessControllerIn::ProgramPrepared {
-                request_id: self.request_id.clone(),
-                result,
-            },
-        );
+        let delivered = ctx
+            .send(
+                self.controller,
+                ContextualProcessControllerIn::ProgramPrepared {
+                    request_id: self.request_id.clone(),
+                    result,
+                    operation: self.operation,
+                },
+            )
+            .is_ok();
+        if !delivered {
+            remove_program_tree(&self.path);
+        }
         ctx.stop_self();
     }
 
-    fn try_start(&mut self, ctx: &swactor::runtime::Ctx<'_>, retry: bool) {
-        if retry && self.route_attempts >= PROGRAM_TRANSFER_RETRY_LIMIT {
-            self.fail(
-                ctx,
-                "uploaded program source did not become routable before the transfer deadline",
-            );
+    fn route_changed(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        if self.phase != ProgramTransferPhase::AwaitingRoute {
             return;
-        }
-        if retry {
-            self.route_attempts += 1;
         }
         if self.routes.is_routable(self.source) {
             let offer = self
@@ -514,21 +606,80 @@ impl ProgramFileTransfer {
                 .as_ref()
                 .expect("program transfer retains its offer")
                 .clone();
-            if ctx
-                .send(self.source, BlobSourceIn::BeginTransfer { offer })
-                .is_err()
-            {
-                self.fail(ctx, "route to uploaded program source is unavailable");
-                return;
-            }
+            // Failed sends stay pending until a route/connection observation or
+            // explicit cancellation; no periodic retry owns this transfer.
+            let _ = ctx.send(self.source, BlobSourceIn::BeginTransfer { offer });
         }
-        if !self.source_confirmed && self.route_retry.is_none() {
-            self.route_retry = Some(self.engine.send_after(
-                PROGRAM_TRANSFER_RETRY,
-                self.sender.clone(),
-                ctx.self_addr(),
-                BlobTransferEvent::RouteRetry,
-            ));
+    }
+
+    fn chunk(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        transfer_id: BlobTransferId,
+        bytes: Vec<u8>,
+    ) {
+        if transfer_id != self.transfer_id || self.phase == ProgramTransferPhase::Completed {
+            return;
+        }
+        self.phase = ProgramTransferPhase::Receiving;
+        self.stop_route_wait();
+        let Some(next) = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .filter(|written| *written <= self.length)
+        else {
+            self.fail(
+                ctx,
+                format!("uploaded program exceeded declared length {}", self.length),
+            );
+            return;
+        };
+        if let Err(error) = self
+            .file
+            .as_mut()
+            .expect("live program transfer owns its file")
+            .write_all(&bytes)
+        {
+            self.fail(ctx, format!("write uploaded program: {error}"));
+            return;
+        }
+        self.written = next;
+    }
+
+    fn received(&mut self, ctx: &swactor::runtime::Ctx<'_>, transfer_id: BlobTransferId) {
+        if transfer_id != self.transfer_id || self.phase == ProgramTransferPhase::Completed {
+            return;
+        }
+        if self.written != self.length {
+            self.fail(
+                ctx,
+                format!(
+                    "uploaded program length mismatch: expected {}, received {}",
+                    self.length, self.written
+                ),
+            );
+            return;
+        }
+        if let Err(error) = self
+            .file
+            .as_mut()
+            .expect("live program transfer owns its file")
+            .flush()
+        {
+            self.fail(ctx, format!("flush uploaded program: {error}"));
+            return;
+        }
+        self.finish(ctx, Ok(self.path.clone()));
+    }
+
+    fn failed(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        transfer_id: BlobTransferId,
+        reason: String,
+    ) {
+        if transfer_id == self.transfer_id {
+            self.fail(ctx, format!("receive uploaded program: {reason}"));
         }
     }
 }
@@ -553,7 +704,7 @@ impl swactor::actor::ActorInterface for ProgramFileTransfer {
                         let _ = sender.send_to(target, BlobTransferEvent::RouteChanged);
                     }),
                 );
-                self.try_start(ctx, true);
+                self.route_changed(ctx);
             }
             Err(error) => self.fail(ctx, format!("open uploaded program transfer: {error}")),
         }
@@ -561,69 +712,28 @@ impl swactor::actor::ActorInterface for ProgramFileTransfer {
 
     fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, event: Self::Incoming) {
         match event {
-            BlobTransferEvent::RouteRetry if !self.source_confirmed => {
-                self.route_retry = None;
-                self.try_start(ctx, true);
-            }
-            BlobTransferEvent::RouteChanged if !self.source_confirmed => {
-                self.try_start(ctx, false);
-            }
-            BlobTransferEvent::Chunk { transfer_id, bytes } if transfer_id == self.transfer_id => {
-                self.source_confirmed = true;
-                self.stop_route_wait();
-                let Some(next) = self
-                    .written
-                    .checked_add(bytes.len() as u64)
-                    .filter(|written| *written <= self.length)
-                else {
-                    self.fail(
-                        ctx,
-                        format!("uploaded program exceeded declared length {}", self.length),
-                    );
-                    return;
-                };
-                if let Err(error) = self
-                    .file
-                    .as_mut()
-                    .expect("live program transfer owns its file")
-                    .write_all(&bytes)
-                {
-                    self.fail(ctx, format!("write uploaded program: {error}"));
-                    return;
-                }
-                self.written = next;
-            }
-            BlobTransferEvent::Finished { transfer_id } if transfer_id == self.transfer_id => {
-                self.source_confirmed = true;
-                self.stop_route_wait();
-                if self.written != self.length {
-                    self.fail(
-                        ctx,
-                        format!(
-                            "uploaded program length mismatch: expected {}, received {}",
-                            self.length, self.written
-                        ),
-                    );
-                    return;
-                }
-                if let Err(error) = self
-                    .file
-                    .as_mut()
-                    .expect("live program transfer owns its file")
-                    .flush()
-                {
-                    self.fail(ctx, format!("flush uploaded program: {error}"));
-                    return;
-                }
-                self.finish(ctx, Ok(self.path.clone()));
-            }
+            BlobTransferEvent::RouteChanged => self.route_changed(ctx),
+            BlobTransferEvent::Chunk { transfer_id, bytes } => self.chunk(ctx, transfer_id, bytes),
+            BlobTransferEvent::Finished { transfer_id } => self.received(ctx, transfer_id),
             BlobTransferEvent::Failed {
                 transfer_id,
                 reason,
-            } if transfer_id == self.transfer_id => {
-                self.fail(ctx, format!("receive uploaded program: {reason}"));
-            }
-            _ => {}
+            } => self.failed(ctx, transfer_id, reason),
+            BlobTransferEvent::Cancel => self.fail(ctx, "uploaded program transfer cancelled"),
+            BlobTransferEvent::RouteRetry
+            | BlobTransferEvent::Allocated(_)
+            | BlobTransferEvent::AllocatorFailed(_)
+            | BlobTransferEvent::Sealed(_)
+            | BlobTransferEvent::Released(_) => {}
+        }
+    }
+
+    fn on_stop(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        if self.phase != ProgramTransferPhase::Completed {
+            self.finish(
+                ctx,
+                Err("uploaded program transfer owner stopped".to_owned()),
+            );
         }
     }
 }
@@ -638,10 +748,23 @@ struct LiveExecutionState {
     request_id: String,
     process: ActorAddress,
     identity: RuntimeExecutionIdentity,
+    operation: u64,
+    output: ActorAddress,
+    output_drained: bool,
+    observer_lost: bool,
+    pending_terminal: Option<ContextualProcessOutput>,
     reply_to: ActorAddress,
     started_pid: Option<u32>,
-    context_ready: bool,
+    phase: ExecutionPhase,
     staged_program: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecutionPhase {
+    Launching,
+    AwaitingContext,
+    Ready,
+    Stopping,
 }
 
 #[derive(Clone)]
@@ -649,7 +772,7 @@ pub(crate) struct ContextualResourceProbe {
     pub runtime: Runtime,
     pub engine: EngineHandle,
     pub arena: Arc<parking_lot::Mutex<data_plane::arena::ArenaManager>>,
-    pub stream_transport: Arc<iroh_driver::IrohStreamTransport>,
+    pub stream_transport: iroh_driver::IrohStreamResourceProbe,
     pub generation: u64,
     pub iroh_node_id: String,
     pub deployment: Option<DeploymentIdentity>,
@@ -659,12 +782,179 @@ struct PendingResourceCensus {
     request_id: String,
     reply_to: ActorAddress,
     executions: Vec<LiveContextualExecution>,
-    started: Instant,
-    deadline: Instant,
     request: ListActorsRequest,
-    timer: ActorTimer,
+    execution_ownership: ResourceExecutionOwnership,
 }
 
+struct PendingStop {
+    request_id: String,
+    reply_to: ActorAddress,
+    process: ActorAddress,
+}
+
+struct PendingContextualEventDelivery {
+    events: VecDeque<(u64, ContextualProcessEvent)>,
+    _route_watch: Option<HostRouteWatch>,
+}
+
+#[derive(Clone)]
+pub(crate) enum ContextualEventDeliveryIn {
+    Enqueue {
+        reply_to: ActorAddress,
+        event: ContextualProcessEvent,
+    },
+    RouteChanged {
+        reply_to: ActorAddress,
+    },
+    Acknowledge {
+        reply_to: ActorAddress,
+        sequence: u64,
+    },
+    Cancel {
+        reply_to: ActorAddress,
+        request_id: String,
+    },
+    Seal,
+}
+
+struct ContextualEventDelivery {
+    routes: Arc<dyn HostRouteRegistrar>,
+    sender: swactor::runtime::ExternalSender,
+    deliveries: HashMap<ActorAddress, PendingContextualEventDelivery>,
+    next_sequence: u64,
+    sealed: bool,
+}
+
+impl ContextualEventDelivery {
+    fn enqueue(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        reply_to: ActorAddress,
+        event: ContextualProcessEvent,
+    ) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .expect("contextual delivery identity exhausted");
+        let delivery = self.deliveries.entry(reply_to).or_insert_with(|| {
+            let sender = self.sender.clone();
+            let owner = ctx.self_addr();
+            let route_watch = self.routes.watch_route(
+                reply_to,
+                Arc::new(move || {
+                    let _ =
+                        sender.send_to(owner, ContextualEventDeliveryIn::RouteChanged { reply_to });
+                }),
+            );
+            PendingContextualEventDelivery {
+                events: VecDeque::new(),
+                _route_watch: route_watch,
+            }
+        });
+        delivery.events.push_back((sequence, event));
+        if delivery.events.len() == 1 {
+            self.deliver(ctx, reply_to);
+        }
+    }
+
+    fn deliver(&self, ctx: &swactor::runtime::Ctx<'_>, reply_to: ActorAddress) {
+        let Some(delivery) = self.deliveries.get(&reply_to) else {
+            return;
+        };
+        let Some((sequence, observation)) = delivery.events.front() else {
+            return;
+        };
+        // Keep ownership through transport acceptance until the recipient
+        // acknowledges this exact sequence. Route/connection changes replay it.
+        let _ = ctx.send(
+            reply_to,
+            crate::orchestration::actor::OrchestratorMsg::ContextualEvent {
+                observation: observation.clone(),
+                delivery_owner: Some(ctx.self_addr()),
+                sequence: *sequence,
+            },
+        );
+    }
+
+    fn advance(&mut self, ctx: &swactor::runtime::Ctx<'_>, reply_to: ActorAddress) {
+        if self
+            .deliveries
+            .get(&reply_to)
+            .is_some_and(|delivery| delivery.events.is_empty())
+        {
+            self.deliveries.remove(&reply_to);
+        } else {
+            self.deliver(ctx, reply_to);
+        }
+        if self.sealed && self.deliveries.is_empty() {
+            ctx.stop_self();
+        }
+    }
+
+    fn acknowledged(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        reply_to: ActorAddress,
+        sequence: u64,
+    ) {
+        let Some(delivery) = self.deliveries.get_mut(&reply_to) else {
+            return;
+        };
+        if delivery.events.front().map(|(pending, _)| *pending) != Some(sequence) {
+            return;
+        }
+        delivery.events.pop_front();
+        self.advance(ctx, reply_to);
+    }
+
+    fn cancel(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        reply_to: ActorAddress,
+        request_id: &str,
+    ) {
+        let Some(delivery) = self.deliveries.get_mut(&reply_to) else {
+            return;
+        };
+        let previous = delivery.events.front().map(|(sequence, _)| *sequence);
+        delivery
+            .events
+            .retain(|(_, event)| event.request_id != request_id);
+        if delivery.events.front().map(|(sequence, _)| *sequence) != previous {
+            self.advance(ctx, reply_to);
+        }
+    }
+}
+
+impl swactor::actor::ActorInterface for ContextualEventDelivery {
+    type Incoming = ContextualEventDeliveryIn;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, message: Self::Incoming) {
+        match message {
+            ContextualEventDeliveryIn::Enqueue { reply_to, event } => {
+                self.enqueue(ctx, reply_to, event)
+            }
+            ContextualEventDeliveryIn::RouteChanged { reply_to } => self.deliver(ctx, reply_to),
+            ContextualEventDeliveryIn::Acknowledge { reply_to, sequence } => {
+                self.acknowledged(ctx, reply_to, sequence)
+            }
+            ContextualEventDeliveryIn::Cancel {
+                reply_to,
+                request_id,
+            } => self.cancel(ctx, reply_to, &request_id),
+            ContextualEventDeliveryIn::Seal => {
+                self.sealed = true;
+                if self.deliveries.is_empty() {
+                    ctx.stop_self();
+                }
+            }
+        }
+    }
+}
+
+// TODO: Why is this here?
 pub(crate) struct ContextualProcessController {
     logical_node_id: u64,
     spawner: Arc<ContextualProcessSpawner>,
@@ -673,7 +963,10 @@ pub(crate) struct ContextualProcessController {
     resource_probe: Option<ContextualResourceProbe>,
     resource_sequence: u64,
     pending_resource_censuses: HashMap<u64, PendingResourceCensus>,
+    event_delivery: ActorAddress,
+    next_program_operation: u64,
     pending_programs: HashMap<String, PendingProgramSpawn>,
+    pending_stops: HashMap<u64, PendingStop>,
     by_process: HashMap<ActorAddress, LiveExecutionState>,
     process_by_request: HashMap<String, ActorAddress>,
     /// Request IDs that reached a terminal state, newest first. A Spawn
@@ -682,24 +975,30 @@ pub(crate) struct ContextualProcessController {
     /// material nobody will send, hangs forever, and leaks its whole actor
     /// assembly past every census.
     finished_requests: VecDeque<String>,
+    finished_controls: VecDeque<String>,
 }
 
 /// Upper bound on remembered terminal requests. Campaigns issue hundreds of
 /// request IDs; the bound keeps long-lived nodes bounded while covering any
 /// realistic redelivery window.
 const FINISHED_REQUEST_MEMORY: usize = 4096;
-// The HTTP control owner allows two seconds. A local admin census that has not
-// completed in this interval is stalled; fail it promptly so retries cannot
-// accumulate dozens of orphaned censuses behind one overloaded worker.
-const RESOURCE_CENSUS_DEADLINE: Duration = Duration::from_millis(500);
 
 impl ContextualProcessController {
     pub(crate) fn new(
+        runtime: Runtime,
         logical_node_id: u64,
         spawner: Arc<ContextualProcessSpawner>,
         sender: swactor::runtime::ExternalSender,
-    ) -> Self {
-        Self {
+        routes: Arc<dyn HostRouteRegistrar>,
+    ) -> Result<Self, swactor::Error> {
+        let event_delivery = runtime.spawn(ContextualEventDelivery {
+            routes,
+            sender: sender.clone(),
+            deliveries: HashMap::new(),
+            next_sequence: 1,
+            sealed: false,
+        })?;
+        Ok(Self {
             logical_node_id,
             spawner,
             sender,
@@ -707,12 +1006,17 @@ impl ContextualProcessController {
             resource_probe: None,
             resource_sequence: 0,
             pending_resource_censuses: HashMap::new(),
+            event_delivery,
+            next_program_operation: 1,
             pending_programs: HashMap::new(),
+            pending_stops: HashMap::new(),
             by_process: HashMap::new(),
             process_by_request: HashMap::new(),
             finished_requests: VecDeque::new(),
-        }
+            finished_controls: VecDeque::new(),
+        })
     }
+
     pub(crate) fn with_program_materializer(
         mut self,
         materializer: ContextualProgramMaterializer,
@@ -727,19 +1031,73 @@ impl ContextualProcessController {
     }
 
     fn emit(
-        &self,
-        ctx: &swactor::runtime::Ctx<'_>,
+        &mut self,
+        _ctx: &swactor::runtime::Ctx<'_>,
         reply_to: ActorAddress,
         request_id: String,
         event: ContextualProcessEventKind,
     ) {
-        let _ = ctx.send(
-            reply_to,
-            crate::orchestration::actor::OrchestratorMsg::ContextualEvent(ContextualProcessEvent {
-                request_id,
-                logical_node_id: self.logical_node_id,
-                event,
-            }),
+        if matches!(event, ContextualProcessEventKind::SpawnRejected { .. })
+            && !self.process_by_request.contains_key(&request_id)
+            && !self.pending_programs.contains_key(&request_id)
+        {
+            self.remember_finished(request_id.clone());
+        }
+        if matches!(
+            event,
+            ContextualProcessEventKind::StopAccepted { .. }
+                | ContextualProcessEventKind::StopRejected { .. }
+                | ContextualProcessEventKind::ControlUnavailable { .. }
+                | ContextualProcessEventKind::LiveExecutions { .. }
+        ) {
+            self.finished_controls.push_front(request_id.clone());
+            if self.finished_controls.len() > FINISHED_REQUEST_MEMORY {
+                self.finished_controls.pop_back();
+            }
+        }
+        let _ = self.sender.send_to(
+            self.event_delivery,
+            ContextualEventDeliveryIn::Enqueue {
+                reply_to,
+                event: ContextualProcessEvent {
+                    request_id,
+                    logical_node_id: self.logical_node_id,
+                    event,
+                },
+            },
+        );
+    }
+
+    fn remember_finished(&mut self, request_id: String) {
+        if self.finished_requests.contains(&request_id) {
+            return;
+        }
+        self.finished_requests.push_front(request_id);
+        if self.finished_requests.len() > FINISHED_REQUEST_MEMORY {
+            self.finished_requests.pop_back();
+        }
+    }
+
+    fn take_program(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: &str,
+    ) -> Option<PendingProgramSpawn> {
+        let pending = self.pending_programs.remove(request_id)?;
+        let _ = ctx.stop_actor(pending.child);
+        Some(pending)
+    }
+
+    fn fail_program(&mut self, ctx: &swactor::runtime::Ctx<'_>, request_id: String, error: String) {
+        let Some(pending) = self.take_program(ctx, &request_id) else {
+            return;
+        };
+
+        self.emit(
+            ctx,
+            pending.reply_to,
+            request_id,
+            ContextualProcessEventKind::SpawnRejected { error },
         );
     }
 
@@ -810,23 +1168,38 @@ impl ContextualProcessController {
                 return;
             }
         };
-        self.pending_programs
-            .insert(request_id.clone(), PendingProgramSpawn { spec, reply_to });
-        if let Err(error) = ctx.spawn(ProgramNamespaceResolver {
+        let operation = self.next_program_operation;
+        self.next_program_operation = operation
+            .checked_add(1)
+            .expect("program operation identity exhausted");
+        match ctx.spawn(ProgramNamespaceResolver {
             namespace_proxy: materializer.namespace_proxy,
             source_path,
             request_id: request_id.clone(),
             controller: ctx.self_addr(),
+            operation,
+            completed: false,
         }) {
-            self.pending_programs.remove(&request_id);
-            self.emit(
+            Ok(child) => {
+                self.pending_programs.insert(
+                    request_id,
+                    PendingProgramSpawn {
+                        spec,
+                        reply_to,
+                        operation,
+                        child,
+                        phase: ProgramLaunchPhase::Resolving,
+                    },
+                );
+            }
+            Err(error) => self.emit(
                 ctx,
                 reply_to,
                 request_id,
                 ContextualProcessEventKind::SpawnRejected {
                     error: format!("spawn uploaded program resolver: {error}"),
                 },
-            );
+            ),
         }
     }
 
@@ -853,9 +1226,14 @@ impl ContextualProcessController {
                 return;
             }
         };
+        let operation = self.next_program_operation;
+        self.next_program_operation = operation
+            .checked_add(1)
+            .expect("contextual observation identity exhausted");
         let relay = match ctx.spawn(ContextualOutputRelay {
             request_id: request_id.clone(),
-            controller: ctx.self_addr(),
+            operation,
+            controller: Some(ctx.self_addr()),
         }) {
             Ok(relay) => relay,
             Err(error) => {
@@ -873,7 +1251,21 @@ impl ContextualProcessController {
                 return;
             }
         };
-        let output = ContextualProcessOutputConfig::disabled(relay);
+        let sender = self.sender.clone();
+        let owner = ctx.self_addr();
+        let observed_request = request_id.clone();
+        let output = ContextualProcessOutputConfig::disabled(relay).with_lifecycle_observer(
+            Arc::new(move |output| {
+                let _ = sender.send_to(
+                    owner,
+                    ContextualProcessControllerIn::Observed {
+                        request_id: observed_request.clone(),
+                        operation,
+                        output,
+                    },
+                );
+            }),
+        );
         match self.spawner.spawn(ctx, &self.sender, spec, output) {
             Ok(spawned) => {
                 self.process_by_request
@@ -884,9 +1276,14 @@ impl ContextualProcessController {
                         request_id: request_id.clone(),
                         process: spawned.actor,
                         identity: spawned.identity,
+                        operation,
+                        output: relay,
+                        output_drained: false,
+                        observer_lost: false,
+                        pending_terminal: None,
                         reply_to,
                         started_pid: None,
-                        context_ready: false,
+                        phase: ExecutionPhase::Launching,
                         staged_program,
                     },
                 );
@@ -921,29 +1318,28 @@ impl ContextualProcessController {
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
+        operation: u64,
         result: Result<BlobBinding, String>,
     ) {
         let Some(pending) = self.pending_programs.get(&request_id) else {
             return;
         };
-        let reply_to = pending.reply_to;
+        if pending.operation != operation || pending.phase != ProgramLaunchPhase::Resolving {
+            return;
+        }
         let binding = match result {
             Ok(binding) => binding,
             Err(error) => {
-                let pending = self
-                    .pending_programs
-                    .remove(&request_id)
-                    .expect("pending uploaded program exists");
-                self.emit(
-                    ctx,
-                    pending.reply_to,
-                    request_id,
-                    ContextualProcessEventKind::SpawnRejected { error },
-                );
+                self.fail_program(ctx, request_id, error);
                 return;
             }
         };
         let Some(materializer) = self.materializer.clone() else {
+            self.fail_program(
+                ctx,
+                request_id,
+                "uploaded program materializer was removed".to_owned(),
+            );
             return;
         };
         let path = program_path(&materializer.root, &request_id);
@@ -961,14 +1357,8 @@ impl ContextualProcessController {
         let file = match file {
             Ok(file) => file,
             Err(error) => {
-                self.pending_programs.remove(&request_id);
                 remove_program_tree(&path);
-                self.emit(
-                    ctx,
-                    reply_to,
-                    request_id,
-                    ContextualProcessEventKind::SpawnRejected { error },
-                );
+                self.fail_program(ctx, request_id, error);
                 return;
             }
         };
@@ -979,16 +1369,12 @@ impl ContextualProcessController {
             .routes
             .retain_source(binding.source, binding.source_node)
         {
-            self.pending_programs.remove(&request_id);
             drop(file);
             remove_program_tree(&path);
-            self.emit(
+            self.fail_program(
                 ctx,
-                reply_to,
                 request_id,
-                ContextualProcessEventKind::SpawnRejected {
-                    error: format!("retain uploaded program source route: {error}"),
-                },
+                format!("retain uploaded program source route: {error}"),
             );
             return;
         }
@@ -1001,33 +1387,37 @@ impl ContextualProcessController {
         let transfer = ProgramFileTransfer {
             request_id: request_id.clone(),
             controller: ctx.self_addr(),
+            operation,
             source: binding.source,
             length: binding.length,
             transfer_id,
             receiver: materializer.receiver,
             routes: materializer.routes,
-            engine: materializer.engine,
             sender: materializer.sender,
             file: Some(file),
             path: path.clone(),
             offer: None,
             written: 0,
-            source_confirmed: false,
-            route_attempts: 0,
+            phase: ProgramTransferPhase::AwaitingRoute,
             route_watch: None,
-            route_retry: None,
         };
-        if let Err(error) = ctx.spawn(transfer) {
-            self.pending_programs.remove(&request_id);
-            remove_program_tree(&path);
-            self.emit(
-                ctx,
-                reply_to,
-                request_id,
-                ContextualProcessEventKind::SpawnRejected {
-                    error: format!("spawn uploaded program transfer: {error}"),
-                },
-            );
+        match ctx.spawn(transfer) {
+            Ok(child) => {
+                let pending = self
+                    .pending_programs
+                    .get_mut(&request_id)
+                    .expect("resolving operation retained");
+                pending.child = child;
+                pending.phase = ProgramLaunchPhase::Transferring;
+            }
+            Err(error) => {
+                remove_program_tree(&path);
+                self.fail_program(
+                    ctx,
+                    request_id,
+                    format!("spawn uploaded program transfer: {error}"),
+                );
+            }
         }
     }
 
@@ -1035,14 +1425,31 @@ impl ContextualProcessController {
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
+        operation: u64,
         result: Result<PathBuf, String>,
     ) {
-        let Some(mut pending) = self.pending_programs.remove(&request_id) else {
+        if !self
+            .pending_programs
+            .get(&request_id)
+            .is_some_and(|pending| {
+                pending.operation == operation && pending.phase == ProgramLaunchPhase::Transferring
+            })
+        {
             if let Ok(path) = result {
-                remove_program_tree(&path);
+                let owned = self
+                    .by_process
+                    .values()
+                    .any(|execution| execution.staged_program.as_ref() == Some(&path));
+                if !owned && !self.pending_programs.contains_key(&request_id) {
+                    remove_program_tree(&path);
+                }
             }
             return;
-        };
+        }
+        let mut pending = self
+            .take_program(ctx, &request_id)
+            .expect("prepared operation retained");
+
         let path = match result {
             Ok(path) => path,
             Err(error) => {
@@ -1062,36 +1469,137 @@ impl ContextualProcessController {
         self.spawn_ready(ctx, request_id, pending.spec, pending.reply_to, Some(path));
     }
 
+    fn cancel(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: String,
+        reply_to: ActorAddress,
+    ) {
+        if self
+            .pending_programs
+            .get(&request_id)
+            .is_some_and(|pending| pending.reply_to == reply_to)
+        {
+            self.take_program(ctx, &request_id);
+            self.remember_finished(request_id.clone());
+        }
+        let mut cancelled_control = false;
+        self.pending_stops.retain(|_, pending| {
+            let retain = pending.request_id != request_id || pending.reply_to != reply_to;
+            cancelled_control |= !retain;
+            retain
+        });
+        self.pending_resource_censuses.retain(|_, pending| {
+            let retain = pending.request_id != request_id || pending.reply_to != reply_to;
+            cancelled_control |= !retain;
+            retain
+        });
+        if cancelled_control {
+            self.finished_controls.push_front(request_id.clone());
+            if self.finished_controls.len() > FINISHED_REQUEST_MEMORY {
+                self.finished_controls.pop_back();
+            }
+        }
+        let _ = ctx.send(
+            self.event_delivery,
+            ContextualEventDeliveryIn::Cancel {
+                reply_to,
+                request_id,
+            },
+        );
+    }
+
     fn stop(
-        &self,
+        &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
         target_request_id: String,
-        kill_after_ms: Option<u64>,
+        force: bool,
         reply_to: ActorAddress,
     ) {
-        let event = if let Some(process) = self.process_by_request.get(&target_request_id).copied()
-        {
-            match send_contextual_process_command(
-                &self.sender,
-                process,
-                ContextualProcessCommand::Stop {
-                    kill_after: kill_after_ms.map(Duration::from_millis),
+        if self.control_pending_or_finished(&request_id) {
+            return;
+        }
+        if let Some(pending) = self.pending_programs.get(&target_request_id) {
+            let process = pending.child.to_full_hex();
+            self.fail_program(
+                ctx,
+                target_request_id,
+                "contextual launch cancelled before native spawn".to_owned(),
+            );
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKind::StopAccepted { process },
+            );
+            return;
+        }
+        let Some(process) = self.process_by_request.get(&target_request_id).copied() else {
+            self.emit(
+                ctx,
+                reply_to,
+                request_id,
+                ContextualProcessEventKind::StopRejected {
+                    error: "contextual process is not live on this node".to_owned(),
                 },
-            ) {
-                Ok(()) => ContextualProcessEventKind::StopAccepted {
-                    process: process.to_full_hex(),
-                },
-                Err(error) => ContextualProcessEventKind::StopRejected {
-                    error: error.to_string(),
-                },
-            }
-        } else {
-            ContextualProcessEventKind::StopRejected {
-                error: "contextual process is not live on this node".to_owned(),
-            }
+            );
+            return;
         };
-        self.emit(ctx, reply_to, request_id, event);
+        let operation = self.next_program_operation;
+        self.next_program_operation = operation
+            .checked_add(1)
+            .expect("contextual operation identity exhausted");
+        self.pending_stops.insert(
+            operation,
+            PendingStop {
+                request_id,
+                reply_to,
+                process,
+            },
+        );
+
+        let command = if force {
+            ContextualProcessCommand::CancelAcknowledged { operation }
+        } else {
+            ContextualProcessCommand::StopGracefullyAcknowledged { operation }
+        };
+        if let Err(error) = send_contextual_process_command(&self.sender, process, command) {
+            self.stop_completed(ctx, operation, Err(error.to_string()));
+        }
+    }
+
+    fn stop_completed(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        operation: u64,
+        result: Result<(), String>,
+    ) {
+        let Some(pending) = self.pending_stops.remove(&operation) else {
+            return;
+        };
+
+        let event = match result {
+            Ok(()) => ContextualProcessEventKind::StopAccepted {
+                process: pending.process.to_full_hex(),
+            },
+            Err(error) => ContextualProcessEventKind::StopRejected { error },
+        };
+        self.emit(ctx, pending.reply_to, pending.request_id, event);
+    }
+
+    fn control_pending_or_finished(&self, request_id: &str) -> bool {
+        self.finished_controls
+            .iter()
+            .any(|finished| finished == request_id)
+            || self
+                .pending_stops
+                .values()
+                .any(|pending| pending.request_id == request_id)
+            || self
+                .pending_resource_censuses
+                .values()
+                .any(|pending| pending.request_id == request_id)
     }
 
     fn query(
@@ -1100,6 +1608,9 @@ impl ContextualProcessController {
         request_id: String,
         reply_to: ActorAddress,
     ) {
+        if self.control_pending_or_finished(&request_id) {
+            return;
+        }
         let mut executions = self
             .by_process
             .values()
@@ -1108,15 +1619,24 @@ impl ContextualProcessController {
                 process: execution.process.to_full_hex(),
                 identity: execution_identity(execution.identity),
                 started_pid: execution.started_pid,
-                context_ready: execution.context_ready,
+                context_ready: execution.phase == ExecutionPhase::Ready,
             })
             .collect::<Vec<_>>();
         executions.sort_by(|left, right| left.request_id.cmp(&right.request_id));
         if let Some(probe) = &self.resource_probe {
-            self.resource_sequence = self.resource_sequence.saturating_add(1);
+            self.resource_sequence = self
+                .resource_sequence
+                .checked_add(1)
+                .expect("resource census identity exhausted");
             let sample_sequence = self.resource_sequence;
-            let started = probe.engine.now().to_instant();
-            let deadline = started + RESOURCE_CENSUS_DEADLINE;
+            let execution_ownership = {
+                let ownership = probe.engine.ownership_snapshot();
+                ResourceExecutionOwnership {
+                    tasks: ownership.tasks,
+                    actor_timers: ownership.actor_timers,
+                    blocking: ownership.blocking,
+                }
+            };
             let request =
                 match probe
                     .runtime
@@ -1140,22 +1660,14 @@ impl ContextualProcessController {
                         return;
                     }
                 };
-            let timer = probe.engine.send_after(
-                deadline.saturating_duration_since(probe.engine.now().to_instant()),
-                self.sender.clone(),
-                ctx.self_addr(),
-                ContextualProcessControllerIn::ResourceCensusDeadline { sample_sequence },
-            );
             self.pending_resource_censuses.insert(
                 sample_sequence,
                 PendingResourceCensus {
                     request_id,
                     reply_to,
                     executions,
-                    started,
-                    deadline,
                     request,
-                    timer,
+                    execution_ownership,
                 },
             );
             return;
@@ -1175,124 +1687,188 @@ impl ContextualProcessController {
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         sample_sequence: u64,
-        response: Option<ListActorsResponse>,
+        mut response: ListActorsResponse,
     ) {
         let Some(pending) = self.pending_resource_censuses.remove(&sample_sequence) else {
             return;
         };
-        pending.timer.cancel();
-        pending.request.cancel();
         let probe = self
             .resource_probe
             .as_ref()
             .expect("pending resource census has a probe");
-        let response = response.filter(|_| probe.engine.now().to_instant() < pending.deadline);
-        let event = if let Some(mut response) = response {
-            response
-                .actors
-                .sort_unstable_by_key(|actor| actor.address.0);
-            let actors = response
-                .actors
-                .into_iter()
-                .map(|actor| ResourceActor {
-                    address: actor.address.to_full_hex(),
-                    actor_type: actor.actor_type.to_owned(),
-                    worker_id: actor.worker_id as u64,
-                    mailbox_depth: actor.mailbox_depth as u64,
-                    poisoned: actor.status.poisoned,
-                    stopping: actor.status.stopping,
-                })
-                .collect::<Vec<_>>();
-            let arena: data_plane::arena::ArenaSample =
-                probe.arena.lock().sample(sample_sequence).into();
-            let arena = ResourceArena {
-                seq: arena.seq,
-                sample_unix_ms: arena.sample_unix_ms,
-                capacity_bytes: arena.capacity_bytes,
-                live_bytes: arena.live_bytes,
-                free_bytes: arena.free_bytes,
-                active_leases: arena.active_leases,
-                pending_leases: arena.pending_leases,
-                largest_free_range_bytes: arena.largest_free_range_bytes,
-                allocation_failures_total: arena.allocation_failures_total,
-                release_failures_total: arena.release_failures_total,
-            };
-            let transport = match serde_json::from_value::<ResourceTransport>(
-                probe.stream_transport.resource_snapshot(),
-            ) {
-                Ok(transport) => transport,
-                Err(error) => {
-                    self.emit(
-                        ctx,
-                        pending.reply_to,
-                        pending.request_id,
-                        ContextualProcessEventKind::ControlUnavailable {
-                            error: format!("invalid stream transport resource snapshot: {error}"),
-                        },
-                    );
-                    return;
-                }
-            };
-            let resources = WorkerResourceSnapshot {
-                schema_version: SCHEMA_VERSION,
-                request_id: pending.request_id.clone(),
-                logical_node_id: self.logical_node_id,
-                generation: probe.generation,
-                sample_sequence,
-                iroh_node_id: probe.iroh_node_id.clone(),
-                artifact_digest: probe
-                    .deployment
-                    .as_ref()
-                    .map(|identity| identity.artifact_digest.clone()),
-                deployment_generation: probe
-                    .deployment
-                    .as_ref()
-                    .map(|identity| identity.deployment_generation.clone()),
-                actors,
-                arena,
-                collection_elapsed_us: probe
-                    .engine
-                    .now()
-                    .to_instant()
-                    .duration_since(pending.started)
-                    .as_micros()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                transport,
-            };
-            if probe.engine.now().to_instant() < pending.deadline {
-                ContextualProcessEventKind::LiveExecutions {
-                    executions: pending.executions,
-                    resources: Some(resources),
-                }
-            } else {
+        let current_ownership = probe.engine.ownership_snapshot();
+        pending.request.cancel();
+        if current_ownership.tasks != pending.execution_ownership.tasks
+            || current_ownership.blocking != pending.execution_ownership.blocking
+            || current_ownership.actor_timers != pending.execution_ownership.actor_timers
+        {
+            self.emit(
+                ctx,
+                pending.reply_to,
+                pending.request_id,
                 ContextualProcessEventKind::ControlUnavailable {
-                    error: "fresh worker actor/arena census deadline expired".to_owned(),
-                }
-            }
-        } else {
-            ContextualProcessEventKind::ControlUnavailable {
-                error: "fresh worker actor/arena census deadline expired".to_owned(),
+                    error: "worker execution ownership changed during census".to_owned(),
+                },
+            );
+            return;
+        }
+        response
+            .actors
+            .sort_unstable_by_key(|actor| actor.address.0);
+        let actors = response
+            .actors
+            .into_iter()
+            .map(|actor| ResourceActor {
+                address: actor.address.to_full_hex(),
+                actor_type: actor.actor_type.to_owned(),
+                worker_id: actor.worker_id as u64,
+                mailbox_depth: actor.mailbox_depth as u64,
+                poisoned: actor.status.poisoned,
+                stopping: actor.status.stopping,
+            })
+            .collect::<Vec<_>>();
+        let arena = probe.arena.lock().sample(sample_sequence);
+        let arena = ResourceArena {
+            seq: arena.seq,
+            capacity_bytes: arena.capacity_bytes,
+            live_bytes: arena.live_bytes,
+            free_bytes: arena.free_bytes,
+            active_leases: arena.active_leases,
+            pending_leases: arena.pending_leases,
+            largest_free_range_bytes: arena.largest_free_range_bytes,
+            allocation_failures_total: arena.allocation_failures_total,
+            release_failures_total: arena.release_failures_total,
+        };
+        let transport = match serde_json::from_value::<ResourceTransport>(
+            probe.stream_transport.resource_snapshot(),
+        ) {
+            Ok(transport) => transport,
+            Err(error) => {
+                self.emit(
+                    ctx,
+                    pending.reply_to,
+                    pending.request_id,
+                    ContextualProcessEventKind::ControlUnavailable {
+                        error: format!("invalid stream transport resource snapshot: {error}"),
+                    },
+                );
+                return;
             }
         };
-        self.emit(ctx, pending.reply_to, pending.request_id, event);
+        let resources = WorkerResourceSnapshot {
+            schema_version: SCHEMA_VERSION,
+            request_id: pending.request_id.clone(),
+            logical_node_id: self.logical_node_id,
+            generation: probe.generation,
+            sample_sequence,
+            iroh_node_id: probe.iroh_node_id.clone(),
+            artifact_digest: probe
+                .deployment
+                .as_ref()
+                .map(|identity| identity.artifact_digest.clone()),
+            deployment_generation: probe
+                .deployment
+                .as_ref()
+                .map(|identity| identity.deployment_generation.clone()),
+            actors,
+            execution_ownership: pending.execution_ownership,
+            arena,
+            transport,
+        };
+        self.emit(
+            ctx,
+            pending.reply_to,
+            pending.request_id,
+            ContextualProcessEventKind::LiveExecutions {
+                executions: pending.executions,
+                resources: Some(Box::new(resources)),
+            },
+        );
+    }
+
+    fn output_finished(
+        &mut self,
+        ctx: &swactor::runtime::Ctx<'_>,
+        request_id: String,
+        operation: u64,
+        lost: bool,
+    ) {
+        let Some(process) = self.process_by_request.get(&request_id).copied() else {
+            return;
+        };
+        let Some(execution) = self.by_process.get_mut(&process) else {
+            return;
+        };
+        if execution.operation != operation {
+            return;
+        }
+        execution.output_drained = true;
+        execution.observer_lost |= lost;
+        if let Some(output) = execution.pending_terminal.take() {
+            self.observe(ctx, request_id, operation, output);
+        } else if lost {
+            let _ = send_contextual_process_command(
+                &self.sender,
+                process,
+                ContextualProcessCommand::Cancel,
+            );
+        }
     }
 
     fn observe(
         &mut self,
         ctx: &swactor::runtime::Ctx<'_>,
         request_id: String,
+        operation: u64,
         output: ContextualProcessOutput,
     ) {
         let Some(process) = self.process_by_request.get(&request_id).copied() else {
             return;
         };
+        if self
+            .by_process
+            .get(&process)
+            .is_none_or(|execution| execution.operation != operation)
+        {
+            return;
+        }
+        if matches!(
+            &output,
+            ContextualProcessOutput::Process(
+                ProcessOutput::SpawnFailed { .. }
+                    | ProcessOutput::Exited { .. }
+                    | ProcessOutput::Error { .. }
+            )
+        ) && let Some(execution) = self.by_process.get_mut(&process)
+            && !execution.output_drained
+            && !execution.observer_lost
+        {
+            execution.pending_terminal = Some(output);
+            return;
+        }
+        if let ContextualProcessOutput::StopAcknowledged { operation } = output {
+            if self
+                .pending_stops
+                .get(&operation)
+                .is_some_and(|pending| pending.process == process)
+            {
+                self.stop_completed(ctx, operation, Ok(()));
+            }
+            return;
+        }
         let (reply_to, event, terminal) = {
             let Some(execution) = self.by_process.get_mut(&process) else {
                 return;
             };
             let event = match output {
+                ContextualProcessOutput::StopAcknowledged { .. } => {
+                    unreachable!("stop acknowledgements dispatched above")
+                }
                 ContextualProcessOutput::Process(ProcessOutput::Started { pid }) => {
+                    if execution.phase != ExecutionPhase::Launching {
+                        return;
+                    }
+                    execution.phase = ExecutionPhase::AwaitingContext;
                     execution.started_pid = Some(pid);
                     ContextualProcessEventKind::ProcessStarted { pid }
                 }
@@ -1314,36 +1890,56 @@ impl ContextualProcessController {
                     ContextualProcessEventKind::ProcessError { error }
                 }
                 ContextualProcessOutput::ContextReady => {
-                    execution.context_ready = true;
+                    if execution.phase != ExecutionPhase::AwaitingContext {
+                        return;
+                    }
+                    execution.phase = ExecutionPhase::Ready;
                     ContextualProcessEventKind::ContextReady
                 }
                 ContextualProcessOutput::BootstrapFailed { reason } => {
+                    if execution.phase == ExecutionPhase::Stopping {
+                        return;
+                    }
+                    execution.phase = ExecutionPhase::Stopping;
                     ContextualProcessEventKind::BootstrapFailed {
                         error: bootstrap_failure(&reason),
                     }
                 }
             };
-            (execution.reply_to, event.clone(), event.is_terminal())
+            let terminal = event.is_terminal();
+            (execution.reply_to, event, terminal)
         };
         self.emit(ctx, reply_to, request_id.clone(), event);
         if terminal {
-            if let Some(execution) = self.by_process.remove(&process)
-                && let Some(path) = execution.staged_program
-            {
-                remove_program_tree(&path);
+            let operations: Vec<_> = self
+                .pending_stops
+                .iter()
+                .filter_map(|(operation, pending)| {
+                    (pending.process == process).then_some(*operation)
+                })
+                .collect();
+            for operation in operations {
+                self.stop_completed(
+                    ctx,
+                    operation,
+                    Err("contextual process terminated before stop acknowledgement".to_owned()),
+                );
+            }
+            if let Some(execution) = self.by_process.remove(&process) {
+                let _ = ctx.stop_actor(execution.output);
+                if let Some(path) = execution.staged_program {
+                    remove_program_tree(&path);
+                }
             }
             self.process_by_request.remove(&request_id);
-            self.finished_requests.push_front(request_id.clone());
-            while self.finished_requests.len() > FINISHED_REQUEST_MEMORY {
-                self.finished_requests.pop_back();
-            }
+            self.remember_finished(request_id);
         }
     }
 }
 
 fn program_path(root: &Path, request_id: &str) -> PathBuf {
     let digest = blake3::hash(request_id.as_bytes()).to_hex();
-    root.join(digest.as_str()).join("program.py")
+    root.join(digest.as_str()).join("program")
 }
 
 fn bootstrap_failure(failure: &BootstrapFailure) -> String {
@@ -1365,15 +1961,74 @@ fn bootstrap_failure(failure: &BootstrapFailure) -> String {
 impl Drop for ContextualProcessController {
     fn drop(&mut self) {
         for pending in self.pending_resource_censuses.values() {
-            pending.timer.cancel();
             pending.request.cancel();
         }
+        let _ = self
+            .sender
+            .send_to(self.event_delivery, ContextualEventDeliveryIn::Seal);
     }
 }
 
 impl swactor::actor::ActorInterface for ContextualProcessController {
     type Incoming = ContextualProcessControllerIn;
     type Response = ();
+
+    fn on_stop(&mut self, ctx: &swactor::runtime::Ctx<'_>) {
+        for (_, pending) in std::mem::take(&mut self.pending_stops) {
+            self.emit(
+                ctx,
+                pending.reply_to,
+                pending.request_id,
+                ContextualProcessEventKind::StopRejected {
+                    error: "contextual controller stopped before stop acknowledgement".to_owned(),
+                },
+            );
+        }
+        for (request_id, pending) in std::mem::take(&mut self.pending_programs) {
+            let _ = ctx.stop_actor(pending.child);
+            self.emit(
+                ctx,
+                pending.reply_to,
+                request_id,
+                ContextualProcessEventKind::SpawnRejected {
+                    error: "contextual controller stopped during launch".to_owned(),
+                },
+            );
+        }
+        for (_, pending) in std::mem::take(&mut self.pending_resource_censuses) {
+            pending.request.cancel();
+            self.emit(
+                ctx,
+                pending.reply_to,
+                pending.request_id,
+                ContextualProcessEventKind::ControlUnavailable {
+                    error: "contextual controller stopped during census".to_owned(),
+                },
+            );
+        }
+        for (_, execution) in std::mem::take(&mut self.by_process) {
+            let _ = send_contextual_process_command(
+                &self.sender,
+                execution.process,
+                ContextualProcessCommand::Cancel,
+            );
+            self.emit(
+                ctx,
+                execution.reply_to,
+                execution.request_id,
+                ContextualProcessEventKind::ProcessError {
+                    error: "contextual controller stopped".to_owned(),
+                },
+            );
+            if let Some(path) = execution.staged_program {
+                remove_program_tree(&path);
+            }
+        }
+        self.process_by_request.clear();
+        let _ = self
+            .sender
+            .send_to(self.event_delivery, ContextualEventDeliveryIn::Seal);
+    }
 
     fn handle(&mut self, ctx: &swactor::runtime::Ctx<'_>, message: Self::Incoming) {
         match message {
@@ -1385,52 +2040,96 @@ impl swactor::actor::ActorInterface for ContextualProcessController {
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Stop {
                 request_id,
                 target_request_id,
-                kill_after_ms,
+                force,
                 reply_to,
-            }) => self.stop(ctx, request_id, target_request_id, kill_after_ms, reply_to),
+            }) => self.stop(ctx, request_id, target_request_id, force, reply_to),
             ContextualProcessControllerIn::Command(ContextualNodeCommand::Query {
                 request_id,
                 reply_to,
             }) => self.query(ctx, request_id, reply_to),
-            ContextualProcessControllerIn::Observed { request_id, output } => {
-                self.observe(ctx, request_id, output);
+            ContextualProcessControllerIn::Command(ContextualNodeCommand::Cancel {
+                request_id,
+                reply_to,
+            }) => self.cancel(ctx, request_id, reply_to),
+            ContextualProcessControllerIn::Command(ContextualNodeCommand::AcknowledgeEvent {
+                delivery_owner,
+                reply_to,
+                sequence,
+            }) => {
+                let _ = ctx.send(
+                    delivery_owner,
+                    ContextualEventDeliveryIn::Acknowledge { reply_to, sequence },
+                );
             }
-            ContextualProcessControllerIn::ProgramResolved { request_id, result } => {
-                self.program_resolved(ctx, request_id, result);
+            ContextualProcessControllerIn::Observed {
+                request_id,
+                operation,
+                output,
+            } => {
+                self.observe(ctx, request_id, operation, output);
             }
-            ContextualProcessControllerIn::ProgramPrepared { request_id, result } => {
-                self.program_prepared(ctx, request_id, result);
+            ContextualProcessControllerIn::OutputObserverLost {
+                request_id,
+                operation,
+            } => {
+                self.output_finished(ctx, request_id, operation, true);
+            }
+            ContextualProcessControllerIn::OutputDrained {
+                request_id,
+                operation,
+            } => {
+                self.output_finished(ctx, request_id, operation, false);
+            }
+            ContextualProcessControllerIn::ProgramResolved {
+                request_id,
+                operation,
+                result,
+            } => {
+                self.program_resolved(ctx, request_id, operation, result);
+            }
+            ContextualProcessControllerIn::ProgramPrepared {
+                request_id,
+                operation,
+                result,
+            } => {
+                self.program_prepared(ctx, request_id, operation, result);
             }
             ContextualProcessControllerIn::ResourceCensusObserved {
                 sample_sequence,
                 response,
-            } => self.resource_census(ctx, sample_sequence, Some(response)),
-            ContextualProcessControllerIn::ResourceCensusDeadline { sample_sequence } => {
-                self.resource_census(ctx, sample_sequence, None);
-            }
+            } => self.resource_census(ctx, sample_sequence, response),
         }
     }
 }
 
 #[cfg(test)]
-mod transfer_wake_tests {
+mod contextual_event_tests {
     use super::*;
+    use data_plane::path::SessionAccess;
     use parking_lot::Mutex;
+    use std::any::Any;
     use std::sync::Weak;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use swactor::runtime::RemoteSink;
     use swactor::runtime::{RuntimeConfig, RuntimeParts};
     use swactor_engine::{Engine, SteppingBackend};
+    use swactor_process_context::ProvisionedContext;
 
     #[derive(Default)]
     struct Routes {
         ready: AtomicBool,
-        changed: Mutex<Option<Weak<dyn Fn() + Send + Sync>>>,
+        changed: Mutex<Vec<Weak<dyn Fn() + Send + Sync>>>,
     }
 
     impl Routes {
         fn wake(&self) {
-            let changed = self.changed.lock().as_ref().and_then(Weak::upgrade);
-            if let Some(changed) = changed {
+            let changed: Vec<_> = self
+                .changed
+                .lock()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for changed in changed {
                 changed();
             }
         }
@@ -1454,7 +2153,7 @@ mod transfer_wake_tests {
             _: ActorAddress,
             changed: Arc<dyn Fn() + Send + Sync>,
         ) -> Option<HostRouteWatch> {
-            *self.changed.lock() = Some(Arc::downgrade(&changed));
+            self.changed.lock().push(Arc::downgrade(&changed));
             Some(HostRouteWatch::new(changed))
         }
     }
@@ -1478,6 +2177,41 @@ mod transfer_wake_tests {
         fn cancel(&self, _: &BlobTransferOffer) {}
     }
 
+    #[derive(Default)]
+    struct RecoveringSink {
+        ready: AtomicBool,
+        messages: Mutex<Vec<crate::orchestration::actor::OrchestratorMsg>>,
+    }
+
+    impl RemoteSink for RecoveringSink {
+        fn send(
+            &self,
+            _: ActorAddress,
+            message: Box<dyn Any + Send>,
+        ) -> Result<(), swactor::Error> {
+            if !self.ready.load(Ordering::Acquire) {
+                return Err(swactor::Error::from("route unavailable"));
+            }
+            let message = message
+                .downcast::<crate::orchestration::actor::OrchestratorMsg>()
+                .map_err(|_| swactor::Error::from("unexpected contextual delivery type"))?;
+            self.messages.lock().push(*message);
+            Ok(())
+        }
+    }
+
+    struct UnusedProvisioner;
+
+    impl ContextProvisioner for UnusedProvisioner {
+        fn provision(
+            &self,
+            _: RuntimeExecutionIdentity,
+            _: SessionAccess,
+        ) -> Result<ProvisionedContext, String> {
+            Err("unused provisioner".to_owned())
+        }
+    }
+
     fn settle(backend: &SteppingBackend) {
         for _ in 0..32 {
             backend.step();
@@ -1485,7 +2219,7 @@ mod transfer_wake_tests {
     }
 
     #[test]
-    fn program_route_wakes_preserve_retry_budget_cadence_and_lifetime() {
+    fn contextual_events_redeliver_in_order_after_route_recovers() {
         let parts = RuntimeParts::new(RuntimeConfig {
             worker_count: 1,
             ..RuntimeConfig::default()
@@ -1493,6 +2227,183 @@ mod transfer_wake_tests {
         let runtime = parts.runtime().clone();
         let backend = SteppingBackend::new();
         let engine = Engine::new(parts, backend.clone()).unwrap();
+        let sink = Arc::new(RecoveringSink::default());
+        runtime.set_remote_sink(sink.clone());
+        let routes = Arc::new(Routes::default());
+        let spawner = Arc::new(ContextualProcessSpawner::new(
+            engine.handle(),
+            Arc::new(UnusedProvisioner),
+        ));
+        let controller = runtime
+            .spawn(
+                ContextualProcessController::new(
+                    runtime.clone(),
+                    7,
+                    spawner,
+                    runtime.create_sender(),
+                    routes.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let reply_to = ActorAddress([73; 32]);
+        for request_id in ["first", "second"] {
+            runtime
+                .send_to(
+                    controller,
+                    ContextualProcessControllerIn::Command(ContextualNodeCommand::Query {
+                        request_id: request_id.to_owned(),
+                        reply_to,
+                    }),
+                )
+                .unwrap();
+        }
+        settle(&backend);
+        assert!(sink.messages.lock().is_empty());
+
+        sink.ready.store(true, Ordering::Release);
+        routes.wake();
+        settle(&backend);
+        let first = sink.messages.lock().pop().expect("first event routed");
+        let crate::orchestration::actor::OrchestratorMsg::ContextualEvent {
+            observation,
+            delivery_owner: Some(owner),
+            sequence,
+        } = first
+        else {
+            panic!("contextual event");
+        };
+        assert_eq!(observation.request_id, "first");
+        assert!(
+            sink.messages.lock().is_empty(),
+            "second event waits for acknowledgement"
+        );
+        routes.wake();
+        settle(&backend);
+        assert!(
+            matches!(sink.messages.lock().pop(), Some(crate::orchestration::actor::OrchestratorMsg::ContextualEvent { sequence: retry, .. }) if retry == sequence)
+        );
+        runtime
+            .send_to(
+                owner,
+                ContextualEventDeliveryIn::Acknowledge {
+                    reply_to,
+                    sequence: sequence + 1,
+                },
+            )
+            .unwrap();
+        settle(&backend);
+        assert!(
+            sink.messages.lock().is_empty(),
+            "stale acknowledgement cannot advance ownership"
+        );
+        runtime
+            .send_to(
+                owner,
+                ContextualEventDeliveryIn::Acknowledge { reply_to, sequence },
+            )
+            .unwrap();
+        settle(&backend);
+        let second = sink
+            .messages
+            .lock()
+            .pop()
+            .expect("second event follows acknowledgement");
+        let crate::orchestration::actor::OrchestratorMsg::ContextualEvent {
+            observation,
+            sequence,
+            ..
+        } = second
+        else {
+            panic!("contextual event");
+        };
+        assert_eq!(observation.request_id, "second");
+        runtime
+            .send_to(
+                owner,
+                ContextualEventDeliveryIn::Acknowledge { reply_to, sequence },
+            )
+            .unwrap();
+        runtime
+            .send_to(
+                owner,
+                ContextualEventDeliveryIn::Acknowledge { reply_to, sequence },
+            )
+            .unwrap();
+        settle(&backend);
+        routes.wake();
+        settle(&backend);
+        assert!(sink.messages.lock().is_empty());
+        assert!(
+            routes
+                .changed
+                .lock()
+                .iter()
+                .all(|watch| watch.upgrade().is_none())
+        );
+
+        runtime
+            .send_to(
+                controller,
+                ContextualProcessControllerIn::Command(ContextualNodeCommand::Query {
+                    request_id: "cancelled-delivery".to_owned(),
+                    reply_to,
+                }),
+            )
+            .unwrap();
+        settle(&backend);
+        let Some(crate::orchestration::actor::OrchestratorMsg::ContextualEvent {
+            sequence: cancelled_sequence,
+            ..
+        }) = sink.messages.lock().pop()
+        else {
+            panic!("pending cancellable delivery");
+        };
+        runtime.stop_actor(controller).unwrap();
+        settle(&backend);
+        runtime
+            .send_to(
+                owner,
+                ContextualEventDeliveryIn::Acknowledge { reply_to, sequence },
+            )
+            .unwrap();
+        settle(&backend);
+        routes.wake();
+        settle(&backend);
+        assert!(matches!(
+            sink.messages.lock().pop(),
+            Some(crate::orchestration::actor::OrchestratorMsg::ContextualEvent { sequence, .. })
+                if sequence == cancelled_sequence
+        ));
+        runtime
+            .send_to(
+                owner,
+                ContextualEventDeliveryIn::Cancel {
+                    reply_to,
+                    request_id: "cancelled-delivery".to_owned(),
+                },
+            )
+            .unwrap();
+        settle(&backend);
+        assert!(!runtime.stats().actors.iter().any(|actor| actor.0 == owner));
+        assert!(
+            routes
+                .changed
+                .lock()
+                .iter()
+                .all(|watch| watch.upgrade().is_none())
+        );
+    }
+
+    #[test]
+    fn program_route_events_preserve_transfer_ownership_and_lifetime() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).unwrap();
         let source = runtime.new_inbox::<BlobSourceIn>().unwrap();
         let controller = runtime
             .new_inbox::<ContextualProcessControllerIn>()
@@ -1503,34 +2414,30 @@ mod transfer_wake_tests {
         let transfer_id = BlobTransferId(17);
         let transfer = runtime
             .spawn(ProgramFileTransfer {
-                request_id: "wake-budget".to_owned(),
+                request_id: "route-events".to_owned(),
                 controller: *controller.addr(),
+                operation: 1,
                 source: *source.addr(),
                 length: 3,
                 transfer_id,
                 receiver: Arc::new(Receiver),
                 routes: routes.clone(),
-                engine: engine.handle(),
                 sender: runtime.create_sender(),
                 file: Some(File::create(&path).unwrap()),
                 path: path.clone(),
                 offer: None,
                 written: 0,
-                source_confirmed: false,
-                route_attempts: 0,
+                phase: ProgramTransferPhase::AwaitingRoute,
                 route_watch: None,
-                route_retry: None,
             })
             .unwrap();
         settle(&backend);
-        for _ in 0..=PROGRAM_TRANSFER_RETRY_LIMIT {
-            routes.wake();
-            settle(&backend);
-        }
+        routes.wake();
+        settle(&backend);
         assert!(source.try_recv().is_none());
         assert!(controller.try_recv().is_none());
 
-        // No virtual time passes: becoming routable must initiate the transfer.
+        // Route publication initiates the transfer without an independent driver.
         routes.ready.store(true, Ordering::Release);
         routes.wake();
         settle(&backend);
@@ -1540,8 +2447,8 @@ mod transfer_wake_tests {
         ));
         assert!(source.try_recv().is_none());
 
-        // All earlier notifications still leave exactly one fallback re-drive.
-        backend.advance_time(PROGRAM_TRANSFER_RETRY);
+        // Reconnection re-drives the same offer until transfer completion.
+        routes.wake();
         settle(&backend);
         assert!(matches!(
             source.try_recv(),
@@ -1566,9 +2473,285 @@ mod transfer_wake_tests {
             Some(ContextualProcessControllerIn::ProgramPrepared { result: Ok(found), .. }) if found == path
         ));
         assert_eq!(fs::read(&path).unwrap(), b"bin");
-        assert!(routes.changed.lock().as_ref().unwrap().upgrade().is_none());
-        backend.advance_time(PROGRAM_TRANSFER_RETRY);
+
+        assert!(
+            routes
+                .changed
+                .lock()
+                .iter()
+                .all(|watch| watch.upgrade().is_none())
+        );
+        routes.wake();
         settle(&backend);
         assert!(source.try_recv().is_none());
+    }
+    #[test]
+    fn event_delivery_survives_controller_shutdown_and_restart_without_releasing_before_ack() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let sink = Arc::new(RecoveringSink::default());
+        runtime.set_remote_sink(sink.clone());
+        let routes = Arc::new(Routes::default());
+        let spawner = Arc::new(ContextualProcessSpawner::new(
+            engine.handle(),
+            Arc::new(UnusedProvisioner),
+        ));
+        let first_controller = runtime
+            .spawn(
+                ContextualProcessController::new(
+                    runtime.clone(),
+                    7,
+                    spawner.clone(),
+                    runtime.create_sender(),
+                    routes.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let reply_to = ActorAddress([74; 32]);
+        runtime
+            .send_to(
+                first_controller,
+                ContextualProcessControllerIn::Command(ContextualNodeCommand::Query {
+                    request_id: "before-restart".to_owned(),
+                    reply_to,
+                }),
+            )
+            .unwrap();
+        settle(&backend);
+        runtime.stop_actor(first_controller).unwrap();
+        settle(&backend);
+        let restarted = runtime
+            .spawn(
+                ContextualProcessController::new(
+                    runtime.clone(),
+                    7,
+                    spawner,
+                    runtime.create_sender(),
+                    routes.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        runtime
+            .send_to(
+                restarted,
+                ContextualProcessControllerIn::Command(ContextualNodeCommand::Query {
+                    request_id: "after-restart".to_owned(),
+                    reply_to,
+                }),
+            )
+            .unwrap();
+        settle(&backend);
+        assert!(sink.messages.lock().is_empty());
+        sink.ready.store(true, Ordering::Release);
+        routes.wake();
+        settle(&backend);
+        let mut received = std::mem::take(&mut *sink.messages.lock())
+            .into_iter()
+            .map(|message| {
+                let crate::orchestration::actor::OrchestratorMsg::ContextualEvent {
+                    observation,
+                    delivery_owner: Some(owner),
+                    sequence,
+                } = message
+                else {
+                    panic!("event");
+                };
+                (observation.request_id, owner, sequence)
+            })
+            .collect::<Vec<_>>();
+        received.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            received
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            ["after-restart", "before-restart"]
+        );
+        assert_ne!(
+            received[0].1, received[1].1,
+            "restart cannot reuse delivery identity"
+        );
+        let previous_owner = received[1].1;
+        assert!(
+            runtime
+                .stats()
+                .actors
+                .iter()
+                .any(|actor| actor.0 == previous_owner),
+            "stopped controller transfers pending ownership"
+        );
+        for (_, owner, sequence) in received {
+            runtime
+                .send_to(
+                    owner,
+                    ContextualEventDeliveryIn::Acknowledge { reply_to, sequence },
+                )
+                .unwrap();
+        }
+        settle(&backend);
+        assert!(
+            !runtime
+                .stats()
+                .actors
+                .iter()
+                .any(|actor| actor.0 == previous_owner),
+            "sealed owner retires only after acknowledgement"
+        );
+        routes.wake();
+        settle(&backend);
+        assert!(sink.messages.lock().is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_namespace_resolution_fences_late_preparation_and_resolves_once() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).unwrap();
+        let namespace = runtime.new_inbox::<NamespaceClientIn>().unwrap();
+        let events = runtime
+            .new_inbox::<crate::orchestration::actor::OrchestratorMsg>()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spawner = Arc::new(ContextualProcessSpawner::new(
+            engine.handle(),
+            Arc::new(UnusedProvisioner),
+        ));
+        let controller = runtime
+            .spawn(
+                ContextualProcessController::new(
+                    runtime.clone(),
+                    7,
+                    spawner,
+                    runtime.create_sender(),
+                    Arc::new(Routes::default()),
+                )
+                .unwrap()
+                .with_program_materializer(ContextualProgramMaterializer {
+                    namespace_proxy: *namespace.addr(),
+                    receiver: Arc::new(Receiver),
+                    routes: Arc::new(Routes::default()),
+                    sender: runtime.create_sender(),
+                    root: root.path().to_path_buf(),
+                }),
+            )
+            .unwrap();
+        let spec = ContextualProcessSpec {
+            command: "unused-native-program".to_owned(),
+            args: vec![],
+            env: Default::default(),
+            working_dir: None,
+            label: None,
+            execution_id: "cancelled".to_owned(),
+            read_prefixes: vec!["/programs".to_owned()],
+            write_prefixes: vec![],
+            staged_program: Some(myelin_control_contract::ContextualProgramFile {
+                namespace_path: "/programs/pending".to_owned(),
+            }),
+        };
+        runtime
+            .send_to(
+                controller,
+                ContextualProcessControllerIn::Command(ContextualNodeCommand::Spawn {
+                    request_id: "launch".to_owned(),
+                    spec,
+                    reply_to: *events.addr(),
+                }),
+            )
+            .unwrap();
+        settle(&backend);
+        let Some(NamespaceClientIn::Request {
+            reply_to: resolver, ..
+        }) = namespace.try_recv()
+        else {
+            panic!("resolution was accepted before cancellation");
+        };
+        runtime
+            .send_to(
+                controller,
+                ContextualProcessControllerIn::Command(ContextualNodeCommand::Stop {
+                    request_id: "cancel".to_owned(),
+                    target_request_id: "launch".to_owned(),
+                    force: false,
+                    reply_to: *events.addr(),
+                }),
+            )
+            .unwrap();
+        settle(&backend);
+        assert!(matches!(
+            namespace.try_recv(),
+            Some(NamespaceClientIn::Cancel { reply_to }) if reply_to == resolver
+        ));
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let Some(crate::orchestration::actor::OrchestratorMsg::ContextualEvent {
+                observation,
+                delivery_owner: Some(owner),
+                sequence,
+            }) = events.try_recv()
+            else {
+                panic!("terminal operation response");
+            };
+            observed.push(observation);
+            runtime
+                .send_to(
+                    owner,
+                    ContextualEventDeliveryIn::Acknowledge {
+                        reply_to: *events.addr(),
+                        sequence,
+                    },
+                )
+                .unwrap();
+            settle(&backend);
+        }
+        assert!(matches!(
+            observed[0].event,
+            ContextualProcessEventKind::SpawnRejected { .. }
+        ));
+        assert_eq!(observed[0].request_id, "launch");
+        assert!(matches!(
+            observed[1].event,
+            ContextualProcessEventKind::StopAccepted { .. }
+        ));
+        assert_eq!(observed[1].request_id, "cancel");
+        runtime
+            .send_to(
+                controller,
+                ContextualProcessControllerIn::ProgramResolved {
+                    request_id: "launch".to_owned(),
+                    operation: 1,
+                    result: Err("late".to_owned()),
+                },
+            )
+            .unwrap();
+        let late_path = program_path(root.path(), "launch");
+        fs::create_dir_all(late_path.parent().unwrap()).unwrap();
+        fs::write(&late_path, b"late program").unwrap();
+        runtime
+            .send_to(
+                controller,
+                ContextualProcessControllerIn::ProgramPrepared {
+                    request_id: "launch".to_owned(),
+                    operation: 1,
+                    result: Ok(late_path),
+                },
+            )
+            .unwrap();
+        settle(&backend);
+        assert!(
+            events.try_recv().is_none(),
+            "late completion cannot resolve the launch again"
+        );
+        assert!(!program_path(root.path(), "launch").exists());
     }
 }

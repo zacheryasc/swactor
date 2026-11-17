@@ -4,7 +4,6 @@ mod engine_composition;
 pub(crate) mod fuzz_support;
 mod harness;
 mod node_guarantees;
-mod observability_guarantees;
 mod orchestration_guarantees;
 mod prompt_guarantees;
 mod staging_guarantees;

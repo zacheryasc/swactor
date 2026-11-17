@@ -6,23 +6,44 @@
 #[cfg(test)]
 extern crate self as myelin;
 
+// TODO: Remove defaults referring to specific named models like this, if we need a specific named model, it shall be declared and imported elsewhere
 const DEFAULT_PIPELINE_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
 #[doc(hidden)]
 pub const ORCHESTRATOR_WORKER_MODE_ARG: &str = "--myelin-worker-node";
-pub fn run_orchestrator_from_args<I>(args: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = String>,
-{
-    orchestration::app::run_with_options(args, true, None)
-}
+pub use node::worker_node_runtime::{
+    prepare_worker_node, run_helper_from_env as run_worker_helper_from_env,
+};
+pub use orchestration::app::prepare_with_options as prepare_orchestrator_with_options;
+pub use orchestration::app::{
+    ProviderComposition, ProviderContext,
+    prepare_with_providers as prepare_orchestrator_with_providers,
+};
 
-pub fn run_worker_node_from_env() -> std::process::ExitCode {
-    node::worker_node_runtime::run_from_env()
+/// Operational provider implementations available to alternate composition roots.
+pub mod providers {
+    pub use crate::orchestration::app::{derive_ssh_public_key, ensure_vastai_account_ssh_key};
+    pub use crate::orchestration::manual_control::OfferSearchRequestExt;
+    pub use crate::orchestration::provider_adapters::ssh_bootstrap::{
+        BootstrapEnvSource, DEPLOYED_WORKER_BIN_PATH, SshArtifactBootstrapLauncher,
+        SshBootstrapHandle, SshBootstrapLauncher, SshCommandBootstrapLauncher, SshEndpoint,
+    };
+    pub use crate::orchestration::provider_adapters::vastai::{
+        CleanupObserver, OwnershipRecorder, ProvisionRequest, SnapshotObserver, ToolsVastAiLeaseClient, VastAiLeaseClient,
+        VastAiProviderMonitor, VastAiProvisioningConfig, VastAiProvisioningPlugin, VastAiTaskPort,
+    };
+    pub use crate::orchestration::provider_adapters::vastai::webhooks::{
+        VastAiWebhookConfig, VastAiWebhookSubscription, VastAiWebhooks,
+    };
+    pub use crate::provisioning::{
+        LocalDockerPlugin, LocalProcessPlugin, docker_container_is_absent,
+        docker_container_is_running,
+    };
 }
 
 pub mod contextual_process;
 mod data_namespace;
 
+// TODO: Why the explicit paths?
 #[path = "staging/gguf_common.rs"]
 mod gguf_common;
 #[path = "staging/gguf_shard.rs"]
@@ -41,7 +62,6 @@ mod run_plan;
 
 mod codecs;
 mod node;
-mod observability;
 mod orchestration;
 mod staging;
 

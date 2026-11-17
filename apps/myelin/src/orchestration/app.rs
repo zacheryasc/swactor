@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
 #[cfg(target_os = "linux")]
@@ -6,14 +6,9 @@ use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
 
 use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
 use crate::codecs::register_myelin_actor_codecs;
-use crate::observability::frame_collector::FrameCollector;
-use crate::observability::orch_telemetry::{
-    BootstrapEmission, DashboardSupport, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
-};
 use crate::orchestration::actor::{
     ContextualArtifactCleanup, OrchestratorActor, OrchestratorMsg, OrchestratorReport,
 };
@@ -26,34 +21,37 @@ use crate::orchestration::manual_control::{
     OfferSearchRequestExt, OfferSearcher, ProviderConfigurationRequest, ProviderFactory,
     ProviderReadiness, SpecBuilder,
 };
+use crate::orchestration::telemetry::{
+    BootstrapEmission, DashboardSupport, MYELIN_MEMBERSHIP, OrchTelemetry,
+};
 
 use crate::node_actor::NodeAgentMsg;
 use crate::node_provisioning::{ProviderKind, provider_kind};
-use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
+use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::orchestration::provider_adapters::relay::{
     MYELIN_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV,
     relay_mode_env_value, relay_runtime_config_from_settings,
 };
 use crate::orchestration::provider_adapters::ssh_bootstrap::{
-    BootstrapEnvSource, SshArtifactBootstrapLauncher, SshCommandBootstrapLauncher,
-    read_bundle_identity,
+    BootstrapEnvSource, DEPLOYED_WORKER_BIN_PATH, SshArtifactBootstrapLauncher,
+    SshCommandBootstrapLauncher, read_bundle_identity,
 };
-use crate::orchestration::provider_adapters::static_ssh::{
-    StaticFleetManifest, StaticSshFleetPlugin, StaticSshRuntimeConfig, WORKER_BIN_PATH,
+use crate::orchestration::provider_adapters::vastai::webhooks::{
+    VastAiWebhookConfig, VastAiWebhooks,
 };
 use crate::orchestration::provider_adapters::vastai::{
-    ToolsVastAiLeaseClient, VastAiProvisioningConfig, VastAiProvisioningPlugin,
+    ToolsVastAiLeaseClient, VastAiProvisioningConfig, VastAiProvisioningPlugin, VastAiTaskPort,
 };
 use crate::provisioning::{
-    LocalDockerPlugin, LocalProcessPlugin, MockVastAiPlugin, NodeProvisionSpec, PluginObservation,
+    LocalDockerPlugin, LocalProcessPlugin, NodeProvisionSpec, PluginObservation,
     PluginObservationSink, PluginSink, ProvisionEvent, ProvisionEventKind, ProvisionLogLine,
     ProvisionLogStream, ProvisionPlugin,
 };
 use crate::run_fsm::{RunConfig, RunId};
 use crate::run_plan::{GgufSource, TokenizerSource};
+use distribution::directory_actor::DirectoryIn;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry_actor::RegistryIn;
-use distribution::swim::telemetry::ObservedTransition;
 use distribution::transport_bridge::RouteBinder;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::{EndpointAddr, RelayMode};
@@ -61,9 +59,10 @@ use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN};
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime};
-use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor::actor::{ActorAddress, ActorExited, ActorInterface};
+use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeParts};
+use swactor::std::CtxWatching;
+use swactor_engine::{ActorCompletion, BlockingWorkSender, Engine, EngineHandle, TaskSpawner};
 const DEFAULT_IMAGE: &str = "myelin-node:latest";
 const MYELIN_RUNTIME_CONFIG_ENV: &str = "MYELIN_RUNTIME_CONFIG";
 const CACHED_MODEL_HOST_ENV: &str = "MYELIN_CACHED_MODEL_HOST_PATH";
@@ -75,215 +74,140 @@ const DEFAULT_HF_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_STATE_DIR: &str = "./.config";
 const DEFAULT_MAX_TOKENS: u32 = 64;
-const PUMP_INTERVAL: Duration = Duration::from_millis(10);
-const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
-const TELEMETRY_FRAME_LOG_ENV: &str = "MYELIN_TELEMETRY_FRAME_LOG";
 
-fn sample_orchestrator_cpu(
-    mut sampler: telemetry::hardware::cpu::CpuSampler,
-    seq: u64,
-) -> (
-    telemetry::hardware::cpu::CpuSampler,
-    telemetry::hardware::cpu::HostCpuSample,
-) {
-    let sample = sampler.sample(seq);
-    (sampler, sample)
-}
-
-fn sample_orchestrator_gpu((): (), seq: u64) -> ((), telemetry::hardware::gpu::HostGpuSample) {
-    ((), telemetry::hardware::gpu::sample(seq))
-}
-
-fn sample_orchestrator_memory(
-    (): (),
-    seq: u64,
-) -> ((), telemetry::hardware::memory::HostMemorySample) {
-    ((), telemetry::hardware::memory::sample(seq))
-}
-
-fn sample_orchestrator_net((): (), seq: u64) -> ((), telemetry::hardware::net::HostNetSample) {
-    ((), telemetry::hardware::net::sample(seq))
-}
-
-fn sample_orchestrator_storage(
-    (): (),
-    seq: u64,
-) -> ((), telemetry::hardware::storage::HostStorageSample) {
-    ((), telemetry::hardware::storage::sample(seq))
-}
-
-fn spawn_orchestrator_hardware_samplers(engine: &EngineHandle, telemetry: &mut OrchTelemetry) {
+fn spawn_orchestrator_hardware_samplers(
+    tasks: &TaskSpawner,
+    engine: &EngineHandle,
+    telemetry: &mut OrchTelemetry,
+) -> tokio::sync::mpsc::Sender<()> {
     let cpu_channel = telemetry.record_channel::<telemetry::hardware::cpu::HostCpuSample>();
-    let cpu_producer = telemetry.producer();
-    telemetry::hardware::spawn_blocking_sampler(
-        engine.clone(),
-        telemetry::hardware::cpu::CPU_SAMPLE_INTERVAL,
-        telemetry::hardware::cpu::CpuSampler::new([std::process::id()]),
-        sample_orchestrator_cpu,
-        || {},
-        move |_, sample| {
-            cpu_producer.submit_record(cpu_channel, &sample);
-        },
-    );
-
     let gpu_channel = telemetry.record_channel::<telemetry::hardware::gpu::HostGpuSample>();
-    let gpu_producer = telemetry.producer();
-    telemetry::hardware::spawn_blocking_sampler(
-        engine.clone(),
-        telemetry::hardware::gpu::GPU_SAMPLE_INTERVAL,
-        (),
-        sample_orchestrator_gpu,
-        || {},
-        move |_, sample| {
-            gpu_producer.submit_record(gpu_channel, &sample);
-        },
-    );
-
     let memory_channel =
         telemetry.record_channel::<telemetry::hardware::memory::HostMemorySample>();
-    let memory_producer = telemetry.producer();
-    telemetry::hardware::spawn_blocking_sampler(
-        engine.clone(),
-        telemetry::hardware::memory::MEMORY_SAMPLE_INTERVAL,
-        (),
-        sample_orchestrator_memory,
-        || {},
-        move |_, sample| {
-            memory_producer.submit_record(memory_channel, &sample);
-        },
-    );
-
     let net_channel = telemetry.record_channel::<telemetry::hardware::net::HostNetSample>();
-    let net_producer = telemetry.producer();
-    telemetry::hardware::spawn_blocking_sampler(
-        engine.clone(),
-        telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
-        (),
-        sample_orchestrator_net,
-        || {},
-        move |_, sample| {
-            net_producer.submit_record(net_channel, &sample);
-        },
-    );
-
     let storage_channel =
         telemetry.record_channel::<telemetry::hardware::storage::HostStorageSample>();
-    let storage_producer = telemetry.producer();
-    telemetry::hardware::spawn_blocking_sampler(
-        engine.clone(),
-        telemetry::hardware::storage::STORAGE_SAMPLE_INTERVAL,
-        (),
-        sample_orchestrator_storage,
-        || {},
-        move |_, sample| {
-            storage_producer.submit_record(storage_channel, &sample);
-        },
-    );
-}
-
-#[cfg(test)]
-mod hardware_telemetry_tests {
-    use std::time::{Duration, Instant};
-
-    use swactor::config::RuntimeConfig;
-    use swactor::runtime::RuntimeParts;
-
-    use super::*;
-
-    #[test]
-    fn orchestrator_emits_all_host_hardware_channels() {
-        let frame_log = tempfile::NamedTempFile::new().expect("frame log");
-        let mut telemetry =
-            OrchTelemetry::new(1, Some(frame_log.path())).expect("orchestrator telemetry");
-        let engine = Engine::new(
-            RuntimeParts::new(RuntimeConfig::default()),
-            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
-        )
-        .expect("engine");
-        spawn_orchestrator_hardware_samplers(&engine.handle(), &mut telemetry);
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            telemetry.flush(None, "test");
-            let frames = std::fs::read_to_string(frame_log.path()).expect("read frame log");
-            if [
-                "host.cpu",
-                "host.gpu",
-                "host.memory",
-                "host.net",
-                "host.storage",
-            ]
-            .iter()
-            .all(|channel| frames.contains(&format!(r#""channel":"{channel}""#)))
+    let producer = telemetry.producer();
+    let endpoint = telemetry.endpoint();
+    let blocking = engine.blocking_work_sender();
+    let (requests, mut incoming) = tokio::sync::mpsc::channel(1);
+    let _ = requests.try_send(());
+    tasks.spawn(async move {
+        let mut cpu = telemetry::hardware::cpu::CpuSampler::new([std::process::id()]);
+        let mut seq = 0_u64;
+        while incoming.recv().await.is_some() {
+            let (complete, result) = tokio::sync::oneshot::channel();
+            if blocking
+                .submit(Box::new(move || {
+                    let samples = (
+                        cpu.sample(seq),
+                        telemetry::hardware::gpu::sample(seq),
+                        telemetry::hardware::memory::sample(seq),
+                        telemetry::hardware::net::sample(seq),
+                        telemetry::hardware::storage::sample(seq),
+                    );
+                    let _ = complete.send((cpu, samples));
+                }))
+                .is_err()
             {
                 return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "orchestrator hardware channels were incomplete: {frames}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+            let Ok((sampler, (cpu_sample, gpu, memory, net, storage))) = result.await else {
+                return;
+            };
+            cpu = sampler;
+            producer.submit_record(cpu_channel, &cpu_sample);
+            producer.submit_record(gpu_channel, &gpu);
+            producer.submit_record(memory_channel, &memory);
+            producer.submit_record(net_channel, &net);
+            producer.submit_record(storage_channel, &storage);
+            endpoint.tick();
+            let Some(next_seq) = seq.checked_add(1) else {
+                return;
+            };
+            seq = next_seq;
         }
-    }
-}
-fn reconcile_active_deployment_intent(
-    snapshot: &mut daemon::ClusterSnapshot,
-    active: Option<&crate::provisioning::DeploymentIdentity>,
-) -> Vec<u64> {
-    let Some(active) = active else {
-        return Vec::new();
-    };
-    let mut stale_nodes = Vec::new();
-    for node in &mut snapshot.nodes {
-        if matches!(node.phase, NodePhase::Stopped | NodePhase::Orphan) {
-            continue;
-        }
-        let Some(spec) = node.spec.as_mut() else {
-            continue;
-        };
-        let intent_matches = spec.deployment.as_ref() == Some(active);
-        let runtime_matches = node
-            .runtime
-            .as_ref()
-            .and_then(daemon::RuntimeFacts::deployment_identity)
-            .as_ref()
-            == Some(active);
-        if intent_matches && runtime_matches {
-            continue;
-        }
-        spec.deployment = Some(active.clone());
-        spec.env.retain(|(key, _)| {
-            key != "MYELIN_ARTIFACT_DIGEST" && key != "MYELIN_DEPLOYMENT_GENERATION"
-        });
-        spec.env.push((
-            "MYELIN_ARTIFACT_DIGEST".to_owned(),
-            active.artifact_digest.clone(),
-        ));
-        spec.env.push((
-            "MYELIN_DEPLOYMENT_GENERATION".to_owned(),
-            active.deployment_generation.clone(),
-        ));
-        node.runtime = None;
-        if matches!(
-            node.phase,
-            NodePhase::Joining | NodePhase::Acknowledging | NodePhase::Running
-        ) {
-            node.phase = NodePhase::Bootstrapping;
-        }
-        stale_nodes.push(node.logical_node_id);
-    }
-    stale_nodes
+    });
+    requests
 }
 
-pub(crate) fn run_with_options<I>(
+/// Prepare configuration, telemetry, and core workers without creating task authority.
+///
+/// Binary/test roots construct the engine from these parts, mint its task
+/// capability, and pass both to the continuation for the complete application run.
+/// Runtime capabilities supplied to an ordinary provisioning adapter.
+#[derive(Clone)]
+pub struct ProviderContext {
+    pub runtime: Runtime,
+    pub engine: EngineHandle,
+    pub tasks: VastAiTaskPort,
+    pub process_registry_path: PathBuf,
+    pub bootstrap_env: BootstrapEnvSource,
+}
+
+/// An application composition entry; fixture policy belongs to its caller.
+#[derive(Clone)]
+pub struct ProviderComposition {
+    pub kind: ProviderKind,
+    pub readiness: myelin_control_contract::ProviderReadiness,
+    pub remote: bool,
+    pub http_plugin:
+        Option<Arc<dyn Fn(BlockingWorkSender) -> dashboard::DashboardPlugin + Send + Sync>>,
+    pub build:
+        Arc<dyn Fn(ProviderContext) -> Result<Box<dyn ProvisionPlugin>, String> + Send + Sync>,
+    pub prepare_spec: Arc<dyn Fn(&mut NodeProvisionSpec) -> Result<(), String> + Send + Sync>,
+    pub configure: Option<
+        Arc<
+            dyn Fn(myelin_control_contract::ProviderConfigurationRequest) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    >,
+    pub search_offers: Option<
+        Arc<
+            dyn Fn(
+                    myelin_control_contract::OfferSearchRequest,
+                ) -> Result<Vec<myelin_control_contract::Offer>, String>
+                + Send
+                + Sync,
+        >,
+    >,
+}
+
+pub fn prepare_with_options<I>(
     args: I,
     capture_stdio: bool,
     stop_rx: Option<mpsc::Receiver<()>>,
-) -> Result<(), String>
+) -> Result<
+    (
+        RuntimeParts,
+        impl FnOnce(Engine, TaskSpawner) -> Result<(), String>,
+    ),
+    String,
+>
+where
+    I: IntoIterator<Item = String>,
+{
+    prepare_with_providers(args, capture_stdio, Vec::new(), stop_rx)
+}
+
+pub fn prepare_with_providers<I>(
+    args: I,
+    capture_stdio: bool,
+    providers: Vec<ProviderComposition>,
+    stop_rx: Option<mpsc::Receiver<()>>,
+) -> Result<
+    (
+        RuntimeParts,
+        impl FnOnce(Engine, TaskSpawner) -> Result<(), String>,
+    ),
+    String,
+>
 where
     I: IntoIterator<Item = String>,
 {
     let mut config_builder = ConfigBuilder::hardcoded_defaults();
+    config_builder.providers = providers;
     if let Some(overlay) = TomlConfigOverlay::load_optional(Path::new(DEFAULT_CONFIG_PATH))? {
         config_builder = config_builder.overlay_toml(overlay)?;
     }
@@ -293,7 +217,6 @@ where
         .finalize()?;
     let state_dir = daemon::StateDir::new(config.state_dir.clone());
     let data_namespace_path = config.state_dir.join("data-namespace.json");
-    let contextual_upload_root = config.state_dir.join("contextual-uploads");
     if config.reset_state {
         state_dir.reset()?;
     }
@@ -306,8 +229,52 @@ where
         // persisted run owns them so adoption addresses the same resources.
         config.run_id = snapshot.run_id;
     }
-    let deployment_refresh_nodes = reconcile_active_deployment_intent(
-        &mut snapshot,
+    if config
+        .provider_composition
+        .as_ref()
+        .is_some_and(|provider| provider.http_plugin.is_some())
+    {
+        if !config.dashboard {
+            return Err("provider HTTP routes require MYELIN_DASHBOARD".to_owned());
+        }
+        DashboardSupport::configured_url(config.dashboard)?;
+    }
+    if config.provider.as_str() == "vastai" && config.provider_composition.is_none() {
+        if !config.dashboard {
+            return Err(
+                "Vast.ai webhooks require MYELIN_DASHBOARD to serve their receiver route"
+                    .to_owned(),
+            );
+        }
+        DashboardSupport::configured_url(config.dashboard)?;
+        let webhook_config =
+            VastAiWebhookConfig::from_env(config.state_dir.join("vastai-webhooks"))?;
+        let vastai = config
+            .vastai
+            .as_mut()
+            .expect("built-in Vast.ai configuration");
+        vastai.webhooks = Some(VastAiWebhooks::open(
+            webhook_config,
+            vastai.api_key.as_deref().unwrap_or(""),
+        )?);
+    }
+    let readiness = if let Some(provider) = &config.provider_composition {
+        let mut readiness = provider.readiness.clone();
+        if provider.http_plugin.is_some() {
+            readiness.kind = myelin_control_contract::ProviderReadinessKind::Validating;
+        }
+        readiness
+    } else if config.provider.as_str() == "vastai" {
+        ProviderReadiness::unconfigured_for(
+            config.provider.as_str(),
+            config.image.clone(),
+            "submit a Vast.ai API key, SSH identity, and bootstrap command",
+        )
+    } else {
+        ProviderReadiness::ready_for(config.provider.as_str(), config.image.clone())
+    };
+    let mut manual_core = ManualControl::new(snapshot, readiness);
+    let deployment_refresh_nodes = manual_core.reconcile_active_deployment_intent(
         config.deployment.as_ref().map(|bundle| &bundle.identity),
     );
     if let Some(url) = DashboardSupport::configured_url(config.dashboard)? {
@@ -321,20 +288,14 @@ where
     } else {
         None
     };
-    let mut orch_telemetry =
-        OrchTelemetry::new(config.run_id, config.telemetry_frame_log.as_deref())?;
+    let mut orch_telemetry = OrchTelemetry::new(config.run_id, &config.state_dir)?;
     let run_id = config.run_id;
     let node_id = config.node_id;
-    let bootstrap = |ds: &mut OrchTelemetry,
-                     dash: Option<&DashboardSupport>,
-                     phase: &str,
-                     status: &str,
-                     detail: Value| {
-        ds.emit_bootstrap(dash, run_id, node_id, phase, status, detail);
+    let bootstrap = move |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
+        ds.emit_bootstrap(run_id, node_id, phase, status, detail);
     };
     bootstrap(
         &mut orch_telemetry,
-        None,
         "config",
         "ready",
         json!({
@@ -354,51 +315,6 @@ where
             "deployment_refresh_nodes":&deployment_refresh_nodes,
         }),
     );
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "telemetry_preflight",
-        "configured",
-        json!({
-            "producer":"myelin-orchestrator",
-            "telemetry_endpoint":{
-                "role":"orchestrator-frame-archive",
-                "transport":"telemetry-frame-log",
-                "configured":config.telemetry_frame_log.is_some(),
-                "archive_path":config.telemetry_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
-            },
-            "expected_worker_producers":["myelin-worker","tinygrad-worker"],
-            "provider":config.provider.as_str(),
-            "pipeline_stages":config.pipeline_stages,
-            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-            "provider_config":config.provider_telemetry_detail(),
-        }),
-    );
-    let orch_synthetic_id = format!("myelin-orchestrator-{}-telemetry-preflight", config.run_id);
-    for (phase, status) in [
-        ("TelemetryProducerConfigured", "configured"),
-        ("TelemetryProducerConnected", "ready"),
-        ("TelemetrySyntheticEventSent", "sent"),
-        ("TelemetrySyntheticEventObserved", "observed"),
-    ] {
-        bootstrap(
-            &mut orch_telemetry,
-            None,
-            phase,
-            status,
-            json!({
-                "producer":"myelin-orchestrator",
-                "producer_class":"rust-orchestrator",
-                "synthetic_id":orch_synthetic_id,
-                "telemetry_endpoint":{
-                    "role":"orchestrator-frame-archive",
-                    "transport":"telemetry-frame-log",
-                    "configured":config.telemetry_frame_log.is_some(),
-                    "archive_path":config.telemetry_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
-                },
-            }),
-        );
-    }
     let actors_channel = orch_telemetry.channel_by_name("runtime.actors");
     let orch_stats_hook = orch_telemetry.stats_hook_on(actors_channel);
 
@@ -413,581 +329,578 @@ where
         },
         Some(orch_stats_hook),
     );
-    let engine = match TokioBackend::new(TokioConfig::default())
-        .and_then(|backend| Engine::new(parts, backend))
-    {
-        Ok(engine) => {
-            bootstrap(
-                &mut orch_telemetry,
-                None,
-                "engine",
-                "ready",
-                json!({"backend":"tokio","owns":"core+substrate"}),
-            );
-            engine
-        }
-        Err(error) => {
-            bootstrap(
-                &mut orch_telemetry,
-                None,
-                "engine",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("create engine: {error}"));
-        }
-    };
-    spawn_orchestrator_hardware_samplers(&engine.handle(), &mut orch_telemetry);
-    let mut driver = match IrohDriver::with_engine(
-        engine.handle(),
-        IrohDriverConfig {
-            secret_key: Some(identity),
-            relay_mode: config.relay.mode.clone(),
-            bind_port: config.endpoint_bind_port,
-            node: DistributedNodeConfig::default(),
-            peer_auth: None,
-            additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
-        },
-    ) {
-        Ok(driver) => driver,
-        Err(error) => {
-            bootstrap(
-                &mut orch_telemetry,
-                None,
-                "iroh_driver",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("create iroh driver: {error}"));
-        }
-    };
-    let remote_vast_relay_required = config.vastai.as_ref().is_some_and(|vastai| {
-        vastai.provisioning_mode == VastAiProvisioningMode::Real
-            && !matches!(config.relay.mode, RelayMode::Disabled)
-    });
-    if remote_vast_relay_required {
+    Ok((parts, move |engine: Engine, tasks: TaskSpawner| {
         bootstrap(
             &mut orch_telemetry,
-            None,
-            "iroh_relay",
-            "waiting",
-            json!({"relay_mode":format!("{:?}", config.relay.mode)}),
-        );
-        let endpoint = driver.wait_for_relay_endpoint()?;
-        bootstrap(
-            &mut orch_telemetry,
-            None,
-            "iroh_relay",
+            "engine",
             "ready",
-            json!({"relay_url":endpoint.relay_urls().next().map(ToString::to_string)}),
+            json!({"backend":"tokio","owns":"core+substrate"}),
         );
-    }
-    let live_coordinator_endpoint = driver.endpoint_addr_supplier();
-    let coordinator_endpoint =
-        advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "iroh_driver",
-        "ready",
-        json!({"endpoint":coordinator_endpoint.clone(),"has_relay":coordinator_endpoint.relay_urls().next().is_some(),"direct_addr_count":coordinator_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay.mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
-    );
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "endpoint_config_snapshot",
-        "ready",
-        json!({
-            "producer":"myelin-orchestrator",
-            "coordinator_endpoint":coordinator_endpoint.clone(),
-            "has_relay":coordinator_endpoint.relay_urls().next().is_some(),
-            "direct_addr_count":coordinator_endpoint.ip_addrs().count(),
-            "relay_mode":format!("{:?}", config.relay.mode),
-            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-            "connectivity_preflight":"ready",
-        }),
-    );
-    let stack = DistributionRuntimeStack::new_from_runtime(
-        runtime,
-        codec,
-        transport_router,
-        driver.node_id(),
-        DistributedNodeConfig::default(),
-        engine.handle(),
-    );
-    let orch_stdio_rx = orch_stdio_capture
-        .map(|capture| capture.start(&stack.runtime))
-        .transpose()?;
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "distribution_stack",
-        "ready",
-        json!({"actors":"initialized","route_view":"initialized","swim":"initialized"}),
-    );
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "codecs",
-        "ready",
-        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
-    );
-    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
-        runtime: stack.runtime.clone(),
-        codec: stack.codec.clone(),
-        routes: stack.actor_bridge_routes(),
-        swim: stack.actors.swim,
-        relay_mirror: stack.relay_mirror.clone(),
-        route_view: stack.route_view.clone(),
-        outbox: stack.outbox.clone(),
-    });
-    let recovery_swim_peers = snapshot
-        .nodes
-        .iter()
-        .filter(|node| !matches!(node.phase, NodePhase::Stopped))
-        .filter_map(|node| node.runtime.as_ref().map(|runtime| runtime.swim_node_id))
-        .collect::<Vec<_>>();
-    let data_namespace = crate::data_namespace::DataNamespaceAuthority::start(
-        &stack,
-        &driver,
-        data_namespace_path,
-        recovery_swim_peers,
-    )?;
-    let tiny_linear_weights = std::env::var_os("MYELIN_TINY_LINEAR_WEIGHTS")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("apps/myelin/testdata/tiny_linear.weights"));
-    futures_lite::future::block_on(
-        data_namespace.control().ensure(
-            data_plane::path::DataPath::parse("/models/tiny-linear/weights")
-                .expect("static tiny-linear data path"),
-            data_plane::blob::file(tiny_linear_weights),
-        ),
-    )
-    .map_err(|error| format!("register tiny-linear weights: {error}"))?;
-    let recovery_nodes = snapshot
-        .nodes
-        .iter()
-        .filter(|node| !matches!(node.phase, NodePhase::Stopped))
-        .filter_map(|node| {
-            node.runtime
-                .as_ref()
-                .map(|runtime| (node.logical_node_id, runtime))
-        })
-        .map(|(node_id, runtime)| {
-            serde_json::from_str::<EndpointAddr>(&runtime.endpoint)
-                .map(|endpoint| (node_id, endpoint, runtime))
-                .map_err(|error| format!("parse persisted endpoint for node {node_id}: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for (_, _endpoint, runtime) in &recovery_nodes {
-        if let Ok(mut pinned) = stack.pinned_routes.write() {
-            pinned.insert(runtime.node_actor, runtime.swim_node_id);
-        }
-        if let Ok(mut routes) = stack.route_view.write() {
-            routes.insert(runtime.node_actor, runtime.swim_node_id);
-        }
-        stack.route_binder.ensure_routable(runtime.node_actor);
-    }
-    if !recovery_nodes.is_empty() {
-        driver.join(
-            &recovery_nodes
-                .iter()
-                .map(|(_, endpoint, _)| endpoint.clone())
-                .collect::<Vec<_>>(),
-        );
-        for (node_id, _, runtime) in &recovery_nodes {
-            // Dial each worker directly (fresh endpoint) in addition to the
-            // join above: a restarted orchestrator has new direct addresses,
-            // while every worker still caches the pre-restart endpoint for
-            // redials. Without this push, worker egress to the orchestrator
-            // black-holes until endpoint gossip rediscovers the fresh
-            // addresses, which stranded namespace clients for the whole
-            // request deadline in recovery campaigns.
-            let mut dial_targets = vec![coordinator_endpoint.clone()];
-            dial_targets.extend(
-                recovery_nodes
-                    .iter()
-                    .filter(|(peer_id, _, _)| peer_id != node_id)
-                    .map(|(_, endpoint, _)| endpoint.clone()),
-            );
-            let _ = stack.runtime.send_to(
-                runtime.node_actor,
-                NodeAgentMsg::JoinPeers {
-                    endpoints: dial_targets,
-                },
-            );
-            let _ = stack
-                .runtime
-                .send_to(runtime.node_actor, NodeAgentMsg::ResyncRoutes);
-        }
-    }
-    // Engine owns protocol tick injection and core progression; the application
-    // loop only drains integration-owned queues (ENGINE_SPEC.md).
-    stack.spawn_protocol_ticker(PUMP_INTERVAL);
-    driver.install_actor_bridge_pump(PUMP_INTERVAL);
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "actor_bridge",
-        "ready",
-        json!({"transport":"iroh","routes":"attached","protocol_ticker":"engine-hosted"}),
-    );
-
-    let collector = FrameCollector::new();
-    collector.restore_archive(config.telemetry_frame_log.as_deref())?;
-    for (node_id, endpoint, _) in &recovery_nodes {
-        collector.subscribe_node(
-            &engine.handle(),
-            driver.endpoint(),
-            endpoint.clone(),
-            snapshot.run_id,
-            *node_id,
-        );
-    }
-    bootstrap(
-        &mut orch_telemetry,
-        None,
-        "telemetry_collector",
-        "ready",
-        json!({"alpn":String::from_utf8_lossy(TELEMETRY_ALPN)}),
-    );
-    let dashboard: Option<DashboardSupport>;
-
-    let orchestrator_reports = match stack.runtime.new_inbox::<OrchestratorReport>() {
-        Ok(inbox) => inbox,
-        Err(error) => {
+        let hardware_samples =
+            spawn_orchestrator_hardware_samplers(&tasks, &engine.handle(), &mut orch_telemetry);
+        let mut driver = match IrohDriver::with_engine(
+            tasks.clone(),
+            engine.handle(),
+            IrohDriverConfig {
+                secret_key: Some(identity),
+                relay_mode: config.relay.mode.clone(),
+                bind_port: config.endpoint_bind_port,
+                node: DistributedNodeConfig::default(),
+                peer_auth: None,
+                additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
+            },
+        ) {
+            Ok(driver) => driver,
+            Err(error) => {
+                bootstrap(
+                    &mut orch_telemetry,
+                    "iroh_driver",
+                    "failed",
+                    json!({"error":error.to_string()}),
+                );
+                return Err(format!("create iroh driver: {error}"));
+            }
+        };
+        driver.retain_telemetry_connections();
+        let remote_vast_relay_required = config
+            .provider_composition
+            .as_ref()
+            .map_or(config.provider.as_str() == "vastai", |provider| {
+                provider.remote
+            })
+            && !matches!(config.relay.mode, RelayMode::Disabled);
+        if remote_vast_relay_required {
             bootstrap(
                 &mut orch_telemetry,
-                None,
-                "orchestrator_report_actor",
-                "failed",
-                json!({"error":error.to_string()}),
+                "iroh_relay",
+                "waiting",
+                json!({"relay_mode":format!("{:?}", config.relay.mode)}),
             );
-            return Err(format!("orchestrator report inbox: {error}"));
+            let endpoint = driver.wait_for_relay_endpoint()?;
+            bootstrap(
+                &mut orch_telemetry,
+                "iroh_relay",
+                "ready",
+                json!({"relay_url":endpoint.relay_urls().next().map(ToString::to_string)}),
+            );
         }
-    };
-    let orchestrator_report_actor = *orchestrator_reports.addr();
-    stack.register_local_actor(driver.register_actor(orchestrator_report_actor, 1));
+        let live_coordinator_endpoint = driver.endpoint_addr_supplier();
+        let coordinator_endpoint =
+            advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
+        bootstrap(
+            &mut orch_telemetry,
+            "iroh_driver",
+            "ready",
+            json!({"endpoint":coordinator_endpoint.clone(),"has_relay":coordinator_endpoint.relay_urls().next().is_some(),"direct_addr_count":coordinator_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay.mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
+        );
+        bootstrap(
+            &mut orch_telemetry,
+            "endpoint_config_snapshot",
+            "ready",
+            json!({
+                "producer":"myelin-orchestrator",
+                "coordinator_endpoint":coordinator_endpoint.clone(),
+                "has_relay":coordinator_endpoint.relay_urls().next().is_some(),
+                "direct_addr_count":coordinator_endpoint.ip_addrs().count(),
+                "relay_mode":format!("{:?}", config.relay.mode),
+                "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
+                "connectivity_preflight":"ready",
+            }),
+        );
+        let stack = DistributionRuntimeStack::new_from_runtime(
+            runtime,
+            codec,
+            transport_router,
+            driver.node_id(),
+            DistributedNodeConfig::default(),
+            engine.handle(),
+        );
+        let ingress = ServeClusterIngress::new(stack.runtime.create_sender());
+        let _ingress_lifetime = ServeClusterIngressLifetime(&ingress);
+        let orch_stdio_actor = orch_stdio_capture
+            .map(|capture| {
+                capture.start(
+                    &engine.handle().blocking_work_sender(),
+                    &stack.runtime,
+                    ingress.clone(),
+                )
+            })
+            .transpose()?;
+        bootstrap(
+            &mut orch_telemetry,
+            "distribution_stack",
+            "ready",
+            json!({"actors":"initialized","route_view":"initialized","membership":"transport-events"}),
+        );
+        bootstrap(
+            &mut orch_telemetry,
+            "codecs",
+            "ready",
+            json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
+        );
+        driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+            runtime: stack.runtime.clone(),
+            codec: stack.codec.clone(),
+            routes: stack.actor_bridge_routes(),
+            swim: stack.actors.swim,
+            relay_mirror: stack.relay_mirror.clone(),
+            route_view: stack.route_view.clone(),
+            outbox: stack.outbox.clone(),
+        });
+        let snapshot = manual_core.snapshot();
+        let recovery_run_id = snapshot.run_id;
+        let recovery_swim_peers = snapshot
+            .nodes
+            .iter()
+            .filter(|node| !matches!(node.phase, NodePhase::Stopped))
+            .filter_map(|node| node.runtime.as_ref().map(|runtime| runtime.swim_node_id))
+            .collect::<Vec<_>>();
+        let data_namespace = crate::data_namespace::DataNamespaceAuthority::start(
+            &stack,
+            &driver,
+            data_namespace_path,
+            recovery_swim_peers,
+        )?;
+        let recovery_nodes = snapshot
+            .nodes
+            .iter()
+            .filter(|node| !matches!(node.phase, NodePhase::Stopped))
+            .filter_map(|node| {
+                node.runtime
+                    .as_ref()
+                    .map(|runtime| (node.logical_node_id, runtime))
+            })
+            .map(|(node_id, runtime)| {
+                serde_json::from_str::<EndpointAddr>(&runtime.endpoint)
+                    .map(|endpoint| {
+                        (
+                            node_id,
+                            endpoint,
+                            (runtime.node_actor, runtime.swim_node_id),
+                        )
+                    })
+                    .map_err(|error| {
+                        format!("parse persisted endpoint for node {node_id}: {error}")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (_, _, (node_actor, swim_node_id)) in &recovery_nodes {
+            if let Ok(mut pinned) = stack.pinned_routes.write() {
+                pinned.insert(*node_actor, *swim_node_id);
+            }
+            if let Ok(mut routes) = stack.route_view.write() {
+                routes.insert(*node_actor, *swim_node_id);
+            }
+            stack.route_binder.ensure_routable(*node_actor);
+        }
+        if !recovery_nodes.is_empty() {
+            driver.join(
+                &recovery_nodes
+                    .iter()
+                    .map(|(_, endpoint, _)| endpoint.clone())
+                    .collect::<Vec<_>>(),
+            );
+            for (node_id, _, (node_actor, _)) in &recovery_nodes {
+                // Dial each worker directly (fresh endpoint) in addition to the
+                // join above: a restarted orchestrator has new direct addresses,
+                // while every worker still caches the pre-restart endpoint for
+                // redials. Without this push, worker egress to the orchestrator
+                // black-holes until endpoint gossip rediscovers the fresh
+                // addresses, stranding namespace clients during recovery.
+                let mut dial_targets = vec![coordinator_endpoint.clone()];
+                dial_targets.extend(
+                    recovery_nodes
+                        .iter()
+                        .filter(|(peer_id, _, _)| peer_id != node_id)
+                        .map(|(_, endpoint, _)| endpoint.clone()),
+                );
+                let _ = stack.runtime.send_to(
+                    *node_actor,
+                    NodeAgentMsg::JoinPeers {
+                        endpoints: dial_targets,
+                    },
+                );
+                let _ = stack
+                    .runtime
+                    .send_to(*node_actor, NodeAgentMsg::ResyncRoutes);
+            }
+        }
+        driver.install_actor_bridge();
+        bootstrap(
+            &mut orch_telemetry,
+            "actor_bridge",
+            "ready",
+            json!({"transport":"iroh","routes":"attached","actor_bridge":"event-driven"}),
+        );
 
-    let (obs_tx, obs_rx) = mpsc::channel::<PluginObservation>();
-    let sink = PluginSink::new(Arc::new(ChannelObservationSink {
-        tx: Mutex::new(obs_tx),
-    }));
-    let shared_config = Arc::new(Mutex::new(config.clone()));
-    let live_orchestrator_actor = Arc::new(Mutex::new(None::<ActorAddress>));
-    let bootstrap_route_config = Arc::clone(&shared_config);
-    let bootstrap_route_actor = Arc::clone(&live_orchestrator_actor);
-    let bootstrap_env_source: BootstrapEnvSource = Arc::new(move || {
-        let config = bootstrap_route_config.lock();
-        let endpoint = advertised_endpoint(live_coordinator_endpoint(), config.endpoint_addr_mask)?;
-        let actor = (*bootstrap_route_actor.lock()).ok_or_else(|| {
-            "current orchestrator actor is unavailable before SSH bootstrap".to_owned()
-        })?;
-        Ok(vec![
-            (
-                "MYELIN_COORDINATOR_ENDPOINT".to_owned(),
-                serde_json::to_string(&endpoint)
-                    .map_err(|error| format!("serialize live coordinator endpoint: {error}"))?,
-            ),
-            (
-                "MYELIN_ORCHESTRATOR_ACTOR".to_owned(),
-                serde_json::to_string(&actor)
-                    .map_err(|error| format!("serialize live orchestrator actor: {error}"))?,
-            ),
-        ])
-    });
-    let provider_runtime = stack.runtime.clone();
-    let provider_engine = engine.handle();
-    let provider_config = Arc::clone(&shared_config);
-    let provider_registry = state_dir.process_registry_path();
-    let provider_bootstrap_env = Arc::clone(&bootstrap_env_source);
-    let provider_factory: ProviderFactory = Arc::new(move || {
-        provider_config.lock().clone().build_provisioner(
-            provider_runtime.clone(),
-            provider_engine.clone(),
-            provider_registry.clone(),
-            Arc::clone(&provider_bootstrap_env),
-        )
-    });
-    let spec_config = Arc::clone(&shared_config);
-    let spec_coordinator = coordinator_endpoint.clone();
-    let spec_route_actor = Arc::clone(&live_orchestrator_actor);
-    let spec_builder: SpecBuilder = Arc::new(move |node_id, orchestrator_actor| {
-        *spec_route_actor.lock() = Some(orchestrator_actor);
-        let config = spec_config.lock();
-        let spec =
-            config.node_spec_for_stage(spec_coordinator.clone(), orchestrator_actor, node_id, 0)?;
-        Ok(spec)
-    });
-    let validation_config = Arc::clone(&shared_config);
-    let validation_runtime = stack.runtime.clone();
-    let validation_engine = engine.handle();
-    let validation_registry = state_dir.process_registry_path();
-    let validation_bootstrap_env = Arc::clone(&bootstrap_env_source);
-    let config_validator: ConfigValidator = Arc::new(move |request| {
-        let mut candidate = validation_config.lock().clone();
-        if candidate.provider.as_str() != "vastai" {
-            return Ok(());
-        }
-        let vastai = candidate
-            .vastai
-            .as_mut()
-            .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
-        if let Some(api_key) = request.api_key {
-            vastai.client = Some(swactor_vastai::VastClient::new(&api_key));
-            vastai.api_key = Some(api_key);
-        }
-        if let Some(path) = request.ssh_identity {
-            vastai.ssh_identity = Some(expand_home_path(&path)?);
-        }
-        if let Some(command) = request.bootstrap_command {
-            vastai.bootstrap_command = Some(command);
-        }
-        if vastai.provisioning_mode == VastAiProvisioningMode::Mock {
+        let dashboard: Option<DashboardSupport>;
+
+        let orchestrator_report_actor = stack
+            .runtime
+            .spawn(OrchestratorReportForwarder {
+                ingress: ingress.clone(),
+            })
+            .map_err(|error| format!("spawn orchestrator report actor: {error}"))?;
+        stack.register_local_actor(driver.register_actor(orchestrator_report_actor, 1));
+
+        let sink = PluginSink::new(Arc::new(ChannelObservationSink {
+            ingress: ingress.clone(),
+        }));
+        let shared_config = Arc::new(Mutex::new(config.clone()));
+        let live_orchestrator_actor = Arc::new(Mutex::new(None::<ActorAddress>));
+        let bootstrap_route_config = Arc::clone(&shared_config);
+        let bootstrap_route_actor = Arc::clone(&live_orchestrator_actor);
+        let bootstrap_env_source: BootstrapEnvSource = Arc::new(move || {
+            let config = bootstrap_route_config.lock();
+            let endpoint =
+                advertised_endpoint(live_coordinator_endpoint(), config.endpoint_addr_mask)?;
+            let actor = (*bootstrap_route_actor.lock()).ok_or_else(|| {
+                "current orchestrator actor is unavailable before SSH bootstrap".to_owned()
+            })?;
+            Ok(vec![
+                (
+                    "MYELIN_COORDINATOR_ENDPOINT".to_owned(),
+                    serde_json::to_string(&endpoint)
+                        .map_err(|error| format!("serialize live coordinator endpoint: {error}"))?,
+                ),
+                (
+                    "MYELIN_ORCHESTRATOR_ACTOR".to_owned(),
+                    serde_json::to_string(&actor)
+                        .map_err(|error| format!("serialize live orchestrator actor: {error}"))?,
+                ),
+            ])
+        });
+        let provider_runtime = stack.runtime.clone();
+        let provider_engine = engine.handle();
+        let provider_config = Arc::clone(&shared_config);
+        let provider_registry = state_dir.process_registry_path();
+        let provider_bootstrap_env = Arc::clone(&bootstrap_env_source);
+        let provider_tasks = VastAiTaskPort::new(&tasks, engine.handle().blocking_work_sender());
+        let validation_tasks = provider_tasks.clone();
+        let provider_factory: ProviderFactory = Arc::new(move || {
+            provider_config.lock().clone().build_provisioner(
+                provider_runtime.clone(),
+                provider_engine.clone(),
+                provider_tasks.clone(),
+                provider_registry.clone(),
+                Arc::clone(&provider_bootstrap_env),
+            )
+        });
+        let spec_config = Arc::clone(&shared_config);
+        let spec_coordinator = coordinator_endpoint.clone();
+        let spec_route_actor = Arc::clone(&live_orchestrator_actor);
+        let spec_builder: SpecBuilder = Arc::new(move |node_id, orchestrator_actor| {
+            *spec_route_actor.lock() = Some(orchestrator_actor);
+            let config = spec_config.lock();
+            let spec = config.node_spec_for_stage(
+                spec_coordinator.clone(),
+                orchestrator_actor,
+                node_id,
+                0,
+            )?;
+            Ok(spec)
+        });
+        let validation_config = Arc::clone(&shared_config);
+        let validation_runtime = stack.runtime.clone();
+        let validation_engine = engine.handle();
+        let validation_registry = state_dir.process_registry_path();
+        let validation_bootstrap_env = Arc::clone(&bootstrap_env_source);
+        let config_validator: ConfigValidator = Arc::new(move |request| {
+            let mut candidate = validation_config.lock().clone();
+            if let Some(provider) = &candidate.provider_composition {
+                if let Some(configure) = &provider.configure {
+                    configure(request)?;
+                }
+                let _ = candidate.build_provisioner(
+                    validation_runtime.clone(),
+                    validation_engine.clone(),
+                    validation_tasks.clone(),
+                    validation_registry.clone(),
+                    Arc::clone(&validation_bootstrap_env),
+                )?;
+                return Ok(());
+            }
+            if candidate.provider.as_str() != "vastai" {
+                return Ok(());
+            }
+            let vastai = candidate
+                .vastai
+                .as_mut()
+                .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
+            if let Some(api_key) = request.api_key
+                && vastai.api_key.as_deref() != Some(api_key.as_str())
+            {
+                if vastai.webhooks.is_some() {
+                    return Err("changing the Vast.ai API key requires restarting with matching webhook credentials".to_owned());
+                }
+                vastai.client = Some(swactor_vastai::VastClient::new(&api_key));
+                vastai.api_key = Some(api_key);
+            }
+            if let Some(path) = request.ssh_identity {
+                vastai.ssh_identity = Some(expand_home_path(&path)?);
+            }
+            if let Some(command) = request.bootstrap_command {
+                vastai.bootstrap_command = Some(command);
+            }
+
+            if vastai.api_key.as_deref().is_none_or(str::is_empty) {
+                return Err("Vast.ai API key is required for live offer search".to_owned());
+            }
+            candidate.prepare_vastai_ssh_key()?;
             let _ = candidate.build_provisioner(
                 validation_runtime.clone(),
                 validation_engine.clone(),
+                validation_tasks.clone(),
                 validation_registry.clone(),
                 Arc::clone(&validation_bootstrap_env),
             )?;
             *validation_config.lock() = candidate;
-            return Ok(());
-        }
-        if vastai.api_key.as_deref().is_none_or(str::is_empty) {
-            return Err("Vast.ai API key is required for live offer search".to_owned());
-        }
-        candidate.prepare_vastai_ssh_key()?;
-        let _ = candidate.build_provisioner(
-            validation_runtime.clone(),
-            validation_engine.clone(),
-            validation_registry.clone(),
-            Arc::clone(&validation_bootstrap_env),
-        )?;
-        *validation_config.lock() = candidate;
-        Ok(())
-    });
-    let offer_searcher: Option<OfferSearcher> = if config.provider.as_str() == "vastai" {
-        let search_config = Arc::clone(&shared_config);
-        Some(Arc::new(move |request: OfferSearchRequest| {
-            request.validate()?;
-            let criteria = request.browse_criteria();
-            let config = search_config.lock().clone();
-            let vastai = config
-                .vastai
-                .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
-            let api_key = vastai
-                .api_key
-                .ok_or_else(|| "Vast.ai API key is not configured".to_owned())?;
-            let mut client = ToolsVastAiLeaseClient::from_api_key(api_key)?;
-            Ok(client
-                .browse_offers(&criteria)?
-                .into_iter()
-                .map(|offer| OfferDto {
-                    offer_id: offer.id,
-                    host_id: offer.host_id,
-                    gpu_model: offer.gpu_name,
-                    gpu_ram_mb: offer.gpu_ram,
-                    compute_cap: offer.compute_cap,
-                    verification: offer.verification,
-                    reliability: offer.reliability2,
-                    download_mbps: offer.inet_down,
-                    upload_mbps: offer.inet_up,
-                    location: offer.geolocation,
-                    hourly_price: offer.dph_total,
-                    download_cost_per_tb: offer.inet_down_cost_per_tb,
-                    upload_cost_per_tb: offer.inet_up_cost_per_tb,
-                })
-                .collect())
-        }) as OfferSearcher)
-    } else {
-        None
-    };
-    let vastai_provisioning_mode = config
-        .vastai
-        .as_ref()
-        .map_or("real", |vastai| vastai.provisioning_mode.as_str());
-    let readiness = if config.provider.as_str() == "vastai" && vastai_provisioning_mode != "mock" {
-        ProviderReadiness::unconfigured_for(
-            config.provider.as_str(),
-            config.image.clone(),
-            "submit a Vast.ai API key, SSH identity, and bootstrap command",
-        )
-        .with_provisioning_mode(vastai_provisioning_mode)
-    } else {
-        ProviderReadiness::ready_for(config.provider.as_str(), config.image.clone())
-            .with_provisioning_mode(vastai_provisioning_mode)
-    };
-    let initial_configuration = config
-        .vastai
-        .as_ref()
-        .map(|vastai| ProviderConfigurationRequest {
-            api_key: vastai.api_key.clone(),
-            ssh_identity: vastai
-                .ssh_identity
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            bootstrap_command: vastai.bootstrap_command.clone(),
+            Ok(())
         });
-    let manual = ManualActorControl::new(
-        ManualControl::new(snapshot, readiness),
-        stack.runtime.clone(),
-        stack.engine.blocking_work_sender(),
-        ManualActorControlConfig {
-            state_dir: state_dir.clone(),
-            sink,
-            provider_factory,
-            spec_builder,
-            config_validator: Some(config_validator),
-            offer_searcher,
-            control_generation: daemon::unix_ms_now(),
-        },
-    );
-    let orchestrator_actor = match stack.runtime.spawn(
-        OrchestratorActor::new(
-            RunConfig {
-                run_id: RunId(config.run_id),
-                max_tokens: u64::from(config.default_max_tokens),
-                prompt: Vec::new(),
+        let offer_searcher: Option<OfferSearcher> =
+            if let Some(provider) = &config.provider_composition {
+                provider.search_offers.clone()
+            } else if config.provider.as_str() == "vastai" {
+                let search_config = Arc::clone(&shared_config);
+                Some(Arc::new(move |request: OfferSearchRequest| {
+                    request.validate()?;
+                    let criteria = request.browse_criteria();
+                    let config = search_config.lock().clone();
+                    let vastai = config
+                        .vastai
+                        .ok_or_else(|| "Vast.ai configuration is unavailable".to_owned())?;
+                    let api_key = vastai
+                        .api_key
+                        .ok_or_else(|| "Vast.ai API key is not configured".to_owned())?;
+                    let mut client = ToolsVastAiLeaseClient::from_api_key(api_key)?;
+                    Ok(client
+                        .browse_offers(&criteria)?
+                        .into_iter()
+                        .map(|offer| OfferDto {
+                            offer_id: offer.id,
+                            host_id: offer.host_id,
+                            gpu_model: offer.gpu_name,
+                            gpu_ram_mb: offer.gpu_ram,
+                            compute_cap: offer.compute_cap,
+                            verification: offer.verification,
+                            reliability: offer.reliability2,
+                            download_mbps: offer.inet_down,
+                            upload_mbps: offer.inet_up,
+                            location: offer.geolocation,
+                            hourly_price: offer.dph_total,
+                            download_cost_per_tb: offer.inet_down_cost_per_tb,
+                            upload_cost_per_tb: offer.inet_up_cost_per_tb,
+                        })
+                        .collect())
+                }) as OfferSearcher)
+            } else {
+                None
+            };
+        let initial_configuration = config
+            .vastai
+            .as_ref()
+            .map(|vastai| ProviderConfigurationRequest {
+                api_key: vastai.api_key.clone(),
+                ssh_identity: vastai
+                    .ssh_identity
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                bootstrap_command: vastai.bootstrap_command.clone(),
+            })
+            .or_else(|| {
+                config
+                    .provider_composition
+                    .as_ref()
+                    .filter(|provider| provider.http_plugin.is_some())
+                    .map(|_| ProviderConfigurationRequest {
+                        api_key: None,
+                        ssh_identity: None,
+                        bootstrap_command: None,
+                    })
+            });
+        let manual = ManualActorControl::new(
+            manual_core,
+            stack.runtime.clone(),
+            stack.engine.blocking_work_sender(),
+            ManualActorControlConfig {
+                state_dir: state_dir.clone(),
+                sink,
+                provider_factory,
+                spec_builder,
+                config_validator: Some(config_validator),
+                offer_searcher,
+                control_generation: state_dir.allocate_control_generation()?,
             },
-            Some(orchestrator_report_actor),
-        )
-        .with_manual_control(manual)
-        .with_contextual_artifact_cleanup(ContextualArtifactCleanup::new(
-            data_namespace.directory(),
-            contextual_upload_root.clone(),
-        )),
-    ) {
-        Ok(actor) => actor,
-        Err(error) => return Err(format!("spawn orchestrator actor: {error}")),
-    };
-    stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
-    // The live actor handle is a static fact from spawn time; recovery
-    // tooling (the control endpoint route) needs it before any SSH
-    // bootstrap has driven the spec builder.
-    *live_orchestrator_actor.lock() = Some(orchestrator_actor);
-    stack
-        .runtime
-        .send_to(
-            stack.actors.registry,
-            RegistryIn::RegisterName {
-                name: CONTROL_REGISTRY_NAME.to_owned(),
-                actor_addr: orchestrator_actor,
-            },
-        )
-        .map_err(|error| format!("register manual control actor: {error}"))?;
-    if let Some(request) = initial_configuration {
+        );
+        let orchestrator_actor = match stack.runtime.spawn(
+            OrchestratorActor::new(
+                RunConfig {
+                    run_id: RunId(config.run_id),
+                    max_tokens: u64::from(config.default_max_tokens),
+                    prompt: Vec::new(),
+                },
+                Some(orchestrator_report_actor),
+            )
+            .with_manual_control(manual)
+            .with_contextual_artifact_cleanup(ContextualArtifactCleanup::new(
+                data_namespace.directory(),
+            )),
+        ) {
+            Ok(actor) => actor,
+            Err(error) => return Err(format!("spawn orchestrator actor: {error}")),
+        };
+        stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
+        // The live actor handle is a static fact from spawn time; recovery
+        // tooling (the control endpoint route) needs it before any SSH
+        // bootstrap has driven the spec builder.
+        *live_orchestrator_actor.lock() = Some(orchestrator_actor);
         stack
             .runtime
             .send_to(
-                orchestrator_actor,
-                OrchestratorMsg::Manual(ManualControlMsg::Configure {
-                    request,
-                    reply_to: None,
-                }),
+                stack.actors.registry,
+                RegistryIn::RegisterName {
+                    name: CONTROL_REGISTRY_NAME.to_owned(),
+                    actor_addr: orchestrator_actor,
+                },
             )
-            .map_err(|error| format!("route initial provider validation: {error}"))?;
-    }
+            .map_err(|error| format!("register manual control actor: {error}"))?;
 
-    let control_plugin = control::plugin(
-        stack.runtime.clone(),
-        engine.handle(),
-        orchestrator_actor,
-        data_namespace.control(),
-        contextual_upload_root,
-        Arc::clone(&bootstrap_env_source),
-    );
-    dashboard = DashboardSupport::start_with_plugins(
-        config.dashboard,
-        &engine.handle(),
-        vec![control_plugin],
-    )?;
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "fleet_control",
-        "started",
-        json!({
-            "mode":"manual",
-            "commands":["provision","kill"],
-            "transport":"direct_actor_message",
-        }),
-    );
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "serve_cluster",
-        "started",
-        json!({"mode":"daemon","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
-    );
-
-    let runtime = stack.runtime.clone();
-    let completion = ActorCompletion::new();
-    let serve_actor = runtime
-        .spawn(ServeClusterActor {
-            driver,
-            stack,
-            obs_rx,
-            collector,
-            orchestrator_reports,
-            dashboard,
-            orch_telemetry,
-            orch_stdio_rx,
-            run_id: config.run_id,
-            orchestrator_node_id: config.node_id,
-            provider: config.provider.clone(),
+        let control_plugin = control::plugin(
+            stack.runtime.clone(),
             orchestrator_actor,
-            engine: engine.handle(),
-            sender: runtime.create_sender(),
-            lifecycle: ServeClusterLifecycle::new(),
-            ready_peers: BTreeMap::new(),
-            dispatched_deployments: BTreeMap::new(),
-            requires_deployment_receipt: config.deployment.is_some(),
-            pending_undispatched_readies: BTreeMap::new(),
-            flush_reply_actor: None,
-            completion: completion.clone(),
-        })
-        .map_err(|error| format!("spawn daemon lifecycle actor: {error}"))?;
-    if let Err(error) = spawn_stop_listener(&runtime, stop_rx, serve_actor) {
-        let _ = runtime.send_to(serve_actor, ServeClusterMsg::Abort(error));
-    }
-    let result = completion.wait();
-    if result.is_ok() {
-        let snapshot = state_dir.load_snapshot()?;
-        state_dir.cleanup_recovery_checkpoint(&snapshot)?;
-    }
-    result
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VastAiProvisioningMode {
-    Real,
-    Mock,
-}
-
-impl VastAiProvisioningMode {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "real" => Ok(Self::Real),
-            "mock" | "simulated" => Ok(Self::Mock),
-            other => Err(format!(
-                "unsupported Vast.ai provisioning mode {other:?}; use real or mock"
-            )),
+            data_namespace.control(),
+            Arc::clone(&bootstrap_env_source),
+        );
+        let mut plugins = vec![control_plugin];
+        if let Some(webhooks) = config
+            .vastai
+            .as_ref()
+            .and_then(|vastai| vastai.webhooks.as_ref())
+        {
+            plugins.push(dashboard::DashboardPlugin::new(
+                webhooks.router(engine.handle().blocking_work_sender()),
+            ));
         }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Real => "real",
-            Self::Mock => "mock",
+        if let Some(plugin) = config
+            .provider_composition
+            .as_ref()
+            .and_then(|provider| provider.http_plugin.as_ref())
+        {
+            plugins.push(plugin(engine.handle().blocking_work_sender()));
         }
-    }
+        dashboard = DashboardSupport::start_with_plugins(
+            config.dashboard,
+            &tasks,
+            &engine.handle(),
+            driver.endpoint(),
+            plugins,
+        )?;
+        if let Some(request) = initial_configuration {
+            stack
+                .runtime
+                .send_to(
+                    orchestrator_actor,
+                    OrchestratorMsg::Manual(ManualControlMsg::Configure {
+                        request,
+                        reply_to: None,
+                    }),
+                )
+                .map_err(|error| format!("route initial provider validation: {error}"))?;
+        }
+        if let Some(dashboard) = &dashboard {
+            dashboard.observe_local(orch_telemetry.endpoint());
+            for (node_id, endpoint, _) in &recovery_nodes {
+                dashboard.subscribe_node(endpoint.clone(), recovery_run_id, *node_id);
+            }
+        }
+        let peers = driver.peer_connector();
+        let route_ingress = ingress.clone();
+        let distribution_wake: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || route_ingress.send(ServeClusterMsg::DistributionChanged));
+        stack.watch_membership(Arc::downgrade(&distribution_wake));
+        stack
+            .runtime
+            .send_to(
+                stack.actors.directory,
+                DirectoryIn::WatchRoutes {
+                    changed: Arc::downgrade(&distribution_wake),
+                },
+            )
+            .map_err(|error| format!("subscribe daemon route changes: {error}"))?;
+        let connection_watch = driver
+            .connection_observer()
+            .watch_connections(Arc::clone(&distribution_wake));
+        orch_telemetry.serve(&tasks, driver);
+        bootstrap(
+            &mut orch_telemetry,
+            "fleet_control",
+            "started",
+            json!({
+                "mode":"manual",
+                "commands":["provision","kill"],
+                "transport":"direct_actor_message",
+            }),
+        );
+        bootstrap(
+            &mut orch_telemetry,
+            "serve_cluster",
+            "started",
+            json!({"mode":"daemon","ingress":"actor-events"}),
+        );
+
+        let runtime = stack.runtime.clone();
+        let completion = ActorCompletion::new();
+        let serve_actor = runtime
+            .spawn(ServeClusterActor {
+                peers,
+                stack,
+                ingress: ingress.clone(),
+                _distribution_wake: distribution_wake,
+                _connection_watch: connection_watch,
+                orchestrator_report_actor,
+                dashboard,
+                orch_telemetry,
+                orch_stdio_actor,
+                hardware_samples,
+                run_id: config.run_id,
+                orchestrator_node_id: config.node_id,
+                provider: config.provider.clone(),
+                orchestrator_actor,
+                sender: runtime.create_sender(),
+                lifecycle: ServeClusterLifecycle::new(),
+                ready_peers: BTreeMap::new(),
+                dispatched_deployments: BTreeMap::new(),
+                requires_deployment_receipt: config.deployment.is_some(),
+                pending_undispatched_readies: BTreeMap::new(),
+                flush_reply_actor: None,
+                completion: Some(completion.clone()),
+            })
+            .map_err(|error| format!("spawn daemon lifecycle actor: {error}"))?;
+        ingress.bind(serve_actor);
+        ingress.send(ServeClusterMsg::DistributionChanged);
+        if let Err(error) = spawn_stop_listener(
+            &engine.handle().blocking_work_sender(),
+            &runtime,
+            stop_rx,
+            serve_actor,
+        ) {
+            let _ = runtime.send_to(serve_actor, ServeClusterMsg::Abort(error));
+        }
+        let result = completion.wait();
+        if result.is_ok() {
+            let snapshot = state_dir.load_snapshot()?;
+            state_dir.cleanup_recovery_checkpoint(&snapshot)?;
+        }
+        result
+    }))
 }
 
 #[derive(Clone)]
 struct VastAiRuntimeConfig {
     api_key: Option<String>,
     client: Option<swactor_vastai::VastClient>,
-    provisioning_mode: VastAiProvisioningMode,
+    webhooks: Option<Arc<VastAiWebhooks>>,
+
     provisioning: VastAiProvisioningConfig,
     bootstrap_command: Option<String>,
     ssh_identity: Option<PathBuf>,
@@ -1079,14 +992,6 @@ impl VastAiRuntimeConfig {
                 provisioning.selection.blacklist_hosts.push(*host_id);
             }
         }
-        if let Some(poll_interval_secs) = raw_config!(
-            parse_value,
-            "MYELIN_VASTAI_POLL_INTERVAL_SECS",
-            builder.vastai_poll_interval_secs_raw,
-            builder.vastai_poll_interval_secs
-        ) {
-            provisioning.lifecycle.poll_interval = Duration::from_secs(poll_interval_secs);
-        }
         let ssh_identity = builder
             .vastai_ssh_identity_raw
             .as_ref()
@@ -1098,7 +1003,8 @@ impl VastAiRuntimeConfig {
                 .vastai_api_key
                 .as_ref()
                 .map(swactor_vastai::VastClient::new),
-            provisioning_mode: builder.vastai_provisioning_mode,
+            webhooks: None,
+
             provisioning,
             bootstrap_command: builder.vastai_bootstrap_command.clone(),
             ssh_identity,
@@ -1108,7 +1014,6 @@ impl VastAiRuntimeConfig {
 
     fn telemetry_detail(&self) -> Value {
         json!({
-            "provisioning_mode": self.provisioning_mode.as_str(),
             "disk_gb": self.provisioning.disk_gb,
             "ssh_user": &self.provisioning.ssh_user,
             "gpu_name": &self.provisioning.selection.gpu_name,
@@ -1120,7 +1025,6 @@ impl VastAiRuntimeConfig {
             "min_reliability": self.provisioning.selection.min_reliability,
             "require_verified": self.provisioning.selection.require_verified,
             "blacklist_hosts": &self.provisioning.selection.blacklist_hosts,
-            "state_timeout_secs": self.provisioning.lifecycle.state_timeout.as_secs(),
             "confirm_lease": self.provisioning.confirm_lease,
             "has_api_key": self.api_key.is_some(),
             "has_onstart": self.provisioning.onstart.is_some(),
@@ -1216,6 +1120,7 @@ fn default_pipeline_cached_model_path() -> PathBuf {
 
 #[derive(Clone)]
 struct Config {
+    provider_composition: Option<ProviderComposition>,
     config_profile: RuntimeConfigProfile,
     image: String,
     docker_gpus: String,
@@ -1234,15 +1139,15 @@ struct Config {
     endpoint_bind_port: Option<u16>,
     endpoint_addr_mask: EndpointAddrMask,
     vastai: Option<VastAiRuntimeConfig>,
-    static_ssh: Option<StaticSshRuntimeConfig>,
+
     deployment: Option<DeploymentBundle>,
     cached_model: Option<CachedModelConfig>,
-    telemetry_frame_log: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct ConfigBuilder {
+    providers: Vec<ProviderComposition>,
     config_profile: RuntimeConfigProfile,
     provider: Option<ProviderKind>,
     image: String,
@@ -1267,7 +1172,7 @@ struct ConfigBuilder {
     endpoint_bind_port: Option<u16>,
     endpoint_addr_mask: Option<String>,
     vastai_api_key: Option<String>,
-    vastai_provisioning_mode: VastAiProvisioningMode,
+
     vastai_bootstrap_command: Option<String>,
     vastai_disk_gb: Option<u32>,
     vastai_disk_gb_raw: Option<String>,
@@ -1276,8 +1181,7 @@ struct ConfigBuilder {
     vastai_confirm_lease_raw: Option<String>,
     vastai_onstart: Option<String>,
     vastai_ssh_identity_raw: Option<String>,
-    static_ssh_manifest_raw: Option<String>,
-    static_ssh_identity_raw: Option<String>,
+
     deployment_bundle_raw: Option<String>,
     vastai_gpu_name: Option<String>,
     vastai_min_gpu_ram_mb: Option<u64>,
@@ -1292,17 +1196,23 @@ struct ConfigBuilder {
     vastai_min_reliability_raw: Option<String>,
     vastai_require_verified: Option<bool>,
     vastai_require_verified_raw: Option<String>,
-    vastai_poll_interval_secs: Option<u64>,
     vastai_blacklist_hosts: Vec<u64>,
-    vastai_poll_interval_secs_raw: Option<String>,
     cached_model_host_path: Option<PathBuf>,
-    telemetry_frame_log: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
 }
 
 impl ConfigBuilder {
+    fn parse_provider(&self, name: &str) -> Result<ProviderKind, String> {
+        self.providers
+            .iter()
+            .find(|entry| entry.kind.as_str() == name)
+            .map(|entry| Ok(entry.kind.clone()))
+            .unwrap_or_else(|| provider_kind::parse_deploy(name))
+    }
+
     fn hardcoded_defaults() -> Self {
         Self {
+            providers: Vec::new(),
             config_profile: RuntimeConfigProfile::Local,
             provider: None,
             image: DEFAULT_IMAGE.to_owned(),
@@ -1331,7 +1241,7 @@ impl ConfigBuilder {
             endpoint_bind_port: None,
             endpoint_addr_mask: None,
             vastai_api_key: None,
-            vastai_provisioning_mode: VastAiProvisioningMode::Real,
+
             vastai_bootstrap_command: None,
             vastai_disk_gb: None,
             vastai_disk_gb_raw: None,
@@ -1340,8 +1250,7 @@ impl ConfigBuilder {
             vastai_confirm_lease_raw: None,
             vastai_onstart: None,
             vastai_ssh_identity_raw: None,
-            static_ssh_manifest_raw: None,
-            static_ssh_identity_raw: None,
+
             deployment_bundle_raw: None,
             vastai_gpu_name: None,
             vastai_min_gpu_ram_mb: None,
@@ -1356,11 +1265,8 @@ impl ConfigBuilder {
             vastai_min_reliability_raw: None,
             vastai_require_verified: None,
             vastai_require_verified_raw: None,
-            vastai_poll_interval_secs: None,
             vastai_blacklist_hosts: Vec::new(),
-            vastai_poll_interval_secs_raw: None,
             cached_model_host_path: None,
-            telemetry_frame_log: None,
             worker_bin: None,
         }
     }
@@ -1389,7 +1295,7 @@ impl ConfigBuilder {
             self.pipeline_stages = pipeline_stages
         });
         apply!(overlay.provider.kind, |provider| {
-            self.provider = Some(provider_kind::parse_deploy(&provider)?);
+            self.provider = Some(self.parse_provider(&provider)?);
         });
         apply!(overlay.image.node, |image| { self.image = image });
         apply!(overlay.relay.mode, |mode| { self.relay_mode = Some(mode) });
@@ -1423,15 +1329,10 @@ impl ConfigBuilder {
         apply!(overlay.docker.cached_model_host_path, |path| {
             self.cached_model_host_path = Some(PathBuf::from(path))
         });
-        apply!(overlay.observability.telemetry_frame_log, |path| {
-            self.telemetry_frame_log = Some(PathBuf::from(path))
-        });
         apply!(overlay.vastai.image, |image| {
             self.toml_vastai_image = Some(image)
         });
-        apply!(overlay.vastai.provisioning_mode, |mode| {
-            self.vastai_provisioning_mode = VastAiProvisioningMode::parse(&mode)?
-        });
+
         apply!(overlay.vastai.api_key, |api_key| {
             self.vastai_api_key = Some(api_key)
         });
@@ -1477,9 +1378,6 @@ impl ConfigBuilder {
         for host_id in overlay.vastai.blacklist_hosts {
             self.push_vastai_blacklist_host(host_id);
         }
-        apply!(overlay.vastai.poll_interval_secs, |poll_interval_secs| {
-            self.vastai_poll_interval_secs = Some(poll_interval_secs)
-        });
         Ok(self)
     }
 
@@ -1522,7 +1420,7 @@ impl ConfigBuilder {
         apply!(
             env_optional("MYELIN_NODE_PROVIDER").or_else(|| env_optional("MYELIN_PROVIDER")),
             |provider| {
-                self.provider = Some(provider_kind::parse_deploy(&provider)?);
+                self.provider = Some(self.parse_provider(&provider)?);
             }
         );
         env_apply!("MYELIN_NODE_IMAGE", |image| {
@@ -1546,9 +1444,6 @@ impl ConfigBuilder {
             self.state_dir = Some(PathBuf::from(state_dir))
         });
 
-        env_apply!(TELEMETRY_FRAME_LOG_ENV, |path| {
-            self.telemetry_frame_log = Some(PathBuf::from(path))
-        });
         env_apply!("MYELIN_MODEL_ID", |model_id| { self.model_id = model_id });
         env_apply!("MYELIN_GGUF_LOCAL_PATH", |path| {
             self.gguf_source = GgufSource::LocalPath(path)
@@ -1592,21 +1487,14 @@ impl ConfigBuilder {
                 self.vastai_api_key = Some(api_key);
             }
         );
-        env_apply!("MYELIN_VASTAI_PROVISIONING_MODE", |mode| {
-            self.vastai_provisioning_mode = VastAiProvisioningMode::parse(&mode)?
-        });
+
         env_apply!("MYELIN_VASTAI_BOOTSTRAP_COMMAND", |command| {
             self.vastai_bootstrap_command = Some(command)
         });
         env_apply!("MYELIN_VASTAI_SSH_IDENTITY", |identity| {
             self.vastai_ssh_identity_raw = Some(identity)
         });
-        env_apply!("MYELIN_STATIC_SSH_MANIFEST", |manifest| {
-            self.static_ssh_manifest_raw = Some(manifest)
-        });
-        env_apply!("MYELIN_STATIC_SSH_IDENTITY", |identity| {
-            self.static_ssh_identity_raw = Some(identity)
-        });
+
         env_apply!("MYELIN_DEPLOYMENT_BUNDLE", |bundle| {
             self.deployment_bundle_raw = Some(bundle)
         });
@@ -1648,9 +1536,6 @@ impl ConfigBuilder {
                 self.push_vastai_blacklist_host(host_id);
             }
         });
-        env_apply!("MYELIN_VASTAI_POLL_INTERVAL_SECS", |poll_interval_secs| {
-            self.vastai_poll_interval_secs_raw = Some(poll_interval_secs)
-        });
         Ok(self)
     }
 
@@ -1663,20 +1548,9 @@ impl ConfigBuilder {
                         RuntimeConfigProfile::parse(&next_arg(&mut args, "--runtime-config")?)?
                 }
                 "--provider" => {
-                    self.provider = Some(provider_kind::parse_deploy(&next_arg(
-                        &mut args,
-                        "--provider",
-                    )?)?)
+                    self.provider = Some(self.parse_provider(&next_arg(&mut args, "--provider")?)?)
                 }
-                "--vastai-provisioning" => {
-                    self.vastai_provisioning_mode = VastAiProvisioningMode::parse(&next_arg(
-                        &mut args,
-                        "--vastai-provisioning",
-                    )?)?
-                }
-                "--vastai-provisioning-mock" => {
-                    self.vastai_provisioning_mode = VastAiProvisioningMode::Mock
-                }
+
                 "--worker-bin" => {
                     self.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
                 }
@@ -1699,10 +1573,6 @@ impl ConfigBuilder {
                     self.state_dir = Some(PathBuf::from(next_arg(&mut args, "--state-dir")?))
                 }
                 "--reset-state" => self.reset_state = true,
-                "--telemetry-frame-log" => {
-                    self.telemetry_frame_log =
-                        Some(PathBuf::from(next_arg(&mut args, "--telemetry-frame-log")?));
-                }
                 "--model-id" => self.model_id = next_arg(&mut args, "--model-id")?,
                 "--gguf-local-path" => {
                     self.gguf_source =
@@ -1767,11 +1637,6 @@ impl ConfigBuilder {
                     let host_id = parse_next(&mut args, "--vastai-blacklist-host")?;
                     self.push_vastai_blacklist_host(host_id);
                 }
-                "--vastai-poll-interval-secs" => {
-                    self.vastai_poll_interval_secs =
-                        Some(parse_next(&mut args, "--vastai-poll-interval-secs")?);
-                    self.vastai_poll_interval_secs_raw = None;
-                }
                 "--vastai-api-key" => {
                     self.vastai_api_key = Some(next_arg(&mut args, "--vastai-api-key")?)
                 }
@@ -1783,13 +1648,7 @@ impl ConfigBuilder {
                     self.vastai_ssh_identity_raw =
                         Some(next_arg(&mut args, "--vastai-ssh-identity")?);
                 }
-                "--static-ssh-manifest" => {
-                    self.static_ssh_manifest_raw =
-                        Some(next_arg(&mut args, "--static-ssh-manifest")?);
-                }
-                "--ssh-identity" => {
-                    self.static_ssh_identity_raw = Some(next_arg(&mut args, "--ssh-identity")?);
-                }
+
                 "--deployment-bundle" => {
                     self.deployment_bundle_raw = Some(next_arg(&mut args, "--deployment-bundle")?);
                 }
@@ -1880,55 +1739,27 @@ impl ConfigBuilder {
         let vastai = (provider_name == "vastai")
             .then(|| VastAiRuntimeConfig::from_builder(&self))
             .transpose()?;
-        let static_ssh = if provider_name == "static-ssh" {
-            Some(resolve_static_ssh_config(
-                self.static_ssh_manifest_raw.as_deref(),
-                self.static_ssh_identity_raw.as_deref(),
-            )?)
-        } else {
-            None
-        };
-        let deployment = match self.deployment_bundle_raw.as_deref() {
-            Some(bundle_raw) => {
-                if provider_name == "vastai"
-                    && self
-                        .vastai_provisioning_mode
-                        .eq(&VastAiProvisioningMode::Mock)
-                {
-                    return Err("mock VastAI provisioning does not deploy bundles".to_owned());
-                }
-                if !matches!(provider_name, "vastai" | "static-ssh") {
-                    return Err(format!(
-                        "--deployment-bundle is not applicable to provider {provider_name}"
-                    ));
-                }
-                if provider_name == "static-ssh" && static_ssh.is_none() {
-                    return Err(
-                        "--deployment-bundle is required when --provider static-ssh".to_owned()
-                    );
-                }
-                let path = PathBuf::from(bundle_raw);
-                Some(DeploymentBundle {
-                    path: path.clone(),
+        let deployment = self
+            .deployment_bundle_raw
+            .as_deref()
+            .map(|raw| {
+                let path = PathBuf::from(raw);
+                Ok::<_, String>(DeploymentBundle {
                     identity: read_bundle_identity(&path)?,
+                    path,
                 })
-            }
-            None => {
-                if provider_name == "static-ssh" {
-                    return Err(
-                        "--deployment-bundle (or MYELIN_DEPLOYMENT_BUNDLE) is required when \
-                         --provider static-ssh"
-                            .to_owned(),
-                    );
-                }
-                None
-            }
-        };
+            })
+            .transpose()?;
+        let provider_composition = self
+            .providers
+            .into_iter()
+            .find(|entry| entry.kind == provider);
         Ok(Config {
             config_profile: self.config_profile,
             image,
             docker_gpus: self.docker_gpus,
             provider,
+            provider_composition,
             run_id: self.run_id,
             node_id: self.node_id,
             stage_index: self.stage_index,
@@ -1946,11 +1777,10 @@ impl ConfigBuilder {
             endpoint_bind_port: self.endpoint_bind_port,
             endpoint_addr_mask,
             vastai,
-            static_ssh,
+
             deployment,
             cached_model,
             worker_bin: self.worker_bin,
-            telemetry_frame_log: self.telemetry_frame_log,
         })
     }
 
@@ -2025,27 +1855,6 @@ struct DeploymentBundle {
     identity: crate::provisioning::DeploymentIdentity,
 }
 
-fn resolve_static_ssh_config(
-    manifest_raw: Option<&str>,
-    identity_raw: Option<&str>,
-) -> Result<StaticSshRuntimeConfig, String> {
-    let manifest_raw = manifest_raw.ok_or(
-        "--static-ssh-manifest (or MYELIN_STATIC_SSH_MANIFEST) is required when \
-         --provider static-ssh",
-    )?;
-    let identity_raw = identity_raw.ok_or(
-        "--ssh-identity (or MYELIN_STATIC_SSH_IDENTITY) is required when \
-         --provider static-ssh",
-    )?;
-    let manifest_path = PathBuf::from(manifest_raw);
-    let identity_path = expand_home_path(identity_raw)?;
-    let manifest = StaticFleetManifest::load(&manifest_path)?;
-    Ok(StaticSshRuntimeConfig {
-        manifest,
-        identity_path,
-    })
-}
-
 impl Config {
     fn provider_telemetry_detail(&self) -> Value {
         match self.provider.as_str() {
@@ -2067,14 +1876,6 @@ impl Config {
 
     fn prepare_vastai_ssh_key(&mut self) -> Result<(), String> {
         if self.provider.as_str() != "vastai" {
-            return Ok(());
-        }
-
-        if self
-            .vastai
-            .as_ref()
-            .is_some_and(|vastai| vastai.provisioning_mode == VastAiProvisioningMode::Mock)
-        {
             return Ok(());
         }
 
@@ -2136,17 +1937,29 @@ impl Config {
         &self,
         bootstrap_runtime: swactor::runtime::Runtime,
         bootstrap_engine: EngineHandle,
+        tasks: VastAiTaskPort,
         process_registry_path: PathBuf,
         bootstrap_env: BootstrapEnvSource,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
+        if let Some(provider) = &self.provider_composition {
+            return (provider.build)(ProviderContext {
+                runtime: bootstrap_runtime,
+                engine: bootstrap_engine,
+                tasks,
+                process_registry_path,
+                bootstrap_env,
+            });
+        }
         match self.provider.as_str() {
             "process" => Ok(Box::new(LocalProcessPlugin::with_registry(
+                bootstrap_engine.blocking_work_sender(),
                 self.local_worker_bin()?,
                 process_registry_path,
                 "process",
                 bootstrap_runtime.clone(),
             ))),
             "docker" => Ok(Box::new(LocalDockerPlugin::new(
+                bootstrap_engine.blocking_work_sender(),
                 env_optional("MYELIN_DOCKER_CONTAINER_PREFIX")
                     .unwrap_or_else(|| "myelin-orchestrator".to_owned()),
                 bootstrap_runtime.clone(),
@@ -2155,13 +1968,7 @@ impl Config {
                 let vastai = self.vastai.as_ref().ok_or_else(|| {
                     "VastAI config was not resolved for provider vastai".to_owned()
                 })?;
-                if vastai.provisioning_mode == VastAiProvisioningMode::Mock {
-                    return Ok(Box::new(MockVastAiPlugin::with_docker(
-                        env_optional("MYELIN_MOCK_VASTAI_CONTAINER_PREFIX")
-                            .unwrap_or_else(|| "myelin-mock-vastai".to_owned()),
-                        bootstrap_runtime.clone(),
-                    )));
-                }
+
                 if vastai.bootstrap_command.is_none() {
                     return Err(
                         "MYELIN_VASTAI_BOOTSTRAP_COMMAND is required when MYELIN_NODE_PROVIDER=vastai"
@@ -2176,51 +1983,42 @@ impl Config {
                     .ssh_identity
                     .clone()
                     .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
+                let client =
+                    ToolsVastAiLeaseClient::new(client)?.with_actor_host(
+                        bootstrap_runtime.clone(),
+                        tasks,
+                        Arc::clone(vastai.webhooks.as_ref().ok_or_else(|| {
+                            "Vast.ai webhook receiver is not initialized".to_owned()
+                        })?),
+                    );
                 if let Some(deployment) = self.deployment.as_ref() {
-                    return Ok(Box::new(VastAiProvisioningPlugin::new(
-                        ToolsVastAiLeaseClient::new(client)?
-                            .with_actor_host(bootstrap_runtime.clone(), bootstrap_engine.clone()),
-                        SshArtifactBootstrapLauncher::new(
-                            ssh_identity,
-                            deployment.path.clone(),
-                            bootstrap_runtime,
-                            bootstrap_env,
-                            bootstrap_engine,
-                        ),
-                        vastai.provisioning.clone(),
-                    )));
-                }
-                Ok(Box::new(VastAiProvisioningPlugin::new(
-                    ToolsVastAiLeaseClient::new(client)?
-                        .with_actor_host(bootstrap_runtime.clone(), bootstrap_engine.clone()),
-                    SshCommandBootstrapLauncher::new(
-                        Some(ssh_identity),
-                        bootstrap_runtime,
-                        bootstrap_env,
-                        bootstrap_engine,
-                    ),
-                    vastai.provisioning.clone(),
-                )))
-            }
-            "static-ssh" => {
-                let static_ssh = self.static_ssh.as_ref().ok_or_else(|| {
-                    "static-ssh configuration was not resolved for provider static-ssh".to_owned()
-                })?;
-                let deployment = self.deployment.as_ref().ok_or_else(|| {
-                    "static-ssh provisioning requires a deployment bundle".to_owned()
-                })?;
-                Ok(Box::new(StaticSshFleetPlugin::new(
-                    static_ssh.manifest.clone(),
-                    SshArtifactBootstrapLauncher::new(
-                        static_ssh.identity_path.clone(),
+                    let launcher = SshArtifactBootstrapLauncher::new(
+                        ssh_identity,
                         deployment.path.clone(),
                         bootstrap_runtime,
                         bootstrap_env,
                         bootstrap_engine,
-                    ),
+                    );
+                    return Ok(Box::new(VastAiProvisioningPlugin::new(
+                        client,
+                        launcher,
+                        vastai.provisioning.clone(),
+                    )));
+                }
+                let launcher = SshCommandBootstrapLauncher::new(
+                    Some(ssh_identity),
+                    bootstrap_runtime,
+                    bootstrap_env,
+                    bootstrap_engine,
+                );
+                Ok(Box::new(VastAiProvisioningPlugin::new(
+                    client,
+                    launcher,
+                    vastai.provisioning.clone(),
                 )))
             }
-            _ => Err("mock provider cannot build a runtime provisioner".to_owned()),
+
+            _ => Err("provider is not registered for runtime provisioning".to_owned()),
         }
     }
 
@@ -2230,11 +2028,7 @@ impl Config {
         if let Some(url) = &self.relay.url {
             env.push((MYELIN_IROH_RELAY_URL_ENV.to_owned(), url.clone()));
         }
-        let docker_realized = self.provider.as_str() == "docker"
-            || (self.provider.as_str() == "vastai"
-                && self.vastai.as_ref().is_some_and(|vastai| {
-                    vastai.provisioning_mode == VastAiProvisioningMode::Mock
-                }));
+        let docker_realized = self.provider.as_str() == "docker";
         if docker_realized {
             env.push(("MYELIN_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
@@ -2278,43 +2072,36 @@ impl Config {
                 relay_mode_env_value(&self.relay.mode).to_owned(),
             ),
         ];
-        if provider_name == "vastai"
-            && self
-                .vastai
-                .as_ref()
-                .is_some_and(|vastai| vastai.provisioning_mode == VastAiProvisioningMode::Real)
-            || provider_name == "static-ssh"
+        if self
+            .provider_composition
+            .as_ref()
+            .map_or(provider_name == "vastai", |provider| provider.remote)
         {
             env.retain(|(key, _)| {
                 key != "MYELIN_COORDINATOR_ENDPOINT" && key != "MYELIN_ORCHESTRATOR_ACTOR"
             });
         }
         env.extend(self.extra_worker_env());
-        let args = match provider_name {
-            "vastai"
-                if self.vastai.as_ref().is_some_and(|vastai| {
-                    vastai.provisioning_mode == VastAiProvisioningMode::Mock
-                }) =>
-            {
-                self.worker_bin
-                    .is_none()
-                    .then(|| crate::ORCHESTRATOR_WORKER_MODE_ARG.to_owned())
+        let args = if self.provider_composition.is_some() {
+            Vec::new()
+        } else {
+            match provider_name {
+                "vastai" if self.deployment.is_some() => {
+                    vec![format!("exec {DEPLOYED_WORKER_BIN_PATH}")]
+                }
+                "vastai" => self
+                    .vastai
+                    .as_ref()
+                    .and_then(|vastai| vastai.bootstrap_command.clone())
                     .into_iter()
-                    .collect()
+                    .collect(),
+
+                "process" if self.worker_bin.is_none() => {
+                    vec![crate::ORCHESTRATOR_WORKER_MODE_ARG.to_owned()]
+                }
+                "process" | "docker" => Vec::new(),
+                _ => return Err("provider is not registered for node specifications".to_owned()),
             }
-            "vastai" if self.deployment.is_some() => vec![format!("exec {WORKER_BIN_PATH}")],
-            "vastai" => self
-                .vastai
-                .as_ref()
-                .and_then(|vastai| vastai.bootstrap_command.clone())
-                .into_iter()
-                .collect(),
-            "static-ssh" => vec![format!("exec {WORKER_BIN_PATH}")],
-            "process" if self.worker_bin.is_none() => {
-                vec![crate::ORCHESTRATOR_WORKER_MODE_ARG.to_owned()]
-            }
-            "process" | "docker" => Vec::new(),
-            _ => return Err("myelin-orchestrator does not support mock provider".to_owned()),
         };
         if let Some(deployment) = &self.deployment {
             env.push((
@@ -2330,7 +2117,7 @@ impl Config {
             .deployment
             .as_ref()
             .map(|bundle| bundle.identity.clone());
-        Ok(NodeProvisionSpec {
+        let mut spec = NodeProvisionSpec {
             deployment,
             run_id: self.run_id,
             node_id: logical_node_id,
@@ -2341,7 +2128,11 @@ impl Config {
             args,
             offer_criteria_json: None,
             mounts: Vec::new(),
-        })
+        };
+        if let Some(provider) = &self.provider_composition {
+            (provider.prepare_spec)(&mut spec)?;
+        }
+        Ok(spec)
     }
 }
 
@@ -2420,13 +2211,14 @@ struct OrchStdioCapture {
 #[cfg(not(target_os = "linux"))]
 struct OrchStdioCapture;
 
+#[derive(Clone, Debug)]
 struct OrchStdioLine {
     stream: ProvisionLogStream,
     line: String,
 }
 
 struct OrchStdioRelay {
-    tx: mpsc::Sender<OrchStdioLine>,
+    ingress: ServeClusterIngress,
     closed: u8,
 }
 
@@ -2441,9 +2233,8 @@ impl ActorInterface for OrchStdioRelay {
                     swactor_process::ProcessStream::Stdout => ProvisionLogStream::Stdout,
                     swactor_process::ProcessStream::Stderr => ProvisionLogStream::Stderr,
                 };
-                if self.tx.send(OrchStdioLine { stream, line }).is_err() {
-                    ctx.stop_self();
-                }
+                self.ingress
+                    .send(ServeClusterMsg::Stdio(OrchStdioLine { stream, line }));
             }
             swactor_process::ProcessStreamObservation::Error { .. } => {}
             swactor_process::ProcessStreamObservation::Closed { .. } => {
@@ -2465,25 +2256,31 @@ impl OrchStdioCapture {
         }))
     }
 
-    fn start(self, runtime: &Runtime) -> Result<mpsc::Receiver<OrchStdioLine>, String> {
-        let (tx, rx) = mpsc::channel();
+    fn start(
+        self,
+        blocking: &BlockingWorkSender,
+        runtime: &Runtime,
+        ingress: ServeClusterIngress,
+    ) -> Result<ActorAddress, String> {
         let actor = runtime
-            .spawn(OrchStdioRelay { tx, closed: 0 })
+            .spawn(OrchStdioRelay { ingress, closed: 0 })
             .map_err(|error| format!("spawn orchestrator stdio relay actor: {error}"))?;
         let sender = runtime.create_sender();
         swactor_process::spawn_line_reader(
+            blocking,
             swactor_process::ProcessStream::Stdout,
             self.stdout,
             sender.clone(),
             actor,
         );
         swactor_process::spawn_line_reader(
+            blocking,
             swactor_process::ProcessStream::Stderr,
             self.stderr,
             sender,
             actor,
         );
-        Ok(rx)
+        Ok(actor)
     }
 
     fn redirect_stream(fd: libc::c_int, name: &str) -> Result<File, String> {
@@ -2519,41 +2316,107 @@ impl OrchStdioCapture {
         Ok(None)
     }
 
-    fn start(self, _runtime: &Runtime) -> Result<mpsc::Receiver<OrchStdioLine>, String> {
+    fn start(
+        self,
+        _blocking: &BlockingWorkSender,
+        _runtime: &Runtime,
+        _ingress: ServeClusterIngress,
+    ) -> Result<ActorAddress, String> {
         unreachable!("stdio capture is unavailable on this target")
     }
 }
 
-fn drain_orch_stdio_capture(
-    rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    telemetry: &mut OrchTelemetry,
-    dashboard: Option<&DashboardSupport>,
-) {
-    let Some(rx) = rx else {
-        return;
-    };
-    while let Ok(line) = rx.try_recv() {
-        telemetry.emit_orchestrator_log(dashboard, line.stream, line.line);
+#[derive(Clone)]
+struct ServeClusterIngress {
+    sender: ExternalSender,
+    state: Arc<Mutex<ServeClusterIngressState>>,
+}
+
+struct ServeClusterIngressLifetime<'a>(&'a ServeClusterIngress);
+
+impl Drop for ServeClusterIngressLifetime<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+struct ServeClusterIngressState {
+    actor: Option<ActorAddress>,
+    pending: VecDeque<ServeClusterMsg>,
+    closed: bool,
+}
+
+impl ServeClusterIngress {
+    fn new(sender: ExternalSender) -> Self {
+        Self {
+            sender,
+            state: Arc::new(Mutex::new(ServeClusterIngressState {
+                actor: None,
+                pending: VecDeque::new(),
+                closed: false,
+            })),
+        }
+    }
+
+    fn send(&self, message: ServeClusterMsg) {
+        let mut state = self.state.lock();
+        if state.closed {
+            return;
+        }
+        if let Some(actor) = state.actor {
+            let _ = self.sender.send_to(actor, message);
+        } else {
+            state.pending.push_back(message);
+        }
+    }
+
+    fn bind(&self, actor: ActorAddress) {
+        let mut state = self.state.lock();
+        state.actor = Some(actor);
+        for message in state.pending.drain(..) {
+            let _ = self.sender.send_to(actor, message);
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.pending.clear();
+    }
+}
+
+struct OrchestratorReportForwarder {
+    ingress: ServeClusterIngress,
+}
+
+impl ActorInterface for OrchestratorReportForwarder {
+    type Incoming = OrchestratorReport;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, report: Self::Incoming) {
+        self.ingress.send(ServeClusterMsg::Report(report));
     }
 }
 
 struct ChannelObservationSink {
-    tx: Mutex<mpsc::Sender<PluginObservation>>,
+    ingress: ServeClusterIngress,
 }
 
 impl PluginObservationSink for ChannelObservationSink {
     fn observe(&self, observation: PluginObservation) {
-        let _ = self.tx.lock().send(observation);
+        self.ingress.send(ServeClusterMsg::Observation(observation));
     }
 }
 
 #[derive(Clone, Debug)]
 enum ServeClusterMsg {
-    Tick,
+    DistributionChanged,
+    Report(OrchestratorReport),
+    Observation(PluginObservation),
+    Stdio(OrchStdioLine),
     Stop,
     Flushed,
     FlushFailed(String),
-    FlushTimeout,
     Abort(String),
 }
 
@@ -2577,7 +2440,10 @@ struct ServeClusterLifecycle<T> {
 #[derive(Debug)]
 enum ServeClusterEffect {
     None,
-    Pump,
+    ObserveDistribution,
+    Report(OrchestratorReport),
+    Observation(PluginObservation),
+    Stdio(OrchStdioLine),
     BeginFlush,
     ProviderTerminalFailure { node_id: u64, error: String },
     Complete(Result<(), String>),
@@ -2593,8 +2459,21 @@ impl<T> ServeClusterLifecycle<T> {
 
     fn apply_message(&mut self, message: ServeClusterMsg) -> ServeClusterEffect {
         match message {
-            ServeClusterMsg::Tick if matches!(self.state, ServeClusterState::Running) => {
-                ServeClusterEffect::Pump
+            ServeClusterMsg::DistributionChanged
+                if !matches!(self.state, ServeClusterState::Finished) =>
+            {
+                ServeClusterEffect::ObserveDistribution
+            }
+            ServeClusterMsg::Report(report) if matches!(self.state, ServeClusterState::Running) => {
+                ServeClusterEffect::Report(report)
+            }
+            ServeClusterMsg::Observation(observation)
+                if !matches!(self.state, ServeClusterState::Finished) =>
+            {
+                ServeClusterEffect::Observation(observation)
+            }
+            ServeClusterMsg::Stdio(line) if !matches!(self.state, ServeClusterState::Finished) => {
+                ServeClusterEffect::Stdio(line)
             }
             ServeClusterMsg::Stop if matches!(self.state, ServeClusterState::Running) => {
                 self.state = ServeClusterState::Flushing;
@@ -2609,19 +2488,16 @@ impl<T> ServeClusterLifecycle<T> {
             {
                 self.complete(Err(error))
             }
-            ServeClusterMsg::FlushTimeout if matches!(self.state, ServeClusterState::Flushing) => {
-                self.complete(Err(
-                    "timed out waiting for shutdown persistence flush".to_owned()
-                ))
-            }
             ServeClusterMsg::Abort(error) if !matches!(self.state, ServeClusterState::Finished) => {
                 self.complete(Err(error))
             }
-            ServeClusterMsg::Tick
+            ServeClusterMsg::DistributionChanged
+            | ServeClusterMsg::Report(_)
+            | ServeClusterMsg::Observation(_)
+            | ServeClusterMsg::Stdio(_)
             | ServeClusterMsg::Stop
             | ServeClusterMsg::Flushed
             | ServeClusterMsg::FlushFailed(_)
-            | ServeClusterMsg::FlushTimeout
             | ServeClusterMsg::Abort(_) => ServeClusterEffect::None,
         }
     }
@@ -2721,6 +2597,7 @@ impl ActorInterface for StopSignalActor {
 }
 
 fn spawn_stop_listener(
+    blocking: &BlockingWorkSender,
     runtime: &Runtime,
     external: Option<mpsc::Receiver<()>>,
     serve_actor: ActorAddress,
@@ -2733,12 +2610,12 @@ fn spawn_stop_listener(
         .map_err(|error| format!("spawn stop signal actor: {error}"))?;
     let sender = runtime.create_sender();
     if let Some(external) = external {
-        swactor_process::spawn_stop_channel_wait(external, sender, actor);
+        swactor_process::spawn_stop_channel_wait(blocking, external, sender, actor);
         return Ok(());
     }
 
     #[cfg(target_os = "linux")]
-    swactor_process::spawn_os_stop_signal_wait(sender, actor)
+    swactor_process::spawn_os_stop_signal_wait(blocking, sender, actor)
         .map_err(|error| format!("install orchestrator stop signal handler: {error}"))?;
     Ok(())
 }
@@ -2754,13 +2631,12 @@ fn serve_cluster_flush_reply(reply: ManualControlReply) -> Option<ServeClusterMs
         ManualControlReply::Rejected(error) => Some(ServeClusterMsg::FlushFailed(format!(
             "shutdown persistence flush rejected: {error}"
         ))),
-        ManualControlReply::TimedOut => Some(ServeClusterMsg::FlushTimeout),
         ManualControlReply::Accepted(_)
         | ManualControlReply::Provider(_)
         | ManualControlReply::Status(_)
         | ManualControlReply::FleetStatus(_)
         | ManualControlReply::Offers(_)
-        | ManualControlReply::Rejoined(_) => None,
+        | ManualControlReply::RejoinResolved { .. } => None,
     }
 }
 
@@ -2777,19 +2653,20 @@ impl ActorInterface for ManualFlushForwarder {
 }
 
 struct ServeClusterActor {
-    driver: IrohDriver,
+    peers: iroh_driver::PeerConnector,
     stack: DistributionRuntimeStack,
-    obs_rx: mpsc::Receiver<PluginObservation>,
-    collector: FrameCollector,
-    orchestrator_reports: Inbox<OrchestratorReport>,
+    ingress: ServeClusterIngress,
+    _distribution_wake: Arc<dyn Fn() + Send + Sync>,
+    _connection_watch: iroh_driver::ConnectionWatch,
+    orchestrator_report_actor: ActorAddress,
     dashboard: Option<DashboardSupport>,
     orch_telemetry: OrchTelemetry,
-    orch_stdio_rx: Option<mpsc::Receiver<OrchStdioLine>>,
+    orch_stdio_actor: Option<ActorAddress>,
+    hardware_samples: tokio::sync::mpsc::Sender<()>,
     run_id: u64,
     orchestrator_node_id: u64,
     provider: ProviderKind,
     orchestrator_actor: ActorAddress,
-    engine: EngineHandle,
     sender: ExternalSender,
     lifecycle: ServeClusterLifecycle<RuntimeReady>,
     flush_reply_actor: Option<ActorAddress>,
@@ -2798,7 +2675,7 @@ struct ServeClusterActor {
     requires_deployment_receipt: bool,
     pending_undispatched_readies:
         BTreeMap<(u64, Option<String>, Option<String>, u64), OrchestratorReport>,
-    completion: ActorCompletion<Result<(), String>>,
+    completion: Option<ActorCompletion<Result<(), String>>>,
 }
 
 fn daemon_label(config: &Config) -> String {
@@ -2848,7 +2725,6 @@ impl ServeClusterActor {
                         deferred_report,
                     );
                     self.orch_telemetry.emit_bootstrap(
-                        self.dashboard.as_ref(),
                         self.run_id,
                         node_id,
                         "runtime_ready",
@@ -2864,14 +2740,7 @@ impl ServeClusterActor {
                     &artifact_digest,
                     &deployment_generation,
                 ) {
-                    self.orch_telemetry.emit_bootstrap(
-                        self.dashboard.as_ref(),
-                        self.run_id,
-                        node_id,
-                        "runtime_ready",
-                        "rejected",
-                        json!({"reason":"runtime identity does not match validated deployment receipt"}),
-                    );
+                    self.orch_telemetry.emit_bootstrap(self.run_id, node_id, "runtime_ready", "rejected", json!({"reason":"runtime identity does not match validated deployment receipt"}));
                     return;
                 }
                 let ready = RuntimeReady {
@@ -2906,15 +2775,11 @@ impl ServeClusterActor {
                     self.lifecycle
                         .track_runtime_ready(node_id, readiness_id, ready.clone());
                 if tracked {
-                    self.driver.join(std::slice::from_ref(&endpoint));
+                    self.peers.connect(endpoint.clone());
                     self.connect_ready_peer_mesh(node_id, &ready);
-                    self.collector.subscribe_node(
-                        &self.engine,
-                        self.driver.endpoint(),
-                        endpoint,
-                        run_id,
-                        node_id,
-                    );
+                    if let Some(dashboard) = &self.dashboard {
+                        dashboard.subscribe_node(endpoint, run_id, node_id);
+                    }
                 }
             }
             OrchestratorReport::NodeRuntimeReadyAck {
@@ -2974,133 +2839,91 @@ impl ServeClusterActor {
         self.ready_peers.insert(node_id, ready.clone());
     }
 
-    fn drain_observations(&mut self) {
-        loop {
-            let observation = match self.obs_rx.try_recv() {
-                Ok(observation) => observation,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let _ = self.lifecycle.plugin_observation(None);
-                    break;
+    fn observe_plugin(&mut self, observation: PluginObservation) {
+        let mut deferred_ready = None;
+        match &observation {
+            PluginObservation::PhaseChanged {
+                run_id,
+                node_id,
+                phase: ProvisionEventKind::NodeStopped,
+            }
+            | PluginObservation::Exited {
+                run_id, node_id, ..
+            }
+            | PluginObservation::Failed {
+                run_id, node_id, ..
+            } if *run_id == self.run_id => {
+                if let Some(dashboard) = &self.dashboard {
+                    dashboard.unsubscribe_node(*run_id, *node_id);
                 }
-            };
-            let mut deferred_ready = None;
-            match &observation {
-                PluginObservation::Exited {
-                    run_id, node_id, ..
-                }
-                | PluginObservation::Failed {
-                    run_id, node_id, ..
-                } if *run_id == self.run_id => {
-                    self.collector.unsubscribe_node(*run_id, *node_id);
+                self.lifecycle.remove_runtime_ready(*node_id);
+                self.ready_peers.remove(node_id);
+                self.dispatched_deployments.remove(node_id);
+                self.pending_undispatched_readies
+                    .retain(|(pending_node, _, _, _), _| pending_node != node_id);
+            }
+            PluginObservation::ProviderLine {
+                run_id,
+                node_id,
+                line,
+            } if *run_id == self.run_id => {
+                if let Some(identity) = deployment_dispatch_identity(line, *node_id) {
+                    let key = (
+                        *node_id,
+                        Some(identity.0.clone()),
+                        Some(identity.1.clone()),
+                        identity.2,
+                    );
                     self.lifecycle.remove_runtime_ready(*node_id);
                     self.ready_peers.remove(node_id);
-                    self.dispatched_deployments.remove(node_id);
+                    if let Some(dashboard) = &self.dashboard {
+                        dashboard.unsubscribe_node(*run_id, *node_id);
+                    }
+                    self.dispatched_deployments.insert(*node_id, identity);
+                    deferred_ready = self.pending_undispatched_readies.remove(&key);
                     self.pending_undispatched_readies
                         .retain(|(pending_node, _, _, _), _| pending_node != node_id);
                 }
-                PluginObservation::ProviderLine {
-                    run_id,
-                    node_id,
-                    line,
-                } if *run_id == self.run_id => {
-                    if let Some(identity) = deployment_dispatch_identity(line, *node_id) {
-                        let key = (
-                            *node_id,
-                            Some(identity.0.clone()),
-                            Some(identity.1.clone()),
-                            identity.2,
-                        );
-                        self.lifecycle.remove_runtime_ready(*node_id);
-                        self.ready_peers.remove(node_id);
-                        self.collector.unsubscribe_node(*run_id, *node_id);
-                        self.dispatched_deployments.insert(*node_id, identity);
-                        deferred_ready = self.pending_undispatched_readies.remove(&key);
-                        self.pending_undispatched_readies
-                            .retain(|(pending_node, _, _, _), _| pending_node != node_id);
-                    }
-                }
-                _ => {}
             }
-            emit_plugin_observation(
-                &mut self.orch_telemetry,
-                self.dashboard.as_ref(),
-                &self.provider,
-                &observation,
+            _ => {}
+        }
+        emit_plugin_observation(&mut self.orch_telemetry, &self.provider, &observation);
+        let terminal = match observation {
+            PluginObservation::Exited {
+                node_id, status, ..
+            } => Some((
+                node_id,
+                format!("provider process exited with status {status:?}"),
+            )),
+            PluginObservation::Failed {
+                node_id, reason, ..
+            } => Some((node_id, reason)),
+            _ => None,
+        };
+        if let ServeClusterEffect::ProviderTerminalFailure { node_id, error } =
+            self.lifecycle.plugin_observation(terminal)
+        {
+            let _ = self.stack.runtime.send_to(
+                self.orchestrator_actor,
+                OrchestratorMsg::Manual(ManualControlMsg::ProviderTerminalFailure {
+                    node_id,
+                    error,
+                }),
             );
-            let terminal = match observation {
-                PluginObservation::Exited {
-                    node_id, status, ..
-                } => Some((
-                    node_id,
-                    format!("provider process exited with status {status:?}"),
-                )),
-                PluginObservation::Failed {
-                    node_id, reason, ..
-                } => Some((node_id, reason)),
-                _ => None,
-            };
-            if let ServeClusterEffect::ProviderTerminalFailure { node_id, error } =
-                self.lifecycle.plugin_observation(terminal)
-            {
-                let _ = self.stack.runtime.send_to(
-                    self.orchestrator_actor,
-                    OrchestratorMsg::Manual(ManualControlMsg::ProviderTerminalFailure {
-                        node_id,
-                        error,
-                    }),
-                );
-            }
-            if let Some(report) = deferred_ready {
-                self.observe_report(report);
-            }
+        }
+        if let Some(report) = deferred_ready {
+            self.observe_report(report);
         }
     }
 
-    fn pump_once(&mut self) {
-        self.collector.pump(&self.driver);
-        let dashboard = self.dashboard.as_ref();
-        let telemetry = &mut self.orch_telemetry;
-        self.collector
-            .drain(|stream, descriptor, channel, content, frame| {
-                if let Some(dashboard) = dashboard {
-                    dashboard.publish_frame(stream, descriptor, channel, content, frame);
-                }
-                telemetry.archive_frame("node", stream, channel, content, frame);
-            });
-        self.orch_telemetry
-            .flush(self.dashboard.as_ref(), "orchestrator");
-        self.drain_observations();
-        while let Some(report) = self.orchestrator_reports.try_recv() {
-            self.observe_report(report);
-        }
-        self.lifecycle
-            .advance_join_barriers(&self.stack, self.orchestrator_actor);
-        emit_swim_transitions(
+    fn observe_distribution(&mut self) {
+        emit_membership_transitions(
             &mut self.orch_telemetry,
-            self.dashboard.as_ref(),
             self.run_id,
             self.orchestrator_node_id,
             &self.stack,
         );
-        emit_swim_probe_events(
-            &mut self.orch_telemetry,
-            self.dashboard.as_ref(),
-            &self.stack,
-            "daemon_monitor",
-        );
-        drain_orch_stdio_capture(
-            self.orch_stdio_rx.as_ref(),
-            &mut self.orch_telemetry,
-            self.dashboard.as_ref(),
-        );
-        self.orch_telemetry
-            .flush(self.dashboard.as_ref(), "orchestrator");
-    }
-
-    fn schedule(&self, ctx: &Ctx, delay: Duration, message: ServeClusterMsg) {
-        self.engine
-            .send_after(delay, self.sender.clone(), ctx.self_addr(), message);
+        self.orch_telemetry.flush();
     }
 
     fn begin_flush(&mut self, ctx: &Ctx) -> Result<(), String> {
@@ -3122,17 +2945,23 @@ impl ServeClusterActor {
             return Err(format!("request shutdown persistence flush: {error}"));
         }
         self.flush_reply_actor = Some(reply_actor);
-        self.schedule(ctx, SHUTDOWN_FLUSH_TIMEOUT, ServeClusterMsg::FlushTimeout);
         Ok(())
     }
 
     fn finish(&mut self, ctx: &Ctx, result: Result<(), String>) {
+        self.ingress.close();
+        let _ = self
+            .stack
+            .runtime
+            .stop_actor(self.orchestrator_report_actor);
+        if let Some(actor) = self.orch_stdio_actor.take() {
+            let _ = self.stack.runtime.stop_actor(actor);
+        }
         if let Some(reply_actor) = self.flush_reply_actor.take() {
             let _ = self.stack.runtime.stop_actor(reply_actor);
         }
         if let Err(error) = &result {
             self.orch_telemetry.emit_bootstrap(
-                self.dashboard.as_ref(),
                 self.run_id,
                 self.orchestrator_node_id,
                 "serve_cluster",
@@ -3141,7 +2970,11 @@ impl ServeClusterActor {
             );
         }
         assert!(
-            self.completion.complete(result).is_ok(),
+            self.completion
+                .take()
+                .expect("daemon lifecycle completion owner")
+                .complete(result)
+                .is_ok(),
             "daemon lifecycle completed twice"
         );
         ctx.stop_self();
@@ -3153,16 +2986,45 @@ impl ActorInterface for ServeClusterActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        let _ = ctx.send(ctx.self_addr(), ServeClusterMsg::Tick);
+        ctx.watch(self.orchestrator_actor);
+        if !self.stack.runtime.is_local_actor(self.orchestrator_actor) {
+            self.handle(
+                ctx,
+                ServeClusterMsg::Abort("orchestrator actor is unavailable".to_owned()),
+            );
+        }
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx, exited: ActorExited) {
+        if exited.addr == self.orchestrator_actor {
+            self.handle(
+                ctx,
+                ServeClusterMsg::Abort(format!("orchestrator actor exited: {:?}", exited.reason)),
+            );
+        }
     }
 
     fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
+        if matches!(
+            &message,
+            ServeClusterMsg::Report(_)
+                | ServeClusterMsg::Observation(
+                    PluginObservation::PhaseChanged { .. }
+                        | PluginObservation::Exited { .. }
+                        | PluginObservation::Failed { .. }
+                )
+        ) {
+            let _ = self.hardware_samples.try_send(());
+        }
         let effect = self.lifecycle.apply_message(message);
         match effect {
             ServeClusterEffect::None => {}
-            ServeClusterEffect::Pump => {
-                self.pump_once();
-                self.schedule(ctx, PUMP_INTERVAL, ServeClusterMsg::Tick);
+            ServeClusterEffect::ObserveDistribution => self.observe_distribution(),
+            ServeClusterEffect::Report(report) => self.observe_report(report),
+            ServeClusterEffect::Observation(observation) => self.observe_plugin(observation),
+            ServeClusterEffect::Stdio(line) => {
+                self.orch_telemetry
+                    .emit_orchestrator_log(line.stream, line.line);
             }
             ServeClusterEffect::BeginFlush => {
                 if let Err(error) = self.begin_flush(ctx) {
@@ -3183,12 +3045,36 @@ impl ActorInterface for ServeClusterActor {
             }
             ServeClusterEffect::Complete(result) => self.finish(ctx, result),
         }
+        if matches!(self.lifecycle.state, ServeClusterState::Running) {
+            self.lifecycle
+                .advance_join_barriers(&self.stack, self.orchestrator_actor);
+        }
+    }
+}
+
+impl Drop for ServeClusterActor {
+    fn drop(&mut self) {
+        self.ingress.close();
+        if let Some(completion) = self.completion.take() {
+            let _ = self
+                .stack
+                .runtime
+                .stop_actor(self.orchestrator_report_actor);
+            if let Some(actor) = self.orch_stdio_actor.take() {
+                let _ = self.stack.runtime.stop_actor(actor);
+            }
+            if let Some(actor) = self.flush_reply_actor.take() {
+                let _ = self.stack.runtime.stop_actor(actor);
+            }
+            let _ = completion.complete(Err(
+                "daemon lifecycle actor stopped before shutdown completed".to_owned(),
+            ));
+        }
     }
 }
 
 fn emit_plugin_observation(
     orch_telemetry: &mut OrchTelemetry,
-    dashboard: Option<&DashboardSupport>,
     provider: &ProviderKind,
     observation: &PluginObservation,
 ) {
@@ -3197,148 +3083,93 @@ fn emit_plugin_observation(
             run_id,
             node_id,
             line,
-        } => orch_telemetry.emit_log(
-            dashboard,
-            ProvisionLogLine {
-                run_id: *run_id,
-                node_id: *node_id,
-                stream: ProvisionLogStream::Stdout,
-                line: line.clone(),
-            },
-        ),
+        } => orch_telemetry.emit_log(ProvisionLogLine {
+            run_id: *run_id,
+            node_id: *node_id,
+            stream: ProvisionLogStream::Stdout,
+            line: line.clone(),
+        }),
         PluginObservation::StderrLine {
             run_id,
             node_id,
             line,
-        } => orch_telemetry.emit_log(
-            dashboard,
-            ProvisionLogLine {
-                run_id: *run_id,
-                node_id: *node_id,
-                stream: ProvisionLogStream::Stderr,
-                line: line.clone(),
-            },
-        ),
+        } => orch_telemetry.emit_log(ProvisionLogLine {
+            run_id: *run_id,
+            node_id: *node_id,
+            stream: ProvisionLogStream::Stderr,
+            line: line.clone(),
+        }),
         PluginObservation::ProviderLine {
             run_id,
             node_id,
             line,
-        } => orch_telemetry.emit_log(
-            dashboard,
-            ProvisionLogLine {
-                run_id: *run_id,
-                node_id: *node_id,
-                stream: ProvisionLogStream::Provider,
-                line: line.clone(),
-            },
-        ),
+        } => orch_telemetry.emit_log(ProvisionLogLine {
+            run_id: *run_id,
+            node_id: *node_id,
+            stream: ProvisionLogStream::Provider,
+            line: line.clone(),
+        }),
         PluginObservation::PhaseChanged {
             run_id,
             node_id,
             phase,
-        } => orch_telemetry.emit_event(
-            dashboard,
-            ProvisionEvent {
-                run_id: *run_id,
-                node_id: *node_id,
-                kind: *phase,
-                provider: Some(provider.as_str().to_owned()),
-                message: None,
-            },
-        ),
+        } => orch_telemetry.emit_event(ProvisionEvent {
+            run_id: *run_id,
+            node_id: *node_id,
+            kind: *phase,
+            provider: Some(provider.as_str().to_owned()),
+            message: None,
+        }),
         PluginObservation::TelemetryFrame {
             channel, payload, ..
-        } => orch_telemetry.emit_bytes_from(
-            dashboard,
-            channel,
-            payload.as_bytes().to_vec(),
-            "node_bootstrap_stdio",
-        ),
+        } => orch_telemetry.emit_bytes(channel, payload.as_bytes().to_vec()),
         PluginObservation::Exited {
             run_id,
             node_id,
             status,
-        } => orch_telemetry.emit_event(
-            dashboard,
-            ProvisionEvent {
-                run_id: *run_id,
-                node_id: *node_id,
-                kind: ProvisionEventKind::NodeStopped,
-                provider: Some(provider.as_str().to_owned()),
-                message: Some(format!("node process exited with {status:?}")),
-            },
-        ),
+        } => orch_telemetry.emit_event(ProvisionEvent {
+            run_id: *run_id,
+            node_id: *node_id,
+            kind: ProvisionEventKind::NodeStopped,
+            provider: Some(provider.as_str().to_owned()),
+            message: Some(format!("node process exited with {status:?}")),
+        }),
         PluginObservation::Failed {
             run_id,
             node_id,
             reason,
-        } => orch_telemetry.emit_event(
-            dashboard,
-            ProvisionEvent {
-                run_id: *run_id,
-                node_id: *node_id,
-                kind: ProvisionEventKind::ProvisionFailed,
-                provider: Some(provider.as_str().to_owned()),
-                message: Some(reason.clone()),
-            },
-        ),
+        } => orch_telemetry.emit_event(ProvisionEvent {
+            run_id: *run_id,
+            node_id: *node_id,
+            kind: ProvisionEventKind::ProvisionFailed,
+            provider: Some(provider.as_str().to_owned()),
+            message: Some(reason.clone()),
+        }),
     }
 }
 
-fn emit_swim_transitions(
+fn emit_membership_transitions(
     orch_telemetry: &mut OrchTelemetry,
-    dashboard: Option<&DashboardSupport>,
     run_id: u64,
     node_id: u64,
     stack: &DistributionRuntimeStack,
-) -> Vec<ObservedTransition> {
-    let transitions = stack.drain_swim_transitions();
-    for transition in &transitions {
-        let peer = format!("{:?}", transition.peer);
-        let from = transition.from.map(|state| format!("{:?}", state));
-        let to = format!("{:?}", transition.to);
-        let member_state = stack
-            .member_state(transition.peer)
-            .map(|state| format!("{:?}", state));
-        let last_ack_age_ms = transition.last_ack_age.map(duration_ms_u64);
-        let consecutive_timeouts = transition.consecutive_timeouts;
-        let recent_probe_targets = stack.swim_recent_probe_targets();
+) {
+    for transition in stack.drain_membership_transitions() {
         orch_telemetry.emit_bootstrap_to_channel(BootstrapEmission {
-            dashboard,
-            channel: MYELIN_SWIM_MEMBERSHIP,
+            channel: MYELIN_MEMBERSHIP,
             run_id,
             node_id,
             phase: "membership_transition",
             status: "observed",
             detail: json!({
-                "peer":peer.clone(),
-                "from":from.clone(),
-                "to":to.clone(),
+                "peer":format!("{:?}", transition.peer),
+                "from":transition.from.map(|state| format!("{:?}", state)),
+                "to":format!("{:?}", transition.to),
                 "reason":transition.reason,
-                "last_ack_age_ms":last_ack_age_ms,
-                "consecutive_timeouts":consecutive_timeouts,
-                "recent_probe_targets":recent_probe_targets.clone(),
-                "member_state":member_state.clone(),
+                "member_state":stack.member_state(transition.peer).map(|state| format!("{:?}", state)),
             }),
         });
-        orch_telemetry.emit_record(dashboard, &stack.membership_transition(transition));
-    }
-    transitions
-}
-
-fn emit_swim_probe_events(
-    orch_telemetry: &mut OrchTelemetry,
-    dashboard: Option<&DashboardSupport>,
-    stack: &DistributionRuntimeStack,
-    local_phase: &str,
-) {
-    for event in stack.drain_swim_probe_events() {
-        let record = stack.swim_probe_event_record(event, local_phase);
-        orch_telemetry.emit_record(dashboard, &record);
-    }
-    if let Some(summary) = stack.drain_swim_probe_summary() {
-        let record = stack.swim_probe_summary_record(summary, local_phase);
-        orch_telemetry.emit_record(dashboard, &record);
+        orch_telemetry.emit_record(&stack.membership_transition(&transition));
     }
 }
 
@@ -3374,7 +3205,7 @@ pub(crate) fn expand_home_path(value: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(trimmed))
 }
 
-pub(crate) fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
+pub fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
     let output = swactor_process::command_output(
         Command::new("ssh-keygen").arg("-y").arg("-f").arg(identity),
     )
@@ -3422,7 +3253,7 @@ pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
         .unwrap_or_else(|| UNAVAILABLE.to_owned())
 }
 
-pub(crate) fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), String> {
+pub fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), String> {
     let client = swactor_vastai::BlockingVastClient::new(swactor_vastai::VastClient::new(api_key))?;
     if account_ssh_keys_output_contains_public_key(&client.account_ssh_keys()?, public_key) {
         return Ok(());
@@ -3568,7 +3399,6 @@ mod serve_cluster_properties {
             phase: NodePhase::Joining,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         });
         let mut core = ManualControl::new(snapshot, ProviderReadiness::ready());
         let mut lifecycle = ServeClusterLifecycle::new();
@@ -3694,24 +3524,18 @@ mod serve_cluster_properties {
 
     #[derive(Clone, Debug)]
     enum LifecycleAction {
-        Tick,
         RuntimeReady { node_id: u8, readiness_id: u8 },
         RuntimeReadyAck { node_id: u8, readiness_id: u8 },
-        PluginObserved { node_id: u8 },
         PluginFailed { node_id: u8, code: u8 },
-        PluginDisconnected,
         Stop,
         ManualFlushed,
         ManualRejected(u8),
-        ManualTimedOut,
-        FlushTimeout,
         Abort(u8),
     }
 
     fn lifecycle_actions() -> impl Strategy<Value = Vec<LifecycleAction>> {
         prop::collection::vec(
             prop_oneof![
-                4 => Just(LifecycleAction::Tick),
                 4 => (0_u8..READY_NODE_DOMAIN, any::<u8>()).prop_map(
                     |(node_id, readiness_id)| LifecycleAction::RuntimeReady {
                         node_id,
@@ -3724,17 +3548,12 @@ mod serve_cluster_properties {
                         readiness_id,
                     }
                 ),
-                3 => (0_u8..READY_NODE_DOMAIN)
-                    .prop_map(|node_id| LifecycleAction::PluginObserved { node_id }),
                 3 => (0_u8..READY_NODE_DOMAIN, any::<u8>()).prop_map(
                     |(node_id, code)| LifecycleAction::PluginFailed { node_id, code }
                 ),
-                2 => Just(LifecycleAction::PluginDisconnected),
                 3 => Just(LifecycleAction::Stop),
                 2 => Just(LifecycleAction::ManualFlushed),
                 2 => any::<u8>().prop_map(LifecycleAction::ManualRejected),
-                2 => Just(LifecycleAction::ManualTimedOut),
-                2 => Just(LifecycleAction::FlushTimeout),
                 2 => any::<u8>().prop_map(LifecycleAction::Abort),
             ],
             0..=32,
@@ -3744,7 +3563,6 @@ mod serve_cluster_properties {
     #[derive(Clone, Debug)]
     enum LifecycleHarnessMsg {
         Action(LifecycleAction),
-        ScheduledFlushTimeout,
         Finalize,
     }
 
@@ -3755,14 +3573,10 @@ mod serve_cluster_properties {
         max_pending_readies: usize,
         completion_results: Vec<Result<(), String>>,
         completion_publication_failures: usize,
-        pumps: usize,
         readies_tracked: usize,
         readies_acknowledged: usize,
         provider_failures: Vec<(u64, String)>,
-        disconnected_observations: usize,
-        manual_replies: Vec<&'static str>,
         flushes_started: usize,
-        flush_timers_scheduled: usize,
     }
 
     impl LifecycleTrace {
@@ -3773,14 +3587,10 @@ mod serve_cluster_properties {
                 max_pending_readies: 0,
                 completion_results: Vec::new(),
                 completion_publication_failures: 0,
-                pumps: 0,
                 readies_tracked: 0,
                 readies_acknowledged: 0,
                 provider_failures: Vec::new(),
-                disconnected_observations: 0,
-                manual_replies: Vec::new(),
                 flushes_started: 0,
-                flush_timers_scheduled: 0,
             }
         }
     }
@@ -3789,8 +3599,6 @@ mod serve_cluster_properties {
         lifecycle: ServeClusterLifecycle<()>,
         completion: ActorCompletion<Result<(), String>>,
         trace: Arc<Mutex<LifecycleTrace>>,
-        engine: EngineHandle,
-        sender: ExternalSender,
     }
 
     impl ServeClusterLifecycleHarness {
@@ -3807,24 +3615,15 @@ mod serve_cluster_properties {
             trace.pending_readies = pending_readies;
         }
 
-        fn apply_effect(&mut self, ctx: &Ctx, effect: ServeClusterEffect) {
+        fn apply_effect(&mut self, effect: ServeClusterEffect) {
             match effect {
-                ServeClusterEffect::None => {}
-                ServeClusterEffect::Pump => {
-                    self.trace.lock().pumps += 1;
-                }
+                ServeClusterEffect::None
+                | ServeClusterEffect::ObserveDistribution
+                | ServeClusterEffect::Report(_)
+                | ServeClusterEffect::Observation(_)
+                | ServeClusterEffect::Stdio(_) => {}
                 ServeClusterEffect::BeginFlush => {
-                    {
-                        let mut trace = self.trace.lock();
-                        trace.flushes_started += 1;
-                        trace.flush_timers_scheduled += 1;
-                    }
-                    self.engine.send_after(
-                        SHUTDOWN_FLUSH_TIMEOUT,
-                        self.sender.clone(),
-                        ctx.self_addr(),
-                        LifecycleHarnessMsg::ScheduledFlushTimeout,
-                    );
+                    self.trace.lock().flushes_started += 1;
                 }
                 ServeClusterEffect::ProviderTerminalFailure { node_id, error } => {
                     self.trace.lock().provider_failures.push((node_id, error));
@@ -3838,9 +3637,8 @@ mod serve_cluster_properties {
             }
         }
 
-        fn apply_action(&mut self, ctx: &Ctx, action: LifecycleAction) {
+        fn apply_action(&mut self, action: LifecycleAction) {
             let effect = match action {
-                LifecycleAction::Tick => self.lifecycle.apply_message(ServeClusterMsg::Tick),
                 LifecycleAction::RuntimeReady {
                     node_id,
                     readiness_id,
@@ -3866,49 +3664,30 @@ mod serve_cluster_properties {
                     }
                     ServeClusterEffect::None
                 }
-                LifecycleAction::PluginObserved { node_id } => {
-                    let _ = node_id;
-                    self.lifecycle.plugin_observation(None)
-                }
                 LifecycleAction::PluginFailed { node_id, code } => {
                     self.lifecycle.plugin_observation(Some((
                         u64::from(node_id),
                         format!("plugin-failed-{code}"),
                     )))
                 }
-                LifecycleAction::PluginDisconnected => {
-                    self.trace.lock().disconnected_observations += 1;
-                    self.lifecycle.plugin_observation(None)
-                }
                 LifecycleAction::Stop => self.lifecycle.apply_message(ServeClusterMsg::Stop),
                 LifecycleAction::ManualFlushed => {
-                    self.trace.lock().manual_replies.push("flushed");
                     let message = serve_cluster_flush_reply(ManualControlReply::Flushed)
                         .expect("flush reply must be forwarded");
                     self.lifecycle.apply_message(message)
                 }
                 LifecycleAction::ManualRejected(code) => {
-                    self.trace.lock().manual_replies.push("rejected");
                     let message = serve_cluster_flush_reply(ManualControlReply::Rejected(format!(
                         "manual-rejected-{code}"
                     )))
                     .expect("rejected flush reply must be forwarded");
                     self.lifecycle.apply_message(message)
                 }
-                LifecycleAction::ManualTimedOut => {
-                    self.trace.lock().manual_replies.push("timed-out");
-                    let message = serve_cluster_flush_reply(ManualControlReply::TimedOut)
-                        .expect("timed-out flush reply must be forwarded");
-                    self.lifecycle.apply_message(message)
-                }
-                LifecycleAction::FlushTimeout => {
-                    self.lifecycle.apply_message(ServeClusterMsg::FlushTimeout)
-                }
                 LifecycleAction::Abort(code) => self
                     .lifecycle
                     .apply_message(ServeClusterMsg::Abort(format!("abort-{code}"))),
             };
-            self.apply_effect(ctx, effect);
+            self.apply_effect(effect);
             self.record_state();
         }
     }
@@ -3919,18 +3698,13 @@ mod serve_cluster_properties {
 
         fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
             match message {
-                LifecycleHarnessMsg::Action(action) => self.apply_action(ctx, action),
-                LifecycleHarnessMsg::ScheduledFlushTimeout => {
-                    let effect = self.lifecycle.apply_message(ServeClusterMsg::FlushTimeout);
-                    self.apply_effect(ctx, effect);
-                    self.record_state();
-                }
+                LifecycleHarnessMsg::Action(action) => self.apply_action(action),
                 LifecycleHarnessMsg::Finalize => {
                     if !matches!(self.lifecycle.state, ServeClusterState::Finished) {
                         let effect = self.lifecycle.apply_message(ServeClusterMsg::Abort(
                             "generated sequence exhausted".to_owned(),
                         ));
-                        self.apply_effect(ctx, effect);
+                        self.apply_effect(effect);
                     }
                     self.record_state();
                     ctx.stop_self();
@@ -3942,10 +3716,10 @@ mod serve_cluster_properties {
     #[derive(Clone, Debug)]
     struct ExpectedLifecycle {
         success: bool,
+        terminal_observed: bool,
         readies_tracked: usize,
         readies_acknowledged: usize,
         provider_failures: usize,
-        manual_replies: usize,
         flushes_started: usize,
     }
 
@@ -3956,12 +3730,10 @@ mod serve_cluster_properties {
         let mut readies_tracked = 0;
         let mut readies_acknowledged = 0;
         let mut provider_failures = 0;
-        let mut manual_replies = 0;
         let mut flushes_started = 0;
 
         for action in actions {
             match action {
-                LifecycleAction::Tick | LifecycleAction::PluginObserved { .. } => {}
                 LifecycleAction::RuntimeReady {
                     node_id,
                     readiness_id,
@@ -3992,55 +3764,41 @@ mod serve_cluster_properties {
                 {
                     provider_failures += 1;
                 }
-                LifecycleAction::PluginDisconnected
-                | LifecycleAction::PluginFailed { .. }
-                | LifecycleAction::RuntimeReady { .. } => {}
+                LifecycleAction::PluginFailed { .. } | LifecycleAction::RuntimeReady { .. } => {}
                 LifecycleAction::Stop if matches!(state, ServeClusterState::Running) => {
                     state = ServeClusterState::Flushing;
                     pending_readies.clear();
                     flushes_started += 1;
                 }
                 LifecycleAction::ManualFlushed => {
-                    manual_replies += 1;
                     if matches!(state, ServeClusterState::Flushing) {
                         state = ServeClusterState::Finished;
                         pending_readies.clear();
                         result = Some(true);
                     }
                 }
-                LifecycleAction::ManualRejected(_) | LifecycleAction::ManualTimedOut => {
-                    manual_replies += 1;
+                LifecycleAction::ManualRejected(_) => {
                     if matches!(state, ServeClusterState::Flushing) {
                         state = ServeClusterState::Finished;
                         pending_readies.clear();
                         result = Some(false);
                     }
                 }
-                LifecycleAction::FlushTimeout if matches!(state, ServeClusterState::Flushing) => {
-                    state = ServeClusterState::Finished;
-                    pending_readies.clear();
-                    result = Some(false);
-                }
                 LifecycleAction::Abort(_) if !matches!(state, ServeClusterState::Finished) => {
                     state = ServeClusterState::Finished;
                     pending_readies.clear();
                     result = Some(false);
                 }
-                LifecycleAction::Stop
-                | LifecycleAction::FlushTimeout
-                | LifecycleAction::Abort(_) => {}
+                LifecycleAction::Stop | LifecycleAction::Abort(_) => {}
             }
         }
 
-        if matches!(state, ServeClusterState::Flushing) {
-            result = Some(false);
-        }
         ExpectedLifecycle {
             success: result.unwrap_or(false),
+            terminal_observed: result.is_some(),
             readies_tracked,
             readies_acknowledged,
             provider_failures,
-            manual_replies,
             flushes_started,
         }
     }
@@ -4164,19 +3922,10 @@ mod serve_cluster_properties {
                 trace.provider_failures, expected.provider_failures
             ));
         }
-        if trace.manual_replies.len() != expected.manual_replies {
+        if trace.flushes_started != expected.flushes_started || trace.flushes_started > 1 {
             errors.push(format!(
-                "manual reply evidence mismatch: observed={:?} expected_count={}",
-                trace.manual_replies, expected.manual_replies
-            ));
-        }
-        if trace.flushes_started != expected.flushes_started
-            || trace.flush_timers_scheduled != trace.flushes_started
-            || trace.flushes_started > 1
-        {
-            errors.push(format!(
-                "flush state was not bounded: starts={} timers={} expected_starts={}",
-                trace.flushes_started, trace.flush_timers_scheduled, expected.flushes_started
+                "flush state was not bounded: starts={} expected_starts={}",
+                trace.flushes_started, expected.flushes_started
             ));
         }
         if resources.peak_actors > resources.baseline_actors.saturating_add(1) {
@@ -4191,7 +3940,7 @@ mod serve_cluster_properties {
                 resources.baseline_actors, resources.final_actors
             ));
         }
-        if resources.peak_tasks > resources.baseline_tasks.saturating_add(1) {
+        if resources.peak_tasks > resources.baseline_tasks {
             errors.push(format!(
                 "pending tasks were unbounded: baseline={} peak={}",
                 resources.baseline_tasks, resources.peak_tasks
@@ -4235,7 +3984,7 @@ mod serve_cluster_properties {
             });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
-            let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
+            let _engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
             let baseline_actors = runtime.stats().actors.len();
             let baseline_tasks = backend.pending_task_count();
             let completion = ActorCompletion::new();
@@ -4245,24 +3994,25 @@ mod serve_cluster_properties {
                     lifecycle: ServeClusterLifecycle::new(),
                     completion: completion.clone(),
                     trace: Arc::clone(&trace),
-                    engine: engine.handle(),
-                    sender: runtime.create_sender(),
                 })
                 .expect("spawn production lifecycle transition harness");
             let mut resources = LifecycleResources::new(baseline_actors, baseline_tasks);
             resources.observe(&runtime, &backend);
 
-            for action in &actions {
+            for (index, action) in actions.iter().enumerate() {
                 runtime
                     .send_to(actor, LifecycleHarnessMsg::Action(action.clone()))
                     .expect("queue generated serve-cluster action");
                 drive_steps(&backend, STEPS_PER_ACTION);
                 resources.observe(&runtime, &backend);
+                let expected = expected_lifecycle(&actions[..=index]);
+                prop_assert_eq!(
+                    !trace.lock().completion_results.is_empty(),
+                    expected.terminal_observed,
+                    "completion occurred without a terminal ingress event",
+                );
             }
 
-            backend.advance_time(SHUTDOWN_FLUSH_TIMEOUT);
-            drive_steps(&backend, FINAL_STEPS);
-            resources.observe(&runtime, &backend);
             runtime
                 .send_to(actor, LifecycleHarnessMsg::Finalize)
                 .expect("queue serve-cluster lifecycle finalizer");
@@ -4287,58 +4037,10 @@ mod serve_cluster_properties {
             );
         }
     }
-
-    #[test]
-    fn serve_cluster_lifecycle_invariants_reject_injected_duplicate_and_growth() {
-        let mut trace = LifecycleTrace::new();
-        trace.state = ServeClusterState::Finished;
-        trace.completion_results = vec![
-            Err("injected-first".to_owned()),
-            Err("injected-duplicate".to_owned()),
-        ];
-        trace.completion_publication_failures = 1;
-        let expected = ExpectedLifecycle {
-            success: false,
-            readies_tracked: 0,
-            readies_acknowledged: 0,
-            provider_failures: 0,
-            manual_replies: 0,
-            flushes_started: 0,
-        };
-        let resources = LifecycleResources {
-            baseline_actors: 3,
-            peak_actors: 5,
-            final_actors: 3,
-            baseline_tasks: 0,
-            peak_tasks: 0,
-            final_tasks: 0,
-            poisoned_actors: 0,
-            worker_panics: 0,
-            mailbox_depth: 0,
-        };
-        let published_result = Some(Err("injected-first".to_owned()));
-
-        let errors = lifecycle_invariant_errors(&trace, &resources, &expected, &published_result);
-        assert!(
-            errors.iter().any(|error| error.contains("one completion"))
-                && errors
-                    .iter()
-                    .any(|error| error.contains("per-event actor growth")),
-            "controlled defects were not rejected by property invariants: {errors:#?}"
-        );
-    }
 }
 
 #[cfg(test)]
 mod lifecycle_policy_tests {
-    use super::{
-        ActorAddress, ConfigBuilder, EndpointAddr, VastAiProvisioningMode,
-        reconcile_active_deployment_intent,
-    };
-    use crate::orchestration::daemon::{ClusterSnapshot, RuntimeFacts, SnapshotNode};
-    use crate::orchestration::manual_control::NodePhase;
-    use crate::provisioning::DeploymentIdentity;
-    use distribution::types::NodeId as DistNodeId;
 
     #[test]
     fn deployment_receipt_rejects_readiness_from_an_earlier_launch() {
@@ -4386,182 +4088,5 @@ mod lifecycle_policy_tests {
             &artifact,
             &generation,
         ));
-    }
-    #[test]
-    fn vastai_mock_mode_needs_no_ssh_or_bootstrap_configuration() {
-        let mut config = ConfigBuilder::hardcoded_defaults()
-            .overlay_cli([
-                "--provider".to_owned(),
-                "vastai".to_owned(),
-                "--vastai-provisioning".to_owned(),
-                "mock".to_owned(),
-            ])
-            .unwrap()
-            .finalize()
-            .unwrap();
-
-        config.prepare_vastai_ssh_key().unwrap();
-        let vastai = config.vastai.as_ref().unwrap();
-        assert_eq!(vastai.provisioning_mode, VastAiProvisioningMode::Mock);
-        assert!(vastai.ssh_identity.is_none());
-        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[7; 32]).public());
-        let spec = config
-            .node_spec_for_stage(coordinator, ActorAddress::default(), 1, 0)
-            .unwrap();
-        assert_eq!(spec.args, [crate::ORCHESTRATOR_WORKER_MODE_ARG]);
-        let attempt_id = spec.attempt_id.to_string();
-        assert_eq!(
-            spec.env.iter().find_map(
-                |(key, value)| (key == "MYELIN_NODE_ATTEMPT_ID").then_some(value.as_str())
-            ),
-            Some(attempt_id.as_str()),
-        );
-        assert_eq!(
-            spec.env
-                .iter()
-                .find_map(|(key, value)| (key == "MYELIN_DOCKER_GPUS").then_some(value.as_str())),
-            Some("all"),
-        );
-        assert!(vastai.bootstrap_command.is_none());
-    }
-
-    #[test]
-    fn vastai_real_specs_do_not_persist_orchestrator_routing() {
-        let mut config = ConfigBuilder::hardcoded_defaults()
-            .overlay_cli([
-                "--provider".to_owned(),
-                "vastai".to_owned(),
-                "--vastai-provisioning".to_owned(),
-                "mock".to_owned(),
-            ])
-            .unwrap()
-            .finalize()
-            .unwrap();
-        let vastai = config.vastai.as_mut().unwrap();
-        vastai.provisioning_mode = VastAiProvisioningMode::Real;
-        vastai.bootstrap_command = Some("exec /usr/local/bin/myelin-node".to_owned());
-        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[8; 32]).public());
-
-        let spec = config
-            .node_spec_for_stage(coordinator, ActorAddress::default(), 1, 0)
-            .unwrap();
-
-        assert!(spec.env.iter().all(|(key, _)| {
-            key != "MYELIN_COORDINATOR_ENDPOINT" && key != "MYELIN_ORCHESTRATOR_ACTOR"
-        }));
-    }
-
-    #[test]
-    fn vastai_mock_alias_selects_docker_backed_mock_mode() {
-        let config = ConfigBuilder::hardcoded_defaults()
-            .overlay_cli([
-                "--provider".to_owned(),
-                "vastai".to_owned(),
-                "--vastai-provisioning-mock".to_owned(),
-                "--gpus".to_owned(),
-                "device=0".to_owned(),
-            ])
-            .unwrap()
-            .finalize()
-            .unwrap();
-
-        assert_eq!(
-            config.vastai.as_ref().unwrap().provisioning_mode,
-            VastAiProvisioningMode::Mock
-        );
-        assert_eq!(
-            config.extra_worker_env().iter().find_map(|(key, value)| {
-                (key == "MYELIN_DOCKER_GPUS").then_some(value.as_str())
-            }),
-            Some("device=0"),
-        );
-    }
-
-    #[test]
-    fn vastai_provisioning_mode_rejects_unknown_values() {
-        let error = ConfigBuilder::hardcoded_defaults()
-            .overlay_cli([
-                "--provider".to_owned(),
-                "vastai".to_owned(),
-                "--vastai-provisioning".to_owned(),
-                "imaginary".to_owned(),
-            ])
-            .err()
-            .unwrap();
-        assert!(error.contains("imaginary"));
-        assert!(error.contains("mock"));
-    }
-
-    #[test]
-    fn active_bundle_replaces_stale_recovery_intent_and_runtime() {
-        let config = ConfigBuilder::hardcoded_defaults().finalize().unwrap();
-        let endpoint = EndpointAddr::new(iroh::SecretKey::from_bytes(&[6; 32]).public());
-        let mut spec = config
-            .node_spec_for_stage(endpoint, ActorAddress::default(), 1, 0)
-            .unwrap();
-        let stale = DeploymentIdentity {
-            artifact_digest: "sha256:stale".to_owned(),
-            deployment_generation: "deploy-a".to_owned(),
-        };
-        spec.deployment = Some(stale.clone());
-        spec.env.push((
-            "MYELIN_ARTIFACT_DIGEST".to_owned(),
-            stale.artifact_digest.clone(),
-        ));
-        spec.env.push((
-            "MYELIN_DEPLOYMENT_GENERATION".to_owned(),
-            stale.deployment_generation.clone(),
-        ));
-        let mut snapshot = ClusterSnapshot::fresh(7, "test");
-        snapshot.nodes.push(SnapshotNode {
-            logical_node_id: 1,
-            spec: Some(spec),
-            selected_offer_id: None,
-            provider_ref: Some("static-ssh:slot-0".to_owned()),
-            phase: NodePhase::Running,
-            runtime: Some(RuntimeFacts {
-                run_id: 7,
-                attempt_id: 0,
-                endpoint: "endpoint".to_owned(),
-                node_actor: ActorAddress::default(),
-                swim_node_id: DistNodeId([1; 32]),
-                stage_index: 0,
-                readiness_id: 0,
-                artifact_digest: Some(stale.artifact_digest),
-                deployment_generation: Some(stale.deployment_generation),
-            }),
-            last_error: None,
-            last_seen_unix_ms: 0,
-        });
-        let active = DeploymentIdentity {
-            artifact_digest: "sha256:active".to_owned(),
-            deployment_generation: "deploy-b".to_owned(),
-        };
-
-        assert_eq!(
-            reconcile_active_deployment_intent(&mut snapshot, Some(&active)),
-            [1]
-        );
-        let node = &snapshot.nodes[0];
-        assert_eq!(
-            node.spec.as_ref().unwrap().deployment.as_ref(),
-            Some(&active)
-        );
-        assert!(node.runtime.is_none());
-        assert_eq!(node.phase, NodePhase::Bootstrapping);
-        assert_eq!(
-            node.spec
-                .as_ref()
-                .unwrap()
-                .env
-                .iter()
-                .filter(|(key, value)| {
-                    (key == "MYELIN_ARTIFACT_DIGEST" && value == &active.artifact_digest)
-                        || (key == "MYELIN_DEPLOYMENT_GENERATION"
-                            && value == &active.deployment_generation)
-                })
-                .count(),
-            2
-        );
     }
 }

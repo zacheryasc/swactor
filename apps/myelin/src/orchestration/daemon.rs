@@ -10,7 +10,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::orchestration::manual_control::{CommandKind, CommandRecord, CommandState, NodePhase};
 use crate::provisioning::{DeploymentIdentity, NodeProvisionSpec};
@@ -37,7 +36,6 @@ struct LegacySnapshotNode {
     provider_ref: Option<String>,
     status: LegacyNodeStatus,
     runtime: Option<RuntimeFacts>,
-    last_seen_unix_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -105,7 +103,6 @@ pub(crate) struct SnapshotNode {
     pub runtime: Option<RuntimeFacts>,
     #[serde(default)]
     pub last_error: Option<String>,
-    pub last_seen_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,6 +188,26 @@ impl StateDir {
     }
     pub(crate) fn process_registry_path(&self) -> PathBuf {
         self.root.join("process-nodes.json")
+    }
+
+    /// Allocate a durable controller incarnation, independent of wall time.
+    pub(crate) fn allocate_control_generation(&self) -> Result<u64, String> {
+        fs::create_dir_all(&self.root)
+            .map_err(|error| format!("create state dir {}: {error}", self.root.display()))?;
+        let path = self.root.join("control-generation");
+        let previous = match fs::read_to_string(&path) {
+            Ok(value) => value
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| format!("parse {}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
+        let generation = previous
+            .checked_add(1)
+            .ok_or_else(|| "controller generation exhausted".to_owned())?;
+        write_atomic(&path, generation.to_string().as_bytes())?;
+        Ok(generation)
     }
 
     /// Loads the persisted iroh secret key, creating it on first boot. The
@@ -407,7 +424,6 @@ fn migrate_v1(legacy: LegacyClusterSnapshot) -> ClusterSnapshot {
                 },
                 runtime,
                 last_error: None,
-                last_seen_unix_ms: legacy_node.last_seen_unix_ms,
             }
         })
         .collect();
@@ -428,13 +444,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         format!("persist {}: {error}", path.display())
     })
-}
-
-pub(crate) fn unix_ms_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -534,7 +543,6 @@ mod tests {
             phase: NodePhase::Running,
             runtime: None,
             last_error: None,
-            last_seen_unix_ms: 0,
         });
         state.save_snapshot(&active).unwrap();
 

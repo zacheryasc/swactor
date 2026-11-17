@@ -3,29 +3,25 @@
 //! Verifies the real process-local execution composition for one Myelin node:
 //! a swactor `Engine` over a Tokio substrate owns the core runtime and drives
 //! it; the production distribution runtime/actors are constructed on that
-//! engine; a real `IrohDriver` is bound through `EngineHandle` with
-//! relay-disabled networking; actor-bridge and protocol-ticker progression are
+//! engine; a real `IrohDriver` receives explicit task authority with
+//! relay-disabled networking; transport-observed actor-bridge progression is
 //! installed on that same engine; and observable actor progress happens with no
 //! ambient Tokio runtime and no application call to `tick`, `try_tick`,
 //! `has_work`, or a manual network pump.
 //!
 //! The composition shares the production wiring (`DistributionRuntimeStack` +
-//! `IrohDriver`); it does not duplicate a fake version of it. The only blocking
-//! here is test-side observation polling — never engine work.
+//! `IrohDriver`); it does not duplicate a fake version of it. Observations await
+//! inbox notifications and actual HTTP listener readiness.
 
-use std::time::{Duration, Instant};
-use swactor::actor::{ActorAddress, ActorInterface, Ctx, Message};
-use swactor::runtime::Inbox;
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+use swactor::runtime::RuntimeParts;
+use swactor_engine::{Engine, EngineHandle, TaskSpawner, TokioBackend, TokioConfig};
 
 use distribution::node::DistributedNodeConfig;
 use iroh::RelayMode;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
-
-const PROBE_TICK: Duration = Duration::from_millis(10);
-const PROBE_DEADLINE: Duration = Duration::from_secs(8);
 
 // ── Local probe actor ──────────────────────────────────────────────────────
 
@@ -51,74 +47,62 @@ impl ActorInterface for EchoProbe {
 
 /// Build the production composition for one node, mirroring the node boot
 /// sequence: build the core runtime → the engine owns and drives it → the iroh
-/// driver is bound through the engine handle → the distribution stack is built
-/// on the same runtime → actor bridge, protocol ticker, and adapter pump are
-/// installed on that one engine.
-fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
+/// driver receives task authority → the distribution stack is built
+/// on the same runtime → the actor bridge is installed on that one engine.
+fn prepare_composition() -> (
+    RuntimeParts,
+    impl FnOnce(TaskSpawner, EngineHandle) -> (IrohDriver, DistributionRuntimeStack),
+) {
     let (parts, runtime, codec, transport_router) =
         DistributionRuntimeStack::build_runtime(|_| {}, None);
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig::default()).expect("build tokio backend"),
-    )
-    .expect("build engine");
+    (parts, move |tasks, engine| {
+        let mut driver = IrohDriver::with_engine(
+            tasks,
+            engine.clone(),
+            IrohDriverConfig {
+                secret_key: None,
+                relay_mode: RelayMode::Disabled,
+                bind_port: None,
+                node: DistributedNodeConfig::default(),
+                peer_auth: None,
+                additional_alpns: vec![],
+            },
+        )
+        .expect("build iroh driver with task capability");
 
-    let mut driver = IrohDriver::with_engine(
-        engine.handle(),
-        IrohDriverConfig {
-            secret_key: None,
-            relay_mode: RelayMode::Disabled,
-            bind_port: None,
-            node: DistributedNodeConfig::default(),
-            peer_auth: None,
-            additional_alpns: vec![],
-        },
-    )
-    .expect("build iroh driver with engine handle");
+        let stack = DistributionRuntimeStack::new_from_runtime(
+            runtime.clone(),
+            codec,
+            transport_router,
+            driver.node_id(),
+            DistributedNodeConfig::default(),
+            engine,
+        );
 
-    let stack = DistributionRuntimeStack::new_from_runtime(
-        runtime.clone(),
-        codec,
-        transport_router,
-        driver.node_id(),
-        DistributedNodeConfig::default(),
-        engine.handle(),
-    );
+        driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+            runtime: stack.runtime.clone(),
+            codec: stack.codec.clone(),
+            routes: stack.actor_bridge_routes(),
+            swim: stack.actors.swim,
+            relay_mirror: stack.relay_mirror.clone(),
+            route_view: stack.route_view.clone(),
+            outbox: stack.outbox.clone(),
+        });
+        driver.install_actor_bridge();
 
-    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
-        runtime: stack.runtime.clone(),
-        codec: stack.codec.clone(),
-        routes: stack.actor_bridge_routes(),
-        swim: stack.actors.swim,
-        relay_mirror: stack.relay_mirror.clone(),
-        route_view: stack.route_view.clone(),
-        outbox: stack.outbox.clone(),
-    });
-    // Engine-hosted protocol tick injection + adapter progression — no manual
-    // pump is wired anywhere.
-    stack.spawn_protocol_ticker(PROBE_TICK);
-    driver.install_actor_bridge_pump(PROBE_TICK);
-
-    (engine, driver, stack)
-}
-
-/// Bounded inbox polling for test observation; not runtime work.
-fn recv_within<T: Message>(inbox: &Inbox<T>, deadline: Duration) -> Option<T> {
-    let started = Instant::now();
-    loop {
-        if let Some(value) = inbox.try_recv() {
-            return Some(value);
-        }
-        if started.elapsed() >= deadline {
-            return None;
-        }
-        std::thread::sleep(PROBE_TICK);
-    }
+        (driver, stack)
+    })
 }
 
 #[test]
 fn engine_drives_actor_progress_without_manual_tick() {
-    let (engine, _driver, stack) = build_composition();
+    let (parts, compose) = prepare_composition();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+    )
+    .expect("engine");
+    let (_driver, stack) = compose(engine.task_spawner(), engine.handle());
 
     // A probe actor plus an external inbox observe its reply. Delivery and the
     // reply are processed entirely by engine-driven core progression — this
@@ -138,50 +122,54 @@ fn engine_drives_actor_progress_without_manual_tick() {
         .send_to(echo, ProbePing)
         .expect("send probe ping");
 
-    let pong = recv_within(&pong_inbox, PROBE_DEADLINE);
+    let pong = futures_lite::future::block_on(pong_inbox.recv());
     // Keep the engine alive until the observation completes.
     drop(engine);
-    assert_eq!(pong, Some(ProbePong), "engine did not drive actor progress");
+    assert_eq!(pong, ProbePong, "engine did not drive actor progress");
 }
 
 #[cfg(feature = "dashboard")]
 #[test]
 fn dashboard_server_is_scheduled_through_the_engine() {
-    // The dashboard server future is scheduled through the Myelin engine path
-    // (engine.spawn(handle.http_server())), exactly as in production, without
-    // constructing another runtime (ENGINE_SPEC.md).
-    let free_port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("probe bind for free port")
-        .local_addr()
-        .expect("probe local addr")
-        .port();
+    use std::io::{Read, Write};
 
-    let (engine, _driver, _stack) = build_composition();
+    // The dashboard server future is scheduled through the Myelin engine path
+    // (tasks.spawn(handle.http_server())), exactly as in production, without
+    // constructing another runtime (ENGINE_SPEC.md).
+    let (parts, compose) = prepare_composition();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+    )
+    .expect("engine");
+    let tasks = engine.task_spawner();
+    let (_driver, _stack) = compose(tasks.clone(), engine.handle());
     let config = dashboard::DashboardConfig {
-        port: free_port,
+        port: 0,
         ..dashboard::DashboardConfig::default()
     };
     let handle = dashboard::DashboardHandle::new(config);
-    handle.spawn(&engine.handle());
+    handle.spawn(&tasks);
 
-    // Behavioral proof the server future is actually running on the engine:
-    // the bound port accepts a TCP connection. No second runtime is involved.
-    let connected = poll_connect(("127.0.0.1", free_port), PROBE_DEADLINE);
+    // Readiness is published only after the engine-hosted server binds its
+    // listener. Connect once to that exact address, without reserving a port
+    // early or retrying until an unrelated service happens to accept.
+    let address = futures_lite::future::block_on(handle.wait_until_ready())
+        .expect("dashboard listener readiness");
+    assert_eq!(
+        futures_lite::future::block_on(handle.wait_until_ready())
+            .expect("readiness remains observable after startup"),
+        address,
+    );
+    let mut connection =
+        std::net::TcpStream::connect(address).expect("dashboard server accepts connections");
+    connection
+        .write_all(b"GET /api/views HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("request dashboard views");
+    let mut response = String::new();
+    connection
+        .read_to_string(&mut response)
+        .expect("read dashboard response");
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
     drop(engine);
-    assert!(connected, "dashboard server did not accept connections");
-}
-
-#[cfg(feature = "dashboard")]
-fn poll_connect(addr: (&str, u16), deadline: Duration) -> bool {
-    use std::net::TcpStream;
-    let started = Instant::now();
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        std::thread::sleep(PROBE_TICK);
-    }
 }

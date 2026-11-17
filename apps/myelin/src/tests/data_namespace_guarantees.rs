@@ -1,7 +1,6 @@
 #![cfg(target_os = "linux")]
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use data_plane::arena::{ArenaConfig, ArenaManager, NodeId as ArenaNodeId};
 use data_plane::blob;
@@ -12,8 +11,12 @@ use data_plane::host::{HostDataPlaneConfig, HostDataPlaneSessionActor};
 use data_plane::namespace::{DirectoryClient, NamespaceError};
 use data_plane::path::{DataPath, SessionAccess};
 use data_plane::protocol::SessionCapability;
+use distribution::directory_actor::DirectoryIn;
+use distribution::registry_actor::RegistryIn;
 use iroh_driver::{IrohBlobTransferReceiver, IrohBlobTransferSender, IrohDriver};
-use swactor_engine::Engine;
+use swactor::actor::{ActorAddress, ActorExited, ActorInterface, Ctx};
+use swactor::std::CtxWatching;
+use swactor_engine::{Engine, TaskSpawner, TokioBackend, TokioConfig};
 
 use crate::contextual_process::MyelinChildRouteRegistrar;
 use crate::data_namespace::{
@@ -21,10 +24,8 @@ use crate::data_namespace::{
     install_namespace_client,
 };
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
-use crate::tests::harness::build_iroh_composition;
+use crate::tests::harness::prepare_iroh_composition;
 
-const POLL: Duration = Duration::from_millis(25);
-const DEADLINE: Duration = Duration::from_secs(30);
 const CAPABILITY: SessionCapability = SessionCapability::new([0x77; 32]);
 
 struct DataNode {
@@ -37,17 +38,21 @@ struct DataNode {
 }
 
 impl DataNode {
-    fn start() -> Self {
-        let (engine, driver, stack) = build_iroh_composition(POLL);
+    fn start(
+        engine: Engine,
+        tasks: &TaskSpawner,
+        driver: IrohDriver,
+        stack: DistributionRuntimeStack,
+    ) -> Self {
         let namespace = install_namespace_client(&stack, &driver).expect("namespace client");
         let receiver = Arc::new(IrohBlobTransferReceiver::new(
             driver.endpoint_addr(),
             driver.edge_events_handle(),
         ));
         receiver.install_pump(
-            &engine.handle(),
+            tasks,
+            driver.connection_changes(),
             stack.runtime.clone(),
-            POLL,
             driver.edge_events_changed(),
         );
         let receiver: Arc<dyn BlobTransferReceiver> = receiver;
@@ -66,7 +71,7 @@ impl DataNode {
         }
     }
 
-    fn session(
+    async fn session(
         &self,
         generation: u64,
         read_prefixes: Vec<DataPath>,
@@ -115,18 +120,74 @@ impl DataNode {
                         self.driver.connection_observer(),
                     ))),
                     stream_transport: None,
+                    transitions: None,
                 })
                 .expect("host session"),
             )
             .expect("spawn host session");
-        futures_lite::future::block_on(DataPlaneBootstrap::attach(
+        DataPlaneBootstrap::attach(
             handoff.arena_fd,
             self.stack.runtime.clone(),
             host,
             CAPABILITY,
-        ))
+            None,
+        )
+        .await
         .expect("attach child session")
     }
+}
+
+struct SourceExitObserver {
+    watching: ActorAddress,
+    exited: ActorAddress,
+}
+
+impl ActorInterface for SourceExitObserver {
+    type Incoming = ActorAddress;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, source: ActorAddress) {
+        ctx.watch(source);
+        ctx.send(self.watching, source)
+            .expect("source watch installed");
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx, exited: ActorExited) {
+        ctx.send(self.exited, exited).expect("source exit observed");
+        ctx.stop_self();
+    }
+}
+
+fn observe_distribution(
+    stack: &DistributionRuntimeStack,
+) -> (
+    Arc<dyn Fn() + Send + Sync>,
+    tokio::sync::watch::Receiver<()>,
+) {
+    let (changed, observations) = tokio::sync::watch::channel(());
+    let watch: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        changed.send_replace(());
+    });
+    stack
+        .runtime
+        .send_to(
+            stack.actors.registry,
+            RegistryIn::WatchName {
+                name: DATA_DIRECTORY_SERVICE.to_owned(),
+                changed: Arc::downgrade(&watch),
+            },
+        )
+        .expect("observe namespace service binding");
+    stack
+        .runtime
+        .send_to(
+            stack.actors.directory,
+            DirectoryIn::WatchRoutes {
+                changed: Arc::downgrade(&watch),
+            },
+        )
+        .expect("observe namespace actor routes");
+    (watch, observations)
 }
 
 #[test]
@@ -135,8 +196,18 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
     let file = state.path().join("registered.bin");
     std::fs::write(&file, b"control-file-over-iroh").expect("registered file");
 
-    let node_a = DataNode::start();
-    let node_b = DataNode::start();
+    let (parts_a, prepare_a) = prepare_iroh_composition();
+    let engine_a =
+        Engine::new(parts_a, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let tasks_a = engine_a.task_spawner();
+    let (driver_a, stack_a) = prepare_a(tasks_a.clone(), engine_a.handle());
+    let node_a = DataNode::start(engine_a, &tasks_a, driver_a, stack_a);
+    let (parts_b, prepare_b) = prepare_iroh_composition();
+    let engine_b =
+        Engine::new(parts_b, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let tasks_b = engine_b.task_spawner();
+    let (driver_b, stack_b) = prepare_b(tasks_b.clone(), engine_b.handle());
+    let node_b = DataNode::start(engine_b, &tasks_b, driver_b, stack_b);
     let authority = DataNamespaceAuthority::start(
         &node_a.stack,
         &node_a.driver,
@@ -145,13 +216,26 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
     )
     .expect("namespace authority");
 
+    let (_watch_a, mut changed_a) = observe_distribution(&node_a.stack);
+    let (_watch_b, mut changed_b) = observe_distribution(&node_b.stack);
+
     node_a
         .driver
         .join(std::slice::from_ref(&node_b.driver.endpoint_addr()));
-    assert!(wait_until(DEADLINE, || {
-        namespace_visible(&node_a.stack, authority.directory())
-            && namespace_visible(&node_b.stack, authority.directory())
-    }));
+    futures_lite::future::block_on(async {
+        while !namespace_visible(&node_a.stack, authority.directory()) {
+            changed_a
+                .changed()
+                .await
+                .expect("node A distribution observation");
+        }
+        while !namespace_visible(&node_b.stack, authority.directory()) {
+            changed_b
+                .changed()
+                .await
+                .expect("node B distribution observation");
+        }
+    });
 
     let file_path = DataPath::parse("/shared/registered").unwrap();
     futures_lite::future::block_on(
@@ -164,11 +248,20 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
     let file_source = futures_lite::future::block_on(directory.resolve(file_path.clone()))
         .expect("registered binding")
         .source;
-    assert!(wait_until(DEADLINE, || {
-        node_b.stack.route_owner(file_source).is_some()
-    }));
+    futures_lite::future::block_on(async {
+        while node_b.stack.route_owner(file_source).is_none() {
+            changed_b
+                .changed()
+                .await
+                .expect("registered source route observation");
+        }
+    });
 
-    let reader_b = node_b.session(1, vec![DataPath::parse("/shared").unwrap()], vec![]);
+    let reader_b = futures_lite::future::block_on(node_b.session(
+        1,
+        vec![DataPath::parse("/shared").unwrap()],
+        vec![],
+    ));
     let registered = futures_lite::future::block_on(reader_b.data_plane.read_blob(&file_path))
         .expect("remote registered-file read");
     assert_eq!(
@@ -178,11 +271,11 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
     drop(registered);
 
     let published_path = DataPath::parse("/shared/published").unwrap();
-    let producer = node_b.session(
+    let producer = futures_lite::future::block_on(node_b.session(
         2,
         vec![DataPath::parse("/shared").unwrap()],
         vec![DataPath::parse("/shared").unwrap()],
-    );
+    ));
     let mut writer = futures_lite::future::block_on(
         producer
             .data_plane
@@ -202,11 +295,35 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
             .source;
     producer.data_plane.close().expect("close producer");
 
-    let reader_a = node_a.session(3, vec![DataPath::parse("/shared").unwrap()], vec![]);
+    let reader_a = futures_lite::future::block_on(node_a.session(
+        3,
+        vec![DataPath::parse("/shared").unwrap()],
+        vec![],
+    ));
     let published = futures_lite::future::block_on(reader_a.data_plane.read_blob(&published_path))
         .expect("read after producer close");
     assert_eq!(published.map().unwrap().as_ref(), b"session-over-iroh");
     drop(published);
+
+    let watching = node_b.stack.runtime.new_inbox::<ActorAddress>().unwrap();
+    let exited = node_b.stack.runtime.new_inbox::<ActorExited>().unwrap();
+    let observer = node_b
+        .stack
+        .runtime
+        .spawn(SourceExitObserver {
+            watching: *watching.addr(),
+            exited: *exited.addr(),
+        })
+        .expect("observe retained source lifecycle");
+    node_b
+        .stack
+        .runtime
+        .send_to(observer, published_source)
+        .expect("watch retained source");
+    assert_eq!(
+        futures_lite::future::block_on(watching.recv()),
+        published_source,
+    );
 
     futures_lite::future::block_on(authority.control().unregister(published_path.clone()))
         .expect("unregister publication");
@@ -214,15 +331,11 @@ fn control_and_session_publications_cross_real_iroh_and_outlive_the_producer() {
         futures_lite::future::block_on(directory.resolve(published_path)),
         Err(NamespaceError::PathNotFound(_))
     ));
-    assert!(wait_until(DEADLINE, || {
-        node_b
-            .stack
-            .runtime
-            .stats()
-            .actors
-            .iter()
-            .all(|(actor, _)| *actor != published_source)
-    }));
+    assert_eq!(
+        futures_lite::future::block_on(exited.recv()).addr,
+        published_source,
+        "unregistered publication source must retire",
+    );
 
     reader_a.data_plane.close().expect("close reader A");
     reader_b.data_plane.close().expect("close reader B");
@@ -244,17 +357,4 @@ fn namespace_visible(
                     && entry.actor_addr == directory
                     && !entry.tombstone
             })
-}
-
-fn wait_until(deadline: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let started = Instant::now();
-    loop {
-        if check() {
-            return true;
-        }
-        if started.elapsed() >= deadline {
-            return false;
-        }
-        std::thread::sleep(POLL);
-    }
 }

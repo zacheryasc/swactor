@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use telemetry::{ChannelContent, Record, TelemetryProducer};
 
-use crate::observability::telemetry::{
+use crate::orchestration::provisioning_telemetry::{
     MYELIN_PROVISIONING_LOGS, MyelinProvisionLogRecord, myelin_provision_log_channel,
 };
 use crate::provisioning::{

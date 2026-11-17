@@ -18,7 +18,6 @@ pub(crate) enum PromptEvent {
         request_id: u64,
         final_text: String,
         tokens_generated: u32,
-        elapsed_ms: u64,
     },
     Fault {
         request_id: u64,

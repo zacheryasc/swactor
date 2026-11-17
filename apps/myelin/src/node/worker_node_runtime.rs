@@ -1,11 +1,11 @@
 //! Worker-node runtime behavior behind the `myelin::node` boundary.
 //!
-//! The `myelin-worker` binary remains a thin entrypoint wrapper; this module
-//! owns the reusable node-local runtime, helper-command, telemetry archive,
-//! debug-join, staging, transport, and worker coordination behavior.
+//! The `myelin-worker` binary constructs the engine and grants task authority.
+//! This module prepares runtime parts and owns reusable node-local behavior:
+//! helper commands, telemetry, debug join, staging, and worker coordination.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
@@ -13,13 +13,14 @@ use std::sync::{
     Arc,
     mpsc::{self, Receiver, Sender, TryRecvError},
 };
-use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use telemetry::decode_record_value;
+#[cfg(test)]
 use telemetry::frame::TelemetryEvent;
 use telemetry::{
     ChannelContent, ChannelId, Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
-    TelemetryEndpoint, TelemetryProducer, TelemetrySubscription, decode_record_value,
-    encode_record,
+    TelemetryEndpoint, TelemetryProducer, encode_record,
 };
 
 use crate::codecs::register_myelin_actor_codecs;
@@ -30,13 +31,13 @@ use crate::contextual_process::{
 use crate::data_namespace::install_namespace_client;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
 use crate::node::prompt_wire::{PromptEvent, TokenizerEvent};
+use crate::node::telemetry::allocate_telemetry_lifetime;
 use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
     StageObjectSpecWire, StageOutboundEdgeWire,
 };
-use crate::observability::benchmark;
 use crate::orchestration::actor::OrchestratorMsg;
-use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
+use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::orchestration::manual_control::{
     CONTROL_REGISTRY_NAME, ManualControlMsg, ManualControlReply, RejoinHello, SELECTED_OFFER_ID_ENV,
 };
@@ -50,21 +51,21 @@ use data_plane::edge_runtime;
 use data_plane::host::HostRouteRegistrar;
 use data_plane::object_record as ingress;
 use distribution::node::DistributedNodeConfig;
-use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
+use distribution::telemetry::TransportMembershipTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::{EndpointAddr, RelayMode};
 use iroh_driver::{
     EDGE_ALPN, IrohBlobTransferReceiver, IrohBlobTransferSender, IrohDriver, IrohDriverConfig,
-    TELEMETRY_ALPN, spawn_pull_server,
+    IrohEdgePort, PeerConnector, TELEMETRY_ALPN, spawn_pull_server,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use myelin_control_contract::DeploymentIdentity;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime};
+use swactor::runtime::{Ctx, ExternalSender, Inbox, Runtime, RuntimeParts};
 use swactor::stats::{ActorSnapshot, StatsHook, StatsSnapshotKind};
-use swactor_engine::{ActorCompletion, Engine, EngineHandle, TokioBackend, TokioConfig};
+use swactor_engine::{ActorCompletion, BlockingWorkSender, Engine, EngineHandle, TaskSpawner};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/myelin/tinygrad_worker.py";
@@ -74,9 +75,6 @@ const DEFAULT_HF_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_ARENA_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_ARENA_ALIGNMENT: u64 = 64;
-const PUMP_INTERVAL: Duration = Duration::from_millis(10);
-const RUNTIME_READY_RETRY_INITIAL: Duration = Duration::from_millis(100);
-const RUNTIME_READY_RETRY_MAX: Duration = Duration::from_secs(2);
 const NODE_BOOTSTRAP_CHANNEL: &str = "myelin.node.bootstrap";
 const NODE_RUNTIME_CHANNEL: &str = "myelin.node.runtime";
 const NODE_STAGE_CHANNEL: &str = "myelin.node.stage";
@@ -84,23 +82,6 @@ const NODE_WORKER_CHANNEL: &str = "myelin.node.worker";
 const NODE_PROMPT_CHANNEL: &str = "myelin.node.prompt";
 const NODE_SHUTDOWN_CHANNEL: &str = "myelin.node.shutdown";
 const NODE_SAMPLER_CHANNEL: &str = "myelin.node.sampler";
-const WORKER_COMMAND_WAIT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
-
-fn worker_benchmark_stamp(run_id: u64, node_id: u64) -> Value {
-    let mut benchmark = benchmark::stamp("myelin-worker");
-    let pid = benchmark
-        .get("producer_process_id")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| u64::from(std::process::id()));
-    let producer_instance_id = format!("myelin-worker:{run_id}:node-{node_id}:pid-{pid}");
-    if let Some(object) = benchmark.as_object_mut() {
-        object.insert(
-            "producer_instance_id".to_owned(),
-            json!(producer_instance_id),
-        );
-    }
-    benchmark
-}
 
 fn node_event_payload(
     config: &DeploymentConfig,
@@ -108,9 +89,7 @@ fn node_event_payload(
     status: &str,
     detail: Value,
 ) -> Value {
-    let benchmark = worker_benchmark_stamp(config.run_id, config.logical_node_id);
     json!({
-        "schema_version": benchmark["schema_version"].clone(),
         "type":"NodeEvent",
         "event_type":"NodeEvent",
         "event_name":phase,
@@ -119,16 +98,6 @@ fn node_event_payload(
         "run_id":config.run_id,
         "node_id":config.logical_node_id,
         "stage_index":config.stage_index,
-        "producer_component":benchmark["producer_component"].clone(),
-        "producer_instance_id":benchmark["producer_instance_id"].clone(),
-        "producer_process_id":benchmark["producer_process_id"].clone(),
-        "producer_sequence":benchmark["producer_sequence"].clone(),
-        "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
-        "monotonic_ms":benchmark["monotonic_ms"].clone(),
-        "clock_source":benchmark["clock_source"].clone(),
-        "span_id":format!("myelin-worker:{}:{}:{}:{phase}", config.run_id, config.logical_node_id, benchmark["producer_sequence"]),
-        "parent_span_id":Value::Null,
-        "benchmark":benchmark,
         "detail":detail,
     })
 }
@@ -272,8 +241,6 @@ enum DebugJoinClientError {
     Runtime(String),
 }
 
-pub(crate) const DEBUG_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-
 fn debug_join_client_main(args: Vec<String>) -> ExitCode {
     match run_debug_join_client(args) {
         Ok(response) => {
@@ -368,26 +335,16 @@ fn run_debug_join_client(args: Vec<String>) -> Result<DebugJoinResponseWire, Deb
         .map_err(|error| {
             DebugJoinClientError::Cli(format!("parse orchestrator actor JSON: {error}"))
         })?;
-    let deadline = Instant::now() + DEBUG_JOIN_TIMEOUT;
-    let deadline = crate::provisioning::execution_owner_deadline()
-        .map_err(DebugJoinClientError::Runtime)?
-        .map_or(deadline, |owner| owner.min(deadline));
-    send_debug_join_request(
-        &socket,
-        endpoint,
-        orchestrator_actor,
-        deadline.saturating_duration_since(Instant::now()),
-    )
-    .map_err(DebugJoinClientError::Runtime)
+    send_debug_join_request(&socket, endpoint, orchestrator_actor)
+        .map_err(DebugJoinClientError::Runtime)
 }
 
 pub(crate) fn request_debug_join(
     socket: &Path,
     endpoint: EndpointAddr,
     orchestrator_actor: ActorAddress,
-    timeout: Duration,
 ) -> Result<(), String> {
-    match send_debug_join_request(socket, endpoint, Some(orchestrator_actor), timeout)? {
+    match send_debug_join_request(socket, endpoint, Some(orchestrator_actor))? {
         DebugJoinResponseWire::JoinQueued { .. } => Ok(()),
         DebugJoinResponseWire::JoinRejected { error, detail } => {
             Err(format!("worker join rejected: {error}: {detail}"))
@@ -402,24 +359,12 @@ fn send_debug_join_request(
     socket: &Path,
     endpoint: EndpointAddr,
     orchestrator_actor: Option<ActorAddress>,
-    timeout: Duration,
 ) -> Result<DebugJoinResponseWire, String> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| "debug join deadline overflow".to_owned())?;
-    let remaining = || {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| "debug join request deadline expired".to_owned())
-    };
     let request = debug_join_request_line(endpoint, orchestrator_actor)?;
-    let mut stream = connect_debug_socket(socket, remaining()?)?;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|error| format!("connect {}: {error}", socket.display()))?;
     let mut request = request.as_bytes();
     while !request.is_empty() {
-        stream
-            .set_write_timeout(Some(remaining()?))
-            .map_err(|error| error.to_string())?;
         match stream.write(request) {
             Ok(0) => return Err("debug join socket closed while writing".to_owned()),
             Ok(written) => request = &request[written..],
@@ -430,9 +375,6 @@ fn send_debug_join_request(
     let mut response = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
-        stream
-            .set_read_timeout(Some(remaining()?))
-            .map_err(|error| error.to_string())?;
         let read = match stream.read(&mut buffer) {
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -458,56 +400,6 @@ fn send_debug_join_request(
         .map_err(|e| format!("parse response JSON: {e}"))
 }
 
-fn connect_debug_socket(
-    path: &Path,
-    timeout: Duration,
-) -> Result<std::os::unix::net::UnixStream, String> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = path.as_os_str().as_bytes();
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-            return Err("debug join socket path is invalid or too long".to_owned());
-        }
-        address.sun_family = libc::AF_UNIX as _;
-        for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
-            *slot = *byte as _;
-        }
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        // Linux AF_UNIX connect observes SO_SNDTIMEO, including a full
-        // listener backlog. Configure it before the potentially blocking call.
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|error| error.to_string())?;
-        let result = unsafe {
-            libc::connect(
-                stream.as_raw_fd(),
-                (&address as *const libc::sockaddr_un).cast(),
-                std::mem::size_of_val(&address) as _,
-            )
-        };
-        if result != 0 {
-            return Err(format!(
-                "connect {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(stream)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (path, timeout);
-        Err("bounded worker debug join requires Linux AF_UNIX sockets".to_owned())
-    }
-}
-
 fn debug_join_request_line(
     endpoint: EndpointAddr,
     orchestrator_actor: Option<ActorAddress>,
@@ -524,8 +416,9 @@ fn debug_join_request_line(
 }
 
 fn spawn_debug_join_listener(
-    engine: EngineHandle,
+    tasks: TaskSpawner,
     path: PathBuf,
+    wake: RuntimeWake,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>, String> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -540,10 +433,11 @@ fn spawn_debug_join_listener(
         }
     }
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<DebugJoinCommand>();
-    swactor_process::spawn_unix_stream_listener(engine, &path, move |stream| {
+    swactor_process::spawn_unix_stream_listener(tasks, &path, move |stream| {
         let command_tx = command_tx.clone();
+        let wake = wake.clone();
         async move {
-            handle_debug_join_stream(stream, command_tx).await;
+            handle_debug_join_stream(stream, command_tx, wake).await;
         }
     })
     .map_err(|error| format!("bind debug join socket {}: {error}", path.display()))?;
@@ -555,6 +449,7 @@ fn spawn_debug_join_listener(
 async fn handle_debug_join_stream(
     stream: tokio::net::UnixStream,
     command_tx: tokio::sync::mpsc::UnboundedSender<DebugJoinCommand>,
+    wake: RuntimeWake,
 ) {
     let mut reader = tokio::io::BufReader::new(stream);
     let mut line = String::new();
@@ -582,6 +477,7 @@ async fn handle_debug_join_stream(
                         detail: "worker main loop is not accepting debug join commands".to_owned(),
                     }
                 } else {
+                    wake.send(NodeRuntimeMsg::Progress);
                     response_rx
                         .await
                         .unwrap_or_else(|error| DebugJoinResponseWire::JoinRejected {
@@ -601,6 +497,7 @@ async fn handle_debug_join_stream(
                         detail: "worker main loop is not accepting debug commands".to_owned(),
                     }
                 } else {
+                    wake.send(NodeRuntimeMsg::Progress);
                     response_rx
                         .await
                         .unwrap_or_else(|error| DebugJoinResponseWire::JoinRejected {
@@ -647,7 +544,7 @@ fn parse_debug_join_request(raw: &str) -> Result<DebugJoinRequestWire, DebugJoin
 
 fn drain_debug_join_commands(
     debug_join_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>>,
-    driver: &mut IrohDriver,
+    peers: &PeerConnector,
     config: &DeploymentConfig,
     telemetry: &mut NodeTelemetry,
     pending_control_rejoin: &mut PendingControlRejoin,
@@ -666,7 +563,7 @@ fn drain_debug_join_commands(
                 let peer_node_id = endpoint.id.to_string();
                 let has_relay = endpoint.relay_urls().next().is_some();
                 let direct_addr_count = endpoint.ip_addrs().count();
-                driver.join(std::slice::from_ref(&endpoint));
+                peers.connect(endpoint.clone());
                 if let Some(orchestrator_actor) = orchestrator_actor {
                     pending_control_rejoin.set_recovery_actor(orchestrator_actor);
                 }
@@ -728,9 +625,7 @@ fn sampler_health_payload(
     status: &str,
     detail: Value,
 ) -> Value {
-    let benchmark = worker_benchmark_stamp(context.run_id, context.node_id);
     json!({
-        "schema_version":benchmark["schema_version"].clone(),
         "type":"SamplerHealth",
         "event_type":"SamplerHealth",
         "event_name":"host_sampler_health",
@@ -738,21 +633,11 @@ fn sampler_health_payload(
         "run_id":context.run_id,
         "node_id":context.node_id,
         "stage_index":context.stage_index,
-        "producer_component":benchmark["producer_component"].clone(),
-        "producer_instance_id":benchmark["producer_instance_id"].clone(),
-        "producer_process_id":benchmark["producer_process_id"].clone(),
-        "producer_sequence":benchmark["producer_sequence"].clone(),
-        "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
-        "monotonic_ms":benchmark["monotonic_ms"].clone(),
-        "clock_source":benchmark["clock_source"].clone(),
-        "span_id":format!("myelin-worker:{}:{}:{}:host_sampler_health", context.run_id, context.node_id, benchmark["producer_sequence"]),
-        "parent_span_id":Value::Null,
         "phase":"host_sampler_health",
         "status":status,
         "sampler":sampler,
         "sample_channel":sample_channel,
         "detail":detail,
-        "benchmark":benchmark,
     })
 }
 
@@ -778,7 +663,6 @@ fn submit_sampler_started(
     context: SamplerHealthContext,
     sampler: &str,
     sample_channel: &str,
-    interval: Duration,
 ) {
     submit_sampler_health(
         producer,
@@ -787,7 +671,7 @@ fn submit_sampler_started(
         sampler,
         sample_channel,
         "started",
-        json!({"state":"started","sample_interval_ms":duration_ms_u64(interval)}),
+        json!({"state":"started","trigger":"work_progress"}),
     );
     submit_sampler_health(
         producer,
@@ -796,7 +680,7 @@ fn submit_sampler_started(
         sampler,
         sample_channel,
         "waiting",
-        json!({"state":"no_sample_yet","sample_interval_ms":duration_ms_u64(interval)}),
+        json!({"state":"no_sample_yet","trigger":"work_progress"}),
     );
 }
 
@@ -842,57 +726,65 @@ fn submit_sampler_sample_health(
     );
 }
 
-#[derive(Clone)]
-struct SamplerTick;
-
 struct BlockingSamplerConfig<Sample> {
-    producer: TelemetryProducer,
+    endpoint: Arc<TelemetryEndpoint>,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
     sampler: &'static str,
     sample_channel: &'static str,
-    interval: Duration,
     error_of: fn(&Sample) -> Option<&str>,
 }
 
 fn spawn_blocking_sampler_task<State, Sample>(
+    tasks: TaskSpawner,
     engine: EngineHandle,
     state: State,
     sample_fn: fn(State, u64) -> (State, Sample),
     config: BlockingSamplerConfig<Sample>,
-) where
+) -> tokio::sync::mpsc::Sender<()>
+where
     State: Send + 'static,
     Sample: Record + Send + 'static,
 {
     let BlockingSamplerConfig {
-        producer,
+        endpoint,
         channel,
         health_channel,
         health_context,
         sampler,
         sample_channel,
-        interval,
         error_of,
     } = config;
-    let started_producer = producer.clone();
-    let health_state = Arc::new(Mutex::new(SamplerHealthState::Waiting));
-    telemetry::hardware::spawn_blocking_sampler(
-        engine,
-        interval,
-        state,
-        sample_fn,
-        move || {
-            submit_sampler_started(
-                &started_producer,
-                health_channel,
-                health_context,
-                sampler,
-                sample_channel,
-                interval,
-            );
-        },
-        move |seq, sample| {
+    let producer = endpoint.producer();
+    submit_sampler_started(
+        &producer,
+        health_channel,
+        health_context,
+        sampler,
+        sample_channel,
+    );
+    let (progress, mut observations) = tokio::sync::mpsc::channel(1);
+    let _ = progress.try_send(());
+    tasks.spawn(async move {
+        let blocking = engine.blocking_work_sender();
+        let health_state = Mutex::new(SamplerHealthState::Waiting);
+        let mut state = state;
+        let mut seq = 0_u64;
+        while observations.recv().await.is_some() {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            if blocking
+                .submit(Box::new(move || {
+                    let _ = reply.send(sample_fn(state, seq));
+                }))
+                .is_err()
+            {
+                return;
+            }
+            let Ok((next_state, sample)) = result.await else {
+                return;
+            };
+            state = next_state;
             submit_sampler_sample_health(
                 &producer,
                 health_channel,
@@ -903,8 +795,11 @@ fn spawn_blocking_sampler_task<State, Sample>(
                 &health_state,
             );
             producer.submit_record(channel, &sample);
-        },
-    );
+            endpoint.tick();
+            seq = seq.saturating_add(1);
+        }
+    });
+    progress
 }
 
 fn sample_host_gpu((): (), seq: u64) -> ((), telemetry::hardware::gpu::HostGpuSample) {
@@ -912,27 +807,28 @@ fn sample_host_gpu((): (), seq: u64) -> ((), telemetry::hardware::gpu::HostGpuSa
 }
 
 fn spawn_host_gpu_sampler(
+    tasks: TaskSpawner,
     engine: EngineHandle,
-    producer: TelemetryProducer,
+    endpoint: Arc<TelemetryEndpoint>,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
-) {
+) -> tokio::sync::mpsc::Sender<()> {
     spawn_blocking_sampler_task(
+        tasks,
         engine,
         (),
         sample_host_gpu,
         BlockingSamplerConfig {
-            producer,
+            endpoint,
             channel,
             health_channel,
             health_context,
             sampler: "gpu",
             sample_channel: telemetry::hardware::gpu::HOST_GPU_CHANNEL,
-            interval: telemetry::hardware::gpu::GPU_SAMPLE_INTERVAL,
             error_of: |sample| sample.error.as_deref(),
         },
-    );
+    )
 }
 
 fn sample_host_memory((): (), seq: u64) -> ((), telemetry::hardware::memory::HostMemorySample) {
@@ -940,27 +836,28 @@ fn sample_host_memory((): (), seq: u64) -> ((), telemetry::hardware::memory::Hos
 }
 
 fn spawn_host_memory_sampler(
+    tasks: TaskSpawner,
     engine: EngineHandle,
-    producer: TelemetryProducer,
+    endpoint: Arc<TelemetryEndpoint>,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
-) {
+) -> tokio::sync::mpsc::Sender<()> {
     spawn_blocking_sampler_task(
+        tasks,
         engine,
         (),
         sample_host_memory,
         BlockingSamplerConfig {
-            producer,
+            endpoint,
             channel,
             health_channel,
             health_context,
             sampler: "memory",
             sample_channel: telemetry::hardware::memory::HOST_MEMORY_CHANNEL,
-            interval: telemetry::hardware::memory::MEMORY_SAMPLE_INTERVAL,
             error_of: |sample| sample.error.as_deref(),
         },
-    );
+    )
 }
 
 fn sample_host_cpu(
@@ -975,28 +872,29 @@ fn sample_host_cpu(
 }
 
 fn spawn_host_cpu_sampler(
+    tasks: TaskSpawner,
     engine: EngineHandle,
-    producer: TelemetryProducer,
+    endpoint: Arc<TelemetryEndpoint>,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
     watched_pids: Vec<u32>,
-) {
+) -> tokio::sync::mpsc::Sender<()> {
     spawn_blocking_sampler_task(
+        tasks,
         engine,
         telemetry::hardware::cpu::CpuSampler::new(watched_pids),
         sample_host_cpu,
         BlockingSamplerConfig {
-            producer,
+            endpoint,
             channel,
             health_channel,
             health_context,
             sampler: "cpu",
             sample_channel: telemetry::hardware::cpu::HOST_CPU_CHANNEL,
-            interval: telemetry::hardware::cpu::CPU_SAMPLE_INTERVAL,
             error_of: |sample| sample.error.as_deref(),
         },
-    );
+    )
 }
 
 fn sample_host_net((): (), seq: u64) -> ((), telemetry::hardware::net::HostNetSample) {
@@ -1004,27 +902,28 @@ fn sample_host_net((): (), seq: u64) -> ((), telemetry::hardware::net::HostNetSa
 }
 
 fn spawn_host_net_sampler(
+    tasks: TaskSpawner,
     engine: EngineHandle,
-    producer: TelemetryProducer,
+    endpoint: Arc<TelemetryEndpoint>,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
-) {
+) -> tokio::sync::mpsc::Sender<()> {
     spawn_blocking_sampler_task(
+        tasks,
         engine,
         (),
         sample_host_net,
         BlockingSamplerConfig {
-            producer,
+            endpoint,
             channel,
             health_channel,
             health_context,
             sampler: "net",
             sample_channel: telemetry::hardware::net::HOST_NET_CHANNEL,
-            interval: telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
             error_of: |sample| sample.error.as_deref(),
         },
-    );
+    )
 }
 
 fn sample_host_storage((): (), seq: u64) -> ((), telemetry::hardware::storage::HostStorageSample) {
@@ -1032,82 +931,43 @@ fn sample_host_storage((): (), seq: u64) -> ((), telemetry::hardware::storage::H
 }
 
 fn spawn_host_storage_sampler(
+    tasks: TaskSpawner,
     engine: EngineHandle,
-    producer: TelemetryProducer,
+    endpoint: Arc<TelemetryEndpoint>,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
-) {
+) -> tokio::sync::mpsc::Sender<()> {
     spawn_blocking_sampler_task(
+        tasks,
         engine,
         (),
         sample_host_storage,
         BlockingSamplerConfig {
-            producer,
+            endpoint,
             channel,
             health_channel,
             health_context,
             sampler: "storage",
             sample_channel: telemetry::hardware::storage::HOST_STORAGE_CHANNEL,
-            interval: telemetry::hardware::storage::STORAGE_SAMPLE_INTERVAL,
             error_of: |sample| sample.error.as_deref(),
         },
-    );
+    )
 }
 
-struct ArenaSamplerActor {
-    engine: EngineHandle,
-    sender: ExternalSender,
+struct ArenaSampler {
     producer: TelemetryProducer,
     channel: ChannelId,
     arena_manager: Arc<Mutex<arena::ArenaManager>>,
     seq: u64,
 }
 
-impl ArenaSamplerActor {
-    fn schedule(&self, ctx: &Ctx) {
-        self.engine.send_after(
-            arena::ARENA_SAMPLE_INTERVAL,
-            self.sender.clone(),
-            ctx.self_addr(),
-            SamplerTick,
-        );
-    }
-}
-
-impl ActorInterface for ArenaSamplerActor {
-    type Incoming = SamplerTick;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        self.schedule(ctx);
-    }
-
-    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
+impl ArenaSampler {
+    fn observe_progress(&mut self) {
         let sample: arena::ArenaSample = self.arena_manager.lock().sample(self.seq).into();
         self.seq = self.seq.saturating_add(1);
         self.producer.submit_record(self.channel, &sample);
-        self.schedule(ctx);
     }
-}
-
-fn spawn_arena_sampler(
-    runtime: Runtime,
-    engine: EngineHandle,
-    producer: TelemetryProducer,
-    channel: ChannelId,
-    arena_manager: Arc<Mutex<arena::ArenaManager>>,
-) {
-    runtime
-        .spawn(ArenaSamplerActor {
-            engine,
-            sender: runtime.create_sender(),
-            producer,
-            channel,
-            arena_manager,
-            seq: 0,
-        })
-        .expect("spawn arena sampler actor");
 }
 
 struct LoadedObject {
@@ -1135,7 +995,7 @@ struct ExecuteStepRequest {
 /// only supplies myelin effects (tinygrad worker port, telemetry, node-agent
 /// reporting) around it.
 struct WorkerEdgeRuntime {
-    runtime: edge_runtime::EdgeRuntime<IrohDriver>,
+    runtime: edge_runtime::EdgeRuntime<IrohEdgePort>,
     inbound_edge: Option<StageInboundEdgeWire>,
     outbound_edge: Option<StageOutboundEdgeWire>,
 }
@@ -1224,7 +1084,7 @@ impl edge_runtime::WorkerPort for TinygradRingPort<'_> {
 struct WorkerRuntimeContext<'a> {
     config: &'a DeploymentConfig,
     stack: &'a DistributionRuntimeStack,
-    driver: &'a mut IrohDriver,
+    driver: &'a mut IrohEdgePort,
     node_actor: ActorAddress,
     worker: &'a mut TinygradWorker,
     arena_manager: &'a Arc<Mutex<arena::ArenaManager>>,
@@ -1345,7 +1205,7 @@ impl WorkerEdgeRuntime {
                     end_of_sequence,
                     record_bytes,
                     buffered_bytes,
-                    write_ms,
+                    ..
                 } => {
                     let edge_kind = self
                         .inbound_edge
@@ -1368,7 +1228,6 @@ impl WorkerEdgeRuntime {
                             "end_of_sequence":end_of_sequence,
                             "record_bytes":record_bytes,
                             "ingress_buffer_bytes":buffered_bytes,
-                            "ingress_ring_write_ms":write_ms,
                         }),
                     );
                 }
@@ -1377,7 +1236,7 @@ impl WorkerEdgeRuntime {
                     ring_id,
                     stream_id,
                     object,
-                    load_ms,
+                    ..
                 } => {
                     let edge_kind = self
                         .inbound_edge
@@ -1397,7 +1256,6 @@ impl WorkerEdgeRuntime {
                             "sequence":object.sequence,
                             "handle_generation":object.handle_generation,
                             "handle_id":object.handle_id,
-                            "object_load_ms":load_ms,
                         }),
                     );
                     stack
@@ -1595,7 +1453,7 @@ impl WorkerEdgeRuntime {
             outbound.kind,
             crate::node_actor::StageEdgeKindWire::TokenOut
         );
-        let step_started = Instant::now();
+
         let committed_bytes = match worker.execute_step(
             ExecuteStepRequest {
                 role_id: u64::from(config.stage_index) + 1,
@@ -1620,8 +1478,7 @@ impl WorkerEdgeRuntime {
                 return Err(e);
             }
         };
-        let helper_execute_ms = duration_ms_u64(step_started.elapsed());
-        let egress_read_started = Instant::now();
+
         let record = {
             let arena = arena_manager.lock();
             let lease = arena
@@ -1641,7 +1498,7 @@ impl WorkerEdgeRuntime {
                 return Err(format!("read egress ring: {e}"));
             }
         };
-        let egress_read_ms = duration_ms_u64(egress_read_started.elapsed());
+
         let record_bytes = record.len();
         node_stage(
             telemetry,
@@ -1660,11 +1517,9 @@ impl WorkerEdgeRuntime {
                 "record_bytes":record_bytes,
                 "committed_bytes":committed_bytes,
                 "final_stage":final_stage,
-                "helper_execute_ms":helper_execute_ms,
-                "egress_ring_read_ms":egress_read_ms,
             }),
         );
-        let edge_send_started = Instant::now();
+
         let sender = self
             .runtime
             .outbound_writer()
@@ -1678,7 +1533,7 @@ impl WorkerEdgeRuntime {
             );
             return Err(e);
         }
-        let edge_send_ms = duration_ms_u64(edge_send_started.elapsed());
+
         node_stage(
             telemetry,
             "iroh_edge_bytes_sent",
@@ -1691,7 +1546,6 @@ impl WorkerEdgeRuntime {
                 "sequence":sequence,
                 "bytes":record_bytes,
                 "record_bytes":record_bytes,
-                "send_ms":edge_send_ms,
             }),
         );
         stack
@@ -1706,7 +1560,7 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
-        _driver: &mut IrohDriver,
+        _driver: &mut IrohEdgePort,
         _stack: &DistributionRuntimeStack,
     ) -> Result<(), String> {
         worker.release_device_object(handle_id, config, telemetry)
@@ -1720,9 +1574,9 @@ fn value_u64(value: &Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("helper event missing numeric {field}: {value}"))
 }
 
-pub(crate) fn run_from_env() -> ExitCode {
+pub fn run_helper_from_env() -> Option<ExitCode> {
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    Some(match args.next().as_deref() {
         Some("debug-join") => debug_join_client_main(args.collect()),
         Some("stage-shard-fetcher") => match run_stage_shard_fetcher() {
             Ok(()) => ExitCode::SUCCESS,
@@ -1732,14 +1586,8 @@ pub(crate) fn run_from_env() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        _ => match run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("myelin-worker: {error}");
-                ExitCode::from(1)
-            }
-        },
-    }
+        _ => return None,
+    })
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1761,13 +1609,80 @@ fn run_stage_shard_fetcher() -> Result<(), String> {
     })
 }
 
-fn run() -> Result<(), String> {
+fn publish_bootstrap_exec(config: &DeploymentConfig) -> Result<(), String> {
+    let Some(raw_fd) = env_optional("MYELIN_BOOTSTRAP_READY_FD") else {
+        return Ok(());
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+        Err(format!(
+            "bootstrap readiness descriptor {raw_fd} requires Linux"
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+
+        let fd = raw_fd
+            .parse::<i32>()
+            .map_err(|error| format!("invalid MYELIN_BOOTSTRAP_READY_FD: {error}"))?;
+        if fd <= 2 {
+            return Err("bootstrap readiness requires a dedicated inherited descriptor".to_owned());
+        }
+        // SAFETY: F_GETFD only checks the descriptor; it borrows no Rust value.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(format!(
+                "inspect bootstrap readiness descriptor: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: the launcher transfers this live descriptor exclusively to
+        // this startup path, before the worker creates its runtime threads.
+        let mut ready = unsafe { fs::File::from_raw_fd(fd) };
+        let deployment = config
+            .deployment
+            .as_ref()
+            .ok_or_else(|| "bootstrap readiness requires a deployment identity".to_owned())?;
+        let process_start_ticks = config
+            .process_start_ticks
+            .ok_or_else(|| "bootstrap readiness requires a process identity".to_owned())?;
+        #[derive(serde::Serialize)]
+        struct ExecReceipt<'a> {
+            pid: u32,
+            process_start_ticks: u64,
+            deployment_generation: &'a str,
+        }
+        serde_json::to_writer(
+            &mut ready,
+            &ExecReceipt {
+                pid: std::process::id(),
+                process_start_ticks,
+                deployment_generation: &deployment.deployment_generation,
+            },
+        )
+        .map_err(|error| format!("write bootstrap exec receipt: {error}"))?;
+        ready
+            .write_all(b"\n")
+            .map_err(|error| format!("finish bootstrap exec receipt: {error}"))
+    }
+}
+
+/// Prepare worker runtime parts before the binary constructs its execution engine.
+///
+/// The returned continuation receives task authority explicitly; it never mints
+/// a capability and keeps the engine alive through terminal runtime completion.
+pub fn prepare_worker_node() -> Result<
+    (
+        RuntimeParts,
+        impl FnOnce(Engine, TaskSpawner) -> Result<(), String>,
+    ),
+    String,
+> {
     let config = DeploymentConfig::from_env()?;
+    publish_bootstrap_exec(&config)?;
     let boot = |phase: &str, status: &str, detail: Value| {
         emit_stdio_node_event(&config, NODE_BOOTSTRAP_CHANNEL, phase, status, detail)
-    };
-    let worker_evt = |phase: &str, status: &str, detail: Value| {
-        emit_stdio_node_event(&config, NODE_WORKER_CHANNEL, phase, status, detail)
     };
     boot(
         "config",
@@ -1815,472 +1730,632 @@ fn run() -> Result<(), String> {
         },
         Some(worker_stats_hook),
     );
-    let engine = match TokioBackend::new(TokioConfig::default())
-        .and_then(|backend| Engine::new(parts, backend))
-    {
-        Ok(engine) => {
-            boot(
-                "engine",
-                "ready",
-                json!({"backend":"tokio","owns":"core+substrate"}),
-            )?;
-            engine
-        }
-        Err(error) => {
-            boot("engine", "failed", json!({"error":error.to_string()}))?;
-            return Err(format!("create engine: {error}"));
-        }
-    };
-    let mut driver = match IrohDriver::with_engine(
-        engine.handle(),
-        IrohDriverConfig {
-            secret_key: None,
-            relay_mode: config.relay_mode.clone(),
-            bind_port: None,
-            node: DistributedNodeConfig::default(),
-            peer_auth: None,
-            additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
-        },
-    ) {
-        Ok(driver) => driver,
-        Err(error) => {
-            boot("iroh_driver", "failed", json!({"error":error.to_string()}))?;
-            return Err(format!("create iroh driver: {error}"));
-        }
-    };
-    // Bootstrap supervisors pull telemetry from the node endpoint. Keep these
-    // ALPN connections available to the node loop instead of the legacy push
-    // reader path.
-    driver.retain_telemetry_connections();
-    let coordinator_uses_relay = config
-        .coordinator_endpoint
-        .as_ref()
-        .is_some_and(|endpoint| endpoint.relay_urls().next().is_some());
-    if coordinator_uses_relay && !matches!(config.relay_mode, RelayMode::Disabled) {
+    Ok((parts, move |engine: Engine, tasks: TaskSpawner| {
+        let boot = |phase: &str, status: &str, detail: Value| {
+            emit_stdio_node_event(&config, NODE_BOOTSTRAP_CHANNEL, phase, status, detail)
+        };
+        let worker_evt = |phase: &str, status: &str, detail: Value| {
+            emit_stdio_node_event(&config, NODE_WORKER_CHANNEL, phase, status, detail)
+        };
         boot(
-            "iroh_relay",
-            "waiting",
-            json!({"relay_mode":format!("{:?}", config.relay_mode)}),
-        )?;
-        let endpoint = driver.wait_for_relay_endpoint()?;
-        boot(
-            "iroh_relay",
+            "engine",
             "ready",
-            json!({"relay_url":endpoint.relay_urls().next().map(ToString::to_string)}),
+            json!({"backend":"tokio","owns":"core+substrate"}),
         )?;
-    }
-    let advertised_self_endpoint =
-        advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
-    boot(
-        "iroh_driver",
-        "ready",
-        json!({"endpoint":advertised_self_endpoint.clone(),"has_relay":advertised_self_endpoint.relay_urls().next().is_some(),"direct_addr_count":advertised_self_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay_mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
-    )?;
-    if let Some(coordinator) = &config.coordinator_endpoint {
-        driver.join(std::slice::from_ref(coordinator));
-        boot(
-            "coordinator_join",
-            "started",
-            json!({"endpoint":coordinator,"has_relay":coordinator.relay_urls().next().is_some(),"direct_addr_count":coordinator.ip_addrs().count()}),
-        )?;
-    } else {
-        boot(
-            "coordinator_join",
-            "skipped",
-            json!({"reason":"MYELIN_COORDINATOR_ENDPOINT not set","mode":"standalone"}),
-        )?;
-    }
-
-    let stack = DistributionRuntimeStack::new_from_runtime(
-        runtime.clone(),
-        codec,
-        transport_router,
-        driver.node_id(),
-        DistributedNodeConfig::default(),
-        engine.handle(),
-    );
-    boot(
-        "distribution_stack",
-        "ready",
-        json!({"actors":"initialized","route_view":"initialized","swim":"initialized","outbox":"initialized"}),
-    )?;
-    boot(
-        "codecs",
-        "ready",
-        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
-    )?;
-    driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
-        runtime: stack.runtime.clone(),
-        codec: stack.codec.clone(),
-        routes: stack.actor_bridge_routes(),
-        swim: stack.actors.swim,
-        relay_mirror: stack.relay_mirror.clone(),
-        route_view: stack.route_view.clone(),
-        outbox: stack.outbox.clone(),
-    });
-    // Engine owns protocol tick injection and core progression; the application
-    // loop only drains integration-owned queues (ENGINE_SPEC.md).
-    stack.spawn_protocol_ticker(PUMP_INTERVAL);
-    driver.install_actor_bridge_pump(PUMP_INTERVAL);
-    boot(
-        "actor_bridge",
-        "ready",
-        json!({"transport":"iroh","routes":"attached","protocol_ticker":"engine-hosted"}),
-    )?;
-
-    let arena_manager = match arena::ArenaManager::boot(arena::ArenaConfig {
-        node_id: arena::NodeId(config.logical_node_id),
-        reservation_ceiling: config.arena_bytes,
-        base_alignment: config.arena_alignment,
-    }) {
-        Ok(manager) => {
+        let mut driver = match IrohDriver::with_engine(
+            tasks.clone(),
+            engine.handle(),
+            IrohDriverConfig {
+                secret_key: None,
+                relay_mode: config.relay_mode.clone(),
+                bind_port: None,
+                node: DistributedNodeConfig::default(),
+                peer_auth: None,
+                additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
+            },
+        ) {
+            Ok(driver) => driver,
+            Err(error) => {
+                boot("iroh_driver", "failed", json!({"error":error.to_string()}))?;
+                return Err(format!("create iroh driver: {error}"));
+            }
+        };
+        // Bootstrap supervisors pull telemetry from the node endpoint. Keep these
+        // ALPN connections available to the node loop instead of the legacy push
+        // reader path.
+        driver.retain_telemetry_connections();
+        let coordinator_uses_relay = config
+            .coordinator_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.relay_urls().next().is_some());
+        if coordinator_uses_relay && !matches!(config.relay_mode, RelayMode::Disabled) {
             boot(
-                "arena_manager",
+                "iroh_relay",
+                "waiting",
+                json!({"relay_mode":format!("{:?}", config.relay_mode)}),
+            )?;
+            let endpoint = driver.wait_for_relay_endpoint()?;
+            boot(
+                "iroh_relay",
                 "ready",
-                json!({
-                    "arena_bytes":config.arena_bytes,
-                    "arena_alignment":config.arena_alignment,
-                }),
+                json!({"relay_url":endpoint.relay_urls().next().map(ToString::to_string)}),
             )?;
-            Arc::new(Mutex::new(manager))
         }
-        Err(error) => {
+        let advertised_self_endpoint =
+            advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
+        boot(
+            "iroh_driver",
+            "ready",
+            json!({"endpoint":advertised_self_endpoint.clone(),"has_relay":advertised_self_endpoint.relay_urls().next().is_some(),"direct_addr_count":advertised_self_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay_mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
+        )?;
+        if let Some(coordinator) = &config.coordinator_endpoint {
+            driver.join(std::slice::from_ref(coordinator));
             boot(
-                "arena_manager",
-                "failed",
-                json!({"error":format!("{error:?}")}),
+                "coordinator_join",
+                "started",
+                json!({"endpoint":coordinator,"has_relay":coordinator.relay_urls().next().is_some(),"direct_addr_count":coordinator.ip_addrs().count()}),
             )?;
-            return Err(format!("boot arena manager: {error:?}"));
+        } else {
+            boot(
+                "coordinator_join",
+                "skipped",
+                json!({"reason":"MYELIN_COORDINATOR_ENDPOINT not set","mode":"standalone"}),
+            )?;
         }
-    };
-    let arena_fd = arena_manager.lock().arena_fd();
 
-    let node_boot = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
-        emit_node_event(ds, &config, NODE_BOOTSTRAP_CHANNEL, phase, status, detail)
-    };
-    let node_runtime = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
-        emit_node_event(ds, &config, NODE_RUNTIME_CHANNEL, phase, status, detail)
-    };
-    // Telemetry leaves this node exclusively through pull subscriptions served
-    // by `serve_telemetry_pulls` on `TELEMETRY_ALPN`; no publisher actor.
-    let sampler_health_channel = telemetry.channel_by_name(NODE_SAMPLER_CHANNEL);
-    let sampler_health_context = SamplerHealthContext::from_config(&config);
-    spawn_host_gpu_sampler(
-        engine.handle(),
-        telemetry.producer.clone(),
-        telemetry.channels.host_gpu,
-        sampler_health_channel,
-        sampler_health_context,
-    );
-    spawn_host_memory_sampler(
-        engine.handle(),
-        telemetry.producer.clone(),
-        telemetry.channels.host_memory,
-        sampler_health_channel,
-        sampler_health_context,
-    );
-    spawn_host_net_sampler(
-        engine.handle(),
-        telemetry.producer.clone(),
-        telemetry.channels.host_net,
-        sampler_health_channel,
-        sampler_health_context,
-    );
-    spawn_host_storage_sampler(
-        engine.handle(),
-        telemetry.producer.clone(),
-        telemetry.channels.host_storage,
-        sampler_health_channel,
-        sampler_health_context,
-    );
-    spawn_arena_sampler(
-        runtime.clone(),
-        engine.handle(),
-        telemetry.producer.clone(),
-        telemetry.channels.arena,
-        Arc::clone(&arena_manager),
-    );
-    let worker_synthetic_id = format!(
-        "myelin-worker-{}-{}-telemetry-preflight",
-        config.logical_node_id, config.stage_index
-    );
-    for (phase, status) in [
-        ("TelemetryProducerConfigured", "configured"),
-        ("TelemetryProducerConnected", "ready"),
-        ("TelemetrySyntheticEventSent", "sent"),
-        ("TelemetrySyntheticEventObserved", "observed"),
-    ] {
-        node_boot(
-            &mut telemetry,
-            phase,
-            status,
-            json!({
-                "producer":"myelin-worker",
-                "producer_class":"rust-worker-node",
-                "synthetic_id":worker_synthetic_id,
-                "telemetry_endpoint":{
-                    "role":"worker-node-iroh-pull-server",
-                    "transport":"iroh-telemetry",
-                    "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-                    "relay_mode":format!("{:?}", config.relay_mode),
-                },
-            }),
+        let stack = DistributionRuntimeStack::new_from_runtime(
+            runtime.clone(),
+            codec,
+            transport_router,
+            driver.node_id(),
+            DistributedNodeConfig::default(),
+            engine.handle(),
         );
-    }
-    let debug_join_rx = match &config.debug_join_socket {
-        Some(path) => match spawn_debug_join_listener(engine.handle(), PathBuf::from(path)) {
-            Ok(rx) => {
-                node_runtime(
-                    &mut telemetry,
-                    "debug_join_socket",
+        boot(
+            "distribution_stack",
+            "ready",
+            json!({"actors":"initialized","route_view":"initialized","membership":"initialized","outbox":"initialized"}),
+        )?;
+        boot(
+            "codecs",
+            "ready",
+            json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
+        )?;
+        driver.enable_actor_bridge(iroh_driver::ActorBridgeConfig {
+            runtime: stack.runtime.clone(),
+            codec: stack.codec.clone(),
+            routes: stack.actor_bridge_routes(),
+            swim: stack.actors.swim,
+            relay_mirror: stack.relay_mirror.clone(),
+            route_view: stack.route_view.clone(),
+            outbox: stack.outbox.clone(),
+        });
+        // Distribution protocols own their progression; Myelin supplies no cadence.
+        driver.install_actor_bridge();
+        boot(
+            "actor_bridge",
+            "ready",
+            json!({"transport":"iroh","routes":"attached","progress":"transport_observations"}),
+        )?;
+
+        let arena_manager = match arena::ArenaManager::boot(arena::ArenaConfig {
+            node_id: arena::NodeId(config.logical_node_id),
+            reservation_ceiling: config.arena_bytes,
+            base_alignment: config.arena_alignment,
+        }) {
+            Ok(manager) => {
+                boot(
+                    "arena_manager",
                     "ready",
-                    json!({"socket":path}),
-                );
-                Some(rx)
+                    json!({
+                        "arena_bytes":config.arena_bytes,
+                        "arena_alignment":config.arena_alignment,
+                    }),
+                )?;
+                Arc::new(Mutex::new(manager))
             }
             Err(error) => {
+                boot(
+                    "arena_manager",
+                    "failed",
+                    json!({"error":format!("{error:?}")}),
+                )?;
+                return Err(format!("boot arena manager: {error:?}"));
+            }
+        };
+        let arena_fd = arena_manager.lock().arena_fd();
+
+        let node_runtime = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
+            emit_node_event(ds, &config, NODE_RUNTIME_CHANNEL, phase, status, detail)
+        };
+        // Telemetry leaves this node exclusively through pull subscriptions served
+        // by the external transport owner on `TELEMETRY_ALPN`; no publisher actor.
+        let sampler_health_channel = telemetry.channel_by_name(NODE_SAMPLER_CHANNEL);
+        let sampler_health_context = SamplerHealthContext::from_config(&config);
+        let report_wake_target = Arc::new(Mutex::new(None));
+        let runtime_wake = RuntimeWake {
+            sender: stack.runtime.create_sender(),
+            target: Arc::clone(&report_wake_target),
+        };
+        telemetry
+            .resource_samples
+            .lock()
+            .push(spawn_host_gpu_sampler(
+                tasks.clone(),
+                engine.handle(),
+                Arc::clone(&telemetry.endpoint),
+                telemetry.channels.host_gpu,
+                sampler_health_channel,
+                sampler_health_context,
+            ));
+        telemetry
+            .resource_samples
+            .lock()
+            .push(spawn_host_memory_sampler(
+                tasks.clone(),
+                engine.handle(),
+                Arc::clone(&telemetry.endpoint),
+                telemetry.channels.host_memory,
+                sampler_health_channel,
+                sampler_health_context,
+            ));
+        telemetry
+            .resource_samples
+            .lock()
+            .push(spawn_host_net_sampler(
+                tasks.clone(),
+                engine.handle(),
+                Arc::clone(&telemetry.endpoint),
+                telemetry.channels.host_net,
+                sampler_health_channel,
+                sampler_health_context,
+            ));
+        telemetry
+            .resource_samples
+            .lock()
+            .push(spawn_host_storage_sampler(
+                tasks.clone(),
+                engine.handle(),
+                Arc::clone(&telemetry.endpoint),
+                telemetry.channels.host_storage,
+                sampler_health_channel,
+                sampler_health_context,
+            ));
+        telemetry.arena_sampler = Some(ArenaSampler {
+            producer: telemetry.producer.clone(),
+            channel: telemetry.channels.arena,
+            arena_manager: Arc::clone(&arena_manager),
+            seq: 0,
+        });
+        telemetry.observe_work();
+        let debug_join_rx = match &config.debug_join_socket {
+            Some(path) => match spawn_debug_join_listener(
+                tasks.clone(),
+                PathBuf::from(path),
+                runtime_wake.clone(),
+            ) {
+                Ok(rx) => {
+                    node_runtime(
+                        &mut telemetry,
+                        "debug_join_socket",
+                        "ready",
+                        json!({"socket":path}),
+                    );
+                    Some(rx)
+                }
+                Err(error) => {
+                    node_runtime(
+                        &mut telemetry,
+                        "debug_join_socket",
+                        "failed",
+                        json!({"socket":path,"error":error}),
+                    );
+                    return Err(format!("bind debug join socket {}: {error}", path));
+                }
+            },
+            None => {
                 node_runtime(
                     &mut telemetry,
                     "debug_join_socket",
-                    "failed",
-                    json!({"socket":path,"error":error}),
+                    "skipped",
+                    json!({"reason":"MYELIN_DEBUG_JOIN_SOCKET=disabled"}),
                 );
-                return Err(format!("bind debug join socket {}: {error}", path));
+                None
             }
-        },
-        None => {
+        };
+
+        let reports = match stack.runtime.new_inbox::<NodeAgentReport>() {
+            Ok(inbox) => {
+                boot("node_report_inbox", "ready", json!({"actor":inbox.addr()}))?;
+                inbox
+            }
+            Err(error) => {
+                boot(
+                    "node_report_inbox",
+                    "failed",
+                    json!({"error":error.to_string()}),
+                )?;
+                return Err(format!("node report inbox: {error}"));
+            }
+        };
+        let report_forwarder = stack
+            .runtime
+            .spawn(NodeReportWakeForwarder {
+                destination: *reports.addr(),
+                target: Arc::clone(&report_wake_target),
+            })
+            .map_err(|error| format!("spawn node report wake forwarder: {error}"))?;
+        let route_target = Arc::clone(&report_wake_target);
+        let route_sender = stack.runtime.create_sender();
+        let route_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(target) = *route_target.lock() {
+                let _ = route_sender.send_to(target, NodeRuntimeMsg::RoutingChanged);
+            }
+        });
+        stack
+            .runtime
+            .send_to(
+                stack.actors.directory,
+                distribution::directory_actor::DirectoryIn::WatchRoutes {
+                    changed: Arc::downgrade(&route_wake),
+                },
+            )
+            .map_err(|error| format!("watch runtime ready routes: {error}"))?;
+        stack
+            .runtime
+            .send_to(
+                stack.actors.registry,
+                distribution::registry_actor::RegistryIn::WatchName {
+                    name: CONTROL_REGISTRY_NAME.to_owned(),
+                    changed: Arc::downgrade(&route_wake),
+                },
+            )
+            .map_err(|error| format!("watch control registry: {error}"))?;
+        stack.watch_membership(Arc::downgrade(&route_wake));
+        // The synchronous entrypoint retains the transport watch until its runtime
+        // actor completes; teardown cancels the watch even on startup failure.
+        let _route_watch = driver.connection_observer().watch_connections(route_wake);
+        let rejoin_replies = stack
+            .runtime
+            .new_inbox::<ManualControlReply>()
+            .map_err(|error| format!("rejoin reply inbox: {error}"))?;
+        let rejoin_forwarder = stack
+            .runtime
+            .spawn(RejoinReplyForwarder {
+                destination: *rejoin_replies.addr(),
+                wake: runtime_wake.clone(),
+            })
+            .map_err(|error| format!("spawn rejoin reply observer: {error}"))?;
+        let orchestrator = config.orchestrator_actor.ok_or_else(|| {
+            "MYELIN_ORCHESTRATOR_ACTOR is required for runtime readiness signaling".to_owned()
+        })?;
+        let orchestrator_source = "env";
+        boot(
+            "orchestrator_actor",
+            "ready",
+            json!({"actor":orchestrator,"source":orchestrator_source}),
+        )?;
+        let mut contextual_blob_receiver = None;
+        let contextual_services = if config.agent_only {
+            let namespace = install_namespace_client(&stack, &driver)?;
+            let blob_receiver = Arc::new(IrohBlobTransferReceiver::new(
+                driver.endpoint_addr(),
+                driver.edge_events_handle(),
+            ));
+            contextual_blob_receiver = Some(Arc::clone(&blob_receiver));
+            let transfer_receiver: Arc<dyn BlobTransferReceiver> = blob_receiver;
+            let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
+                driver.edge_connector(),
+                &engine.handle(),
+                stack.runtime.clone(),
+            ));
+            let routes: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
+                stack.route_view.clone(),
+                stack.pinned_routes.clone(),
+                stack.route_binder.clone(),
+                stack.runtime.clone(),
+                stack.actors.directory,
+                driver.connection_observer(),
+            ));
+            let spawner = Arc::new(build_contextual_process_spawner(
+                MyelinContextualProcessConfig {
+                    runtime: stack.runtime.clone(),
+                    engine: engine.handle(),
+                    arena_bytes: config.arena_bytes,
+                    arena_alignment: config.arena_alignment,
+                    namespace: Some(namespace.client.clone()),
+                    transfer_receiver: Some(Arc::clone(&transfer_receiver)),
+                    source_sender: Some(source_sender),
+                    source_publisher: Some(namespace.source_publisher),
+                    route_registrar: Arc::clone(&routes),
+                    stream_transport: Some(driver.stream_transport()),
+                    host_endpoint: driver.endpoint_addr(),
+                },
+            )?);
+            let materializer = ContextualProgramMaterializer {
+                namespace_proxy: namespace.client.proxy(),
+                receiver: transfer_receiver,
+                routes,
+                sender: stack.runtime.create_sender(),
+                root: std::env::temp_dir().join("myelin-contextual"),
+            };
+            Some((spawner, materializer))
+        } else {
+            None
+        };
+        let contextual_controller = contextual_services
+            .as_ref()
+            .map(|(spawner, materializer)| {
+                stack.runtime.spawn(
+                    ContextualProcessController::new(
+                        stack.runtime.clone(),
+                        config.logical_node_id,
+                        Arc::clone(spawner),
+                        stack.runtime.create_sender(),
+                        Arc::clone(&materializer.routes),
+                    )?
+                    .with_program_materializer(materializer.clone())
+                    .with_resource_probe(
+                        crate::contextual_process::ContextualResourceProbe {
+                            runtime: stack.runtime.clone(),
+                            engine: engine.handle(),
+                            arena: Arc::clone(&arena_manager),
+                            stream_transport: driver.stream_transport().resource_probe(),
+                            generation: telemetry.producer.stream_id().life.0,
+                            iroh_node_id: driver.node_id().to_string(),
+                            deployment: config.deployment.clone(),
+                        },
+                    ),
+                )
+            })
+            .transpose()
+            .map_err(|error| format!("spawn contextual process controller: {error}"))?;
+        let mut node_agent = NodeAgentActor::new(
+            stage::NodeId(config.logical_node_id),
+            orchestrator,
+            Some(report_forwarder),
+        )
+        .with_directory_actor(stack.actors.directory)
+        .with_peer_connector(driver.peer_connector());
+        if let Some(controller) = contextual_controller {
+            node_agent = node_agent.with_contextual_controller(controller);
+        }
+        let node_actor = match stack.runtime.spawn(node_agent) {
+            Ok(actor) => {
+                boot(
+                    "node_agent",
+                    "ready",
+                    json!({"node_actor":actor,"source":"generated"}),
+                )?;
+                actor
+            }
+            Err(error) => {
+                boot(
+                    "node_agent",
+                    "failed",
+                    json!({"error":error.to_string(),"source":"generated"}),
+                )?;
+                return Err(format!("spawn node agent: {error}"));
+            }
+        };
+        stack.register_local_actor(driver.register_actor(node_actor, 1));
+        // Agent-only nodes do not launch the legacy Tinygrad child, but they still
+        // need host CPU telemetry. The sampler's host totals are independent of
+        // the watched process list; watch the node process itself for process detail.
+        if config.agent_only {
+            telemetry
+                .resource_samples
+                .lock()
+                .push(spawn_host_cpu_sampler(
+                    tasks.clone(),
+                    engine.handle(),
+                    Arc::clone(&telemetry.endpoint),
+                    telemetry.channels.host_cpu,
+                    sampler_health_channel,
+                    sampler_health_context,
+                    vec![std::process::id()],
+                ));
+        }
+        stack.register_local_actor(driver.register_actor(rejoin_forwarder, 1));
+        let pending_control_rejoin = PendingControlRejoin::new(
+            &config,
+            &advertised_self_endpoint,
+            driver.node_id(),
+            node_actor,
+            orchestrator,
+            rejoin_forwarder,
+        )?;
+        boot(
+            "network_registration",
+            "ready",
+            json!({"node_actor":node_actor,"network_reachable":true}),
+        )?;
+        let peers = driver.peer_connector();
+        let mut edge_port = driver.edge_port();
+        let _transport = spawn_worker_transport(
+            tasks.clone(),
+            driver,
+            Arc::clone(&telemetry.endpoint),
+            runtime_wake.clone(),
+            contextual_blob_receiver,
+            stack.runtime.clone(),
+        );
+
+        if config.agent_only {
+            boot(
+                "agent_mode",
+                "ready",
+                json!({"framework":"none","workloads":"contextual_processes"}),
+            )?;
+            let pending_runtime_ready =
+                PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
+            let ready = json!({
+                "type":"ready",
+                "endpoint":advertised_self_endpoint,
+                "node_actor":node_actor,
+                "logical_node_id":config.logical_node_id,
+                "stage_index":config.stage_index,
+            });
+            boot(
+                "runtime_ready_local",
+                "ready",
+                json!({
+                    "endpoint":advertised_self_endpoint,
+                    "node_actor":node_actor,
+                    "logical_node_id":config.logical_node_id,
+                    "stage_index":config.stage_index,
+                    "readiness_id":pending_runtime_ready.readiness_id,
+                }),
+            )?;
             node_runtime(
                 &mut telemetry,
-                "debug_join_socket",
-                "skipped",
-                json!({"reason":"MYELIN_DEBUG_JOIN_SOCKET=disabled"}),
+                "main_loop",
+                "started",
+                json!({
+                    "mode":"agent_only",
+                    "checks":["network","telemetry","node_reports","stdin_shutdown"],
+                }),
             );
-            None
-        }
-    };
-
-    let reports = match stack.runtime.new_inbox::<NodeAgentReport>() {
-        Ok(inbox) => {
-            boot("node_report_inbox", "ready", json!({"actor":inbox.addr()}))?;
-            inbox
-        }
-        Err(error) => {
-            boot(
-                "node_report_inbox",
-                "failed",
-                json!({"error":error.to_string()}),
-            )?;
-            return Err(format!("node report inbox: {error}"));
-        }
-    };
-    let report_wake_target = Arc::new(Mutex::new(None));
-    let report_forwarder = stack
-        .runtime
-        .spawn(NodeReportWakeForwarder {
-            destination: *reports.addr(),
-            target: Arc::clone(&report_wake_target),
-        })
-        .map_err(|error| format!("spawn node report wake forwarder: {error}"))?;
-    let route_target = Arc::clone(&report_wake_target);
-    let route_sender = stack.runtime.create_sender();
-    let route_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        if let Some(target) = *route_target.lock() {
-            let _ = route_sender.send_to(target, NodeRuntimeMsg::RoutingChanged);
-        }
-    });
-    stack
-        .runtime
-        .send_to(
-            stack.actors.directory,
-            distribution::directory_actor::DirectoryIn::WatchRoutes {
-                changed: Arc::downgrade(&route_wake),
-            },
-        )
-        .map_err(|error| format!("watch runtime ready routes: {error}"))?;
-    // The synchronous entrypoint retains the transport watch until its runtime
-    // actor completes; teardown cancels the watch even on startup failure.
-    let _route_watch = driver.connection_observer().watch_connections(route_wake);
-    let rejoin_replies = stack
-        .runtime
-        .new_inbox::<ManualControlReply>()
-        .map_err(|error| format!("rejoin reply inbox: {error}"))?;
-    let orchestrator = config.orchestrator_actor.ok_or_else(|| {
-        "MYELIN_ORCHESTRATOR_ACTOR is required for runtime readiness signaling".to_owned()
-    })?;
-    let orchestrator_source = "env";
-    boot(
-        "orchestrator_actor",
-        "ready",
-        json!({"actor":orchestrator,"source":orchestrator_source}),
-    )?;
-    let contextual_services = if config.agent_only {
-        let namespace = install_namespace_client(&stack, &driver)?;
-        let blob_receiver = Arc::new(IrohBlobTransferReceiver::new(
-            driver.endpoint_addr(),
-            driver.edge_events_handle(),
-        ));
-        blob_receiver.install_pump(
-            &engine.handle(),
-            stack.runtime.clone(),
-            PUMP_INTERVAL,
-            driver.edge_events_changed(),
-        );
-        let transfer_receiver: Arc<dyn BlobTransferReceiver> = blob_receiver;
-        let source_sender: Arc<dyn BlobTransferSender> = Arc::new(IrohBlobTransferSender::new(
-            driver.edge_connector(),
-            &engine.handle(),
-            stack.runtime.clone(),
-        ));
-        let routes: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
-            stack.route_view.clone(),
-            stack.pinned_routes.clone(),
-            stack.route_binder.clone(),
-            stack.runtime.clone(),
-            stack.actors.directory,
-            driver.connection_observer(),
-        ));
-        let spawner = Arc::new(build_contextual_process_spawner(
-            MyelinContextualProcessConfig {
-                runtime: stack.runtime.clone(),
-                engine: engine.handle(),
-                arena_bytes: config.arena_bytes,
-                arena_alignment: config.arena_alignment,
-                namespace: Some(namespace.client.clone()),
-                transfer_receiver: Some(Arc::clone(&transfer_receiver)),
-                source_sender: Some(source_sender),
-                source_publisher: Some(namespace.source_publisher),
-                route_registrar: Arc::clone(&routes),
-                stream_transport: Some(driver.stream_transport()),
-                host_endpoint: driver.endpoint_addr(),
-            },
-        )?);
-        let materializer = ContextualProgramMaterializer {
-            namespace_proxy: namespace.client.proxy(),
-            receiver: transfer_receiver,
-            routes,
-            engine: engine.handle(),
-            sender: stack.runtime.create_sender(),
-            root: std::env::temp_dir().join("myelin-contextual"),
-        };
-        Some((spawner, materializer))
-    } else {
-        None
-    };
-    let contextual_controller = contextual_services
-        .as_ref()
-        .map(|(spawner, materializer)| {
-            stack.runtime.spawn(
-                ContextualProcessController::new(
-                    config.logical_node_id,
-                    Arc::clone(spawner),
-                    stack.runtime.create_sender(),
-                )
-                .with_program_materializer(materializer.clone())
-                .with_resource_probe(
-                    crate::contextual_process::ContextualResourceProbe {
-                        runtime: stack.runtime.clone(),
-                        engine: engine.handle(),
-                        arena: Arc::clone(&arena_manager),
-                        stream_transport: driver.stream_transport(),
-                        generation: telemetry.producer.stream_id().life.0,
-                        iroh_node_id: driver.node_id().to_string(),
-                        deployment: config.deployment.clone(),
+            let actor_runtime = stack.runtime.clone();
+            let sender = actor_runtime.create_sender();
+            let exit_on_stdin_eof = config.exit_on_stdin_eof;
+            let completion = ActorCompletion::new();
+            let runtime_actor = actor_runtime
+                .spawn(AgentNodeRuntimeActor {
+                    effects: AgentNodeRuntimeLive {
+                        config,
+                        telemetry,
+                        peers,
+                        stack,
+                        debug_join_rx,
+                        runtime_stats: runtime_stats.clone(),
+                        pending_control_rejoin,
+                        rejoin_replies,
                     },
-                ),
-            )
-        })
-        .transpose()
-        .map_err(|error| format!("spawn contextual process controller: {error}"))?;
-    let mut node_agent = NodeAgentActor::new(
-        stage::NodeId(config.logical_node_id),
-        orchestrator,
-        Some(report_forwarder),
-    )
-    .with_directory_actor(stack.actors.directory)
-    .with_peer_connector(driver.peer_connector());
-    if let Some(controller) = contextual_controller {
-        node_agent = node_agent.with_contextual_controller(controller);
-    }
-    let node_actor = match stack.runtime.spawn(node_agent) {
-        Ok(actor) => {
-            boot(
-                "node_agent",
-                "ready",
-                json!({"node_actor":actor,"source":"generated"}),
-            )?;
-            actor
+                    reports,
+                    pending_runtime_ready,
+                    ready,
+                    node_actor,
+                    completion: completion.clone(),
+                })
+                .map_err(|error| format!("spawn agent node runtime actor: {error}"))?;
+            *report_wake_target.lock() = Some(runtime_actor);
+            let _ = sender.send_to(runtime_actor, NodeRuntimeMsg::RoutingChanged);
+            let stop_actor = actor_runtime
+                .spawn(StdinStopForwarder {
+                    sender: sender.clone(),
+                    target: runtime_actor,
+                })
+                .map_err(|error| format!("spawn stdin stop forwarder: {error}"))?;
+            spawn_stdin_shutdown_listener(
+                &engine.handle().blocking_work_sender(),
+                exit_on_stdin_eof,
+                sender,
+                stop_actor,
+            );
+            return completion.wait();
         }
-        Err(error) => {
-            boot(
-                "node_agent",
-                "failed",
-                json!({"error":error.to_string(),"source":"generated"}),
-            )?;
-            return Err(format!("spawn node agent: {error}"));
-        }
-    };
-    stack.register_local_actor(driver.register_actor(node_actor, 1));
-    // Agent-only nodes do not launch the legacy Tinygrad child, but they still
-    // need host CPU telemetry. The sampler's host totals are independent of
-    // the watched process list; watch the node process itself for process detail.
-    if config.agent_only {
-        spawn_host_cpu_sampler(
-            engine.handle(),
-            telemetry.producer.clone(),
-            telemetry.channels.host_cpu,
-            sampler_health_channel,
-            sampler_health_context,
-            vec![std::process::id()],
-        );
-    }
-    stack.register_local_actor(driver.register_actor(*rejoin_replies.addr(), 1));
-    let pending_control_rejoin = PendingControlRejoin::new(
-        &config,
-        &advertised_self_endpoint,
-        driver.node_id(),
-        node_actor,
-        orchestrator,
-    )?;
-    boot(
-        "network_registration",
-        "ready",
-        json!({"node_actor":node_actor,"network_reachable":true}),
-    )?;
 
-    if config.agent_only {
-        boot(
-            "agent_mode",
-            "ready",
-            json!({"framework":"none","workloads":"contextual_processes"}),
+        worker_evt(
+            "worker_process",
+            "started",
+            json!({
+                "program":"python3",
+                "script":&config.worker_script,
+                "device":&config.device,
+                "stdin":"piped",
+                "stdout":"piped",
+                "stderr":"piped",
+            }),
         )?;
+        let mut worker = match TinygradWorker::spawn(
+            &config,
+            arena_fd,
+            runtime.clone(),
+            engine.handle(),
+            runtime_wake.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                worker_evt("worker_process", "failed", json!({"error":error}))?;
+                return Err(error);
+            }
+        };
+        telemetry
+            .resource_samples
+            .lock()
+            .push(spawn_host_cpu_sampler(
+                tasks.clone(),
+                engine.handle(),
+                Arc::clone(&telemetry.endpoint),
+                telemetry.channels.host_cpu,
+                sampler_health_channel,
+                sampler_health_context,
+                vec![std::process::id(), worker.child.id()],
+            ));
+        worker_evt(
+            "worker_initialize",
+            "started",
+            json!({"command":"InitializeWorker","helper_abi_version":1,"device":&config.device}),
+        )?;
+        match worker.initialize(&config.device, &config, &mut telemetry) {
+            Ok(()) => worker_evt(
+                "worker_initialize",
+                "ready",
+                json!({"worker_event_type":"WorkerReady"}),
+            )?,
+            Err(error) => {
+                worker_evt("worker_initialize", "failed", json!({"error":error}))?;
+                return Err(error);
+            }
+        }
+        let edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
         let pending_runtime_ready =
             PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
+
         let ready = json!({
             "type":"ready",
-            "endpoint":advertised_self_endpoint,
-            "node_actor":node_actor,
-            "logical_node_id":config.logical_node_id,
-            "stage_index":config.stage_index,
+            "role":"node",
+            "endpoint": advertised_self_endpoint.clone(),
+            "node_actor": node_actor,
+            "logical_node_id": config.logical_node_id,
+            "stage_index": config.stage_index,
         });
         boot(
             "runtime_ready_local",
             "ready",
             json!({
-                "endpoint":advertised_self_endpoint,
+                "endpoint":advertised_self_endpoint.clone(),
                 "node_actor":node_actor,
                 "logical_node_id":config.logical_node_id,
                 "stage_index":config.stage_index,
                 "readiness_id":pending_runtime_ready.readiness_id,
             }),
         )?;
+
+        if let Some(prompt) = &config.self_test_prompt {
+            run_self_test(
+                &mut worker,
+                &config,
+                prompt,
+                &mut telemetry,
+                &mut edge_port,
+                &stack,
+            )?;
+        }
+
+        node_runtime(
+            &mut telemetry,
+            "stdin_shutdown_listener",
+            "ready",
+            json!({"command":"shutdown"}),
+        );
         node_runtime(
             &mut telemetry,
             "main_loop",
             "started",
             json!({
-                "mode":"agent_only",
-                "poll_interval_ms":PUMP_INTERVAL.as_millis(),
-                "checks":["network","telemetry","node_reports","stdin_shutdown"],
+                "checks":["network","edge_streams","telemetry","node_reports","stdin_shutdown","worker_health"],
             }),
         );
         let actor_runtime = stack.runtime.clone();
@@ -2288,26 +2363,28 @@ fn run() -> Result<(), String> {
         let exit_on_stdin_eof = config.exit_on_stdin_eof;
         let completion = ActorCompletion::new();
         let runtime_actor = actor_runtime
-            .spawn(AgentNodeRuntimeActor {
-                effects: AgentNodeRuntimeLive {
+            .spawn(WorkerNodeRuntimeActor {
+                effects: WorkerNodeRuntimeLive {
                     config,
                     telemetry,
-                    driver,
+                    driver: edge_port,
+                    peers,
                     stack,
                     debug_join_rx,
                     runtime_stats: runtime_stats.clone(),
                     pending_control_rejoin,
                     rejoin_replies,
+                    worker,
+                    edge_runtime,
+                    arena_manager,
                 },
                 reports,
                 pending_runtime_ready,
                 ready,
                 node_actor,
-                engine: engine.handle(),
-                sender: sender.clone(),
                 completion: completion.clone(),
             })
-            .map_err(|error| format!("spawn agent node runtime actor: {error}"))?;
+            .map_err(|error| format!("spawn worker node runtime actor: {error}"))?;
         *report_wake_target.lock() = Some(runtime_actor);
         let _ = sender.send_to(runtime_actor, NodeRuntimeMsg::RoutingChanged);
         let stop_actor = actor_runtime
@@ -2316,146 +2393,62 @@ fn run() -> Result<(), String> {
                 target: runtime_actor,
             })
             .map_err(|error| format!("spawn stdin stop forwarder: {error}"))?;
-        spawn_stdin_shutdown_listener(exit_on_stdin_eof, sender, stop_actor);
-        return completion.wait();
-    }
+        spawn_stdin_shutdown_listener(
+            &engine.handle().blocking_work_sender(),
+            exit_on_stdin_eof,
+            sender,
+            stop_actor,
+        );
+        completion.wait()
+    }))
+}
+#[derive(Clone)]
+struct RuntimeWake {
+    sender: ExternalSender,
+    target: Arc<Mutex<Option<ActorAddress>>>,
+}
 
-    worker_evt(
-        "worker_process",
-        "started",
-        json!({
-            "program":"python3",
-            "script":&config.worker_script,
-            "device":&config.device,
-            "stdin":"piped",
-            "stdout":"piped",
-            "stderr":"piped",
-        }),
-    )?;
-    let mut worker =
-        match TinygradWorker::spawn(&config, arena_fd, runtime.clone(), engine.handle()) {
-            Ok(worker) => worker,
-            Err(error) => {
-                worker_evt("worker_process", "failed", json!({"error":error}))?;
-                return Err(error);
-            }
-        };
-    spawn_host_cpu_sampler(
-        engine.handle(),
-        telemetry.producer.clone(),
-        telemetry.channels.host_cpu,
-        sampler_health_channel,
-        sampler_health_context,
-        vec![std::process::id(), worker.child.id()],
-    );
-    worker_evt(
-        "worker_initialize",
-        "started",
-        json!({"command":"InitializeWorker","helper_abi_version":1,"device":&config.device}),
-    )?;
-    match worker.initialize(&config.device, &config, &mut telemetry) {
-        Ok(()) => worker_evt(
-            "worker_initialize",
-            "ready",
-            json!({"worker_event_type":"WorkerReady"}),
-        )?,
-        Err(error) => {
-            worker_evt("worker_initialize", "failed", json!({"error":error}))?;
-            return Err(error);
+impl RuntimeWake {
+    fn send(&self, message: NodeRuntimeMsg) {
+        if let Some(target) = *self.target.lock() {
+            let _ = self.sender.send_to(target, message);
         }
     }
-    let edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
-    let pending_runtime_ready =
-        PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
-
-    let ready = json!({
-        "type":"ready",
-        "role":"node",
-        "endpoint": advertised_self_endpoint.clone(),
-        "node_actor": node_actor,
-        "logical_node_id": config.logical_node_id,
-        "stage_index": config.stage_index,
-    });
-    boot(
-        "runtime_ready_local",
-        "ready",
-        json!({
-            "endpoint":advertised_self_endpoint.clone(),
-            "node_actor":node_actor,
-            "logical_node_id":config.logical_node_id,
-            "stage_index":config.stage_index,
-            "readiness_id":pending_runtime_ready.readiness_id,
-        }),
-    )?;
-
-    if let Some(prompt) = &config.self_test_prompt {
-        run_self_test(
-            &mut worker,
-            &config,
-            prompt,
-            &mut telemetry,
-            &mut driver,
-            &stack,
-        )?;
-    }
-
-    node_runtime(
-        &mut telemetry,
-        "stdin_shutdown_listener",
-        "ready",
-        json!({"command":"shutdown"}),
-    );
-    node_runtime(
-        &mut telemetry,
-        "main_loop",
-        "started",
-        json!({
-            "poll_interval_ms":PUMP_INTERVAL.as_millis(),
-            "checks":["network","edge_streams","telemetry","node_reports","stdin_shutdown","worker_health"],
-        }),
-    );
-    let actor_runtime = stack.runtime.clone();
-    let sender = actor_runtime.create_sender();
-    let exit_on_stdin_eof = config.exit_on_stdin_eof;
-    let completion = ActorCompletion::new();
-    let runtime_actor = actor_runtime
-        .spawn(WorkerNodeRuntimeActor {
-            effects: WorkerNodeRuntimeLive {
-                config,
-                telemetry,
-                driver,
-                stack,
-                debug_join_rx,
-                runtime_stats: runtime_stats.clone(),
-                pending_control_rejoin,
-                rejoin_replies,
-                worker,
-                edge_runtime,
-                arena_manager,
-            },
-            reports,
-            pending_runtime_ready,
-            ready,
-            node_actor,
-            engine: engine.handle(),
-            sender: sender.clone(),
-            completion: completion.clone(),
-        })
-        .map_err(|error| format!("spawn worker node runtime actor: {error}"))?;
-    *report_wake_target.lock() = Some(runtime_actor);
-    let _ = sender.send_to(runtime_actor, NodeRuntimeMsg::RoutingChanged);
-    let stop_actor = actor_runtime
-        .spawn(StdinStopForwarder {
-            sender: sender.clone(),
-            target: runtime_actor,
-        })
-        .map_err(|error| format!("spawn stdin stop forwarder: {error}"))?;
-    spawn_stdin_shutdown_listener(exit_on_stdin_eof, sender, stop_actor);
-    completion.wait()
 }
+
+struct RejoinReplyForwarder {
+    destination: ActorAddress,
+    wake: RuntimeWake,
+}
+
+impl ActorInterface for RejoinReplyForwarder {
+    type Incoming = ManualControlReply;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, reply: Self::Incoming) {
+        let _ = ctx.send(self.destination, reply);
+        self.wake.send(NodeRuntimeMsg::Progress);
+    }
+}
+
+struct HelperProcessForwarder {
+    observation: Arc<Mutex<Option<swactor_process::ProcessExitObservation>>>,
+    wake: RuntimeWake,
+}
+
+impl ActorInterface for HelperProcessForwarder {
+    type Incoming = swactor_process::ProcessExitObservation;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, observation: Self::Incoming) {
+        *self.observation.lock() = Some(observation);
+        self.wake.send(NodeRuntimeMsg::Progress);
+        ctx.stop_self();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NodeRuntimeMsg {
-    Tick,
     Progress,
     RoutingChanged,
     Shutdown,
@@ -2505,6 +2498,7 @@ trait AgentNodeRuntimeEffects: Send + 'static {
     ) -> Result<(), String>;
 
     fn shutdown(&mut self);
+    fn routing_changed(&mut self) {}
 
     fn record_finish(&mut self, _result: &Result<(), String>) {}
 }
@@ -2512,7 +2506,7 @@ trait AgentNodeRuntimeEffects: Send + 'static {
 struct AgentNodeRuntimeLive {
     config: DeploymentConfig,
     telemetry: NodeTelemetry,
-    driver: IrohDriver,
+    peers: PeerConnector,
     stack: DistributionRuntimeStack,
     debug_join_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>>,
     runtime_stats: RuntimeStatsInspector,
@@ -2521,20 +2515,24 @@ struct AgentNodeRuntimeLive {
 }
 
 impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
+    fn routing_changed(&mut self) {
+        self.pending_control_rejoin.pending_actor = None;
+    }
+
     fn tick_before_reports(&mut self, node_actor: ActorAddress) -> Result<(), String> {
-        self.pending_control_rejoin
-            .drive(&self.stack, node_actor, &self.rejoin_replies)?;
-        emit_swim_telemetry(&mut self.telemetry, &self.stack, "agent_loop");
+        emit_membership_telemetry(&mut self.telemetry, &self.stack);
         drain_debug_join_commands(
             &mut self.debug_join_rx,
-            &mut self.driver,
+            &self.peers,
             &self.config,
             &mut self.telemetry,
             &mut self.pending_control_rejoin,
             &self.runtime_stats,
         );
+        self.pending_control_rejoin
+            .drive(&self.stack, node_actor, &self.rejoin_replies)?;
+        self.telemetry.observe_work();
         self.telemetry.tick();
-        serve_telemetry_pulls(&self.driver, &self.stack.engine, &self.telemetry.endpoint);
         Ok(())
     }
 
@@ -2561,12 +2559,12 @@ impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
         pending: &mut PendingRuntimeReady,
         node_actor: ActorAddress,
     ) -> Result<(), String> {
-        if !pending.swim_logged && pending.swim_ready(&self.stack) {
+        if !pending.membership_logged && pending.membership_ready(&self.stack) {
             emit_node_event(
                 &mut self.telemetry,
                 &self.config,
                 NODE_RUNTIME_CHANNEL,
-                "coordinator_swim",
+                "coordinator_membership",
                 "ready",
                 json!({
                     "coordinator":pending
@@ -2576,7 +2574,7 @@ impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
                     "readiness_id":pending.readiness_id,
                 }),
             );
-            pending.swim_logged = true;
+            pending.membership_logged = true;
         }
         if !pending.acked && pending.maybe_send(&self.stack, node_actor)? {
             emit_node_event(
@@ -2588,7 +2586,6 @@ impl AgentNodeRuntimeEffects for AgentNodeRuntimeLive {
                 json!({
                     "readiness_id":pending.readiness_id,
                     "attempts":pending.attempts,
-                    "next_backoff_ms":pending.backoff.as_millis(),
                 }),
             );
         }
@@ -2626,21 +2623,10 @@ struct AgentNodeRuntimeActor<E = AgentNodeRuntimeLive> {
     pending_runtime_ready: PendingRuntimeReady,
     ready: Value,
     node_actor: ActorAddress,
-    engine: EngineHandle,
-    sender: ExternalSender,
     completion: ActorCompletion<Result<(), String>>,
 }
 
 impl<E: AgentNodeRuntimeEffects> AgentNodeRuntimeActor<E> {
-    fn schedule_tick(&self, ctx: &Ctx) {
-        self.engine.send_after(
-            PUMP_INTERVAL,
-            self.sender.clone(),
-            ctx.self_addr(),
-            NodeRuntimeMsg::Tick,
-        );
-    }
-
     fn tick(&mut self) -> Result<(), String> {
         self.effects.tick_before_reports(self.node_actor)?;
         while let Some(report) = self.reports.try_recv() {
@@ -2680,18 +2666,15 @@ impl<E: AgentNodeRuntimeEffects> ActorInterface for AgentNodeRuntimeActor<E> {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        let _ = ctx.send(ctx.self_addr(), NodeRuntimeMsg::Tick);
+        let _ = ctx.send(ctx.self_addr(), NodeRuntimeMsg::Progress);
     }
 
     fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
         match message {
-            NodeRuntimeMsg::Tick => match self.tick() {
-                Ok(()) => self.schedule_tick(ctx),
-                Err(error) => self.finish(ctx, Err(error)),
-            },
             NodeRuntimeMsg::Progress | NodeRuntimeMsg::RoutingChanged => {
                 if matches!(message, NodeRuntimeMsg::RoutingChanged) {
-                    self.pending_runtime_ready.next_attempt_at = Instant::now();
+                    self.pending_runtime_ready.sent = false;
+                    self.effects.routing_changed();
                 }
                 if let Err(error) = self.tick() {
                     self.finish(ctx, Err(error));
@@ -2722,7 +2705,8 @@ trait WorkerNodeRuntimeEffects: Send + 'static {
         node_actor: ActorAddress,
     ) -> Result<(), String>;
 
-    fn shutdown(&mut self);
+    fn shutdown(&mut self) -> Result<(), String>;
+    fn routing_changed(&mut self) {}
 
     fn record_finish(&mut self, _result: &Result<(), String>) {}
 }
@@ -2730,7 +2714,8 @@ trait WorkerNodeRuntimeEffects: Send + 'static {
 struct WorkerNodeRuntimeLive {
     config: DeploymentConfig,
     telemetry: NodeTelemetry,
-    driver: IrohDriver,
+    driver: IrohEdgePort,
+    peers: PeerConnector,
     stack: DistributionRuntimeStack,
     debug_join_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>>,
     runtime_stats: RuntimeStatsInspector,
@@ -2742,20 +2727,24 @@ struct WorkerNodeRuntimeLive {
 }
 
 impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
+    fn routing_changed(&mut self) {
+        self.pending_control_rejoin.pending_actor = None;
+    }
+
     fn tick_before_reports(&mut self, node_actor: ActorAddress) -> Result<(), String> {
-        self.pending_control_rejoin
-            .drive(&self.stack, node_actor, &self.rejoin_replies)?;
-        emit_swim_telemetry(&mut self.telemetry, &self.stack, "main_loop");
+        emit_membership_telemetry(&mut self.telemetry, &self.stack);
         drain_debug_join_commands(
             &mut self.debug_join_rx,
-            &mut self.driver,
+            &self.peers,
             &self.config,
             &mut self.telemetry,
             &mut self.pending_control_rejoin,
             &self.runtime_stats,
         );
+        self.pending_control_rejoin
+            .drive(&self.stack, node_actor, &self.rejoin_replies)?;
+        self.telemetry.observe_work();
         self.telemetry.tick();
-        serve_telemetry_pulls(&self.driver, &self.stack.engine, &self.telemetry.endpoint);
         drain_worker_stderr(&self.worker.stderr_rx, &self.config, &mut self.telemetry);
         self.edge_runtime.poll_iroh(&mut WorkerRuntimeContext {
             config: &self.config,
@@ -2816,12 +2805,12 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
         pending: &mut PendingRuntimeReady,
         node_actor: ActorAddress,
     ) -> Result<(), String> {
-        if !pending.swim_logged && pending.swim_ready(&self.stack) {
+        if !pending.membership_logged && pending.membership_ready(&self.stack) {
             emit_node_event(
                 &mut self.telemetry,
                 &self.config,
                 NODE_RUNTIME_CHANNEL,
-                "coordinator_swim",
+                "coordinator_membership",
                 "ready",
                 json!({
                     "coordinator":pending
@@ -2831,7 +2820,7 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
                     "readiness_id":pending.readiness_id,
                 }),
             );
-            pending.swim_logged = true;
+            pending.membership_logged = true;
         }
         if !pending.acked && pending.maybe_send(&self.stack, node_actor)? {
             emit_node_event(
@@ -2843,11 +2832,10 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
                 json!({
                     "readiness_id":pending.readiness_id,
                     "attempts":pending.attempts,
-                    "next_backoff_ms":pending.backoff.as_millis(),
                 }),
             );
         }
-        if let Some(status) = self.worker.try_wait()? {
+        if let Some(status) = self.worker.observe_exit()? {
             emit_node_event(
                 &mut self.telemetry,
                 &self.config,
@@ -2867,7 +2855,7 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
         Ok(())
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<(), String> {
         emit_node_event(
             &mut self.telemetry,
             &self.config,
@@ -2876,7 +2864,8 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
             "started",
             json!({"source":"stdin","command":"shutdown"}),
         );
-        match self.worker.shutdown(&self.config, &mut self.telemetry) {
+        let result = self.worker.shutdown(&self.config, &mut self.telemetry);
+        match &result {
             Ok(()) => {
                 emit_node_event(
                     &mut self.telemetry,
@@ -2904,6 +2893,7 @@ impl WorkerNodeRuntimeEffects for WorkerNodeRuntimeLive {
                 json!({"error":error}),
             ),
         }
+        result
     }
 }
 
@@ -2913,21 +2903,10 @@ struct WorkerNodeRuntimeActor<E = WorkerNodeRuntimeLive> {
     pending_runtime_ready: PendingRuntimeReady,
     ready: Value,
     node_actor: ActorAddress,
-    engine: EngineHandle,
-    sender: ExternalSender,
     completion: ActorCompletion<Result<(), String>>,
 }
 
 impl<E: WorkerNodeRuntimeEffects> WorkerNodeRuntimeActor<E> {
-    fn schedule_tick(&self, ctx: &Ctx) {
-        self.engine.send_after(
-            PUMP_INTERVAL,
-            self.sender.clone(),
-            ctx.self_addr(),
-            NodeRuntimeMsg::Tick,
-        );
-    }
-
     fn tick(&mut self) -> Result<(), String> {
         self.effects.tick_before_reports(self.node_actor)?;
         while let Some(report) = self.reports.try_recv() {
@@ -2970,53 +2949,34 @@ impl<E: WorkerNodeRuntimeEffects> ActorInterface for WorkerNodeRuntimeActor<E> {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        let _ = ctx.send(ctx.self_addr(), NodeRuntimeMsg::Tick);
+        let _ = ctx.send(ctx.self_addr(), NodeRuntimeMsg::Progress);
     }
 
     fn handle(&mut self, ctx: &Ctx, message: Self::Incoming) {
         match message {
-            NodeRuntimeMsg::Tick => match self.tick() {
-                Ok(()) => self.schedule_tick(ctx),
-                Err(error) => self.finish(ctx, Err(error)),
-            },
             NodeRuntimeMsg::Progress | NodeRuntimeMsg::RoutingChanged => {
                 if matches!(message, NodeRuntimeMsg::RoutingChanged) {
-                    self.pending_runtime_ready.next_attempt_at = Instant::now();
+                    self.pending_runtime_ready.sent = false;
+                    self.effects.routing_changed();
                 }
                 if let Err(error) = self.tick() {
                     self.finish(ctx, Err(error));
                 }
             }
             NodeRuntimeMsg::Shutdown => {
-                self.effects.shutdown();
-                self.finish(ctx, Ok(()));
+                let result = self.effects.shutdown();
+                self.finish(ctx, result);
             }
         }
     }
 }
 
-fn emit_swim_telemetry(
-    telemetry: &mut NodeTelemetry,
-    stack: &DistributionRuntimeStack,
-    local_phase: &str,
-) {
-    for transition in stack.drain_swim_transitions() {
+fn emit_membership_telemetry(telemetry: &mut NodeTelemetry, stack: &DistributionRuntimeStack) {
+    for transition in stack.drain_membership_transitions() {
         let record = stack.membership_transition(&transition);
         telemetry
             .producer
             .submit_record(telemetry.channels.membership, &record);
-    }
-    for event in stack.drain_swim_probe_events() {
-        let record = stack.swim_probe_event_record(event, local_phase);
-        telemetry
-            .producer
-            .submit_record(telemetry.channels.swim_probes, &record);
-    }
-    if let Some(summary) = stack.drain_swim_probe_summary() {
-        let record = stack.swim_probe_summary_record(summary, local_phase);
-        telemetry
-            .producer
-            .submit_record(telemetry.channels.swim_probes, &record);
     }
 }
 
@@ -3030,7 +2990,6 @@ struct TelemetryChannelSet {
     host_gpu: ChannelId,
     host_memory: ChannelId,
     membership: ChannelId,
-    swim_probes: ChannelId,
     host_net: ChannelId,
     host_storage: ChannelId,
     arena: ChannelId,
@@ -3040,64 +2999,10 @@ struct NodeTelemetry {
     endpoint: Arc<TelemetryEndpoint>,
     producer: TelemetryProducer,
     channels: TelemetryChannelSet,
+    resource_samples: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<()>>>>,
+    arena_sampler: Option<ArenaSampler>,
     by_name: BTreeMap<String, ChannelId>,
     by_id: BTreeMap<ChannelId, String>,
-    archive: Option<TelemetryArchive>,
-}
-
-fn allocate_telemetry_lifetime(
-    state_root: &Path,
-    node_id: u64,
-    run_id: u64,
-) -> Result<u64, String> {
-    let directory = state_root.join(format!("node-{node_id}"));
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("create telemetry state {}: {error}", directory.display()))?;
-    // Lock a stable inode: the counter itself is atomically replaced below.
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(directory.join("generation.lock"))
-        .map_err(|error| format!("open telemetry generation lock: {error}"))?;
-    lock.lock()
-        .map_err(|error| format!("lock telemetry generation: {error}"))?;
-    let path = directory.join("generation");
-    let previous = match fs::read_to_string(&path) {
-        Ok(value) => value
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| format!("read telemetry generation {}: {error}", path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => {
-            return Err(format!(
-                "read telemetry generation {}: {error}",
-                path.display()
-            ));
-        }
-    };
-    let next = previous
-        .max(run_id)
-        .checked_add(1)
-        .ok_or_else(|| format!("telemetry generation exhausted for node {node_id}"))?;
-    let pending = directory.join("generation.next");
-    let mut file = File::create(&pending)
-        .map_err(|error| format!("create telemetry generation {}: {error}", pending.display()))?;
-    file.write_all(next.to_string().as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| {
-            format!(
-                "persist telemetry generation {}: {error}",
-                pending.display()
-            )
-        })?;
-    fs::rename(&pending, &path)
-        .map_err(|error| format!("commit telemetry generation {}: {error}", path.display()))?;
-    File::open(&directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync telemetry state {}: {error}", directory.display()))?;
-    Ok(next)
 }
 
 impl NodeTelemetry {
@@ -3208,20 +3113,12 @@ impl NodeTelemetry {
                 &mut by_name,
                 &mut by_id,
             ),
-            membership: register_record_channel::<MembershipTransition>(
-                &producer,
-                &mut by_name,
-                &mut by_id,
-            ),
-            swim_probes: register_record_channel::<SwimProbeEvent>(
+            membership: register_record_channel::<TransportMembershipTransition>(
                 &producer,
                 &mut by_name,
                 &mut by_id,
             ),
         };
-        let archive = config.telemetry_frame_log.as_deref().and_then(|path| {
-            TelemetryArchive::open(path, endpoint.subscribe_all("frame-log")).ok()
-        });
 
         Ok(Self {
             endpoint,
@@ -3229,7 +3126,8 @@ impl NodeTelemetry {
             channels,
             by_name,
             by_id,
-            archive,
+            resource_samples: Arc::new(Mutex::new(Vec::new())),
+            arena_sampler: None,
         })
     }
 
@@ -3247,24 +3145,72 @@ impl NodeTelemetry {
 
     fn tick(&mut self) {
         self.endpoint.tick();
-        if let Some(archive) = &mut self.archive {
-            archive.drain(&self.by_id);
+    }
+
+    fn observe_work(&mut self) {
+        for sampler in self.resource_samples.lock().iter() {
+            let _ = sampler.try_send(());
+        }
+        if let Some(sampler) = &mut self.arena_sampler {
+            sampler.observe_progress();
         }
     }
 }
 
-fn serve_telemetry_pulls(
-    driver: &IrohDriver,
-    engine: &EngineHandle,
-    endpoint: &Arc<TelemetryEndpoint>,
-) {
-    for (_node, connection) in driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
-        spawn_pull_server(
-            engine,
-            connection,
-            Arc::clone(endpoint),
-            Duration::from_millis(10),
-        );
+/// Own the live driver and telemetry connection tasks outside all actors.
+fn spawn_worker_transport(
+    tasks: TaskSpawner,
+    driver: IrohDriver,
+    endpoint: Arc<TelemetryEndpoint>,
+    wake: RuntimeWake,
+    blob_receiver: Option<Arc<IrohBlobTransferReceiver>>,
+    runtime: Runtime,
+) -> WorkerTransport {
+    let mut ingress = driver.ingress_changed();
+    let mut edges = driver.edge_events_changed();
+    let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+    let completion = ActorCompletion::new();
+    let finished = completion.clone();
+    let connection_tasks = tasks.clone();
+    tasks.spawn(async move {
+        loop {
+            if let Some(receiver) = &blob_receiver {
+                receiver.drain(&runtime);
+            }
+            for (_node, connection) in driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
+                spawn_pull_server(&connection_tasks, connection, Arc::clone(&endpoint));
+            }
+            tokio::select! {
+                _ = &mut cancelled => break,
+                changed = ingress.changed() => {
+                    if changed.is_err() { break; }
+                }
+                changed = edges.changed() => {
+                    if changed.is_err() { break; }
+                    wake.send(NodeRuntimeMsg::Progress);
+                }
+            }
+        }
+        driver.close().await;
+        let _ = finished.complete(());
+    });
+    WorkerTransport {
+        cancel: Some(cancel),
+        completion,
+    }
+}
+
+struct WorkerTransport {
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    completion: ActorCompletion<()>,
+}
+
+impl Drop for WorkerTransport {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.completion.wait();
     }
 }
 
@@ -3296,44 +3242,6 @@ fn register_record_channel<R: Record>(
     id
 }
 
-struct TelemetryArchive {
-    file: File,
-    subscription: TelemetrySubscription,
-}
-
-impl TelemetryArchive {
-    fn open(path: &str, subscription: TelemetrySubscription) -> std::io::Result<Self> {
-        Ok(Self {
-            file: OpenOptions::new().create(true).append(true).open(path)?,
-            subscription,
-        })
-    }
-
-    fn drain(&mut self, channel_names: &BTreeMap<ChannelId, String>) {
-        for event in self.subscription.drain_available() {
-            if let TelemetryEvent::Frame(frame) = event {
-                let channel = channel_names
-                    .get(&frame.channel.channel)
-                    .cloned()
-                    .unwrap_or_else(|| format!("channel#{}", frame.channel.channel.0));
-                let payload = decode_record_value(&frame.payload)
-                    .map(|value| json!({"encoding":"messagepack","value":value}))
-                    .unwrap_or_else(|_| json!({"encoding":"bytes","value":frame.payload}));
-                let record = json!({
-                    "stream":frame.channel.stream.to_string(),
-                    "channel":channel,
-                    "channel_id":frame.channel.channel.0,
-                    "position":frame.position.0,
-                    "payload":payload,
-                });
-                let _ = serde_json::to_writer(&mut self.file, &record);
-                let _ = writeln!(self.file);
-            }
-        }
-        let _ = self.file.flush();
-    }
-}
-
 enum NodeReportOutcome {
     None,
     RuntimeReadyAck {
@@ -3348,9 +3256,10 @@ struct PendingControlRejoin {
     hello: RejoinHello,
     last_bound_actor: ActorAddress,
     pending_actor: Option<ActorAddress>,
-    next_attempt_at: Instant,
     recovery_actor: Option<ActorAddress>,
-    backoff: Duration,
+    reply_to: ActorAddress,
+    next_request_id: u64,
+    pending_request_id: Option<u64>,
 }
 
 impl PendingControlRejoin {
@@ -3360,6 +3269,7 @@ impl PendingControlRejoin {
         swim_node_id: DistNodeId,
         node_actor: ActorAddress,
         orchestrator_actor: ActorAddress,
+        reply_to: ActorAddress,
     ) -> Result<Self, String> {
         Ok(Self {
             hello: RejoinHello {
@@ -3384,17 +3294,16 @@ impl PendingControlRejoin {
             },
             last_bound_actor: orchestrator_actor,
             pending_actor: None,
-            next_attempt_at: Instant::now(),
-            backoff: RUNTIME_READY_RETRY_INITIAL,
             recovery_actor: None,
+            reply_to,
+            next_request_id: 0,
+            pending_request_id: None,
         })
     }
 
     fn set_recovery_actor(&mut self, actor: ActorAddress) {
         self.recovery_actor = Some(actor);
         self.pending_actor = None;
-        self.next_attempt_at = Instant::now();
-        self.backoff = RUNTIME_READY_RETRY_INITIAL;
     }
 
     fn current_actor(&self, stack: &DistributionRuntimeStack) -> Option<ActorAddress> {
@@ -3417,29 +3326,32 @@ impl PendingControlRejoin {
         replies: &Inbox<ManualControlReply>,
     ) -> Result<(), String> {
         while let Some(reply) = replies.try_recv() {
-            match reply {
-                ManualControlReply::Rejoined(binding)
-                    if self.current_actor(stack) == Some(binding.orchestrator_actor) =>
-                {
-                    stack
-                        .runtime
-                        .send_to(
-                            node_actor,
-                            NodeAgentMsg::RebindOrchestrator {
-                                orchestrator_actor: binding.orchestrator_actor,
-                                control_generation: binding.control_generation,
-                            },
-                        )
-                        .map_err(|error| format!("apply orchestrator rebind: {error}"))?;
-                    self.last_bound_actor = binding.orchestrator_actor;
-                    self.pending_actor = None;
-                    self.backoff = RUNTIME_READY_RETRY_INITIAL;
-                }
-                ManualControlReply::Rejected(_) => {
-                    self.pending_actor = None;
-                }
-                _ => {}
+            let ManualControlReply::RejoinResolved { request_id, result } = reply else {
+                continue;
+            };
+            if self.pending_request_id != Some(request_id)
+                || self.pending_actor.is_none()
+                || self.current_actor(stack) != self.pending_actor
+            {
+                continue;
             }
+            let binding = result.map_err(|reason| format!("control rejoin rejected: {reason}"))?;
+            if self.pending_actor != Some(binding.orchestrator_actor) {
+                continue;
+            }
+            stack
+                .runtime
+                .send_to(
+                    node_actor,
+                    NodeAgentMsg::RebindOrchestrator {
+                        orchestrator_actor: binding.orchestrator_actor,
+                        control_generation: binding.control_generation,
+                    },
+                )
+                .map_err(|error| format!("apply orchestrator rebind: {error}"))?;
+            self.last_bound_actor = binding.orchestrator_actor;
+            self.pending_actor = None;
+            self.pending_request_id = None;
         }
 
         let Some(orchestrator_actor) = self.current_actor(stack) else {
@@ -3449,31 +3361,31 @@ impl PendingControlRejoin {
             self.pending_actor = None;
             return Ok(());
         }
-        let now = Instant::now();
-        if now < self.next_attempt_at {
+        if self.pending_actor == Some(orchestrator_actor) {
             return Ok(());
         }
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| "control rejoin request identity exhausted".to_owned())?;
         if stack
             .runtime
             .send_to(
                 orchestrator_actor,
                 OrchestratorMsg::Manual(ManualControlMsg::Rejoin {
+                    request_id: self.next_request_id,
                     hello: self.hello.clone(),
-                    reply_to: *replies.addr(),
+                    reply_to: self.reply_to,
                 }),
             )
             .is_ok()
         {
             self.pending_actor = Some(orchestrator_actor);
+            self.pending_request_id = Some(self.next_request_id);
         } else {
             self.pending_actor = None;
+            self.pending_request_id = None;
         }
-        self.next_attempt_at = now + self.backoff;
-        self.backoff = self
-            .backoff
-            .checked_mul(2)
-            .unwrap_or(RUNTIME_READY_RETRY_MAX)
-            .min(RUNTIME_READY_RETRY_MAX);
         Ok(())
     }
 }
@@ -3487,10 +3399,9 @@ struct PendingRuntimeReady {
     coordinator: Option<DistNodeId>,
     readiness_id: u64,
     attempts: u32,
-    next_attempt_at: Instant,
-    backoff: Duration,
+    sent: bool,
     acked: bool,
-    swim_logged: bool,
+    membership_logged: bool,
     deployment: Option<DeploymentIdentity>,
 }
 
@@ -3508,15 +3419,14 @@ impl PendingRuntimeReady {
                 .map(|endpoint| DistNodeId(*endpoint.id.as_bytes())),
             readiness_id: config.readiness_id,
             attempts: 0,
-            next_attempt_at: Instant::now(),
-            backoff: RUNTIME_READY_RETRY_INITIAL,
+            sent: false,
             acked: false,
-            swim_logged: false,
+            membership_logged: false,
             deployment: config.deployment.clone(),
         }
     }
 
-    fn swim_ready(&self, stack: &DistributionRuntimeStack) -> bool {
+    fn membership_ready(&self, stack: &DistributionRuntimeStack) -> bool {
         let Some(coordinator) = self.coordinator else {
             return true;
         };
@@ -3547,11 +3457,10 @@ impl PendingRuntimeReady {
         stack: &DistributionRuntimeStack,
         node_actor: ActorAddress,
     ) -> Result<bool, String> {
-        if self.acked || !self.swim_ready(stack) {
+        if self.acked || !self.membership_ready(stack) {
             return Ok(false);
         }
-        let now = Instant::now();
-        if now < self.next_attempt_at {
+        if self.sent {
             return Ok(false);
         }
         stack
@@ -3577,12 +3486,7 @@ impl PendingRuntimeReady {
             )
             .map_err(|error| format!("signal runtime loaded: {error}"))?;
         self.attempts = self.attempts.saturating_add(1);
-        self.next_attempt_at = now + self.backoff;
-        self.backoff = self
-            .backoff
-            .checked_mul(2)
-            .unwrap_or(RUNTIME_READY_RETRY_MAX)
-            .min(RUNTIME_READY_RETRY_MAX);
+        self.sent = true;
         Ok(true)
     }
 }
@@ -3590,7 +3494,7 @@ impl PendingRuntimeReady {
 fn handle_node_report(
     report: NodeAgentReport,
     services: WorkerStageServices<'_>,
-    driver: &mut IrohDriver,
+    driver: &mut IrohEdgePort,
     worker: &mut TinygradWorker,
     edge_runtime: &mut WorkerEdgeRuntime,
     telemetry: &mut NodeTelemetry,
@@ -3732,7 +3636,7 @@ fn handle_prompt_request(
     let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
-    let started = Instant::now();
+
     node_prompt(
         telemetry,
         "prompt_requested",
@@ -3762,15 +3666,11 @@ fn handle_prompt_request(
                 .get("generated_tokens")
                 .and_then(Value::as_array)
                 .map_or(0, |tokens| tokens.len() as u32);
-            let elapsed_ms = result
-                .get("elapsed_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(|| started.elapsed().as_millis() as u64);
             node_prompt(
                 telemetry,
                 "infer_prompt",
                 "ready",
-                json!({"request_id":request_id,"worker_event_type":"PromptCompleted","prompt_tokens":prompt_tokens,"tokens_generated":tokens_generated,"elapsed_ms":elapsed_ms,"text_bytes":text_bytes,"worker_result_payload_bytes":worker_result_payload_bytes}),
+                json!({"request_id":request_id,"worker_event_type":"PromptCompleted","prompt_tokens":prompt_tokens,"tokens_generated":tokens_generated,"text_bytes":text_bytes,"worker_result_payload_bytes":worker_result_payload_bytes}),
             );
             if !text.is_empty() {
                 match stack.runtime.send_to(
@@ -3803,7 +3703,6 @@ fn handle_prompt_request(
                     request_id,
                     final_text: text,
                     tokens_generated,
-                    elapsed_ms,
                 },
             ) {
                 Ok(()) => {
@@ -3811,7 +3710,7 @@ fn handle_prompt_request(
                         telemetry,
                         "prompt_response",
                         "ready",
-                        json!({"request_id":request_id,"event":"Done","tokens_generated":tokens_generated,"elapsed_ms":elapsed_ms,"final_text_bytes":text_bytes,"reply_to":reply_to}),
+                        json!({"request_id":request_id,"event":"Done","tokens_generated":tokens_generated,"final_text_bytes":text_bytes,"reply_to":reply_to}),
                     );
                     Ok(())
                 }
@@ -3966,7 +3865,6 @@ enum StageShardProcessStream {
 #[derive(Clone)]
 enum StageShardFetchMsg {
     Start,
-    PollChild,
     ProcessLine {
         stream: StageShardProcessStream,
         line: String,
@@ -3978,8 +3876,8 @@ enum StageShardFetchMsg {
     ReaderClosed {
         stream: StageShardProcessStream,
     },
-    #[cfg(test)]
     ProcessExited(std::process::ExitStatus),
+    ProcessFailed(String),
 }
 
 struct StageShardFetchOutcome {
@@ -3992,11 +3890,9 @@ struct StageShardFetchActor {
     output_path: PathBuf,
     completion: ActorCompletion<StageShardFetchOutcome>,
     sender: ExternalSender,
-    /// The node's engine. Reader tasks and delayed messages schedule on this
-    /// stored handle; the actor never creates another engine
-    /// (ENGINE_SPEC.md).
     engine: EngineHandle,
-    child: Option<Child>,
+    child: Option<swactor_process::SupervisedChild>,
+    process_relay: Option<ActorAddress>,
     stdout_closed: bool,
     stderr_closed: bool,
     ready_path: Option<PathBuf>,
@@ -4020,6 +3916,7 @@ impl StageShardFetchActor {
             sender,
             engine,
             child: None,
+            process_relay: None,
             stdout_closed: true,
             stderr_closed: true,
             ready_path: None,
@@ -4030,7 +3927,7 @@ impl StageShardFetchActor {
     }
 
     fn start_fetch(&mut self, ctx: &Ctx) {
-        if self.finished {
+        if self.finished || self.child.is_some() {
             return;
         }
         let exe = match std::env::current_exe() {
@@ -4040,97 +3937,35 @@ impl StageShardFetchActor {
                 return;
             }
         };
-        let mut child = match swactor_process::command_spawn(
-            Command::new(exe)
-                .arg("stage-shard-fetcher")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        ) {
-            Ok(child) => child,
+        let relay = match ctx.spawn(StageShardProcessForwarder {
+            target: ctx.self_addr(),
+        }) {
+            Ok(relay) => relay,
             Err(error) => {
-                self.fail(ctx, format!("spawn stage shard fetcher: {error}"));
+                self.fail(ctx, format!("spawn stage shard observer: {error}"));
                 return;
             }
         };
-        match child.stdin.take() {
-            Some(mut stdin) => {
-                if let Err(error) = stdin.write_all(&self.request_json) {
-                    let mut child = Some(child);
-                    stop_stage_shard_child(&mut child);
-                    self.fail(ctx, format!("write stage shard fetch request: {error}"));
-                    return;
-                }
-            }
-            None => {
-                let mut child = Some(child);
-                stop_stage_shard_child(&mut child);
-                self.fail(ctx, "stage shard fetcher stdin missing".to_owned());
-                return;
-            }
-        }
-
+        self.process_relay = Some(relay);
         self.stdout_closed = false;
         self.stderr_closed = false;
-        self.ready_path = None;
-        self.exit_status = None;
-        if let Some(stdout) = child.stdout.take() {
-            spawn_stage_shard_reader(
-                StageShardProcessStream::Stdout,
-                stdout,
-                self.sender.clone(),
-                ctx.self_addr(),
-            );
-        } else {
-            self.stdout_closed = true;
-        }
-        if let Some(stderr) = child.stderr.take() {
-            spawn_stage_shard_reader(
-                StageShardProcessStream::Stderr,
-                stderr,
-                self.sender.clone(),
-                ctx.self_addr(),
-            );
-        } else {
-            self.stderr_closed = true;
-        }
-        self.child = Some(child);
-        schedule_stage_shard_message(
-            &self.engine,
+        match swactor_process::SupervisedChild::spawn(
+            &self.engine.blocking_work_sender(),
+            Command::new(exe).arg("stage-shard-fetcher"),
+            Some(Arc::from(self.request_json.clone())),
             self.sender.clone(),
-            ctx.self_addr(),
-            StageShardFetchMsg::PollChild,
-            PUMP_INTERVAL,
-        );
+            relay,
+            1,
+        ) {
+            Ok(child) => self.child = Some(child),
+            Err(error) => self.fail(ctx, format!("spawn stage shard fetcher: {error}")),
+        }
     }
 
-    fn poll_child(&mut self, ctx: &Ctx) {
-        if self.finished {
-            return;
-        }
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        match swactor_process::child_try_wait(child) {
-            Ok(Some(status)) => self.handle_process_exit(ctx, status),
-            Ok(None) => schedule_stage_shard_message(
-                &self.engine,
-                self.sender.clone(),
-                ctx.self_addr(),
-                StageShardFetchMsg::PollChild,
-                PUMP_INTERVAL,
-            ),
-            Err(error) => {
-                self.child = None;
-                self.fail(ctx, format!("poll stage shard fetcher: {error}"));
-            }
-        }
-    }
     fn handle_process_exit(&mut self, ctx: &Ctx, status: std::process::ExitStatus) {
         if self.finished || self.exit_status.is_some() {
             return;
         }
-        self.child = None;
         self.exit_status = Some(status);
         self.maybe_finish(ctx);
     }
@@ -4175,7 +4010,7 @@ impl StageShardFetchActor {
         {
             return;
         }
-        self.join_readers();
+        self.release_process(ctx);
         let status = self.exit_status.take().expect("exit status checked");
         if status.success() {
             let path = self
@@ -4213,8 +4048,7 @@ impl StageShardFetchActor {
             return;
         }
         self.finished = true;
-        stop_stage_shard_child(&mut self.child);
-        self.join_readers();
+        self.release_process(ctx);
         assert!(
             self.completion
                 .complete(StageShardFetchOutcome {
@@ -4227,13 +4061,12 @@ impl StageShardFetchActor {
         ctx.stop_self();
     }
 
-    fn join_readers(&mut self) {
-        // Reader tasks are engine-hosted (spawn_blocking) and signal completion
-        // through `ReaderClosed` messages tracked by the `*_closed` flags;
-        // there are no thread handles to join. Killing the child closes its
-        // pipes, so outstanding readers hit EOF and exit on their own.
-        self.stdout_closed = true;
-        self.stderr_closed = true;
+    fn release_process(&mut self, ctx: &Ctx) {
+        // The supervisor reaps the child group and joins both readers on drop.
+        self.child = None;
+        if let Some(relay) = self.process_relay.take() {
+            let _ = ctx.stop_actor(relay);
+        }
     }
 }
 
@@ -4244,55 +4077,71 @@ impl ActorInterface for StageShardFetchActor {
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
         match msg {
             StageShardFetchMsg::Start => self.start_fetch(ctx),
-            StageShardFetchMsg::PollChild => self.poll_child(ctx),
             StageShardFetchMsg::ProcessLine { stream, line } => self.handle_line(ctx, stream, line),
             StageShardFetchMsg::ReaderError { stream, error } => {
                 self.handle_reader_error(ctx, stream, error)
             }
             StageShardFetchMsg::ReaderClosed { stream } => self.handle_reader_closed(ctx, stream),
-            #[cfg(test)]
             StageShardFetchMsg::ProcessExited(status) => self.handle_process_exit(ctx, status),
+            StageShardFetchMsg::ProcessFailed(error) => self.fail(ctx, error),
         }
     }
 
-    fn on_stop(&mut self, _ctx: &Ctx) {
-        stop_stage_shard_child(&mut self.child);
-        self.join_readers();
+    fn on_stop(&mut self, ctx: &Ctx) {
+        self.release_process(ctx);
     }
 }
 
-fn stop_stage_shard_child(child: &mut Option<Child>) {
-    let Some(mut child) = child.take() else {
-        return;
-    };
-    let _ = swactor_process::child_kill(&mut child);
-    let _ = swactor_process::child_wait(&mut child);
+struct StageShardProcessForwarder {
+    target: ActorAddress,
 }
 
-fn spawn_stage_shard_reader<R: Read + Send + 'static>(
-    stream: StageShardProcessStream,
-    reader: R,
-    sender: ExternalSender,
-    actor: ActorAddress,
-) {
-    swactor_process::spawn_mapped_line_reader(
-        reader,
-        sender,
-        actor,
-        move |line| StageShardFetchMsg::ProcessLine { stream, line },
-        move |error| StageShardFetchMsg::ReaderError { stream, error },
-        StageShardFetchMsg::ReaderClosed { stream },
-    );
-}
+impl ActorInterface for StageShardProcessForwarder {
+    type Incoming = swactor_process::SupervisedProcessObservation;
+    type Response = ();
 
-fn schedule_stage_shard_message(
-    engine: &EngineHandle,
-    sender: ExternalSender,
-    actor: ActorAddress,
-    msg: StageShardFetchMsg,
-    delay: Duration,
-) {
-    engine.send_after(delay, sender, actor, msg);
+    fn handle(&mut self, ctx: &Ctx, event: Self::Incoming) {
+        use swactor_process::{
+            ProcessStream, ProcessStreamObservation, SupervisedProcessObservation,
+        };
+        let stream_kind = |stream| match stream {
+            ProcessStream::Stdout => StageShardProcessStream::Stdout,
+            ProcessStream::Stderr => StageShardProcessStream::Stderr,
+        };
+        let message = match event {
+            SupervisedProcessObservation::Stream(ProcessStreamObservation::Line {
+                stream,
+                line,
+            }) => StageShardFetchMsg::ProcessLine {
+                stream: stream_kind(stream),
+                line,
+            },
+            SupervisedProcessObservation::Stream(ProcessStreamObservation::Error {
+                stream,
+                error,
+            }) => StageShardFetchMsg::ReaderError {
+                stream: stream_kind(stream),
+                error,
+            },
+            SupervisedProcessObservation::Stream(ProcessStreamObservation::Closed { stream }) => {
+                StageShardFetchMsg::ReaderClosed {
+                    stream: stream_kind(stream),
+                }
+            }
+            SupervisedProcessObservation::Exited {
+                operation: 1,
+                result,
+            } => {
+                ctx.stop_self();
+                match result {
+                    Ok(status) => StageShardFetchMsg::ProcessExited(status),
+                    Err(error) => StageShardFetchMsg::ProcessFailed(error),
+                }
+            }
+            SupervisedProcessObservation::Exited { .. } => return,
+        };
+        let _ = ctx.send(self.target, message);
+    }
 }
 
 fn publish_stage_shard_fetch_event(
@@ -4313,7 +4162,7 @@ fn materialize_stage_shard_with_process(
     plan: &StageShardPlan,
     config: &DeploymentConfig,
     telemetry: &mut NodeTelemetry,
-    _driver: &mut IrohDriver,
+    _driver: &mut IrohEdgePort,
     stack: &DistributionRuntimeStack,
 ) -> Result<PathBuf, String> {
     let output_path = std::env::var("MYELIN_MODEL_CACHE_DIR")
@@ -4384,7 +4233,7 @@ fn materialize_stage_shard_with_process(
 fn handle_stage_command(
     command: StageCommandWire,
     services: WorkerStageServices<'_>,
-    driver: &mut IrohDriver,
+    driver: &mut IrohEdgePort,
     worker: &mut TinygradWorker,
     edge_runtime: &mut WorkerEdgeRuntime,
     telemetry: &mut NodeTelemetry,
@@ -4677,7 +4526,7 @@ fn run_self_test(
     config: &DeploymentConfig,
     prompt: &str,
     telemetry: &mut NodeTelemetry,
-    _driver: &mut IrohDriver,
+    _driver: &mut IrohEdgePort,
     _stack: &DistributionRuntimeStack,
 ) -> Result<(), String> {
     emit_node_event(
@@ -4734,11 +4583,11 @@ struct DeploymentConfig {
     logical_node_id: u64,
     attempt_id: u64,
     readiness_id: u64,
+    process_start_ticks: Option<u64>,
     selected_offer_id: Option<u64>,
     stage_index: u32,
     coordinator_endpoint: Option<EndpointAddr>,
     orchestrator_actor: Option<ActorAddress>,
-    telemetry_frame_log: Option<String>,
     deployment: Option<DeploymentIdentity>,
     debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
@@ -4792,20 +4641,27 @@ impl DeploymentConfig {
                 );
             }
         };
-        let readiness_id = if let Some(identity) = &deployment {
-            let stat = std::fs::read_to_string("/proc/self/stat")
+        let (readiness_id, process_start_ticks) = if let Some(identity) = &deployment {
+            let stat = fs::read_to_string("/proc/self/stat")
                 .map_err(|error| format!("read deployment process identity: {error}"))?;
             let start_ticks = stat
                 .rsplit_once(')')
                 .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-                .ok_or_else(|| "process stat omitted start ticks".to_owned())?;
-            crate::orchestration::daemon::deployment_readiness_id(&format!(
-                "{}:{start_ticks}:{}",
-                std::process::id(),
-                identity.deployment_generation,
-            ))
+                .ok_or_else(|| "process stat omitted start_ticks".to_owned())?;
+            (
+                crate::orchestration::daemon::deployment_readiness_id(&format!(
+                    "{}:{start_ticks}:{}",
+                    std::process::id(),
+                    identity.deployment_generation,
+                )),
+                Some(
+                    start_ticks
+                        .parse::<u64>()
+                        .map_err(|error| format!("parse deployment process identity: {error}"))?,
+                ),
+            )
         } else {
-            attempt_id
+            (attempt_id, None)
         };
         let relay = relay_runtime_config_from_env(run_id)?;
         let debug_join_socket = match env_optional("MYELIN_DEBUG_JOIN_SOCKET").as_deref() {
@@ -4831,6 +4687,7 @@ impl DeploymentConfig {
             logical_node_id,
             attempt_id,
             readiness_id,
+            process_start_ticks,
             selected_offer_id: env_optional(SELECTED_OFFER_ID_ENV)
                 .map(|value| {
                     value.parse().map_err(|error| {
@@ -4851,7 +4708,6 @@ impl DeploymentConfig {
                         .map_err(|e| format!("invalid MYELIN_ORCHESTRATOR_ACTOR JSON: {e}"))
                 })
                 .transpose()?,
-            telemetry_frame_log: env_optional("MYELIN_TELEMETRY_FRAME_LOG"),
             deployment,
             debug_join_socket,
             relay_mode: relay.mode,
@@ -4899,33 +4755,68 @@ enum HelperStdoutEvent {
     ReadError(String),
 }
 
-#[derive(Clone, Copy)]
-struct HelperCommandWaitConfig {
-    poll_interval: Duration,
-    telemetry_interval: Duration,
+fn spawn_helper_stdout_reader<R: Read + Send + 'static>(
+    blocking: &BlockingWorkSender,
+    reader: R,
+    tx: Sender<HelperStdoutEvent>,
+    sender: ExternalSender,
+    wake: Arc<Mutex<Option<ActorAddress>>>,
+) -> Result<swactor_engine::BlockingWorkHandle<()>, String> {
+    use std::io::BufRead;
+    blocking
+        .submit_joinable(move || {
+            let publish = |event| {
+                let sent = tx.send(event).is_ok();
+                if let Some(actor) = *wake.lock() {
+                    let _ = sender.send_to(actor, HelperOutputReady);
+                }
+                sent
+            };
+            for line in std::io::BufReader::new(reader).lines() {
+                match line {
+                    Ok(line) => {
+                        if !publish(HelperStdoutEvent::Line(line)) {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        publish(HelperStdoutEvent::ReadError(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            publish(HelperStdoutEvent::Closed);
+        })
+        .map_err(|error| format!("spawn helper stdout reader: {error}"))
 }
 
-impl HelperCommandWaitConfig {
-    fn production() -> Self {
-        Self {
-            poll_interval: PUMP_INTERVAL,
-            telemetry_interval: WORKER_COMMAND_WAIT_TELEMETRY_INTERVAL,
-        }
-    }
-}
-
-fn spawn_helper_stdout_reader<R: Read + Send + 'static>(reader: R, tx: Sender<HelperStdoutEvent>) {
-    swactor_process::spawn_mapped_line_channel(
-        reader,
-        tx,
-        HelperStdoutEvent::Line,
-        HelperStdoutEvent::ReadError,
-        HelperStdoutEvent::Closed,
-    );
-}
-
-fn spawn_helper_stderr_reader<R: Read + Send + 'static>(reader: R, tx: Sender<String>) {
-    swactor_process::spawn_line_channel(reader, tx);
+fn spawn_helper_stderr_reader<R: Read + Send + 'static>(
+    blocking: &BlockingWorkSender,
+    reader: R,
+    tx: Sender<String>,
+    sender: ExternalSender,
+    wake: Arc<Mutex<Option<ActorAddress>>>,
+) -> Result<swactor_engine::BlockingWorkHandle<()>, String> {
+    use std::io::BufRead;
+    blocking
+        .submit_joinable(move || {
+            for line in std::io::BufReader::new(reader).lines() {
+                let (line, failed) = match line {
+                    Ok(line) => (line, false),
+                    Err(error) => (format!("read helper stderr: {error}"), true),
+                };
+                if tx.send(line).is_err() {
+                    return;
+                }
+                if let Some(actor) = *wake.lock() {
+                    let _ = sender.send_to(actor, NodeRuntimeMsg::Progress);
+                }
+                if failed {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("spawn helper stderr reader: {error}"))
 }
 
 fn drain_worker_stderr(
@@ -4945,41 +4836,27 @@ fn drain_worker_stderr(
 }
 
 #[derive(Clone, Copy)]
-struct HelperWaitTick;
+struct HelperOutputReady;
 
 struct HelperWaitOutcome {
     result: Result<Value, String>,
     lines: Vec<String>,
     stderr_lines: Vec<String>,
-    wait_samples: Vec<(u64, u64)>,
 }
 
 struct HelperWaitActor {
     stdout_rx: Arc<Mutex<Receiver<HelperStdoutEvent>>>,
     stderr_rx: Option<Arc<Mutex<Receiver<String>>>>,
     expected: String,
-    engine: EngineHandle,
-    sender: ExternalSender,
+    command_id: u64,
+    wake: Arc<Mutex<Option<ActorAddress>>>,
+    resource_samples: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<()>>>>,
     completion: ActorCompletion<HelperWaitOutcome>,
-    wait_config: HelperCommandWaitConfig,
-    wait_started: Instant,
-    next_telemetry_at: Instant,
-    wait_cycles: u64,
     lines: Vec<String>,
     stderr_lines: Vec<String>,
-    wait_samples: Vec<(u64, u64)>,
 }
 
 impl HelperWaitActor {
-    fn schedule(&self, ctx: &Ctx) {
-        self.engine.send_after(
-            self.wait_config.poll_interval,
-            self.sender.clone(),
-            ctx.self_addr(),
-            HelperWaitTick,
-        );
-    }
-
     fn drain_stderr(&mut self) {
         let Some(stderr_rx) = &self.stderr_rx else {
             return;
@@ -4991,13 +4868,13 @@ impl HelperWaitActor {
 
     fn finish(&mut self, ctx: &Ctx, result: Result<Value, String>) {
         self.drain_stderr();
+        *self.wake.lock() = None;
         assert!(
             self.completion
                 .complete(HelperWaitOutcome {
                     result,
                     lines: std::mem::take(&mut self.lines),
                     stderr_lines: std::mem::take(&mut self.stderr_lines),
-                    wait_samples: std::mem::take(&mut self.wait_samples),
                 })
                 .is_ok(),
             "helper wait completed twice"
@@ -5005,7 +4882,7 @@ impl HelperWaitActor {
         ctx.stop_self();
     }
 
-    fn poll(&mut self, ctx: &Ctx) {
+    fn receive_output(&mut self, ctx: &Ctx) {
         self.drain_stderr();
         loop {
             let observation = self.stdout_rx.lock().try_recv();
@@ -5020,11 +4897,16 @@ impl HelperWaitActor {
                             return;
                         }
                     };
+                    for sampler in self.resource_samples.lock().iter() {
+                        let _ = sampler.try_send(());
+                    }
                     if value.get("type").and_then(Value::as_str) == Some("WorkerFatal") {
                         self.finish(ctx, Err(format!("worker fatal: {value}")));
                         return;
                     }
-                    if value.get("type").and_then(Value::as_str) == Some(self.expected.as_str()) {
+                    if value.get("type").and_then(Value::as_str) == Some(self.expected.as_str())
+                        && value.get("command_id").and_then(Value::as_u64) == Some(self.command_id)
+                    {
                         self.finish(ctx, Ok(value));
                         return;
                     }
@@ -5043,21 +4925,7 @@ impl HelperWaitActor {
                     self.finish(ctx, Err(format!("read helper stdout: {error}")));
                     return;
                 }
-                Err(TryRecvError::Empty) => {
-                    self.wait_cycles = self.wait_cycles.saturating_add(1);
-                    let now = Instant::now();
-                    if now >= self.next_telemetry_at {
-                        self.wait_samples.push((
-                            duration_ms_u64(now.saturating_duration_since(self.wait_started)),
-                            self.wait_cycles,
-                        ));
-                        self.next_telemetry_at = now
-                            .checked_add(self.wait_config.telemetry_interval)
-                            .unwrap_or(now);
-                    }
-                    self.schedule(ctx);
-                    return;
-                }
+                Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     self.finish(
                         ctx,
@@ -5074,15 +4942,16 @@ impl HelperWaitActor {
 }
 
 impl ActorInterface for HelperWaitActor {
-    type Incoming = HelperWaitTick;
+    type Incoming = HelperOutputReady;
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        let _ = ctx.send(ctx.self_addr(), HelperWaitTick);
+        *self.wake.lock() = Some(ctx.self_addr());
+        self.receive_output(ctx);
     }
 
     fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
-        self.poll(ctx);
+        self.receive_output(ctx);
     }
 }
 
@@ -5091,11 +4960,11 @@ struct HelperWaitRequest<'a> {
     stderr_rx: Option<Arc<Mutex<Receiver<String>>>>,
     expected: &'a str,
     command_type: &'a str,
+    command_id: u64,
     config: &'a DeploymentConfig,
     channel: ChannelId,
     channel_name: &'a str,
-    engine: &'a EngineHandle,
-    wait_config: HelperCommandWaitConfig,
+    wake: Arc<Mutex<Option<ActorAddress>>>,
 }
 
 fn wait_for_helper_event(
@@ -5108,11 +4977,11 @@ fn wait_for_helper_event(
         stderr_rx,
         expected,
         command_type,
+        command_id,
         config,
         channel,
         channel_name,
-        engine,
-        wait_config,
+        wake,
     } = request;
     emit_node_event(
         telemetry,
@@ -5128,40 +4997,18 @@ fn wait_for_helper_event(
             stdout_rx,
             stderr_rx,
             expected: expected.to_owned(),
-            engine: engine.clone(),
-            sender: runtime.create_sender(),
+            command_id,
+            wake,
+            resource_samples: Arc::clone(&telemetry.resource_samples),
             completion: completion.clone(),
-            wait_config,
-            wait_started: Instant::now(),
-            next_telemetry_at: Instant::now(),
-            wait_cycles: 0,
             lines: Vec::new(),
             stderr_lines: Vec::new(),
-            wait_samples: Vec::new(),
         })
         .map_err(|error| format!("spawn helper wait actor: {error}"))?;
     let outcome = completion.wait();
     for line in outcome.stderr_lines {
         let payload = node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
         telemetry.submit_value(telemetry.channels.worker_stderr, &payload);
-    }
-    for (elapsed_ms, wait_cycles) in outcome.wait_samples {
-        emit_node_event(
-            telemetry,
-            config,
-            NODE_WORKER_CHANNEL,
-            "worker_command_wait",
-            "waiting",
-            json!({
-                "command_type":command_type,
-                "expected_event_type":expected,
-                "channel":channel_name,
-                "state":"waiting_for_helper_stdout",
-                "elapsed_ms":elapsed_ms,
-                "wait_cycles":wait_cycles,
-                "poll_interval_ms":duration_ms_u64(wait_config.poll_interval),
-            }),
-        );
     }
     for line in outcome.lines {
         let line_bytes = line.len();
@@ -5249,7 +5096,12 @@ struct TinygradWorker {
     stdout_rx: Arc<Mutex<Receiver<HelperStdoutEvent>>>,
     stderr_rx: Arc<Mutex<Receiver<String>>>,
     runtime: Runtime,
-    engine: EngineHandle,
+    stdout_wake: Arc<Mutex<Option<ActorAddress>>>,
+    readers: Vec<swactor_engine::BlockingWorkHandle<()>>,
+    exit_watch: Option<swactor_process::ProcessWatch>,
+    exit_relay: Option<ActorAddress>,
+    exit_observation: Arc<Mutex<Option<swactor_process::ProcessExitObservation>>>,
+    command_id: u64,
 }
 
 impl TinygradWorker {
@@ -5258,6 +5110,7 @@ impl TinygradWorker {
         arena_fd: std::os::fd::RawFd,
         runtime: Runtime,
         engine: EngineHandle,
+        wake: RuntimeWake,
     ) -> Result<Self, String> {
         let mut child = swactor_process::command_spawn(
             Command::new("python3")
@@ -5269,20 +5122,6 @@ impl TinygradWorker {
                 .env("MYELIN_ARENA_FD", arena_fd.to_string())
                 .env("MYELIN_ARENA_BYTES", config.arena_bytes.to_string())
                 .env(
-                    "MYELIN_TELEMETRY_ENDPOINT_ID",
-                    format!(
-                        "worker-node-{}-stage-{}-stdio-bridge",
-                        config.logical_node_id, config.stage_index
-                    ),
-                )
-                .env(
-                    "MYELIN_BENCHMARK_PRODUCER_INSTANCE",
-                    format!(
-                        "tinygrad-worker:{}:{}",
-                        config.logical_node_id, config.stage_index
-                    ),
-                )
-                .env(
                     "MVP_IROH_ENDPOINT_ADDR_MASK",
                     config.endpoint_addr_mask.as_str(),
                 )
@@ -5292,30 +5131,61 @@ impl TinygradWorker {
                 .stderr(Stdio::piped()),
         )
         .map_err(|e| format!("spawn tinygrad helper {}: {e}", config.worker_script))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "tinygrad helper stdin missing".to_owned())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "tinygrad helper stdout missing".to_owned())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "tinygrad helper stderr missing".to_owned())?;
+        let stdin = child.stdin.take().expect("helper stdin is piped");
+        let stdout = child.stdout.take().expect("helper stdout is piped");
+        let stderr = child.stderr.take().expect("helper stderr is piped");
         let (stdout_tx, stdout_rx) = mpsc::channel();
-        spawn_helper_stdout_reader(stdout, stdout_tx);
         let (stderr_tx, stderr_rx) = mpsc::channel();
-        spawn_helper_stderr_reader(stderr, stderr_tx);
-        Ok(Self {
+        let mut worker = Self {
             child,
             stdin,
             stdout_rx: Arc::new(Mutex::new(stdout_rx)),
             stderr_rx: Arc::new(Mutex::new(stderr_rx)),
             runtime,
-            engine,
-        })
+            stdout_wake: Arc::new(Mutex::new(None)),
+            readers: Vec::new(),
+            exit_watch: None,
+            exit_relay: None,
+            exit_observation: Arc::new(Mutex::new(None)),
+            command_id: 0,
+        };
+        worker.readers.push(spawn_helper_stdout_reader(
+            &engine.blocking_work_sender(),
+            stdout,
+            stdout_tx,
+            worker.runtime.create_sender(),
+            Arc::clone(&worker.stdout_wake),
+        )?);
+        worker.readers.push(spawn_helper_stderr_reader(
+            &engine.blocking_work_sender(),
+            stderr,
+            stderr_tx,
+            worker.runtime.create_sender(),
+            Arc::clone(&wake.target),
+        )?);
+        let relay = worker
+            .runtime
+            .spawn(HelperProcessForwarder {
+                observation: Arc::clone(&worker.exit_observation),
+                wake,
+            })
+            .map_err(|error| format!("spawn helper exit observer: {error}"))?;
+        worker.exit_relay = Some(relay);
+        worker.exit_watch = Some(
+            swactor_process::watch_process(
+                &engine.blocking_work_sender(),
+                swactor_process::ProcessIdentity {
+                    pid: worker.child.id(),
+                    environment: Vec::new(),
+                    process_group_leader: false,
+                },
+                None,
+                worker.runtime.create_sender(),
+                relay,
+            )
+            .map_err(|error| format!("watch helper exit: {error}"))?,
+        );
+        Ok(worker)
     }
 
     fn initialize(
@@ -5619,23 +5489,41 @@ impl TinygradWorker {
             config,
             telemetry,
             "myelin.worker.shutdown",
-        )
-        .map(|_| ())
+        )?;
+        let status = swactor_process::child_wait(&mut self.child)
+            .map_err(|error| format!("reap stopped tinygrad helper: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("tinygrad helper shutdown exited with {status}"))
+        }
     }
 
-    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
-        swactor_process::child_try_wait(&mut self.child)
-            .map_err(|e| format!("poll tinygrad helper: {e}"))
+    fn observe_exit(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        let Some(observation) = self.exit_observation.lock().take() else {
+            return Ok(None);
+        };
+        if let Some(error) = observation.error {
+            return Err(format!("observe tinygrad helper exit: {error}"));
+        }
+        swactor_process::child_wait(&mut self.child)
+            .map(Some)
+            .map_err(|error| format!("reap tinygrad helper: {error}"))
     }
 
     fn command(
         &mut self,
-        command: Value,
+        mut command: Value,
         expected: &str,
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
         channel_name: &str,
     ) -> Result<Value, String> {
+        self.command_id = self
+            .command_id
+            .checked_add(1)
+            .ok_or_else(|| "helper command identity exhausted".to_owned())?;
+        command["command_id"] = json!(self.command_id);
         let node_worker = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_WORKER_CHANNEL, phase, status, detail)
         };
@@ -5704,11 +5592,11 @@ impl TinygradWorker {
                 stderr_rx: Some(Arc::clone(&self.stderr_rx)),
                 expected,
                 command_type,
+                command_id: self.command_id,
                 config,
                 channel,
                 channel_name,
-                engine: &self.engine,
-                wait_config: HelperCommandWaitConfig::production(),
+                wake: Arc::clone(&self.stdout_wake),
             },
         )
     }
@@ -5718,11 +5606,23 @@ impl Drop for TinygradWorker {
     fn drop(&mut self) {
         let _ = swactor_process::child_kill(&mut self.child);
         let _ = swactor_process::child_wait(&mut self.child);
+        self.exit_watch = None;
+        if let Some(relay) = self.exit_relay.take() {
+            let _ = self.runtime.stop_actor(relay);
+        }
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
     }
 }
 
-fn spawn_stdin_shutdown_listener(exit_on_eof: bool, sender: ExternalSender, actor: ActorAddress) {
-    swactor_process::spawn_stdin_command_wait("shutdown", exit_on_eof, sender, actor);
+fn spawn_stdin_shutdown_listener(
+    blocking: &BlockingWorkSender,
+    exit_on_eof: bool,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) {
+    swactor_process::spawn_stdin_command_wait(blocking, "shutdown", exit_on_eof, sender, actor);
 }
 
 #[cfg(test)]
@@ -5740,7 +5640,7 @@ mod control_flow_properties {
 
     use super::*;
     use crate::node_actor::StageLifecycleWire;
-    use crate::tests::fuzz_support::{actor_census, advance_and_drive, drive_steps};
+    use crate::tests::fuzz_support::{actor_census, drive_steps};
 
     const DRIVE_PER_ACTION: usize = 16;
     const FINAL_DRIVE_BUDGET: usize = 256;
@@ -5753,17 +5653,24 @@ mod control_flow_properties {
             allocate_telemetry_lifetime(state.path(), 7, run_id).unwrap(),
             run_id + 1
         );
-        let mut generations = std::thread::scope(|scope| {
-            let handles = (0..4)
-                .map(|_| {
-                    scope.spawn(|| allocate_telemetry_lifetime(state.path(), 7, run_id).unwrap())
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+        )
+        .expect("engine");
+        let blocking = engine.handle().blocking_work_sender();
+        let handles = (0..4)
+            .map(|_| {
+                let path = state.path().to_owned();
+                blocking
+                    .submit_joinable(move || allocate_telemetry_lifetime(&path, 7, run_id).unwrap())
+                    .expect("submit lifetime allocation")
+            })
+            .collect::<Vec<_>>();
+        let mut generations = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
         generations.sort_unstable();
         assert_eq!(generations, (run_id + 2..=run_id + 5).collect::<Vec<_>>());
         // A new process opening the same state cannot regress with a lower run id.
@@ -5808,14 +5715,7 @@ mod control_flow_properties {
         };
         let state = Mutex::new(SamplerHealthState::Waiting);
 
-        submit_sampler_started(
-            &producer,
-            health_channel,
-            context,
-            "cpu",
-            "host.cpu",
-            Duration::from_secs(1),
-        );
+        submit_sampler_started(&producer, health_channel, context, "cpu", "host.cpu");
         submit_sampler_sample_health(
             &producer,
             health_channel,
@@ -5882,60 +5782,6 @@ mod control_flow_properties {
     }
 
     #[test]
-    fn hardware_sampler_runs_as_engine_task_not_actor() {
-        let parts = RuntimeParts::new(RuntimeConfig {
-            worker_count: 1,
-            ..RuntimeConfig::default()
-        });
-        let runtime = parts.runtime().clone();
-        let backend = SteppingBackend::new();
-        let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
-        let producer = TelemetryEndpoint::with_descriptor(
-            StreamDescriptor {
-                stream: StreamId::new(NodeId::new("sampler-test"), Lifetime(1)),
-                label: None,
-                origin: StreamOrigin::RemoteNode,
-            },
-            8,
-            8,
-        )
-        .producer();
-        let sample_channel = producer.register_record::<telemetry::hardware::net::HostNetSample>();
-        let health_channel = producer.register_channel(
-            NODE_SAMPLER_CHANNEL,
-            ChannelContent::MessagePackRecord {
-                schema: Some(NODE_SAMPLER_CHANNEL.to_owned()),
-            },
-        );
-        let baseline_actors = runtime.stats().actors.len();
-        let baseline_tasks = backend.pending_task_count();
-
-        spawn_blocking_sampler_task(
-            engine.handle(),
-            (),
-            sample_host_net,
-            BlockingSamplerConfig {
-                producer,
-                channel: sample_channel,
-                health_channel,
-                health_context: SamplerHealthContext {
-                    run_id: 1,
-                    node_id: 1,
-                    stage_index: 0,
-                },
-                sampler: "net",
-                sample_channel: telemetry::hardware::net::HOST_NET_CHANNEL,
-                interval: telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
-                error_of: |sample| sample.error.as_deref(),
-            },
-        );
-        backend.step();
-
-        assert_eq!(runtime.stats().actors.len(), baseline_actors);
-        assert_eq!(backend.pending_task_count(), baseline_tasks + 1);
-    }
-
-    #[test]
     fn agent_cpu_sampler_emits_decodable_host_stats() {
         let parts = RuntimeParts::new(RuntimeConfig {
             worker_count: 1,
@@ -5947,7 +5793,7 @@ mod control_flow_properties {
             TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
         )
         .expect("engine");
-        let endpoint = TelemetryEndpoint::with_descriptor(
+        let endpoint = Arc::new(TelemetryEndpoint::with_descriptor(
             StreamDescriptor {
                 stream: StreamId::new(NodeId::new("agent-sampler-test"), Lifetime(1)),
                 label: None,
@@ -5955,7 +5801,7 @@ mod control_flow_properties {
             },
             8,
             8,
-        );
+        ));
         let producer = endpoint.producer();
         let sample_channel = producer.register_record::<telemetry::hardware::cpu::HostCpuSample>();
         let health_channel = producer.register_channel(
@@ -5966,9 +5812,10 @@ mod control_flow_properties {
         );
         let subscription = endpoint.subscribe_all("agent-cpu-sampler-test");
 
-        spawn_host_cpu_sampler(
+        let _progress = spawn_host_cpu_sampler(
+            engine.task_spawner(),
             engine.handle(),
-            producer,
+            Arc::clone(&endpoint),
             sample_channel,
             health_channel,
             SamplerHealthContext {
@@ -5979,30 +5826,21 @@ mod control_flow_properties {
             vec![std::process::id()],
         );
 
-        let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            endpoint.tick();
-            for event in subscription.drain_available() {
-                if let TelemetryEvent::Frame(delivery) = event
-                    && delivery.channel.channel == sample_channel
-                {
-                    let sample = telemetry::hardware::cpu::HostCpuSample::decode(&delivery.payload)
-                        .expect("host CPU sample");
-                    assert_eq!(sample.seq, 0);
-                    assert!(
-                        sample
-                            .host
-                            .as_ref()
-                            .is_some_and(|host| host.logical_cpus > 0)
-                    );
-                    return;
-                }
+            if let TelemetryEvent::Frame(delivery) = subscription.recv().expect("sample event")
+                && delivery.channel.channel == sample_channel
+            {
+                let sample = telemetry::hardware::cpu::HostCpuSample::decode(&delivery.payload)
+                    .expect("host CPU sample");
+                assert_eq!(sample.seq, 0);
+                assert!(
+                    sample
+                        .host
+                        .as_ref()
+                        .is_some_and(|host| host.logical_cpus > 0)
+                );
+                break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "agent CPU sampler did not emit within three intervals"
-            );
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -6179,8 +6017,9 @@ mod control_flow_properties {
             }
         }
 
-        fn shutdown(&mut self) {
+        fn shutdown(&mut self) -> Result<(), String> {
             self.evidence.lock().shutdowns += 1;
+            Ok(())
         }
 
         fn record_finish(&mut self, result: &Result<(), String>) {
@@ -6237,10 +6076,9 @@ mod control_flow_properties {
             coordinator: None,
             readiness_id: 99,
             attempts: 0,
-            next_attempt_at: Instant::now(),
-            backoff: RUNTIME_READY_RETRY_INITIAL,
+            sent: false,
             acked: false,
-            swim_logged: false,
+            membership_logged: false,
             deployment: None,
         }
     }
@@ -6270,7 +6108,7 @@ mod control_flow_properties {
         report: NodeAgentReport,
     ) {
         let _ = runtime.send_to(report_to, report);
-        let _ = runtime.send_to(actor, NodeRuntimeMsg::Tick);
+        let _ = runtime.send_to(actor, NodeRuntimeMsg::Progress);
     }
 
     proptest! {
@@ -6290,7 +6128,7 @@ mod control_flow_properties {
             });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
-            let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
+            let _engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
             let baseline_actors = runtime.stats().actors.len();
             let baseline_tasks = backend.pending_task_count();
             let agent_reports = runtime.new_inbox::<NodeAgentReport>().expect("agent reports");
@@ -6311,8 +6149,6 @@ mod control_flow_properties {
                     pending_runtime_ready: pending_runtime_ready(agent_node),
                     ready: json!({"type":"ready","identity":99}),
                     node_actor: agent_node,
-                    engine: engine.handle(),
-                    sender: runtime.create_sender(),
                     completion: agent_completion.clone(),
                 })
                 .expect("spawn actual agent runtime actor");
@@ -6326,8 +6162,6 @@ mod control_flow_properties {
                     pending_runtime_ready: pending_runtime_ready(worker_node),
                     ready: json!({"type":"ready","identity":99}),
                     node_actor: worker_node,
-                    engine: engine.handle(),
-                    sender: runtime.create_sender(),
                     completion: worker_completion.clone(),
                 })
                 .expect("spawn actual worker runtime actor");
@@ -6352,10 +6186,10 @@ mod control_flow_properties {
                 match action {
                     RuntimeAction::Tick => {
                         if agent_live {
-                            let _ = runtime.send_to(agent_actor, NodeRuntimeMsg::Tick);
+                            let _ = runtime.send_to(agent_actor, NodeRuntimeMsg::Progress);
                         }
                         if worker_live {
-                            let _ = runtime.send_to(worker_actor, NodeRuntimeMsg::Tick);
+                            let _ = runtime.send_to(worker_actor, NodeRuntimeMsg::Progress);
                         }
                     }
                     RuntimeAction::CurrentReadinessAck
@@ -6453,7 +6287,7 @@ mod control_flow_properties {
                     }
                     RuntimeAction::WorkerExit if worker_live => {
                         *fail_next_worker_tick.lock() = true;
-                        let _ = runtime.send_to(worker_actor, NodeRuntimeMsg::Tick);
+                        let _ = runtime.send_to(worker_actor, NodeRuntimeMsg::Progress);
                         worker_live = false;
                         expected.worker_failed = true;
                     }
@@ -6499,7 +6333,6 @@ mod control_flow_properties {
                 expected.worker_shutdowns = 1;
             }
             drive_steps(&backend, FINAL_DRIVE_BUDGET);
-            advance_and_drive(&backend, Duration::from_secs(1), FINAL_DRIVE_BUDGET);
 
             let before_wait =
                 check_runtime_clean(&runtime, &backend, baseline_actors, baseline_tasks);
@@ -6648,7 +6481,7 @@ mod control_flow_properties {
             });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
-            let engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
+            let _engine = Engine::new(parts, backend.clone()).expect("one-worker stepping engine");
             let baseline_actors = runtime.stats().actors.len();
             let baseline_tasks = backend.pending_task_count();
             let (stdout_tx, stdout_rx) = mpsc::channel();
@@ -6659,14 +6492,14 @@ mod control_flow_properties {
                     HelperAction::Other => {
                         stdout_tx
                             .send(HelperStdoutEvent::Line(
-                                serde_json::json!({"type":"Progress"}).to_string(),
+                                serde_json::json!({"type":"Progress","command_id":1}).to_string(),
                             ))
                             .expect("queue helper progress");
                     }
                     HelperAction::Expected(value) => {
                         stdout_tx
                             .send(HelperStdoutEvent::Line(
-                                serde_json::json!({"type":"Expected","value":value}).to_string(),
+                                serde_json::json!({"type":"Expected","value":value,"command_id":1}).to_string(),
                             ))
                             .expect("queue expected helper event");
                     }
@@ -6678,7 +6511,7 @@ mod control_flow_properties {
                     HelperAction::Fatal => {
                         stdout_tx
                             .send(HelperStdoutEvent::Line(
-                                serde_json::json!({"type":"WorkerFatal","reason":"scripted"})
+                                serde_json::json!({"type":"WorkerFatal","reason":"scripted","command_id":1})
                                     .to_string(),
                             ))
                             .expect("queue fatal helper event");
@@ -6709,26 +6542,18 @@ mod control_flow_properties {
                     stdout_rx: Arc::new(Mutex::new(stdout_rx)),
                     stderr_rx: Some(Arc::new(Mutex::new(stderr_rx))),
                     expected: "Expected".to_owned(),
-                    engine: engine.handle(),
-                    sender: runtime.create_sender(),
+                    command_id: 1,
+                    wake: Arc::new(Mutex::new(None)),
+                    resource_samples: Arc::new(Mutex::new(Vec::new())),
                     completion: completion.clone(),
-                    wait_config: HelperCommandWaitConfig {
-                        poll_interval: Duration::from_millis(1),
-                        telemetry_interval: Duration::from_millis(1),
-                    },
-                    wait_started: Instant::now(),
-                    next_telemetry_at: Instant::now(),
-                    wait_cycles: 0,
                     lines: Vec::new(),
                     stderr_lines: Vec::new(),
-                    wait_samples: Vec::new(),
                 })
                 .expect("spawn helper wait actor");
             for _ in 0..extra_ticks {
-                let _ = runtime.send_to(actor, HelperWaitTick);
+                let _ = runtime.send_to(actor, HelperOutputReady);
             }
             drive_steps(&backend, FINAL_DRIVE_BUDGET);
-            advance_and_drive(&backend, Duration::from_secs(1), FINAL_DRIVE_BUDGET);
 
             let before_wait =
                 check_runtime_clean(&runtime, &backend, baseline_actors, baseline_tasks);
@@ -6789,6 +6614,53 @@ mod control_flow_properties {
             assert!(!expected_helper_success(&actions));
             assert!(check_helper_classification(&actions, true).is_err());
         }
+    }
+
+    #[test]
+    fn helper_wait_requires_current_command_completion_after_output_wake() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        });
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).expect("stepping engine");
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let completion = ActorCompletion::new();
+        let actor = runtime
+            .spawn(HelperWaitActor {
+                stdout_rx: Arc::new(Mutex::new(stdout_rx)),
+                stderr_rx: None,
+                expected: "Expected".to_owned(),
+                command_id: 2,
+                wake: Arc::new(Mutex::new(None)),
+                resource_samples: Arc::new(Mutex::new(Vec::new())),
+                completion: completion.clone(),
+                lines: Vec::new(),
+                stderr_lines: Vec::new(),
+            })
+            .expect("helper wait actor");
+        drive_steps(&backend, DRIVE_PER_ACTION);
+        for command_id in [1, 2] {
+            stdout_tx
+                .send(HelperStdoutEvent::Line(
+                    json!({"type":"Expected","command_id":command_id}).to_string(),
+                ))
+                .expect("helper output");
+        }
+        runtime
+            .send_to(actor, HelperOutputReady)
+            .expect("output observation");
+        drive_steps(&backend, FINAL_DRIVE_BUDGET);
+        assert!(
+            runtime
+                .stats()
+                .actors
+                .iter()
+                .all(|(address, _)| *address != actor)
+        );
+        let result = completion.wait().result.expect("current command completed");
+        assert_eq!(result["command_id"], 2);
     }
 
     #[derive(Clone, Debug)]

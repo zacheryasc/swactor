@@ -1,85 +1,37 @@
 //! Myelin-system swactor distribution runtime wiring.
 //!
 //! This is the production version of the actor-stack setup that integration
-//! tests used to copy by hand: a swactor runtime, the four distribution protocol
-//! actors, codec/transport routing, and the actor-directory mirrors. Protocol
-//! tick injection is owned by the swactor engine (see
-//! [`DistributionRuntimeStack::spawn_protocol_ticker`]); the application loop
-//! no longer manually ticks core.
+//! tests used to copy by hand: a swactor runtime, event-driven membership and
+//! distribution actors, codec/transport routing, and actor-directory mirrors.
+//! Authenticated transport lifecycle and actual mutations drive progression.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use parking_lot::Mutex as ObservationMutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeParts};
+use swactor::runtime::{Ctx, Runtime, RuntimeParts};
 use swactor::stats::StatsHook;
 use swactor::std::StdExtension;
 use swactor_engine::EngineHandle;
 use swactor_transport::{CodecRegistry, CodecRemoteSink, NetworkMessage, TransportRouter};
 
 use distribution::directory_actor::{DirectoryActor, DirectoryClaims, DirectoryIn};
+use distribution::membership_actor::{ObservedMembershipTransition, TransportMembershipActor};
 use distribution::messages::{
     DirectoryGossip, MetadataGossip, RegistryGossip, actor_codec_registry,
 };
 use distribution::node::DistributedNodeConfig;
 use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
 use distribution::registry_actor::{RegistryActor, RegistryIn, RegistryView};
-use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
+use distribution::swim::actor::MembershipChanged;
 use distribution::swim::member_list::MemberList;
-use distribution::swim::probe::SwimConfig;
-use distribution::swim::telemetry::{
-    ObservedProbeEvent, ObservedProbeSummary, ObservedTransition, SwimTelemetry,
-};
-use distribution::telemetry::{MembershipTransition, SwimProbeEvent, SwimProbeSummary};
+use distribution::telemetry::TransportMembershipTransition;
 use distribution::transport_bridge::{
     Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
 use distribution::types::{DirectoryEntry, MemberState, NodeId};
-
-#[derive(Clone)]
-struct ProtocolTick;
-
-struct ProtocolTicker {
-    runtime: Runtime,
-    engine: EngineHandle,
-    sender: ExternalSender,
-    period: Duration,
-    swim: ActorAddress,
-    registry: ActorAddress,
-    metadata: ActorAddress,
-    directory: ActorAddress,
-}
-
-impl ProtocolTicker {
-    fn schedule(&self, ctx: &Ctx) {
-        self.engine.send_after(
-            self.period,
-            self.sender.clone(),
-            ctx.self_addr(),
-            ProtocolTick,
-        );
-    }
-}
-
-impl ActorInterface for ProtocolTicker {
-    type Incoming = ProtocolTick;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        self.schedule(ctx);
-    }
-
-    fn handle(&mut self, ctx: &Ctx, _message: Self::Incoming) {
-        let now = self.engine.now().to_instant();
-        let _ = self.runtime.send_to(self.swim, SwimIn::Tick { now });
-        let _ = self.runtime.send_to(self.registry, RegistryIn::Tick);
-        let _ = self.runtime.send_to(self.metadata, MetadataIn::Tick);
-        let _ = self.runtime.send_to(self.directory, DirectoryIn::Tick);
-        self.schedule(ctx);
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DistributionActorAddrs {
@@ -92,9 +44,7 @@ pub(crate) struct DistributionActorAddrs {
 
 pub(crate) struct DistributionRuntimeStack {
     pub runtime: Runtime,
-    /// The node engine this stack is bound to. Protocol ticking and all
-    /// supporting work schedule on this stored handle; the stack does not
-    /// accept an unrelated engine at each call (ENGINE_SPEC.md).
+    /// The engine owning this runtime and its supporting I/O work.
     pub engine: EngineHandle,
     pub codec: Arc<CodecRegistry>,
     pub outbox: Outbox,
@@ -105,8 +55,8 @@ pub(crate) struct DistributionRuntimeStack {
     pub registry_view: RegistryView,
     pub directory_claims: DirectoryClaims,
     pub membership_mirror: Arc<Mutex<MemberList>>,
-    pub swim_telemetry: Arc<SwimTelemetry>,
-    pub swim_config: SwimConfig,
+    membership_transitions: Arc<ObservationMutex<VecDeque<ObservedMembershipTransition>>>,
+    membership_watchers: Arc<ObservationMutex<Vec<Weak<dyn Fn() + Send + Sync>>>>,
     pub actors: DistributionActorAddrs,
 }
 
@@ -165,34 +115,25 @@ impl DistributionRuntimeStack {
             Arc::clone(&transport_router),
             Arc::clone(&outbox),
         ));
-        let swim_config = config.swim.clone();
-        let swim_telemetry = SwimTelemetry::new();
         let registry_view = Arc::new(RwLock::new(Default::default()));
 
-        let swim_addr = runtime
-            .spawn(
-                SwimActor::new(
-                    node_id,
-                    swim_config.clone(),
-                    Instant::now(),
-                    peer_directory.clone(),
-                )
-                .with_observer(Box::new(Arc::clone(&swim_telemetry))),
-            )
-            .expect("spawn SwimActor");
         let registry_addr = runtime
             .spawn(
                 RegistryActor::new(node_id, config.registry.clone(), peer_directory.clone())
-                    .with_view(Arc::clone(&registry_view)),
+                    .with_view(Arc::clone(&registry_view))
+                    .with_event_dissemination(),
             )
             .expect("spawn RegistryActor");
         let metadata_addr = runtime
-            .spawn(MetadataActor::new(
-                node_id,
-                config.metadata_lambda,
-                peer_directory.clone(),
-                Arc::clone(&relay_mirror),
-            ))
+            .spawn(
+                MetadataActor::new(
+                    node_id,
+                    config.metadata_lambda,
+                    peer_directory.clone(),
+                    Arc::clone(&relay_mirror),
+                )
+                .with_event_dissemination(),
+            )
             .expect("spawn MetadataActor");
         let route_view_transport = Arc::new(RouteViewTransport::new(
             Arc::clone(&route_view),
@@ -204,31 +145,35 @@ impl DistributionRuntimeStack {
         ));
         let directory = DirectoryActor::with_pinned_routes(
             node_id,
-            peer_directory,
+            peer_directory.clone(),
             Arc::clone(&route_view),
             Arc::clone(&pinned_routes),
             route_binder.clone(),
-        );
+        )
+        .with_event_dissemination();
         let directory_claims = directory.claims();
         let directory_addr = runtime.spawn(directory).expect("spawn DirectoryActor");
 
         let membership_mirror = Arc::new(Mutex::new(MemberList::new(NodeId([0xFF; 32]))));
+        let membership_transitions = Arc::new(ObservationMutex::new(VecDeque::new()));
+        let membership_watchers = Arc::new(ObservationMutex::new(Vec::new()));
         let fanout_addr = runtime
             .spawn(MembershipFanout {
                 registry: registry_addr,
                 metadata: metadata_addr,
                 directory: directory_addr,
                 mirror: Arc::clone(&membership_mirror),
+                transitions: Arc::clone(&membership_transitions),
+                watchers: Arc::clone(&membership_watchers),
             })
             .expect("spawn MembershipFanout");
-        runtime
-            .send_to(
-                swim_addr,
-                SwimIn::Subscribe {
-                    observer: fanout_addr,
-                },
-            )
-            .expect("subscribe MembershipFanout");
+        let swim_addr = runtime
+            .spawn(TransportMembershipActor::new(
+                node_id,
+                peer_directory,
+                fanout_addr,
+            ))
+            .expect("spawn transport membership actor");
 
         Self {
             runtime,
@@ -242,8 +187,8 @@ impl DistributionRuntimeStack {
             membership_mirror,
             registry_view,
             directory_claims,
-            swim_telemetry,
-            swim_config,
+            membership_transitions,
+            membership_watchers,
             actors: DistributionActorAddrs {
                 swim: swim_addr,
                 registry: registry_addr,
@@ -263,6 +208,7 @@ impl DistributionRuntimeStack {
             "swactor_dist::IndirectAck",
             "swactor_dist::JoinRequest",
             "swactor_dist::JoinResponse",
+            "swactor_dist::MembershipGossip",
         ] {
             routes.insert(tag.to_owned(), self.actors.swim);
         }
@@ -272,23 +218,25 @@ impl DistributionRuntimeStack {
             DirectoryGossip::type_tag().to_owned(),
             self.actors.directory,
         );
+        routes.insert(
+            "swactor_dist::DirectoryRouteOffer".to_owned(),
+            self.actors.directory,
+        );
+        routes.insert(
+            "swactor_dist::DirectoryRouteAck".to_owned(),
+            self.actors.directory,
+        );
         routes
     }
 
-    /// Spawn the actor that owns periodic distribution protocol ticks.
-    pub(crate) fn spawn_protocol_ticker(&self, period: Duration) {
-        self.runtime
-            .spawn(ProtocolTicker {
-                runtime: self.runtime.clone(),
-                engine: self.engine.clone(),
-                sender: self.runtime.create_sender(),
-                period,
-                swim: self.actors.swim,
-                registry: self.actors.registry,
-                metadata: self.actors.metadata,
-                directory: self.actors.directory,
-            })
-            .expect("spawn distribution protocol ticker actor");
+    /// Observe the published membership mirror. Register before the initial
+    /// callback so a concurrent transition cannot be lost.
+    pub(crate) fn watch_membership(&self, changed: Weak<dyn Fn() + Send + Sync>) {
+        let callback = changed.upgrade();
+        self.membership_watchers.lock().push(changed);
+        if let Some(callback) = callback {
+            callback();
+        }
     }
 
     pub(crate) fn register_local_actor(&self, entry: DirectoryEntry) {
@@ -309,84 +257,15 @@ impl DistributionRuntimeStack {
         self.route_view.read().ok()?.get(&actor).copied()
     }
 
-    pub(crate) fn drain_swim_transitions(&self) -> Vec<ObservedTransition> {
-        self.swim_telemetry.drain_transitions()
+    pub(crate) fn drain_membership_transitions(&self) -> Vec<ObservedMembershipTransition> {
+        self.membership_transitions.lock().drain(..).collect()
     }
 
-    pub(crate) fn drain_swim_probe_events(&self) -> Vec<ObservedProbeEvent> {
-        self.swim_telemetry.drain_probe_events()
-    }
-
-    pub(crate) fn drain_swim_probe_summary(&self) -> Option<ObservedProbeSummary> {
-        self.swim_telemetry.drain_probe_summary()
-    }
-
-    pub(crate) fn swim_recent_probe_targets(&self) -> Vec<String> {
-        self.swim_telemetry
-            .recent_targets()
-            .into_iter()
-            .map(|node_id| format!("{:?}", node_id))
-            .collect()
-    }
-
-    pub(crate) fn swim_probe_event_record(
-        &self,
-        event: ObservedProbeEvent,
-        local_phase: &str,
-    ) -> SwimProbeEvent {
-        let config = &self.swim_config;
-        let budget_ms = event.budget_ms;
-        SwimProbeEvent {
-            event: event.event.to_owned(),
-            target: format!("{:?}", event.target),
-            sequence: event.sequence,
-            kind: event.kind.to_owned(),
-            rtt_ms: event.rtt_ms,
-            budget_ms,
-            budget_ticks: budget_ms,
-            last_ack_age_ms: event.last_ack_age.map(duration_ms_u64),
-            consecutive_timeouts: event.consecutive_timeouts,
-            recent_probe_targets: self.swim_recent_probe_targets(),
-            member_state: self
-                .member_state(event.target)
-                .map(|state| format!("{:?}", state)),
-            local_phase: local_phase.to_owned(),
-            probe_interval_ms: duration_ms_u64(config.probe_interval),
-            probe_timeout_ms: duration_ms_u64(config.probe_timeout),
-            indirect_probes: u32::try_from(config.indirect_probes).unwrap_or(u32::MAX),
-            suspicion_timeout_ms: duration_ms_u64(config.suspicion_timeout),
-            dead_reprobe_interval_ms: duration_ms_u64(config.dead_reprobe_interval),
-            probe_mode: format!("{:?}", config.probe_mode),
-            lifeguard_enabled: config.lifeguard.is_some(),
-        }
-    }
-
-    pub(crate) fn swim_probe_summary_record(
-        &self,
-        summary: ObservedProbeSummary,
-        local_phase: &str,
-    ) -> SwimProbeSummary {
-        SwimProbeSummary {
-            event: "summary".to_owned(),
-            interval_ms: summary.interval_ms,
-            sent: summary.sent,
-            acked: summary.acked,
-            direct_sent: summary.direct_sent,
-            indirect_sent: summary.indirect_sent,
-            rtt_samples: summary.rtt_samples,
-            rtt_ms_min: summary.rtt_ms_min,
-            rtt_ms_p50: summary.rtt_ms_p50,
-            rtt_ms_p95: summary.rtt_ms_p95,
-            rtt_ms_max: summary.rtt_ms_max,
-            local_phase: local_phase.to_owned(),
-            probe_interval_ms: duration_ms_u64(self.swim_config.probe_interval),
-        }
-    }
     pub(crate) fn membership_transition(
         &self,
-        transition: &ObservedTransition,
-    ) -> MembershipTransition {
-        MembershipTransition {
+        transition: &ObservedMembershipTransition,
+    ) -> TransportMembershipTransition {
+        TransportMembershipTransition {
             peer: format!("{:?}", transition.peer),
             from: transition
                 .from
@@ -394,18 +273,8 @@ impl DistributionRuntimeStack {
                 .unwrap_or_default(),
             to: format!("{:?}", transition.to),
             reason: transition.reason.to_owned(),
-            last_ack_age_ms: transition.last_ack_age.map(duration_ms_u64),
-            consecutive_timeouts: transition.consecutive_timeouts,
-            recent_probe_targets: self.swim_recent_probe_targets(),
-            member_state: self
-                .member_state(transition.peer)
-                .map(|state| format!("{:?}", state)),
         }
     }
-}
-
-pub(crate) fn duration_ms_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct MembershipFanout {
@@ -413,19 +282,45 @@ struct MembershipFanout {
     metadata: ActorAddress,
     directory: ActorAddress,
     mirror: Arc<Mutex<MemberList>>,
+    transitions: Arc<ObservationMutex<VecDeque<ObservedMembershipTransition>>>,
+    watchers: Arc<ObservationMutex<Vec<Weak<dyn Fn() + Send + Sync>>>>,
 }
 
 impl ActorInterface for MembershipFanout {
-    type Incoming = MembershipChanged;
+    type Incoming = ObservedMembershipTransition;
     type Response = ();
 
-    fn handle(&mut self, ctx: &Ctx, change: Self::Incoming) {
+    fn handle(&mut self, ctx: &Ctx, transition: Self::Incoming) {
+        let change = MembershipChanged {
+            node_id: transition.peer,
+            state: transition.to,
+            incarnation: transition.incarnation,
+        };
         self.mirror
             .lock()
             .expect("membership mirror poisoned")
             .apply(change.node_id, change.state, change.incarnation);
+        {
+            let mut transitions = self.transitions.lock();
+            if transitions.len() == 256 {
+                transitions.pop_front();
+            }
+            transitions.push_back(transition);
+        }
         let _ = ctx.send(self.registry, RegistryIn::Membership(change.clone()));
         let _ = ctx.send(self.metadata, MetadataIn::Membership(change.clone()));
         let _ = ctx.send(self.directory, DirectoryIn::Membership(change));
+        let mut callbacks = Vec::new();
+        self.watchers.lock().retain(|watcher| {
+            if let Some(callback) = watcher.upgrade() {
+                callbacks.push(callback);
+                true
+            } else {
+                false
+            }
+        });
+        for callback in callbacks {
+            callback();
+        }
     }
 }

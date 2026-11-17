@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 
 use iroh::EndpointAddr;
 use myelin_control_contract::{
     ContextualControlReply, ContextualEventCursor, ContextualEventRecord,
     ContextualEventsAcknowledgement, ContextualEventsBatch, ContextualExecutionView,
     ContextualProcessEvent, ContextualProcessEventKind, ContextualProcessSpec, ControlRevision,
+    MAX_CONTEXTUAL_EVENT_CURSORS,
 };
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -21,41 +21,28 @@ use swactor_transport::JsonCodec;
 #[derive(Clone)]
 pub(crate) struct ContextualArtifactCleanup {
     directory: ActorAddress,
-    upload_root: PathBuf,
 }
 
 impl ContextualArtifactCleanup {
-    pub(crate) fn new(directory: ActorAddress, upload_root: PathBuf) -> Self {
-        Self {
-            directory,
-            upload_root,
-        }
+    pub(crate) fn new(directory: ActorAddress) -> Self {
+        Self { directory }
     }
 
-    fn cleanup(&self, ctx: &Ctx<'_>, request_id: &str, namespace_path: String) {
+    fn cleanup(&self, ctx: &Ctx<'_>, namespace_path: String) {
         let Ok(namespace_path) = data_plane::path::DataPath::parse(namespace_path) else {
             return;
         };
-        let host_path = self.upload_root.join(format!("{request_id}.py"));
         let random = ActorAddress::new_random();
         let operation_id = data_plane::namespace::OperationId::from_u128(u128::from_le_bytes(
             random.0[..16]
                 .try_into()
                 .expect("actor address contains sixteen operation ID bytes"),
         ));
-        if ctx
-            .spawn(ContextualArtifactCleanupOperation {
-                directory: self.directory,
-                namespace_path,
-                operation_id,
-            })
-            .is_ok()
-        {
-            // The source actor already owns an open descriptor. Removing the
-            // name after process termination cannot invalidate a transfer,
-            // and avoids retaining completed UI uploads while retirement waits.
-            let _ = std::fs::remove_file(host_path);
-        }
+        let _ = ctx.spawn(ContextualArtifactCleanupOperation {
+            directory: self.directory,
+            namespace_path,
+            operation_id,
+        });
     }
 }
 
@@ -161,7 +148,6 @@ pub(crate) enum OrchestratorMsg {
         run_id: u64,
         node_id: u64,
     },
-    AdvanceTimeMs(u64),
     Snapshot {
         reply_to: ActorAddress,
     },
@@ -175,7 +161,8 @@ pub(crate) enum OrchestratorMsg {
     ContextualStop {
         request_id: String,
         control_request_id: String,
-        kill_after_ms: Option<u64>,
+        #[serde(default)]
+        force: bool,
         reply_to: ActorAddress,
     },
     ContextualQuery {
@@ -205,11 +192,15 @@ pub(crate) enum OrchestratorMsg {
         wait_key: Option<String>,
         reply_to: ActorAddress,
     },
-    ContextualEvent(ContextualProcessEvent),
-    /// An HTTP control observer timed out waiting for its reply; drop the
-    /// pending entry so a hung node cannot accumulate parked control requests.
+    ContextualEvent {
+        observation: ContextualProcessEvent,
+        delivery_owner: Option<ActorAddress>,
+        sequence: u64,
+    },
+    /// The request owner disconnected; release only its exact subscription.
     ContextualControlCancel {
         control_request_id: String,
+        reply_to: ActorAddress,
     },
 }
 
@@ -222,10 +213,6 @@ impl NetworkMessage for OrchestratorMsg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ContextualReplyObserverMsg {
     Reply(ContextualControlReply),
-    /// Locally injected by the HTTP reply observer when its deadline passes.
-    TimedOut,
-    /// Local HTTP observer message, enqueued only after request registration.
-    ArmTimeout,
 }
 
 fn send_contextual_reply(ctx: &Ctx<'_>, reply_to: ActorAddress, reply: ContextualControlReply) {
@@ -337,7 +324,6 @@ impl NetworkMessage for OrchestratorReport {
         "myelin::OrchestratorReport"
     }
 }
-const MAX_CONTEXTUAL_EXECUTIONS: usize = 256;
 const MAX_CONTEXTUAL_EVENTS_PER_EXECUTION: usize = 4096;
 
 struct ContextualExecutionState {
@@ -349,6 +335,7 @@ struct ContextualExecutionState {
     events: VecDeque<ContextualEventRecord>,
     spawn_waiter: Option<ActorAddress>,
     staged_source: Option<String>,
+    last_delivery: Option<(ActorAddress, u64)>,
 }
 
 impl ContextualExecutionState {
@@ -402,6 +389,7 @@ pub(crate) struct OrchestratorActor {
     event_cursor: usize,
     manual: Option<ManualActorControl>,
     contextual_executions: HashMap<String, ContextualExecutionState>,
+    contextual_acknowledgements: VecDeque<ContextualEventsAcknowledgement>,
     pending_contextual_replies: HashMap<String, PendingContextualReply>,
     contextual_event_waiters: HashMap<String, (ActorAddress, Vec<ContextualEventCursor>)>,
     control_revision: u64,
@@ -418,6 +406,7 @@ impl OrchestratorActor {
             event_cursor: 0,
             manual: None,
             contextual_executions: HashMap::new(),
+            contextual_acknowledgements: VecDeque::new(),
             pending_contextual_replies: HashMap::new(),
             contextual_event_waiters: HashMap::new(),
             control_revision: 0,
@@ -438,9 +427,14 @@ impl OrchestratorActor {
         self
     }
 
-    fn cleanup_contextual_artifact(&self, ctx: &Ctx<'_>, request_id: &str, source: Option<String>) {
+    fn cleanup_contextual_artifact(
+        &self,
+        ctx: &Ctx<'_>,
+        _request_id: &str,
+        source: Option<String>,
+    ) {
         if let (Some(cleanup), Some(source)) = (&self.contextual_artifact_cleanup, source) {
-            cleanup.cleanup(ctx, request_id, source);
+            cleanup.cleanup(ctx, source);
         }
     }
 
@@ -477,6 +471,113 @@ impl OrchestratorActor {
             .map_err(|error| format!("route contextual command to node {logical_node_id}: {error}"))
     }
 
+    fn contextual_event(
+        &mut self,
+        ctx: &Ctx<'_>,
+        observation: &ContextualProcessEvent,
+        delivery_owner: Option<ActorAddress>,
+        sequence: u64,
+    ) {
+        self.record_contextual_delivery(ctx, observation, delivery_owner, sequence);
+        if let Some(delivery_owner) = delivery_owner {
+            let _ = self.route_contextual(
+                ctx,
+                observation.logical_node_id,
+                ContextualNodeCommand::AcknowledgeEvent {
+                    delivery_owner,
+                    reply_to: ctx.self_addr(),
+                    sequence,
+                },
+            );
+        }
+    }
+
+    fn record_contextual_delivery(
+        &mut self,
+        ctx: &Ctx<'_>,
+        observation: &ContextualProcessEvent,
+        delivery_owner: Option<ActorAddress>,
+        sequence: u64,
+    ) {
+        let pending = self.pending_contextual_replies.get(&observation.request_id);
+        if pending.is_some_and(|pending| pending.logical_node_id != observation.logical_node_id) {
+            return;
+        }
+        let target = pending
+            .and_then(|pending| pending.target_request_id.as_deref())
+            .unwrap_or(&observation.request_id);
+        if let Some(execution) = self.contextual_executions.get_mut(target) {
+            if execution.logical_node_id != observation.logical_node_id {
+                return;
+            }
+            if let Some(owner) = delivery_owner {
+                if let Some((previous_owner, previous_sequence)) = execution.last_delivery
+                    && (previous_owner != owner || sequence <= previous_sequence)
+                {
+                    return;
+                }
+                execution.last_delivery = Some((owner, sequence));
+            }
+        }
+        if let Some(pending) = self
+            .pending_contextual_replies
+            .remove(&observation.request_id)
+        {
+            if let Some(target) = pending.target_request_id {
+                let staged_source =
+                    self.contextual_executions
+                        .get_mut(&target)
+                        .and_then(|execution| {
+                            let mut target_observation = observation.clone();
+                            target_observation.request_id = target.clone();
+                            execution.record(target_observation);
+                            observation
+                                .event
+                                .is_terminal()
+                                .then(|| execution.staged_source.take())
+                                .flatten()
+                        });
+                self.cleanup_contextual_artifact(ctx, &target, staged_source);
+            }
+            if let Some(reply_to) = pending.reply_to {
+                send_contextual_reply(
+                    ctx,
+                    reply_to,
+                    ContextualControlReply::Event {
+                        observation: observation.clone(),
+                    },
+                );
+            }
+            return;
+        }
+        let Some(execution) = self.contextual_executions.get_mut(&observation.request_id) else {
+            return;
+        };
+        if execution.terminal {
+            return;
+        }
+        let resolves_spawn = matches!(
+            observation.event,
+            ContextualProcessEventKind::Spawned { .. }
+        ) || observation.event.is_terminal();
+        execution.record(observation.clone());
+        let staged_source = observation
+            .event
+            .is_terminal()
+            .then(|| execution.staged_source.take())
+            .flatten();
+        if resolves_spawn && let Some(waiter) = execution.spawn_waiter.take() {
+            send_contextual_reply(
+                ctx,
+                waiter,
+                ContextualControlReply::Event {
+                    observation: observation.clone(),
+                },
+            );
+        }
+        self.cleanup_contextual_artifact(ctx, &observation.request_id, staged_source);
+    }
+
     fn handle_contextual(&mut self, ctx: &Ctx<'_>, msg: &OrchestratorMsg) -> bool {
         match msg {
             OrchestratorMsg::ControlChanges {
@@ -490,7 +591,7 @@ impl OrchestratorActor {
                     && *after_revision == Some(self.control_revision)
                     && let Some(key) = wait_key
                 {
-                    if self.control_change_waiters.len() >= MAX_CONTEXTUAL_EXECUTIONS {
+                    if self.control_change_waiters.len() >= MAX_CONTEXTUAL_EVENT_CURSORS {
                         self.contextual_rejection(ctx, *reply_to, "too many control observers");
                     } else {
                         self.control_change_waiters.insert(key.clone(), *reply_to);
@@ -525,7 +626,7 @@ impl OrchestratorActor {
                     );
                     return true;
                 }
-                if self.contextual_executions.len() >= MAX_CONTEXTUAL_EXECUTIONS {
+                if self.contextual_executions.len() >= MAX_CONTEXTUAL_EVENT_CURSORS {
                     self.cleanup_contextual_artifact(
                         ctx,
                         request_id,
@@ -554,6 +655,7 @@ impl OrchestratorActor {
                             .staged_program
                             .as_ref()
                             .map(|program| program.namespace_path.clone()),
+                        last_delivery: None,
                     },
                 );
                 if let Err(error) = self.route_contextual(
@@ -577,7 +679,7 @@ impl OrchestratorActor {
             OrchestratorMsg::ContextualStop {
                 request_id,
                 control_request_id,
-                kill_after_ms,
+                force,
                 reply_to,
             } => {
                 if self
@@ -622,7 +724,7 @@ impl OrchestratorActor {
                     ContextualNodeCommand::Stop {
                         request_id: control_request_id.clone(),
                         target_request_id: request_id.clone(),
-                        kill_after_ms: *kill_after_ms,
+                        force: *force,
                         reply_to: ctx.self_addr(),
                     },
                 ) {
@@ -692,14 +794,49 @@ impl OrchestratorActor {
                 wait_key,
                 reply_to,
             } => {
-                if cursors.len() > MAX_CONTEXTUAL_EXECUTIONS {
+                if cursors.len() > MAX_CONTEXTUAL_EVENT_CURSORS {
                     self.contextual_rejection(ctx, *reply_to, "too many execution cursors");
                     return true;
+                }
+                if cursors
+                    .iter()
+                    .map(|cursor| &cursor.request_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != cursors.len()
+                {
+                    self.contextual_rejection(ctx, *reply_to, "duplicate execution cursor");
+                    return true;
+                }
+                for cursor in cursors {
+                    if cursor.after_sequence != 0 && cursor.execution_incarnation.is_none() {
+                        self.contextual_rejection(
+                            ctx,
+                            *reply_to,
+                            "nonzero cursor requires execution incarnation",
+                        );
+                        return true;
+                    }
+                    if let Some(execution) = self.contextual_executions.get(&cursor.request_id)
+                        && cursor
+                            .execution_incarnation
+                            .as_ref()
+                            .is_some_and(|incarnation| {
+                                incarnation != &execution.execution_incarnation
+                            })
+                    {
+                        self.contextual_rejection(
+                            ctx,
+                            *reply_to,
+                            "execution cursor incarnation changed",
+                        );
+                        return true;
+                    }
                 }
                 if let Some(key) = wait_key
                     && !self.contextual_cursors_ready(cursors)
                 {
-                    if self.contextual_event_waiters.len() >= MAX_CONTEXTUAL_EXECUTIONS {
+                    if self.contextual_event_waiters.len() >= MAX_CONTEXTUAL_EVENT_CURSORS {
                         self.contextual_rejection(ctx, *reply_to, "too many execution observers");
                     } else {
                         self.contextual_event_waiters
@@ -755,8 +892,28 @@ impl OrchestratorActor {
                         return true;
                     }
                     self.contextual_executions.remove(request_id);
+                    if self.contextual_acknowledgements.len() == MAX_CONTEXTUAL_EVENT_CURSORS {
+                        self.contextual_acknowledgements.pop_front();
+                    }
+                    self.contextual_acknowledgements
+                        .push_back(ContextualEventsAcknowledgement {
+                            request_id: request_id.clone(),
+                            execution_incarnation: execution_incarnation.clone(),
+                            through_sequence: *through_sequence,
+                        });
+                } else if !self.contextual_acknowledgements.iter().any(|receipt| {
+                    receipt.request_id == *request_id
+                        && receipt.execution_incarnation == *execution_incarnation
+                        && receipt.through_sequence == *through_sequence
+                }) {
+                    self.contextual_rejection(
+                        ctx,
+                        *reply_to,
+                        "terminal acknowledgement has no retained incarnation receipt",
+                    );
+                    return true;
                 }
-                // Retrying after a lost acknowledgement response is harmless.
+                // Only the exact retained receipt reconciles a lost ACK reply.
                 send_contextual_reply(
                     ctx,
                     *reply_to,
@@ -768,128 +925,64 @@ impl OrchestratorActor {
                 );
                 true
             }
-            OrchestratorMsg::ContextualEvent(observation) => {
-                if let Some(pending) = self
-                    .pending_contextual_replies
-                    .remove(&observation.request_id)
-                {
-                    if pending.logical_node_id != observation.logical_node_id {
-                        if let Some(reply_to) = pending.reply_to {
-                            self.contextual_rejection(
-                                ctx,
-                                reply_to,
-                                format!(
-                                    "contextual reply came from node {}, expected {}",
-                                    observation.logical_node_id, pending.logical_node_id
-                                ),
-                            );
-                        }
-                        return true;
-                    }
-                    if let Some(target) = pending.target_request_id {
-                        let staged_source =
-                            self.contextual_executions
-                                .get_mut(&target)
-                                .and_then(|execution| {
-                                    // The direct reply belongs to the control request;
-                                    // the retained log belongs to its target execution.
-                                    let mut target_observation = observation.clone();
-                                    target_observation.request_id = target.clone();
-                                    execution.record(target_observation);
-                                    observation
-                                        .event
-                                        .is_terminal()
-                                        .then(|| execution.staged_source.take())
-                                        .flatten()
-                                });
-                        self.cleanup_contextual_artifact(ctx, &target, staged_source);
-                    }
-                    if let Some(reply_to) = pending.reply_to {
-                        send_contextual_reply(
-                            ctx,
-                            reply_to,
-                            ContextualControlReply::Event {
-                                observation: observation.clone(),
-                            },
-                        );
-                    }
-                    return true;
-                }
-                let Some(execution) = self.contextual_executions.get_mut(&observation.request_id)
-                else {
-                    return true;
-                };
-                if execution.logical_node_id != observation.logical_node_id {
-                    let expected = execution.logical_node_id;
-                    let waiter = execution.spawn_waiter.take();
-                    let staged_source = execution.staged_source.take();
-                    execution.terminal = true;
-                    if let Some(waiter) = waiter {
-                        send_contextual_reply(
-                            ctx,
-                            waiter,
-                            ContextualControlReply::Rejected {
-                                error: format!(
-                                    "contextual reply came from node {}, expected {}",
-                                    observation.logical_node_id, expected
-                                ),
-                            },
-                        );
-                    }
-                    self.cleanup_contextual_artifact(ctx, &observation.request_id, staged_source);
-                    return true;
-                }
-                let resolves_spawn = matches!(
-                    &observation.event,
-                    ContextualProcessEventKind::Spawned { .. }
-                ) || observation.event.is_terminal();
-                execution.record(observation.clone());
-                let staged_source = observation
-                    .event
-                    .is_terminal()
-                    .then(|| execution.staged_source.take())
-                    .flatten();
-                if resolves_spawn && let Some(waiter) = execution.spawn_waiter.take() {
-                    send_contextual_reply(
-                        ctx,
-                        waiter,
-                        ContextualControlReply::Event {
-                            observation: observation.clone(),
-                        },
-                    );
-                }
-                self.cleanup_contextual_artifact(ctx, &observation.request_id, staged_source);
+            OrchestratorMsg::ContextualEvent {
+                observation,
+                delivery_owner,
+                sequence,
+            } => {
+                self.contextual_event(ctx, observation, *delivery_owner, *sequence);
                 true
             }
-            OrchestratorMsg::ContextualControlCancel { control_request_id } => {
-                // A timed-out HTTP waiter no longer needs a direct reply, but
-                // a dispatched stop still owns a future target-log observation.
+            OrchestratorMsg::ContextualControlCancel {
+                control_request_id,
+                reply_to,
+            } => {
                 if let Some(pending) = self.pending_contextual_replies.get_mut(control_request_id)
-                    && pending.target_request_id.is_some()
+                    && pending.reply_to == Some(*reply_to)
                 {
-                    pending.reply_to = None;
-                } else {
-                    self.pending_contextual_replies.remove(control_request_id);
+                    if pending.target_request_id.is_some() {
+                        // The accepted stop still owes an outcome to the execution log.
+                        pending.reply_to = None;
+                    } else {
+                        let node = pending.logical_node_id;
+                        self.pending_contextual_replies.remove(control_request_id);
+                        let _ = self.route_contextual(
+                            ctx,
+                            node,
+                            ContextualNodeCommand::Cancel {
+                                request_id: control_request_id.clone(),
+                                reply_to: ctx.self_addr(),
+                            },
+                        );
+                    }
                 }
-                self.contextual_event_waiters.remove(control_request_id);
-                self.control_change_waiters.remove(control_request_id);
+                if self
+                    .contextual_event_waiters
+                    .get(control_request_id)
+                    .is_some_and(|(owner, _)| owner == reply_to)
+                {
+                    self.contextual_event_waiters.remove(control_request_id);
+                }
+                if self.control_change_waiters.get(control_request_id) == Some(reply_to) {
+                    self.control_change_waiters.remove(control_request_id);
+                }
+                if let Some(execution) = self.contextual_executions.get_mut(control_request_id)
+                    && execution.spawn_waiter == Some(*reply_to)
+                {
+                    execution.spawn_waiter = None;
+                }
                 true
             }
             _ => false,
         }
     }
     fn contextual_cursors_ready(&self, cursors: &[ContextualEventCursor]) -> bool {
-        let minimum_records = u64::from(cursors.len() > 1) + 1;
         cursors.is_empty()
             || cursors.iter().any(|cursor| {
                 self.contextual_executions
                     .get(&cursor.request_id)
                     .is_none_or(|execution| {
-                        execution.terminal
-                            || execution
-                                .next_sequence
-                                .saturating_sub(cursor.after_sequence)
-                                >= minimum_records
+                        execution.terminal || execution.next_sequence != cursor.after_sequence
                     })
             })
     }
@@ -1022,7 +1115,7 @@ impl OrchestratorActor {
             | OrchestratorMsg::ContextualEventsBatch { .. }
             | OrchestratorMsg::ContextualEventsAck { .. }
             | OrchestratorMsg::ControlChanges { .. }
-            | OrchestratorMsg::ContextualEvent(_)
+            | OrchestratorMsg::ContextualEvent { .. }
             | OrchestratorMsg::ContextualControlCancel { .. } => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
@@ -1078,7 +1171,6 @@ impl OrchestratorActor {
                     node_id: core::NodeId(node_id),
                 });
             }
-            OrchestratorMsg::AdvanceTimeMs(delta) => self.core.advance_time_ms(delta),
         }
     }
 
@@ -1111,6 +1203,17 @@ impl ActorInterface for OrchestratorActor {
     }
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
         if self.handle_contextual(ctx, &msg) {
+            if matches!(
+                msg,
+                OrchestratorMsg::ContextualSpawn { .. }
+                    | OrchestratorMsg::ContextualStop { .. }
+                    | OrchestratorMsg::ContextualEventsAck { .. }
+            ) || matches!(&msg, OrchestratorMsg::ContextualEvent { observation, .. }
+                    if !matches!(observation.event, ContextualProcessEventKind::LiveExecutions { .. }
+                        | ContextualProcessEventKind::ControlUnavailable { .. }))
+            {
+                self.publish_control_change(ctx);
+            }
             self.wake_contextual_event_waiters(ctx);
             return;
         }
@@ -1121,6 +1224,7 @@ impl ActorInterface for OrchestratorActor {
                     | ManualControlMsg::QueryFleet { .. }
                     | ManualControlMsg::SearchOffers { .. }
                     | ManualControlMsg::Flush { .. }
+                    | ManualControlMsg::Cancel { .. }
             );
             if let ManualControlMsg::Kill { request, .. } = &manual_msg {
                 self.fail_contextual_node(
@@ -1138,10 +1242,7 @@ impl ActorInterface for OrchestratorActor {
             }
             return;
         }
-        if !matches!(
-            &msg,
-            OrchestratorMsg::Snapshot { .. } | OrchestratorMsg::AdvanceTimeMs(_)
-        ) {
+        if !matches!(&msg, OrchestratorMsg::Snapshot { .. }) {
             self.publish_control_change(ctx);
         }
         if let OrchestratorMsg::ObserveMembershipLost { node_id, .. } = &msg {
@@ -1365,9 +1466,7 @@ mod event_observation_tests {
         type Response = ();
 
         fn handle(&mut self, _: &Ctx<'_>, reply: Self::Incoming) {
-            let ContextualReplyObserverMsg::Reply(reply) = reply else {
-                panic!("unexpected observer control message");
-            };
+            let ContextualReplyObserverMsg::Reply(reply) = reply;
             self.0.lock().push(reply);
         }
     }
@@ -1382,6 +1481,7 @@ mod event_observation_tests {
             events: VecDeque::new(),
             spawn_waiter: None,
             staged_source: None,
+            last_delivery: None,
         }
     }
 
@@ -1446,7 +1546,11 @@ mod event_observation_tests {
             &runtime,
             &backend,
             actor,
-            OrchestratorMsg::ContextualEvent(accepted.clone()),
+            OrchestratorMsg::ContextualEvent {
+                observation: accepted.clone(),
+                delivery_owner: None,
+                sequence: 0,
+            },
             &replies,
         );
         assert!(
@@ -1457,7 +1561,11 @@ mod event_observation_tests {
             &runtime,
             &backend,
             actor,
-            OrchestratorMsg::ContextualEvent(terminal()),
+            OrchestratorMsg::ContextualEvent {
+                observation: terminal(),
+                delivery_owner: None,
+                sequence: 0,
+            },
             &replies,
         );
         let history = send(
@@ -1576,6 +1684,51 @@ mod event_observation_tests {
             &send(&runtime, &backend, actor, query(), &replies)[..],
             [ContextualControlReply::Rejected { .. }]
         ));
+        // A previous incarnation cannot fabricate a receipt after deletion.
+        let old_incarnation = send(
+            &runtime,
+            &backend,
+            actor,
+            OrchestratorMsg::ContextualEventsAck {
+                request_id: "attempt".to_owned(),
+                through_sequence: 1,
+                reply_to,
+                execution_incarnation: "previous-incarnation".to_owned(),
+            },
+            &replies,
+        );
+        assert!(matches!(
+            &old_incarnation[..],
+            [ContextualControlReply::Rejected { .. }]
+        ));
+        // Restart loses this observer journal, not the obligation to prove the
+        // original terminal result. An absent execution is never an ACK.
+        let restarted = runtime
+            .spawn(OrchestratorActor::new(
+                core::RunConfig {
+                    run_id: core::RunId(1),
+                    max_tokens: 1,
+                    prompt: vec![],
+                },
+                None,
+            ))
+            .unwrap();
+        let lost_journal = send(
+            &runtime,
+            &backend,
+            restarted,
+            OrchestratorMsg::ContextualEventsAck {
+                request_id: "attempt".to_owned(),
+                through_sequence: 1,
+                reply_to,
+                execution_incarnation: "test-incarnation".to_owned(),
+            },
+            &replies,
+        );
+        assert!(matches!(
+            &lost_journal[..],
+            [ContextualControlReply::Rejected { .. }]
+        ));
     }
 
     #[test]
@@ -1608,6 +1761,7 @@ mod event_observation_tests {
                         cursors: vec![ContextualEventCursor {
                             request_id: "attempt".to_owned(),
                             after_sequence: 0,
+                            execution_incarnation: None,
                         }],
                         wait_key: Some(key.to_owned()),
                         reply_to,
@@ -1624,8 +1778,23 @@ mod event_observation_tests {
                 actor,
                 OrchestratorMsg::ContextualControlCancel {
                     control_request_id: "cancelled".to_owned(),
+                    reply_to,
                 },
                 &replies
+            )
+            .is_empty()
+        );
+        // A dropped observer from an earlier request must not cancel its replacement.
+        assert!(
+            send(
+                &runtime,
+                &backend,
+                actor,
+                OrchestratorMsg::ContextualControlCancel {
+                    control_request_id: "live".to_owned(),
+                    reply_to: ActorAddress::new_random(),
+                },
+                &replies,
             )
             .is_empty()
         );
@@ -1633,7 +1802,11 @@ mod event_observation_tests {
             &runtime,
             &backend,
             actor,
-            OrchestratorMsg::ContextualEvent(terminal()),
+            OrchestratorMsg::ContextualEvent {
+                observation: terminal(),
+                delivery_owner: None,
+                sequence: 0,
+            },
             &replies,
         );
         assert!(
@@ -1641,5 +1814,104 @@ mod event_observation_tests {
             if missing.is_empty() && executions.len() == 1
                 && executions[0].events[0].observation == terminal())
         );
+    }
+
+    #[test]
+    fn delivery_duplicates_and_replaced_owner_cannot_repeat_a_local_terminal_result() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).unwrap();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let reply_to = runtime.spawn(Replies(replies.clone())).unwrap();
+        let mut actor = OrchestratorActor::new(
+            core::RunConfig {
+                run_id: core::RunId(1),
+                max_tokens: 1,
+                prompt: vec![],
+            },
+            None,
+        );
+        let mut execution = pending_execution();
+        execution.spawn_waiter = Some(reply_to);
+        actor
+            .contextual_executions
+            .insert("attempt".to_owned(), execution);
+        let actor = runtime.spawn(actor).unwrap();
+        let owner = ActorAddress([71; 32]);
+        let event = OrchestratorMsg::ContextualEvent {
+            observation: terminal(),
+            delivery_owner: Some(owner),
+            sequence: 7,
+        };
+        assert!(
+            matches!(send(&runtime, &backend, actor, event.clone(), &replies).as_slice(), [ContextualControlReply::Event { observation }] if observation == &terminal())
+        );
+        assert!(send(&runtime, &backend, actor, event, &replies).is_empty());
+        assert!(
+            send(
+                &runtime,
+                &backend,
+                actor,
+                OrchestratorMsg::ContextualEvent {
+                    observation: terminal(),
+                    delivery_owner: Some(ActorAddress([72; 32])),
+                    sequence: 1,
+                },
+                &replies
+            )
+            .is_empty()
+        );
+        let history = send(
+            &runtime,
+            &backend,
+            actor,
+            OrchestratorMsg::ContextualEvents {
+                request_id: "attempt".to_owned(),
+                after_sequence: 0,
+                reply_to,
+            },
+            &replies,
+        );
+        assert!(
+            matches!(history.as_slice(), [ContextualControlReply::Events { execution }] if execution.terminal && execution.events.len() == 1 && execution.next_sequence == 1)
+        );
+    }
+
+    #[test]
+    fn disconnecting_observers_does_not_invalidate_control_state() {
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let _engine = Engine::new(parts, backend.clone()).unwrap();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let reply_to = runtime.spawn(Replies(replies.clone())).unwrap();
+        let actor = runtime
+            .spawn(OrchestratorActor::new(
+                core::RunConfig {
+                    run_id: core::RunId(1),
+                    max_tokens: 1,
+                    prompt: vec![],
+                },
+                None,
+            ))
+            .unwrap();
+        let query = || OrchestratorMsg::ControlChanges {
+            generation: None,
+            after_revision: None,
+            wait_key: None,
+            reply_to,
+        };
+        let initial = send(&runtime, &backend, actor, query(), &replies);
+        for message in [
+            OrchestratorMsg::ContextualControlCancel {
+                control_request_id: "disconnected".to_owned(),
+                reply_to,
+            },
+            OrchestratorMsg::Manual(ManualControlMsg::Cancel { reply_to }),
+        ] {
+            assert!(send(&runtime, &backend, actor, message, &replies).is_empty());
+        }
+        assert_eq!(send(&runtime, &backend, actor, query(), &replies), initial);
     }
 }

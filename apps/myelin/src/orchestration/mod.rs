@@ -12,9 +12,11 @@ pub(crate) mod control;
 pub(crate) mod daemon;
 pub(crate) mod distribution_stack;
 pub(crate) mod manual_control;
+pub(crate) mod provisioning_logs;
+pub(crate) mod provisioning_telemetry;
+pub(crate) mod telemetry;
 pub(crate) mod provider_adapters {
     pub(crate) mod relay;
     pub(crate) mod ssh_bootstrap;
-    pub(crate) mod static_ssh;
-    pub(super) mod vastai;
+    pub(crate) mod vastai;
 }

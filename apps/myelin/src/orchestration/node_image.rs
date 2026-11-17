@@ -5,12 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use swactor_engine::BlockingWorkSender;
 
 const NODE_IMAGE_CONTENT_INPUTS: &[&str] = &["apps/myelin/node-image/Dockerfile"];
 
@@ -61,7 +59,6 @@ pub(super) enum NodeImageProgressEventKind {
 pub(super) struct NodeImageProgressEvent {
     pub(super) command_label: Option<String>,
     pub(super) image_ref: Option<String>,
-    pub(super) elapsed_ms: Option<u128>,
     pub(super) kind: NodeImageProgressEventKind,
 }
 
@@ -70,14 +67,16 @@ pub(super) trait NodeImageProgressSink {
 }
 
 pub(super) fn prepare_node_image_with_progress(
+    blocking: &BlockingWorkSender,
     request: NodeImageRequest,
     progress: Option<&mut dyn NodeImageProgressSink>,
 ) -> Result<String, String> {
     let mut progress = progress;
-    prepare_node_image_inner(request, &mut progress)
+    prepare_node_image_inner(blocking, request, &mut progress)
 }
 
 fn prepare_node_image_inner(
+    blocking: &BlockingWorkSender,
     request: NodeImageRequest,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
 ) -> Result<String, String> {
@@ -105,14 +104,12 @@ fn prepare_node_image_inner(
         ));
     }
 
-    run_status_command(
-        &root,
-        "cargo",
-        &["build", "--quiet", "-p", "myelin", "--bin", "myelin-worker"],
-        "build myelin-worker",
-        None,
-        progress,
-    )?;
+    run_status_command(blocking, &root,
+    "cargo",
+    &["build", "--quiet", "-p", "myelin", "--bin", "myelin-worker"],
+    "build myelin-worker",
+    None,
+    progress,)?;
 
     let base_hash = content_hash_for_inputs(&root, BASE_IMAGE_SOURCE_INPUTS)?;
     let image_content_hash = node_image_content_hash(&root, &request.node_bin, &base_hash)?;
@@ -135,21 +132,21 @@ fn prepare_node_image_inner(
     let local_image_matches = docker_image_labels_match(&root, &image_ref, &expected_node_labels)?;
     let remote_available = remote_required && docker_manifest_exists(&root, &image_ref);
     if !request.force_refresh && remote_required && remote_available {
-        ensure_aliases_for_remote(progress, &root, &image_ref, &image, &alias_tags)?;
+        ensure_aliases_for_remote(blocking, progress, &root, &image_ref, &image, &alias_tags)?;
         prune_old_dirty_images(&root, &image, &tag);
         return Ok(image_ref);
     }
     if !request.force_refresh && remote_required && local_image_matches {
-        ensure_aliases_local(progress, &root, &image_ref, &image, &alias_tags)?;
-        push_image(progress, &root, &image_ref)?;
+        ensure_aliases_local(blocking, progress, &root, &image_ref, &image, &alias_tags)?;
+        push_image(blocking, progress, &root, &image_ref)?;
         for alias in alias_refs(&image, &alias_tags) {
-            push_image(progress, &root, &alias)?;
+            push_image(blocking, progress, &root, &alias)?;
         }
         prune_old_dirty_images(&root, &image, &tag);
         return Ok(image_ref);
     }
     if !request.force_refresh && !remote_required && local_image_matches {
-        ensure_aliases_local(progress, &root, &image_ref, &image, &alias_tags)?;
+        ensure_aliases_local(blocking, progress, &root, &image_ref, &image, &alias_tags)?;
         prune_old_dirty_images(&root, &image, &tag);
         return Ok(image_ref);
     }
@@ -157,23 +154,21 @@ fn prepare_node_image_inner(
         docker_image_labels_match(&root, &request.base_image, &expected_base_labels)?;
     if !base_image_matches {
         let base_source_hash_label = format!("{BASE_IMAGE_SOURCE_HASH_LABEL}={base_hash}");
-        run_status_command(
-            &root,
-            "docker",
-            &[
-                "build",
-                "-f",
-                "apps/myelin/node-image/Dockerfile.base",
-                "--label",
-                base_source_hash_label.as_str(),
-                "-t",
-                request.base_image.as_str(),
-                ".",
-            ],
-            "build myelin node base image",
-            Some(&request.base_image),
-            progress,
-        )?;
+        run_status_command(blocking, &root,
+        "docker",
+        &[
+            "build",
+            "-f",
+            "apps/myelin/node-image/Dockerfile.base",
+            "--label",
+            base_source_hash_label.as_str(),
+            "-t",
+            request.base_image.as_str(),
+            ".",
+        ],
+        "build myelin node base image",
+        Some(&request.base_image),
+        progress,)?;
     }
 
     let node_bin = {
@@ -198,20 +193,18 @@ fn prepare_node_image_inner(
         build_args.push(format!("{key}={value}"));
     }
     build_args.extend(["-t".to_owned(), image_ref.clone(), ".".to_owned()]);
-    run_status_command(
-        &root,
-        "docker",
-        &build_args.iter().map(String::as_str).collect::<Vec<_>>(),
-        "build myelin node image",
-        Some(&image_ref),
-        progress,
-    )?;
-    ensure_aliases_local(progress, &root, &image_ref, &image, &alias_tags)?;
+    run_status_command(blocking, &root,
+    "docker",
+    &build_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    "build myelin node image",
+    Some(&image_ref),
+    progress,)?;
+    ensure_aliases_local(blocking, progress, &root, &image_ref, &image, &alias_tags)?;
 
     if remote_required {
-        push_image(progress, &root, &image_ref)?;
+        push_image(blocking, progress, &root, &image_ref)?;
         for alias in alias_refs(&image, &alias_tags) {
-            push_image(progress, &root, &alias)?;
+            push_image(blocking, progress, &root, &alias)?;
         }
     }
 
@@ -415,6 +408,7 @@ fn insert_alias_tag(
 }
 
 fn ensure_aliases_local(
+    blocking: &BlockingWorkSender,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     source_ref: &str,
@@ -423,20 +417,19 @@ fn ensure_aliases_local(
 ) -> Result<(), String> {
     for alias in alias_refs(image, alias_tags) {
         if alias != source_ref {
-            run_status_command(
-                root,
-                "docker",
-                &["tag", source_ref, &alias],
-                "tag myelin node image",
-                Some(&alias),
-                progress,
-            )?;
+            run_status_command(blocking, root,
+            "docker",
+            &["tag", source_ref, &alias],
+            "tag myelin node image",
+            Some(&alias),
+            progress,)?;
         }
     }
     Ok(())
 }
 
 fn ensure_aliases_for_remote(
+    blocking: &BlockingWorkSender,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     source_ref: &str,
@@ -447,18 +440,16 @@ fn ensure_aliases_for_remote(
         return Ok(false);
     }
     if !docker_image_exists(root, source_ref) {
-        run_status_command(
-            root,
-            "docker",
-            &["pull", source_ref],
-            "pull myelin node image",
-            Some(source_ref),
-            progress,
-        )?;
+        run_status_command(blocking, root,
+        "docker",
+        &["pull", source_ref],
+        "pull myelin node image",
+        Some(source_ref),
+        progress,)?;
     }
-    ensure_aliases_local(progress, root, source_ref, image, alias_tags)?;
+    ensure_aliases_local(blocking, progress, root, source_ref, image, alias_tags)?;
     for alias in alias_refs(image, alias_tags) {
-        push_image(progress, root, &alias)?;
+        push_image(blocking, progress, root, &alias)?;
     }
     Ok(true)
 }
@@ -471,18 +462,17 @@ fn alias_refs(image: &ImageName, alias_tags: &BTreeSet<String>) -> Vec<String> {
 }
 
 fn push_image(
+    blocking: &BlockingWorkSender,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     image_ref: &str,
 ) -> Result<(), String> {
-    run_status_command(
-        root,
-        "docker",
-        &["push", image_ref],
-        "push myelin node image",
-        Some(image_ref),
-        progress,
-    )
+    run_status_command(blocking, root,
+    "docker",
+    &["push", image_ref],
+    "push myelin node image",
+    Some(image_ref),
+    progress,)
 }
 
 fn docker_image_labels_match(
@@ -570,7 +560,6 @@ fn emit_image_reference(
         NodeImageProgressEvent {
             command_label: None,
             image_ref: Some(image_ref.to_owned()),
-            elapsed_ms: None,
             kind: NodeImageProgressEventKind::ImageReference {
                 role: role.to_owned(),
                 image_ref: image_ref.to_owned(),
@@ -592,7 +581,6 @@ fn emit_command_progress(
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     label: &str,
     image_ref: Option<&str>,
-    elapsed_ms: u128,
     kind: NodeImageProgressEventKind,
 ) {
     emit_progress(
@@ -600,57 +588,14 @@ fn emit_command_progress(
         NodeImageProgressEvent {
             command_label: Some(label.to_owned()),
             image_ref: image_ref.map(str::to_owned),
-            elapsed_ms: Some(elapsed_ms),
             kind,
         },
     );
 }
 
-enum CommandOutputLine {
-    Stdout(String),
-    Stderr(String),
-}
-
-fn spawn_line_reader<R>(
-    reader: R,
-    to_line: fn(String) -> CommandOutputLine,
-    tx: mpsc::Sender<CommandOutputLine>,
-) -> thread::JoinHandle<()>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            if tx.send(to_line(line)).is_err() {
-                break;
-            }
-        }
-    })
-}
-
-fn drain_command_lines(
-    rx: &mpsc::Receiver<CommandOutputLine>,
-    progress: &mut Option<&mut dyn NodeImageProgressSink>,
-    label: &str,
-    image_ref: Option<&str>,
-    started: Instant,
-) {
-    while let Ok(line) = rx.try_recv() {
-        let kind = match line {
-            CommandOutputLine::Stdout(line) => NodeImageProgressEventKind::CommandStdout { line },
-            CommandOutputLine::Stderr(line) => NodeImageProgressEventKind::CommandStderr { line },
-        };
-        emit_command_progress(
-            progress,
-            label,
-            image_ref,
-            started.elapsed().as_millis(),
-            kind,
-        );
-    }
-}
 
 fn run_status_command(
+    blocking: &BlockingWorkSender,
     root: &Path,
     program: &str,
     args: &[&str],
@@ -675,33 +620,45 @@ fn run_status_command(
         };
     }
 
-    let started = Instant::now();
     emit_command_progress(
         progress,
         label,
         image_ref,
-        0,
         NodeImageProgressEventKind::CommandStarted {
             program: program.to_owned(),
             args: args.to_vec(),
         },
     );
-    let mut child = match swactor_process::command_spawn(&mut Command::new(program)
-        .current_dir(root)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped()))
-    {
-        Ok(child) => child,
+    let mut command = Command::new(program);
+    command.current_dir(root).args(&args).stdin(Stdio::null());
+    let status = swactor_process::command_status_observed(blocking, &mut command, |observation| {
+        let kind = match observation {
+            swactor_process::ProcessStreamObservation::Line {
+                stream: swactor_process::ProcessStream::Stdout,
+                line,
+            } => NodeImageProgressEventKind::CommandStdout { line },
+            swactor_process::ProcessStreamObservation::Line {
+                stream: swactor_process::ProcessStream::Stderr,
+                line,
+            } => NodeImageProgressEventKind::CommandStderr { line },
+            swactor_process::ProcessStreamObservation::Error { stream, error } => {
+                NodeImageProgressEventKind::CommandStderr {
+                    line: format!("read {stream:?}: {error}"),
+                }
+            }
+            swactor_process::ProcessStreamObservation::Closed { .. } => return,
+        };
+        emit_command_progress(progress, label, image_ref, kind);
+    });
+    let status = match status {
+        Ok(status) => status,
         Err(error) => {
             emit_command_progress(
                 progress,
                 label,
                 image_ref,
-                started.elapsed().as_millis(),
                 NodeImageProgressEventKind::CommandExited {
-                    status: format!("spawn error: {error}"),
+                    status: format!("command error: {error}"),
                     code: None,
                     success: false,
                 },
@@ -709,60 +666,12 @@ fn run_status_command(
             return Err(format!("run {label}: {error}"));
         }
     };
-
-    let (tx, rx) = mpsc::channel();
-    let mut readers = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        readers.push(spawn_line_reader(
-            stdout,
-            CommandOutputLine::Stdout,
-            tx.clone(),
-        ));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        readers.push(spawn_line_reader(
-            stderr,
-            CommandOutputLine::Stderr,
-            tx.clone(),
-        ));
-    }
-    drop(tx);
-
-    let status = loop {
-        match swactor_process::child_try_wait(&mut child) {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                drain_command_lines(&rx, progress, label, image_ref, started);
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                drain_command_lines(&rx, progress, label, image_ref, started);
-                emit_command_progress(
-                    progress,
-                    label,
-                    image_ref,
-                    started.elapsed().as_millis(),
-                    NodeImageProgressEventKind::CommandExited {
-                        status: format!("wait error: {error}"),
-                        code: None,
-                        success: false,
-                    },
-                );
-                return Err(format!("run {label}: {error}"));
-            }
-        }
-    };
-    for reader in readers {
-        let _ = reader.join();
-    }
-    drain_command_lines(&rx, progress, label, image_ref, started);
     let status_text = status.to_string();
     let success = status.success();
     emit_command_progress(
         progress,
         label,
         image_ref,
-        started.elapsed().as_millis(),
         NodeImageProgressEventKind::CommandExited {
             status: status_text.clone(),
             code: status.code(),

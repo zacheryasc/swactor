@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use data_plane::host::HostRouteRegistrar;
 use data_plane::path::SessionAccess;
@@ -8,7 +7,8 @@ use distribution::directory_actor::{DirectoryIn, Located};
 use distribution::types::NodeId;
 use myelin_control_contract::{ContextualProcessEventKind, ContextualProcessSpec};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
-use swactor::runtime::ExternalSender;
+use swactor::runtime::{ExternalSender, Inbox, Runtime};
+use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use swactor_process::{ProcessOutput, ProcessSpec};
 use swactor_process_context::{
     ContextualProcessOutput, ContextualProcessOutputConfig, ContextualProcessSpawner,
@@ -20,7 +20,33 @@ use crate::contextual_process::{
     MyelinChildRouteRegistrar, MyelinContextualProcessConfig, build_contextual_process_spawner,
 };
 use crate::orchestration::actor::OrchestratorMsg;
-use crate::tests::harness::build_iroh_composition;
+use crate::tests::harness::prepare_iroh_composition;
+
+fn contextual_event(
+    runtime: &Runtime,
+    events: &Inbox<OrchestratorMsg>,
+) -> myelin_control_contract::ContextualProcessEvent {
+    let OrchestratorMsg::ContextualEvent {
+        observation,
+        delivery_owner,
+        sequence,
+    } = futures_lite::future::block_on(events.recv())
+    else {
+        panic!("unexpected contextual message");
+    };
+    if let Some(owner) = delivery_owner {
+        runtime
+            .send_to(
+                owner,
+                crate::contextual_process::ContextualEventDeliveryIn::Acknowledge {
+                    reply_to: *events.addr(),
+                    sequence,
+                },
+            )
+            .unwrap();
+    }
+    observation
+}
 
 struct Launch {
     spawner: Arc<ContextualProcessSpawner>,
@@ -50,7 +76,9 @@ impl ActorInterface for Launch {
 
 #[test]
 fn shared_source_route_survives_one_owner_release_and_cleans_up_after_last() {
-    let (_engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
+    let (parts, compose) = prepare_iroh_composition();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let (driver, stack) = compose(engine.task_spawner(), engine.handle());
     let host_reader: Arc<dyn HostRouteRegistrar> = Arc::new(MyelinChildRouteRegistrar::new(
         stack.route_view.clone(),
         stack.pinned_routes.clone(),
@@ -80,18 +108,9 @@ fn shared_source_route_survives_one_owner_release_and_cleans_up_after_last() {
                 },
             )
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(located) = replies.try_recv() {
-                assert_eq!(located.actor, source);
-                break located.host;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "directory did not resolve source"
-            );
-            std::thread::yield_now();
-        }
+        let located = futures_lite::future::block_on(replies.recv());
+        assert_eq!(located.actor, source);
+        located.host
     };
 
     host_reader.retain_source(source, source_node.0).unwrap();
@@ -113,7 +132,9 @@ fn shared_source_route_survives_one_owner_release_and_cleans_up_after_last() {
 
 #[test]
 fn unaware_native_child_fails_bootstrap_before_terminal_output() {
-    let (engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
+    let (parts, compose) = prepare_iroh_composition();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let (driver, stack) = compose(engine.task_spawner(), engine.handle());
     let spawner = Arc::new(
         build_contextual_process_spawner(MyelinContextualProcessConfig {
             runtime: stack.runtime.clone(),
@@ -146,72 +167,88 @@ fn unaware_native_child_fails_bootstrap_before_terminal_output() {
         .spawn(Launch {
             spawner,
             sender: stack.runtime.create_sender(),
-            spec: Some(RuntimeContextualProcessSpec {
-                process: ProcessSpec {
+            spec: Some(RuntimeContextualProcessSpec::event_driven(
+                ProcessSpec {
                     command: "/bin/true".to_owned(),
                     args: Vec::new(),
                     env: HashMap::new(),
                     working_dir: None,
                     label: Some("myelin-context-unaware".to_owned()),
                 },
-                access: SessionAccess {
+                SessionAccess {
                     execution_id: "myelin-context-test".to_owned(),
                     read_prefixes: Vec::new(),
                     write_prefixes: Vec::new(),
                 },
-                attach_deadline: Duration::from_secs(1),
-            }),
+            )),
             output: Some(ContextualProcessOutputConfig::disabled(*output.addr())),
         })
         .expect("launch contextual process");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
     let mut observed = Vec::new();
-    while Instant::now() < deadline {
-        while let Some(event) = output.try_recv() {
-            let terminal = matches!(
-                event,
-                ContextualProcessOutput::Process(
-                    ProcessOutput::Exited { .. } | ProcessOutput::Error { .. }
-                )
-            );
-            observed.push(event);
-            if terminal {
-                let failed = observed
-                    .iter()
-                    .position(|event| {
-                        matches!(event, ContextualProcessOutput::BootstrapFailed { .. })
-                    })
-                    .expect("bootstrap failure");
-                let terminal = observed
-                    .iter()
-                    .position(|event| {
-                        matches!(
-                            event,
-                            ContextualProcessOutput::Process(
-                                ProcessOutput::Exited { .. } | ProcessOutput::Error { .. }
-                            )
-                        )
-                    })
-                    .expect("native terminal output");
-                assert!(failed < terminal, "outputs: {observed:?}");
-                driver.shutdown();
-                return;
-            }
+    loop {
+        let event = futures_lite::future::block_on(output.recv());
+        let terminal = matches!(
+            event,
+            ContextualProcessOutput::Process(
+                ProcessOutput::Exited { .. } | ProcessOutput::Error { .. }
+            )
+        );
+        observed.push(event);
+        if terminal {
+            break;
         }
-        std::thread::yield_now();
     }
+    let failed = observed
+        .iter()
+        .position(|event| matches!(event, ContextualProcessOutput::BootstrapFailed { .. }))
+        .expect("bootstrap failure");
+    assert!(failed < observed.len() - 1, "outputs: {observed:?}");
     driver.shutdown();
-    panic!("contextual process did not terminate: {observed:?}");
 }
 
 #[test]
 fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
-    let (engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
+    let (parts, compose) = prepare_iroh_composition();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let (driver, stack) = compose(engine.task_spawner(), engine.handle());
+    check_controller_stop(StopAction::Graceful, engine.handle(), driver, stack);
+}
+
+#[test]
+fn explicit_cancellation_interrupts_graceful_stop_and_reclaims_processes() {
+    let (parts, compose) = prepare_iroh_composition();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let (driver, stack) = compose(engine.task_spawner(), engine.handle());
+    check_controller_stop(StopAction::Force, engine.handle(), driver, stack);
+}
+
+#[test]
+fn contextual_output_observer_loss_cancels_native_before_reclaiming_execution() {
+    let (parts, compose) = prepare_iroh_composition();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let (driver, stack) = compose(engine.task_spawner(), engine.handle());
+    check_controller_stop(StopAction::ObserverLoss, engine.handle(), driver, stack);
+}
+
+enum StopAction {
+    Graceful,
+    Force,
+    ObserverLoss,
+}
+
+fn check_controller_stop(
+    action: StopAction,
+    engine: swactor_engine::EngineHandle,
+    driver: iroh_driver::IrohDriver,
+    stack: crate::orchestration::distribution_stack::DistributionRuntimeStack,
+) {
+    let force_cancel = matches!(action, StopAction::Force);
+    let observer_loss = matches!(action, StopAction::ObserverLoss);
     let spawner = Arc::new(
         build_contextual_process_spawner(MyelinContextualProcessConfig {
             runtime: stack.runtime.clone(),
-            engine: engine.handle(),
+            engine,
             arena_bytes: 1 << 20,
             arena_alignment: 64,
             namespace: None,
@@ -234,12 +271,39 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
     let events = stack.runtime.new_inbox::<OrchestratorMsg>().unwrap();
     let controller = stack
         .runtime
-        .spawn(ContextualProcessController::new(
-            7,
-            spawner,
-            stack.runtime.create_sender(),
-        ))
+        .spawn(
+            ContextualProcessController::new(
+                stack.runtime.clone(),
+                7,
+                spawner,
+                stack.runtime.create_sender(),
+                Arc::new(MyelinChildRouteRegistrar::new(
+                    stack.route_view.clone(),
+                    stack.pinned_routes.clone(),
+                    stack.route_binder.clone(),
+                    stack.runtime.clone(),
+                    stack.actors.directory,
+                    driver.connection_observer(),
+                )),
+            )
+            .unwrap(),
+        )
         .unwrap();
+    let waiting = tempfile::tempdir().unwrap();
+    let fifo = waiting.path().join("child-input");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // A FIFO read is an interruptible child-owned readiness barrier, not a clock.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let _fifo_owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
+    let program = if force_cancel || observer_loss {
+        r#"trap 'printf "stopping\n"; read ignored < "$1"' TERM; printf 'ready\n'; read value < "$1""#
+    } else {
+        r#"trap 'exit 17' TERM; printf 'ready\n'; read value < "$1""#
+    };
     stack
         .runtime
         .send_to(
@@ -248,14 +312,18 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
                 request_id: "execution".to_owned(),
                 spec: ContextualProcessSpec {
                     command: "/bin/sh".to_owned(),
-                    args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+                    args: vec![
+                        "-c".to_owned(),
+                        program.to_owned(),
+                        "contextual-child".to_owned(),
+                        fifo.display().to_string(),
+                    ],
                     env: Default::default(),
                     working_dir: None,
                     label: Some("controller-stop".to_owned()),
                     execution_id: "controller-stop".to_owned(),
                     read_prefixes: vec!["/models".to_owned(), "/runs".to_owned()],
                     write_prefixes: vec!["/runs".to_owned()],
-                    attach_timeout_ms: 10_000,
                     staged_program: None,
                 },
                 reply_to: *events.addr(),
@@ -263,26 +331,36 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
         )
         .unwrap();
 
-    let spawn_deadline = Instant::now() + Duration::from_secs(10);
-    let process = loop {
-        assert!(
-            Instant::now() < spawn_deadline,
-            "spawn event timed out; runtime={:?}",
-            stack.runtime.stats()
-        );
-        if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
-            && event.request_id == "execution"
-        {
-            match event.event {
-                ContextualProcessEventKind::Spawned { process, .. } => break process,
-                ContextualProcessEventKind::SpawnRejected { error } => {
-                    panic!("contextual spawn rejected: {error}")
-                }
-                _ => {}
-            }
+    let mut process = None;
+    let mut stdout = Vec::new();
+    loop {
+        let event = contextual_event(&stack.runtime, &events);
+        if event.request_id != "execution" {
+            continue;
         }
-        std::thread::yield_now();
-    };
+        match event.event {
+            ContextualProcessEventKind::Spawned {
+                process: spawned, ..
+            } => {
+                process = Some(spawned);
+            }
+            ContextualProcessEventKind::Stdout { bytes } => {
+                stdout.extend(bytes);
+                if stdout
+                    .windows(b"ready\n".len())
+                    .any(|window| window == b"ready\n")
+                {
+                    break;
+                }
+            }
+            ContextualProcessEventKind::SpawnRejected { error } => {
+                panic!("contextual spawn rejected: {error}")
+            }
+            event if event.is_terminal() => panic!("child terminated before stop: {event:?}"),
+            _ => {}
+        }
+    }
+    let process = process.expect("spawned process identity");
     stack
         .runtime
         .send_to(
@@ -294,51 +372,99 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
         )
         .unwrap();
     loop {
-        assert!(Instant::now() < spawn_deadline, "live query timed out");
-        if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
-            && event.request_id == "query-live"
+        let event = contextual_event(&stack.runtime, &events);
+        if event.request_id == "query-live"
             && let ContextualProcessEventKind::LiveExecutions { executions, .. } = event.event
         {
             assert_eq!(executions.len(), 1);
             assert_eq!(executions[0].process, process);
             break;
         }
-        std::thread::yield_now();
     }
 
-    stack
-        .runtime
-        .send_to(
-            controller,
-            ContextualProcessControllerIn::Command(ContextualNodeCommand::Stop {
-                request_id: "stop".to_owned(),
-                target_request_id: "execution".to_owned(),
-                kill_after_ms: Some(100),
-                reply_to: *events.addr(),
-            }),
-        )
-        .unwrap();
+    if observer_loss {
+        let census = stack.runtime.admin().list_actors().unwrap();
+        let census = futures_lite::future::block_on(census.recv()).unwrap();
+        let relay = census
+            .actors
+            .iter()
+            .find(|actor| actor.actor_type.ends_with("::ContextualOutputRelay"))
+            .expect("live contextual output relay")
+            .address;
+        stack.runtime.stop_actor(relay).unwrap();
+    } else {
+        stack
+            .runtime
+            .send_to(
+                controller,
+                ContextualProcessControllerIn::Command(ContextualNodeCommand::Stop {
+                    request_id: "stop".to_owned(),
+                    target_request_id: "execution".to_owned(),
+                    force: false,
+                    reply_to: *events.addr(),
+                }),
+            )
+            .unwrap();
+    }
     let mut stop_accepted = false;
     let mut stop_events = Vec::new();
-    let stop_deadline = Instant::now() + Duration::from_secs(20);
     let mut terminal = false;
+    let mut cancelled = false;
+    let mut cancellation_accepted = false;
+    let mut stopping_output = Vec::new();
     while !terminal {
-        assert!(
-            Instant::now() < stop_deadline,
-            "stopped process did not terminate; stop_accepted={stop_accepted}; events={stop_events:?}"
-        );
-        if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv() {
-            stop_events.push((event.request_id.clone(), format!("{:?}", event.event)));
-            if event.request_id == "stop" {
-                stop_accepted |=
-                    matches!(event.event, ContextualProcessEventKind::StopAccepted { .. });
-            } else if event.request_id == "execution" {
-                terminal = event.event.is_terminal();
+        let event = contextual_event(&stack.runtime, &events);
+        stop_events.push((event.request_id.clone(), format!("{:?}", event.event)));
+        if event.request_id == "stop" {
+            stop_accepted |= matches!(event.event, ContextualProcessEventKind::StopAccepted { .. });
+        } else if event.request_id == "force-stop" {
+            cancellation_accepted |=
+                matches!(event.event, ContextualProcessEventKind::StopAccepted { .. });
+        } else if event.request_id == "execution" {
+            terminal = event.event.is_terminal();
+            match event.event {
+                ContextualProcessEventKind::Stdout { bytes } if force_cancel && !cancelled => {
+                    stopping_output.extend(bytes);
+                    if stopping_output
+                        .windows(b"stopping\n".len())
+                        .any(|window| window == b"stopping\n")
+                    {
+                        stack
+                            .runtime
+                            .send_to(
+                                controller,
+                                ContextualProcessControllerIn::Command(
+                                    ContextualNodeCommand::Stop {
+                                        request_id: "force-stop".to_owned(),
+                                        target_request_id: "execution".to_owned(),
+                                        force: true,
+                                        reply_to: *events.addr(),
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                        cancelled = true;
+                    }
+                }
+                ContextualProcessEventKind::Exited { status } => {
+                    let expected = if force_cancel || observer_loss {
+                        myelin_control_contract::ContextualExitStatus::Signal(libc::SIGKILL)
+                    } else {
+                        myelin_control_contract::ContextualExitStatus::Code(17)
+                    };
+                    assert_eq!(status, expected, "stop events: {stop_events:?}");
+                }
+                outcome if terminal => panic!("unexpected terminal outcome: {outcome:?}"),
+                _ => {}
             }
         }
-        std::thread::yield_now();
     }
-    assert!(stop_accepted);
+    assert_eq!(
+        stop_accepted, !observer_loss,
+        "stop events: {stop_events:?}"
+    );
+    assert_eq!(cancelled, force_cancel);
+    assert_eq!(cancellation_accepted, force_cancel);
 
     stack
         .runtime
@@ -350,24 +476,23 @@ fn worker_contextual_controller_spawns_queries_stops_and_reclaims_processes() {
             }),
         )
         .unwrap();
-    let query_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(Instant::now() < query_deadline, "empty query timed out");
-        if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
-            && event.request_id == "query-empty"
+        let event = contextual_event(&stack.runtime, &events);
+        if event.request_id == "query-empty"
             && let ContextualProcessEventKind::LiveExecutions { executions, .. } = event.event
         {
             assert!(executions.is_empty());
             break;
         }
-        std::thread::yield_now();
     }
     driver.shutdown();
 }
 
 #[test]
 fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
-    let (engine, driver, stack) = build_iroh_composition(Duration::from_millis(5));
+    let (parts, compose) = prepare_iroh_composition();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let (driver, stack) = compose(engine.task_spawner(), engine.handle());
     let spawner = Arc::new(
         build_contextual_process_spawner(MyelinContextualProcessConfig {
             runtime: stack.runtime.clone(),
@@ -394,11 +519,23 @@ fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
     let events = stack.runtime.new_inbox::<OrchestratorMsg>().unwrap();
     let controller = stack
         .runtime
-        .spawn(ContextualProcessController::new(
-            7,
-            spawner,
-            stack.runtime.create_sender(),
-        ))
+        .spawn(
+            ContextualProcessController::new(
+                stack.runtime.clone(),
+                7,
+                spawner,
+                stack.runtime.create_sender(),
+                Arc::new(MyelinChildRouteRegistrar::new(
+                    stack.route_view.clone(),
+                    stack.pinned_routes.clone(),
+                    stack.route_binder.clone(),
+                    stack.runtime.clone(),
+                    stack.actors.directory,
+                    driver.connection_observer(),
+                )),
+            )
+            .unwrap(),
+        )
         .unwrap();
     // A child that exits before claiming its bootstrap context fails the
     // bootstrap: this must be a terminal outcome that reclaims the execution.
@@ -417,7 +554,6 @@ fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
                     execution_id: "controller-bootstrap-failure".to_owned(),
                     read_prefixes: vec!["/models".to_owned()],
                     write_prefixes: vec!["/runs".to_owned()],
-                    attach_timeout_ms: 10_000,
                     staged_program: None,
                 },
                 reply_to: *events.addr(),
@@ -425,18 +561,11 @@ fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
         )
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_bootstrap_failure = false;
     let mut reclaimed = false;
     while !reclaimed {
-        assert!(
-            Instant::now() < deadline,
-            "bootstrap failure did not terminate; runtime={:?}",
-            stack.runtime.stats()
-        );
-        if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
-            && event.request_id == "bootstrap-failure"
-        {
+        let event = contextual_event(&stack.runtime, &events);
+        if event.request_id == "bootstrap-failure" {
             match event.event {
                 ContextualProcessEventKind::BootstrapFailed { .. } => {
                     assert!(
@@ -468,7 +597,6 @@ fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
                 _ => {}
             }
         }
-        std::thread::yield_now();
     }
 
     stack
@@ -481,14 +609,9 @@ fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
             }),
         )
         .unwrap();
-    let query_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(
-            Instant::now() < query_deadline,
-            "post-failure query timed out"
-        );
-        if let Some(OrchestratorMsg::ContextualEvent(event)) = events.try_recv()
-            && event.request_id == "query-after-failure"
+        let event = contextual_event(&stack.runtime, &events);
+        if event.request_id == "query-after-failure"
             && let ContextualProcessEventKind::LiveExecutions { executions, .. } = event.event
         {
             assert!(
@@ -497,7 +620,6 @@ fn bootstrap_failure_reports_native_exit_and_reclaims_execution() {
             );
             break;
         }
-        std::thread::yield_now();
     }
     driver.shutdown();
 }
