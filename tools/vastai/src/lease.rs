@@ -380,7 +380,6 @@ mod tests {
             lifecycle: LifecyclePolicy {
                 lease_pace: Duration::ZERO,
                 poll_interval: Duration::from_millis(1),
-                state_timeout: Duration::from_millis(5),
             },
             confirm_lease: false,
         }

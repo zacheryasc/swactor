@@ -23,9 +23,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use protocol_telemetry::{
+    ActorType, Outcome, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
-use swactor_engine::EngineHandle;
+use swactor_engine::{ActorTimer, EngineHandle};
 
 /// Default probe period for the self-driven state machine.
 pub const DEFAULT_PROBE_PERIOD: Duration = Duration::from_millis(250);
@@ -163,12 +166,14 @@ impl BootstrapRegistry {
 /// Universal per-attempt lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    /// No external launch has been accepted.
+    Created,
     /// Launched, no readiness signal yet.
     Bootstrapping,
     /// Node joined and reported bootstrapped.
     Ready,
     /// Termination requested, waiting for the exit observation.
-    Stopping,
+    Stopping { was_ready: bool },
     /// Terminal: exit observed (or start failed). No further reports.
     Dead,
 }
@@ -182,6 +187,7 @@ pub struct BootstrapConfig {
     pub sender: ExternalSender,
     /// Optional telemetry collection hook, fired once after `Bootstrapped`.
     pub collector: Option<Arc<dyn NodeTelemetryCollector>>,
+    pub transitions: Option<TransitionEmitter>,
     pub probe_period: Duration,
 }
 
@@ -193,12 +199,11 @@ pub struct BootstrapActor {
     sender: ExternalSender,
     collector: Option<Arc<dyn NodeTelemetryCollector>>,
     phase: Phase,
-    /// Launch was requested; duplicate `Start` messages are inert.
-    started: bool,
-    /// `Bootstrapped` reported (and collector fired) exactly once.
-    announced: bool,
-    /// Terminal report (Failed/Exited) emitted exactly once.
-    closed: bool,
+    transitions: Option<TransitionEmitter>,
+    address: Option<ActorAddress>,
+    engine: Option<EngineHandle>,
+    probe_period: Duration,
+    probe_timer: Option<ActorTimer>,
 }
 
 impl BootstrapActor {
@@ -209,23 +214,68 @@ impl BootstrapActor {
             reporter: config.reporter,
             sender: config.sender,
             collector: config.collector,
-            phase: Phase::Bootstrapping,
-            started: false,
-            announced: false,
-            closed: false,
+            phase: Phase::Created,
+            transitions: config.transitions,
+            address: None,
+            engine: None,
+            probe_period: config.probe_period,
+            probe_timer: None,
         }
     }
 
+    fn enter_phase(&mut self, next: Phase, reason: Reason, outcome: Option<Outcome>) {
+        let previous = std::mem::replace(&mut self.phase, next);
+        if let (Some(emitter), Some(actor)) = (&self.transitions, self.address) {
+            emitter.emit(TransitionRecord {
+                actor,
+                actor_type: ActorType::BootstrapActor,
+                protocol: Protocol::ProvisioningBootstrap,
+                operation: None,
+                generation: Some(self.attempt),
+                incarnation: None,
+                previous: telemetry_phase(previous),
+                next: telemetry_phase(next),
+                reason,
+                outcome,
+            });
+        }
+    }
+
+    fn start(&mut self, ctx: &Ctx<'_>) {
+        if self.phase != Phase::Created {
+            return;
+        }
+        self.enter_phase(Phase::Bootstrapping, Reason::Started, None);
+        if let Err(reason) = self.logic.start(ctx, ctx.self_addr(), &self.sender) {
+            self.fail(format!("launch failed: {reason}"));
+        }
+    }
+
+    fn stop(&mut self, kill_after: Option<Duration>) {
+        match self.phase {
+            Phase::Dead | Phase::Stopping { .. } => return,
+            Phase::Created => {
+                self.fail("stopped before launch".to_owned());
+                return;
+            }
+            Phase::Bootstrapping | Phase::Ready => {}
+        }
+        let was_ready = self.phase == Phase::Ready;
+        self.enter_phase(Phase::Stopping { was_ready }, Reason::Cancelled, None);
+        self.logic.terminate(&self.sender, kill_after);
+    }
     fn report(&self, event: BootstrapEvent) {
         (self.reporter)(event);
     }
 
     fn fail(&mut self, reason: String) {
-        if self.closed {
+        if self.phase == Phase::Dead {
             return;
         }
-        self.closed = true;
-        self.phase = Phase::Dead;
+        if matches!(self.phase, Phase::Bootstrapping | Phase::Ready) {
+            self.logic.terminate(&self.sender, Some(Duration::ZERO));
+        }
+        self.enter_phase(Phase::Dead, Reason::Failed, Some(Outcome::Failed));
         self.report(BootstrapEvent::Failed {
             attempt: self.attempt,
             reason,
@@ -233,11 +283,10 @@ impl BootstrapActor {
     }
 
     fn exit(&mut self, reason: String) {
-        if self.closed {
+        if self.phase == Phase::Dead {
             return;
         }
-        self.closed = true;
-        self.phase = Phase::Dead;
+        self.enter_phase(Phase::Dead, Reason::Completed, Some(Outcome::Success));
         self.report(BootstrapEvent::Exited {
             attempt: self.attempt,
             reason,
@@ -246,7 +295,7 @@ impl BootstrapActor {
 
     fn probe(&mut self, now: SystemTime) {
         match self.phase {
-            Phase::Dead => {}
+            Phase::Created | Phase::Dead => {}
             Phase::Bootstrapping => match self.logic.probe(now) {
                 LogicProbe::Pending => {}
                 LogicProbe::Bootstrapped(identity) => self.become_ready(identity),
@@ -254,9 +303,11 @@ impl BootstrapActor {
                 // An exit before the join signal is a failed attempt.
                 LogicProbe::Exited(reason) => self.fail(format!("node process exited: {reason}")),
             },
-            Phase::Ready | Phase::Stopping => {
-                if let LogicProbe::Exited(reason) = self.logic.probe(now) {
-                    if self.phase == Phase::Stopping && !self.announced {
+            Phase::Ready | Phase::Stopping { .. } => {
+                if let LogicProbe::Exited(reason) | LogicProbe::Failed(reason) =
+                    self.logic.probe(now)
+                {
+                    if self.phase == (Phase::Stopping { was_ready: false }) {
                         // Stopped before it ever joined: failed attempt.
                         self.fail(format!("stopped before join: {reason}"));
                     } else {
@@ -270,11 +321,10 @@ impl BootstrapActor {
     /// First readiness signal for the attempt (probe or wire announce):
     /// fire the collector and report `Bootstrapped` exactly once.
     fn become_ready(&mut self, identity: NodeIdentity) {
-        if self.announced {
+        if self.phase != Phase::Bootstrapping || identity.attempt != self.attempt {
             return;
         }
-        self.announced = true;
-        self.phase = Phase::Ready;
+        self.enter_phase(Phase::Ready, Reason::Completed, None);
         if let Some(collector) = &self.collector {
             collector.collect(&identity);
         }
@@ -298,32 +348,67 @@ impl ActorInterface for BootstrapActor {
     type Incoming = BootstrapMsg;
     type Response = ();
 
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.address = Some(ctx.self_addr());
+        if let Some(engine) = &self.engine {
+            self.probe_timer = Some(engine.send_every(
+                self.probe_period,
+                self.sender.clone(),
+                ctx.self_addr(),
+                BootstrapMsg::Probe,
+            ));
+        }
+    }
+
     fn handle(&mut self, ctx: &Ctx, msg: BootstrapMsg) {
         match msg {
-            BootstrapMsg::Start => {
-                if self.phase != Phase::Bootstrapping || self.started {
-                    return;
-                }
-                self.started = true;
-                if let Err(reason) = self.logic.start(ctx, ctx.self_addr(), &self.sender) {
-                    self.fail(format!("launch failed: {reason}"));
-                }
-            }
-            BootstrapMsg::Stop { kill_after } => {
-                if self.phase == Phase::Dead {
-                    return;
-                }
-                self.phase = Phase::Stopping;
-                self.logic.terminate(&self.sender, kill_after);
-            }
-            BootstrapMsg::Probe => {
-                self.probe(SystemTime::now());
-                if self.phase == Phase::Dead {
-                    ctx.stop_self();
-                }
-            }
+            BootstrapMsg::Start => self.start(ctx),
+            BootstrapMsg::Stop { kill_after } => self.stop(kill_after),
+            BootstrapMsg::Probe => self.probe(SystemTime::now()),
             BootstrapMsg::Announce(identity) => self.apply_announce(identity),
         }
+        if self.phase == Phase::Dead {
+            ctx.stop_self();
+        }
+    }
+
+    fn on_stop(&mut self, _ctx: &Ctx<'_>) {
+        if let Some(timer) = self.probe_timer.take() {
+            timer.cancel();
+        }
+        if self.phase == Phase::Dead {
+            return;
+        }
+        let was_ready = matches!(
+            self.phase,
+            Phase::Ready | Phase::Stopping { was_ready: true }
+        );
+        if self.phase != Phase::Created {
+            self.logic.terminate(&self.sender, Some(Duration::ZERO));
+        }
+        self.enter_phase(Phase::Dead, Reason::Shutdown, Some(Outcome::Cancelled));
+        self.report(if was_ready {
+            BootstrapEvent::Exited {
+                attempt: self.attempt,
+                reason: "bootstrap owner stopped".to_owned(),
+            }
+        } else {
+            BootstrapEvent::Failed {
+                attempt: self.attempt,
+                reason: "bootstrap owner stopped".to_owned(),
+            }
+        });
+    }
+}
+
+fn telemetry_phase(phase: Phase) -> protocol_telemetry::Phase {
+    use protocol_telemetry::Phase as P;
+    match phase {
+        Phase::Created => P::Created,
+        Phase::Bootstrapping => P::Awaiting,
+        Phase::Ready => P::Ready,
+        Phase::Stopping { .. } => P::Stopping,
+        Phase::Dead => P::Closed,
     }
 }
 
@@ -337,11 +422,11 @@ pub fn spawn_bootstrap_actor(
     config: BootstrapConfig,
 ) -> Result<ActorAddress, String> {
     let sender = config.sender.clone();
-    let period = config.probe_period;
+    let mut bootstrap = BootstrapActor::new(logic, config);
+    bootstrap.engine = Some(engine.clone());
     let actor = ctx
-        .spawn(BootstrapActor::new(logic, config))
+        .spawn(bootstrap)
         .map_err(|error| format!("spawn bootstrap actor: {error}"))?;
-    engine.send_every(period, sender.clone(), actor, BootstrapMsg::Probe);
     let _ = sender.send_to(actor, BootstrapMsg::Start);
     Ok(actor)
 }
@@ -418,28 +503,6 @@ mod tests {
         };
         assert!(registry.create(&unknown).is_err());
     }
-    #[test]
-    fn reporter_contract_carries_identity() {
-        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let reporter: BootstrapReporter = {
-            let events = events.clone();
-            Arc::new(move |event| {
-                let name = match event {
-                    BootstrapEvent::Bootstrapped(_) => "bootstrapped",
-                    BootstrapEvent::Failed { .. } => "failed",
-                    BootstrapEvent::Exited { .. } => "exited",
-                };
-                events.lock().push(name.to_owned());
-            })
-        };
-        reporter(BootstrapEvent::Exited {
-            attempt: 7,
-            reason: "test".to_owned(),
-        });
-        assert_eq!(events.lock().as_slice(), ["exited"]);
-        let id = identity(7);
-        assert_eq!(id.logical_node, "node-7");
-    }
 
     #[test]
     fn announce_completes_attempt_exactly_once() {
@@ -496,6 +559,50 @@ mod tests {
         assert_eq!(logged.len(), 1);
     }
 
+    #[test]
+    fn stale_probe_cannot_complete_a_redeployed_attempt() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = announce_actor(
+            10,
+            events.clone(),
+            vec![
+                LogicProbe::Bootstrapped(identity(9)),
+                LogicProbe::Bootstrapped(identity(10)),
+            ],
+        );
+        actor.probe(SystemTime::UNIX_EPOCH);
+        assert!(events.lock().is_empty());
+        actor.probe(SystemTime::UNIX_EPOCH);
+        let events = events.lock();
+        assert!(
+            matches!(events.as_slice(), [BootstrapEvent::Bootstrapped(identity)] if identity.attempt == 10)
+        );
+    }
+
+    #[test]
+    fn cancelled_bootstrap_cannot_become_ready_from_a_late_announce() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = announce_actor(
+            11,
+            events.clone(),
+            vec![LogicProbe::Exited("terminated".to_owned())],
+        );
+        actor.stop(Some(Duration::ZERO));
+        actor.stop(Some(Duration::ZERO));
+        actor.apply_announce(identity(11));
+        assert!(
+            events.lock().is_empty(),
+            "termination still awaits the process observation"
+        );
+        actor.probe(SystemTime::UNIX_EPOCH);
+        actor.apply_announce(identity(11));
+        actor.probe(SystemTime::UNIX_EPOCH);
+        assert!(matches!(
+            events.lock().as_slice(),
+            [BootstrapEvent::Failed { attempt: 11, .. }]
+        ));
+    }
+
     /// An actor over a scripted logic whose events land in `events`.
     fn announce_actor(
         attempt: u64,
@@ -522,8 +629,11 @@ mod tests {
             reporter,
             sender,
             collector: None,
+            transitions: None,
             probe_period: DEFAULT_PROBE_PERIOD,
         };
-        BootstrapActor::new(Box::new(ScriptedLogic::new(probes)), config)
+        let mut actor = BootstrapActor::new(Box::new(ScriptedLogic::new(probes)), config);
+        actor.enter_phase(Phase::Bootstrapping, Reason::Started, None);
+        actor
     }
 }

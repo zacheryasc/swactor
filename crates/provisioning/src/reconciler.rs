@@ -12,6 +12,10 @@ use crate::node::{
     LogicalNodeId, LogicalNodeSpec, NodeManagerCommand, NodeRecord, NodeStage, RunId,
     RunNodeGroupSpec, SshEndpoint, SwactorFacts, SwactorId, expand_node_group,
 };
+use protocol_telemetry::{
+    ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
+use swactor::actor::ActorAddress;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClusterShape {
@@ -919,15 +923,22 @@ impl From<ShapeError> for DriverError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverPhase {
+    Idle,
+    Queued,
+    Running,
+    RunningDirty,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClusterDriver {
     state: ClusterState,
     desired: ClusterShape,
     expanded_desired: BTreeMap<LogicalNodeId, LogicalNodeSpec>,
     retry: RetryPolicy,
-    queued: bool,
-    processing: bool,
-    dirty: bool,
+    phase: DriverPhase,
+    transitions: Option<(ActorAddress, TransitionEmitter)>,
     requeue_at: Option<SystemTime>,
 }
 
@@ -939,11 +950,78 @@ impl ClusterDriver {
             desired,
             expanded_desired,
             retry,
-            queued: true,
-            processing: false,
-            dirty: false,
+            phase: DriverPhase::Queued,
+            transitions: None,
             requeue_at: None,
         })
+    }
+
+    pub fn with_transitions(
+        mut self,
+        actor: ActorAddress,
+        transitions: Option<TransitionEmitter>,
+    ) -> Self {
+        self.transitions = transitions.map(|emitter| (actor, emitter));
+        self
+    }
+
+    fn enter_phase(&mut self, next: DriverPhase, reason: Reason) {
+        let previous = std::mem::replace(&mut self.phase, next);
+        if previous == next {
+            return;
+        }
+        let phase = |phase| match phase {
+            DriverPhase::Idle => Phase::Idle,
+            DriverPhase::Queued => Phase::Queued,
+            DriverPhase::Running | DriverPhase::RunningDirty => Phase::Running,
+        };
+        if let Some((actor, emitter)) = &self.transitions {
+            emitter.emit(TransitionRecord {
+                actor: *actor,
+                actor_type: ActorType::ClusterDriver,
+                protocol: Protocol::ProvisioningReconciler,
+                operation: None,
+                generation: Some(self.desired.generation),
+                incarnation: None,
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: None,
+            });
+        }
+    }
+
+    fn emit_node_transition(
+        &self,
+        attempt: NodeAttemptId,
+        operation: Option<OperationId>,
+        previous: Phase,
+        next: Phase,
+        reason: Reason,
+    ) {
+        if let Some((actor, emitter)) = &self.transitions {
+            emitter.emit(TransitionRecord {
+                actor: *actor,
+                actor_type: ActorType::ClusterDriver,
+                protocol: Protocol::ProvisioningNode,
+                operation: operation.map(|operation| {
+                    let mut bytes = [0; 16];
+                    bytes[..8].copy_from_slice(&operation.attempt.0.to_be_bytes());
+                    bytes[8..].copy_from_slice(&operation.sequence.to_be_bytes());
+                    bytes
+                }),
+                generation: Some(self.desired.generation),
+                incarnation: Some(attempt.0),
+                previous,
+                next,
+                reason,
+                outcome: match next {
+                    Phase::Closed => Some(Outcome::Success),
+                    Phase::Failed => Some(Outcome::Failed),
+                    _ => None,
+                },
+            });
+        }
     }
 
     pub fn state(&self) -> &ClusterState {
@@ -959,7 +1037,7 @@ impl ClusterDriver {
     }
 
     pub fn is_queued(&self) -> bool {
-        self.queued
+        self.phase == DriverPhase::Queued
     }
 
     pub fn requeue_at(&self) -> Option<SystemTime> {
@@ -967,11 +1045,11 @@ impl ClusterDriver {
     }
 
     pub fn trigger(&mut self) {
-        if self.processing {
-            self.dirty = true;
-        } else {
-            self.queued = true;
-        }
+        let next = match self.phase {
+            DriverPhase::Running | DriverPhase::RunningDirty => DriverPhase::RunningDirty,
+            DriverPhase::Idle | DriverPhase::Queued => DriverPhase::Queued,
+        };
+        self.enter_phase(next, Reason::Requested);
     }
 
     pub fn update_desired(&mut self, desired: ClusterShape) -> Result<(), DriverError> {
@@ -1070,7 +1148,11 @@ impl ClusterDriver {
         if managed.attempt != attempt || !observation_matches(managed, &observation) {
             return false;
         }
+        let previous = node_phase(managed);
+        let operation = managed.pending.as_ref().map(|pending| pending.id);
         observe(managed, observation, now, &self.retry);
+        let next = node_phase(managed);
+        self.emit_node_transition(attempt, operation, previous, next, Reason::Completed);
         self.trigger();
         true
     }
@@ -1096,15 +1178,14 @@ impl ClusterDriver {
     where
         E: EffectExecutor,
     {
-        if self.processing {
+        if matches!(self.phase, DriverPhase::Running | DriverPhase::RunningDirty) {
             return Err(DriverError::ReentrantPass);
         }
-        if !self.queued {
+        if self.phase != DriverPhase::Queued {
             return Ok(0);
         }
 
-        self.queued = false;
-        self.processing = true;
+        self.enter_phase(DriverPhase::Running, Reason::Started);
         let pass = self.run_pass(now);
         let result = match pass {
             Ok(effects) => {
@@ -1125,11 +1206,19 @@ impl ClusterDriver {
             }
             Err(error) => Err(error),
         };
-        self.processing = false;
-        if self.dirty {
-            self.dirty = false;
-            self.queued = true;
-        }
+        let next = if self.phase == DriverPhase::RunningDirty || result.is_err() {
+            DriverPhase::Queued
+        } else {
+            DriverPhase::Idle
+        };
+        self.enter_phase(
+            next,
+            if result.is_ok() {
+                Reason::Completed
+            } else {
+                Reason::Failed
+            },
+        );
         result
     }
 
@@ -1142,7 +1231,7 @@ impl ClusterDriver {
         E: EffectExecutor,
     {
         let mut submitted = 0_usize;
-        while self.queued {
+        while self.phase == DriverPhase::Queued {
             submitted = submitted.saturating_add(self.drive_next(now, executor)?);
         }
         Ok(submitted)
@@ -1175,7 +1264,7 @@ impl ClusterDriver {
                 && (!allocated_actions_valid || allocated_attempt.0 != self.state.next_attempt_id)
             {
                 allocated_actions_valid = false;
-                self.dirty = true;
+                self.trigger();
                 continue;
             }
             if let Some(effect) = self.apply_action(action, now)? {
@@ -1196,7 +1285,7 @@ impl ClusterDriver {
                 if attempt.0 != self.state.next_attempt_id
                     || self.state.nodes.contains_key(&desired.logical_node_id)
                 {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 }
                 self.state.next_attempt_id = self
@@ -1208,7 +1297,14 @@ impl ClusterDriver {
                     desired.logical_node_id.clone(),
                     ManagedNode::new(attempt, desired),
                 );
-                self.dirty = true;
+                self.emit_node_transition(
+                    attempt,
+                    None,
+                    Phase::Created,
+                    Phase::Recovering,
+                    Reason::Started,
+                );
+                self.trigger();
                 Ok(None)
             }
             NodeAction::BeginDelete {
@@ -1216,15 +1312,23 @@ impl ClusterDriver {
                 expected_attempt,
             } => {
                 let Some(managed) = self.current_node_mut(&node, expected_attempt) else {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 };
+                let previous = node_phase(managed);
                 managed.intent = NodeIntent::Deleting;
                 managed.record.ready = false;
                 if managed.retry.ambiguous_operation.is_none() {
                     managed.retry.next_effect_at = None;
                 }
-                self.dirty = true;
+                self.emit_node_transition(
+                    expected_attempt,
+                    None,
+                    previous,
+                    Phase::Releasing,
+                    Reason::Cancelled,
+                );
+                self.trigger();
                 Ok(None)
             }
             NodeAction::MarkDestroyed {
@@ -1232,20 +1336,27 @@ impl ClusterDriver {
                 expected_attempt,
             } => {
                 let Some(managed) = self.current_node_mut(&node, expected_attempt) else {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 };
                 if managed.pending.is_some()
                     || managed.active_bootstrap.is_some()
                     || managed.record.lease.is_some()
                 {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 }
                 managed.record.stage = NodeStage::Destroyed;
                 managed.record.ready = false;
                 managed.record.destroyed_at = Some(now);
-                self.dirty = true;
+                self.emit_node_transition(
+                    expected_attempt,
+                    None,
+                    Phase::Releasing,
+                    Phase::Closed,
+                    Reason::Completed,
+                );
+                self.trigger();
                 Ok(None)
             }
             NodeAction::Restart {
@@ -1255,15 +1366,15 @@ impl ClusterDriver {
                 desired,
             } => {
                 if new_attempt.0 != self.state.next_attempt_id {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 }
                 let Some(old) = self.state.nodes.get(&node) else {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 };
                 if old.attempt != expected_attempt || old.record.stage != NodeStage::Destroyed {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 }
                 let failures = old.retry.consecutive_failures;
@@ -1275,7 +1386,14 @@ impl ClusterDriver {
                 let mut replacement = ManagedNode::new(new_attempt, desired);
                 replacement.retry.consecutive_failures = failures;
                 self.state.nodes.insert(node, replacement);
-                self.dirty = true;
+                self.emit_node_transition(
+                    new_attempt,
+                    None,
+                    Phase::Closed,
+                    Phase::Recovering,
+                    Reason::Restarted,
+                );
+                self.trigger();
                 Ok(None)
             }
             NodeAction::Reap {
@@ -1288,7 +1406,7 @@ impl ClusterDriver {
                 }) {
                     self.state.nodes.remove(&node);
                 } else {
-                    self.dirty = true;
+                    self.trigger();
                 }
                 Ok(None)
             }
@@ -1296,15 +1414,16 @@ impl ClusterDriver {
                 let timeout = self.retry.operation_timeout;
                 let Some(managed) = self.current_node_mut(&effect.node, effect.operation.attempt)
                 else {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 };
                 if managed.pending.is_some()
                     || managed.next_operation_sequence != effect.operation.sequence
                 {
-                    self.dirty = true;
+                    self.trigger();
                     return Ok(None);
                 }
+                let previous = node_phase(managed);
                 let deadline = now.checked_add(timeout).unwrap_or(now);
                 let next_sequence = managed
                     .next_operation_sequence
@@ -1319,6 +1438,13 @@ impl ClusterDriver {
                 if matches!(effect.command, NodeManagerCommand::CreateLease(_)) {
                     managed.record.stage = NodeStage::LeaseRequested;
                 }
+                self.emit_node_transition(
+                    effect.operation.attempt,
+                    Some(effect.operation),
+                    previous,
+                    Phase::AwaitingReply,
+                    Reason::Requested,
+                );
                 self.requeue_at = earliest(self.requeue_at, Some(deadline));
                 Ok(Some(effect))
             }
@@ -1334,6 +1460,35 @@ impl ClusterDriver {
             .nodes
             .get_mut(id)
             .filter(|node| node.attempt == attempt)
+    }
+}
+
+fn node_phase(node: &ManagedNode) -> Phase {
+    if node.record.stage == NodeStage::Destroyed {
+        return Phase::Closed;
+    }
+    if node.intent == NodeIntent::Deleting {
+        return Phase::Releasing;
+    }
+    if node.retry.ambiguous_operation.is_some() {
+        return Phase::Recovering;
+    }
+    if node.pending.is_some() {
+        return Phase::AwaitingReply;
+    }
+    if node.retry.next_effect_at.is_some() {
+        return Phase::Backoff;
+    }
+    match node.record.stage {
+        NodeStage::New => Phase::Created,
+        NodeStage::LeaseRequested => Phase::Allocating,
+        NodeStage::LeaseCreated => Phase::Resolving,
+        NodeStage::EndpointKnown => Phase::Opening,
+        NodeStage::BootstrapRunning => Phase::AwaitingReadiness,
+        NodeStage::SwactorJoined => Phase::AwaitingReply,
+        NodeStage::HandedOff | NodeStage::Dormant => Phase::Ready,
+        NodeStage::Failed => Phase::Failed,
+        NodeStage::Destroyed => Phase::Closed,
     }
 }
 

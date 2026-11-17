@@ -126,13 +126,12 @@ impl Default for SelectionPolicy {
     }
 }
 
-/// Provisioning and monitoring retry/timing knobs.
+/// Provider pacing knobs. Lifecycle completion is driven by provider state,
+/// explicit cancellation, and the caller's cost/lifetime owner.
 #[derive(Debug, Clone)]
 pub struct LifecyclePolicy {
     pub lease_pace: Duration,
     pub poll_interval: Duration,
-    /// Maximum time to stay in one non-running provider state before replacing the lease.
-    pub state_timeout: Duration,
 }
 
 impl Default for LifecyclePolicy {
@@ -140,7 +139,6 @@ impl Default for LifecyclePolicy {
         Self {
             lease_pace: Duration::from_millis(600),
             poll_interval: Duration::from_secs(10),
-            state_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -344,6 +342,8 @@ pub(crate) struct InstanceStatus {
     #[serde(default)]
     pub public_ipaddr: Option<String>,
     #[serde(default)]
+    pub ssh_host: Option<String>,
+    #[serde(default)]
     pub ssh_port: Option<u16>,
     #[serde(default)]
     pub disk_usage: Option<f64>,
@@ -351,6 +351,10 @@ pub(crate) struct InstanceStatus {
 
 impl From<InstanceStatus> for ProviderInstanceStatus {
     fn from(status: InstanceStatus) -> Self {
+        let ssh_host = status
+            .ssh_host
+            .filter(|host| !host.trim().is_empty())
+            .or(status.public_ipaddr);
         Self {
             actual_status: status
                 .actual_status
@@ -359,7 +363,7 @@ impl From<InstanceStatus> for ProviderInstanceStatus {
                 .intended_status
                 .unwrap_or_else(|| "unknown".to_string()),
             status_msg: status.status_msg,
-            public_ipaddr: status.public_ipaddr,
+            public_ipaddr: ssh_host,
             ssh_port: status.ssh_port,
             disk_usage: status.disk_usage,
         }

@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
+use futures_util::future::Either;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use reqwest::StatusCode;
 
 use crate::OwnedCensus;
-use crate::observation::ProviderObserver;
+use crate::observation::{OwnedCensusRequest, ProviderObserver};
 use crate::types::{InstanceInfo, LabeledInstance};
 
 const DESTROY_RETRY_ATTEMPTS: u64 = 10;
@@ -129,10 +133,14 @@ pub async fn list_instances_by_label(
             client,
             base_url,
             api_key,
-            &BTreeSet::from([label.to_owned()]),
-            &BTreeSet::new(),
-            Instant::now(),
-            Instant::now() + crate::VastClient::REQUEST_TIMEOUT * 4 + Duration::from_secs(180),
+            OwnedCensusRequest {
+                labels: &BTreeSet::from([label.to_owned()]),
+                known_ids: &BTreeSet::new(),
+                fresh_after: Instant::now(),
+                deadline: Instant::now()
+                    + crate::VastClient::REQUEST_TIMEOUT * 4
+                    + Duration::from_secs(180),
+            },
         )
         .await
         .map(|census| census.instances)
@@ -162,7 +170,7 @@ pub(crate) async fn cleanup_owned_instances(
 }
 
 enum CleanupEvent {
-    Census(Result<OwnedCensus, String>),
+    Census(Box<Result<OwnedCensus, String>>),
     Deleted(u64, Result<(), String>),
 }
 
@@ -171,7 +179,18 @@ pub struct CleanupFailure {
     pub detail: String,
     /// Query failures and ambiguous accounting remain failures after spend stops.
     pub accounting_failed: bool,
-    pub absence: Option<OwnedCensus>,
+    pub absence: Option<Box<OwnedCensus>>,
+}
+
+pub type DiscoveryRecorder<'a> =
+    dyn FnMut(&BTreeMap<u64, String>) -> Result<(), String> + Send + 'a;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CleanupRequest<'a> {
+    pub labels: &'a BTreeSet<String>,
+    pub known_ids: &'a BTreeSet<u64>,
+    pub unresolved_labels: &'a BTreeSet<String>,
+    pub duration: Duration,
 }
 
 /// One owner for discovery, deletion and typed absence. Pending deletes do not
@@ -190,10 +209,12 @@ pub(crate) async fn cleanup_owned_with_observer(
         base_url,
         api_key,
         observer,
-        labels,
-        known_ids,
-        &BTreeSet::new(),
-        duration,
+        CleanupRequest {
+            labels,
+            known_ids,
+            unresolved_labels: &BTreeSet::new(),
+            duration,
+        },
         &mut |_| Ok(()),
     )
     .await
@@ -205,12 +226,15 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
     base_url: &str,
     api_key: &str,
     observer: &ProviderObserver,
-    labels: &BTreeSet<String>,
-    known_ids: &BTreeSet<u64>,
-    unresolved_labels: &BTreeSet<String>,
-    duration: Duration,
-    record_discovery: &mut (dyn FnMut(&BTreeMap<u64, String>) -> Result<(), String> + Send),
+    request: CleanupRequest<'_>,
+    record_discovery: &mut DiscoveryRecorder<'_>,
 ) -> Result<OwnedCensus, CleanupFailure> {
+    let CleanupRequest {
+        labels,
+        known_ids,
+        unresolved_labels,
+        duration,
+    } = request;
     if !unresolved_labels.is_subset(labels) {
         return Err(CleanupFailure {
             detail: "unresolved create labels exceed exact cleanup ownership".to_owned(),
@@ -219,6 +243,7 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
         });
     }
     let mut unresolved_labels = unresolved_labels.clone();
+    let mut absent_since_generation = BTreeMap::new();
     let mut accounting_errors = BTreeSet::new();
     let deadline = Instant::now() + duration;
     let mut known_ids = known_ids.clone();
@@ -226,7 +251,7 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
     let mut visible = known_ids.clone();
     let mut deleting = BTreeSet::new();
     let mut retry_at = BTreeMap::new();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut pending = FuturesUnordered::new();
     let mut listing = false;
     let mut next_discovery = Instant::now();
     let mut last_error = None;
@@ -254,58 +279,73 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
                 continue;
             }
             deleting.insert(contract);
-            let client = client.clone();
-            let base_url = base_url.to_owned();
-            let api_key = api_key.to_owned();
-            tasks.spawn(async move {
-                CleanupEvent::Deleted(
-                    contract,
-                    destroy_instance(&client, &base_url, &api_key, contract).await,
-                )
-            });
+            pending.push(
+                AssertUnwindSafe(Either::Left(async move {
+                    CleanupEvent::Deleted(
+                        contract,
+                        destroy_instance(client, base_url, api_key, contract).await,
+                    )
+                }))
+                .catch_unwind(),
+            );
         }
         if !listing && next_discovery <= Instant::now() {
             listing = true;
-            let observer = observer.clone();
-            let client = client.clone();
-            let base_url = base_url.to_owned();
-            let api_key = api_key.to_owned();
-            let labels = labels.clone();
             let known_ids = known_ids.clone();
             let fresh_after = Instant::now();
-            tasks.spawn(async move {
-                CleanupEvent::Census(
-                    observer
-                        .census(
-                            &client,
-                            &base_url,
-                            &api_key,
-                            &labels,
-                            &known_ids,
-                            fresh_after,
-                            deadline,
-                        )
-                        .await,
-                )
-            });
+            pending.push(
+                AssertUnwindSafe(Either::Right(async move {
+                    CleanupEvent::Census(Box::new(
+                        observer
+                            .census(
+                                client,
+                                base_url,
+                                api_key,
+                                OwnedCensusRequest {
+                                    labels,
+                                    known_ids: &known_ids,
+                                    fresh_after,
+                                    deadline,
+                                },
+                            )
+                            .await,
+                    ))
+                }))
+                .catch_unwind(),
+            );
         }
         tokio::select! {
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_discovery)), if !listing => {}
-            event = tasks.join_next(), if !tasks.is_empty() => {
+            event = pending.next(), if !pending.is_empty() => {
                 match event {
                     Some(Ok(CleanupEvent::Census(result))) => {
                         listing = false;
                         // Fallback reconciliation is only for unchanged provider state.
                         // A completed deletion advances this immediately below.
                         next_discovery = Instant::now() + Duration::from_secs(2);
-                        match result {
+                        match *result {
                             Ok(mut census) => {
                                 discovered_contract_labels.extend(census.contract_labels.clone());
                                 visible = census.instances.iter().map(|instance| instance.contract_id).collect();
                                 known_ids.extend(&visible);
                                 for label in census.contract_labels.values() {
                                     unresolved_labels.remove(label);
+                                    absent_since_generation.remove(label);
+                                }
+                                for label in &census.missing_labels {
+                                    if !unresolved_labels.contains(label) {
+                                        continue;
+                                    }
+                                    if absent_since_generation
+                                        .get(label)
+                                        .is_some_and(|generation| *generation < census.generation)
+                                    {
+                                        unresolved_labels.remove(label);
+                                    } else {
+                                        absent_since_generation
+                                            .insert(label.clone(), census.generation);
+                                    }
                                 }
                                 let mut by_label = BTreeMap::<&str, BTreeSet<u64>>::new();
                                 for (&contract, label) in &discovered_contract_labels {
@@ -329,7 +369,7 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
                                         break Err(CleanupFailure {
                                             detail: format!("owned spending stopped but cleanup accounting failed: {accounting_errors:?}"),
                                             accounting_failed: true,
-                                            absence: Some(census),
+                                            absence: Some(Box::new(census)),
                                         });
                                     }
                                     break Ok(census);
@@ -337,7 +377,7 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
                                 last_census = Some((census.generation, census.counters));
                             }
                             Err(error) => {
-                                accounting_errors.insert(error.replace(api_key, "[REDACTED]"));
+                                absent_since_generation.clear();
                                 last_error = Some(error.replace(api_key, "[REDACTED]"));
                             }
                         }
@@ -348,13 +388,20 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
                         retry_at.insert(contract, Instant::now() + Duration::from_millis(500));
                         if let Err(error) = result {
                             let error = error.replace(api_key, "[REDACTED]");
-                            accounting_errors.insert(error.clone());
                             last_error = Some(error);
                         }
                         next_discovery = Instant::now();
                     }
                     Some(Err(error)) => {
-                        last_error = Some(format!("owned cleanup task failed: {error}"));
+                        let detail = error
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| error.downcast_ref::<&str>().copied())
+                            .unwrap_or("non-string panic payload");
+                        last_error = Some(
+                            format!("owned cleanup task failed: {detail}")
+                                .replace(api_key, "[REDACTED]"),
+                        );
                         accounting_errors.insert("owned cleanup task failed".to_owned());
                     }
                     None => {}
@@ -362,10 +409,9 @@ pub(crate) async fn cleanup_owned_reconciled_with_observer(
             }
         }
     };
-    // Cancellation drops active reqwest futures; unlike detached blocking work,
-    // every HTTP task is joined before returning to the durable cleanup owner.
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    // No operation is detached: dropping this set synchronously cancels every
+    // active HTTP future before returning to the durable cleanup owner.
+    drop(pending);
     result
 }
 
@@ -423,10 +469,10 @@ mod tests {
                     .iter()
                     .map(|(id, label)| serde_json::json!({"id": id, "label": label}))
                     .collect::<Vec<_>>();
-                if query == 0 {
-                    if let Some((id, label)) = late {
-                        account.insert(id, label);
-                    }
+                if query == 0
+                    && let Some((id, label)) = late
+                {
+                    account.insert(id, label);
                 }
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"instances": instances}))
@@ -469,10 +515,12 @@ mod tests {
             &server.uri(),
             "secret",
             &ProviderObserver::default(),
-            &labels,
-            &BTreeSet::new(),
-            &labels,
-            Duration::from_secs(10),
+            CleanupRequest {
+                labels: &labels,
+                known_ids: &BTreeSet::new(),
+                unresolved_labels: &labels,
+                duration: Duration::from_secs(10),
+            },
             &mut |discovered| {
                 durable.extend(discovered.clone());
                 Ok(())
@@ -490,6 +538,38 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|request| { matches!(request.method.as_str(), "GET" | "DELETE") })
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_create_settles_after_consecutive_fresh_absence() {
+        let (server, live) =
+            scripted_owned_account(BTreeMap::from([(9, "unrelated")]), None, false).await;
+        let labels = BTreeSet::from(["owned".to_owned()]);
+        let census = cleanup_owned_reconciled_with_observer(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "secret",
+            &ProviderObserver::default(),
+            CleanupRequest {
+                labels: &labels,
+                known_ids: &BTreeSet::new(),
+                unresolved_labels: &labels,
+                duration: Duration::from_secs(10),
+            },
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(census.missing_labels, labels);
+        assert_eq!(*live.lock(), BTreeMap::from([(9, "unrelated")]));
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "GET")
+                .count()
+                >= 2
         );
     }
 
@@ -531,10 +611,12 @@ mod tests {
             &server.uri(),
             "secret",
             &ProviderObserver::default(),
-            &labels,
-            &BTreeSet::new(),
-            &labels,
-            Duration::from_secs(10),
+            CleanupRequest {
+                labels: &labels,
+                known_ids: &BTreeSet::new(),
+                unresolved_labels: &labels,
+                duration: Duration::from_secs(10),
+            },
             &mut |discovered| {
                 durable.extend(discovered.clone());
                 Ok(())
@@ -555,33 +637,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_provider_query_stops_spending_without_successful_accounting() {
+    async fn transient_provider_query_retries_without_poisoning_cleanup_accounting() {
         let (server, live) =
             scripted_owned_account(BTreeMap::from([(1, "owned"), (9, "unrelated")]), None, true)
                 .await;
-        let error = cleanup_owned_reconciled_with_observer(
+        let census = cleanup_owned_reconciled_with_observer(
             &reqwest::Client::new(),
             &server.uri(),
             "secret",
             &ProviderObserver::default(),
-            &BTreeSet::from(["owned".to_owned()]),
-            &BTreeSet::from([1]),
-            &BTreeSet::new(),
-            Duration::from_secs(10),
+            CleanupRequest {
+                labels: &BTreeSet::from(["owned".to_owned()]),
+                known_ids: &BTreeSet::from([1]),
+                unresolved_labels: &BTreeSet::new(),
+                duration: Duration::from_secs(10),
+            },
             &mut |_| Ok(()),
         )
         .await
-        .unwrap_err();
-        assert!(error.accounting_failed);
-        assert_eq!(
-            error.absence.unwrap().missing_contract_ids,
-            BTreeSet::from([1])
-        );
+        .unwrap();
+        assert_eq!(census.missing_contract_ids, BTreeSet::from([1]));
         assert_eq!(*live.lock(), BTreeMap::from([(9, "unrelated")]));
     }
 
     #[tokio::test]
-    async fn failed_delete_stops_spending_without_successful_accounting() {
+    async fn ambiguous_delete_response_reconciles_to_exact_absence() {
         let (server, live) = scripted_owned_account(
             BTreeMap::from([(1, "owned"), (9, "unrelated")]),
             None,
@@ -599,25 +679,22 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
-        let error = cleanup_owned_reconciled_with_observer(
+        let census = cleanup_owned_reconciled_with_observer(
             &reqwest::Client::new(),
             &server.uri(),
             key,
             &ProviderObserver::default(),
-            &BTreeSet::from(["owned".to_owned()]),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            Duration::from_secs(10),
+            CleanupRequest {
+                labels: &BTreeSet::from(["owned".to_owned()]),
+                known_ids: &BTreeSet::new(),
+                unresolved_labels: &BTreeSet::new(),
+                duration: Duration::from_secs(10),
+            },
             &mut |_| Ok(()),
         )
         .await
-        .unwrap_err();
-        assert!(error.accounting_failed);
-        assert!(!error.detail.contains(key));
-        assert_eq!(
-            error.absence.unwrap().missing_contract_ids,
-            BTreeSet::from([1])
-        );
+        .unwrap();
+        assert_eq!(census.missing_contract_ids, BTreeSet::from([1]));
         assert_eq!(*live.lock(), BTreeMap::from([(9, "unrelated")]));
     }
 

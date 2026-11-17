@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use crate::observation::ProviderObserver;
+use crate::observation::{OwnedCensusRequest, ProviderObserver};
 use crate::types::{LabeledInstance, LifecyclePolicy, ProviderInstanceStatus, RunningInstance};
 
 pub async fn fetch_instance_status(
@@ -34,9 +34,12 @@ fn provider_terminal_error(
         ));
     }
     match actual {
-        "exited" | "error" | "stopped" => Some(format!(
-            "instance {contract_id} reached terminal status: {actual}"
-        )),
+        "exited" | "error" | "stopped" => Some(match msg.filter(|message| !message.is_empty()) {
+            Some(message) => {
+                format!("instance {contract_id} reached terminal status: {actual}: {message}")
+            }
+            None => format!("instance {contract_id} reached terminal status: {actual}"),
+        }),
         _ => None,
     }
 }
@@ -105,7 +108,6 @@ pub(crate) async fn wait_for_running_with_observer(
 ) -> Result<RunningInstance, String> {
     let mut state_since = std::time::Instant::now();
     let mut last_state: Option<String> = None;
-    let mut running_without_endpoint_since = None;
     let mut poll = 0_u64;
 
     loop {
@@ -153,21 +155,10 @@ pub(crate) async fn wait_for_running_with_observer(
         {
             return Err(error);
         }
-        if actual == "running" {
-            if let Some(endpoint) = status.ssh_endpoint() {
-                return Ok(endpoint);
-            }
-            let since = running_without_endpoint_since
-                .get_or_insert_with(std::time::Instant::now)
-                .elapsed();
-            if !policy.state_timeout.is_zero() && since >= policy.state_timeout {
-                return Err(format!(
-                    "instance {contract_id} running without usable SSH endpoint for {}s",
-                    policy.state_timeout.as_secs()
-                ));
-            }
-        } else {
-            running_without_endpoint_since = None;
+        if actual == "running"
+            && let Some(endpoint) = status.ssh_endpoint()
+        {
+            return Ok(endpoint);
         }
 
         tokio::time::sleep(policy.poll_interval).await;
@@ -205,7 +196,6 @@ pub(crate) async fn wait_for_ssh_endpoint_with_observer(
     labels: &BTreeSet<String>,
     policy: &LifecyclePolicy,
 ) -> Result<RunningInstance, String> {
-    let mut running_without_endpoint_since = None;
     let mut poll = 0_u64;
 
     loop {
@@ -220,10 +210,14 @@ pub(crate) async fn wait_for_ssh_endpoint_with_observer(
             client,
             base_url,
             api_key,
-            labels,
-            &known,
-            boundary,
-            boundary + crate::VastClient::REQUEST_TIMEOUT * 4 + Duration::from_secs(180),
+            OwnedCensusRequest {
+                labels,
+                known_ids: &known,
+                fresh_after: boundary,
+                deadline: boundary
+                    + crate::VastClient::REQUEST_TIMEOUT * 4
+                    + Duration::from_secs(180),
+            },
         );
         tokio::pin!(status, census);
         let (status, census) = tokio::select! {
@@ -296,19 +290,9 @@ pub(crate) async fn wait_for_ssh_endpoint_with_observer(
         if let Some(error) = provider_terminal_error(contract_id, actual, intended, msg) {
             return Err(error);
         }
-        if actual == "running" {
-            let since = running_without_endpoint_since
-                .get_or_insert_with(std::time::Instant::now)
-                .elapsed();
-            if !policy.state_timeout.is_zero() && since >= policy.state_timeout {
-                return Err(format!(
-                    "instance {contract_id} running without usable SSH endpoint for {}s",
-                    policy.state_timeout.as_secs()
-                ));
-            }
-        } else {
-            running_without_endpoint_since = None;
-        }
+        // A running contract without a published endpoint is still a
+        // nonterminal provider state. Keep observing it until the provider
+        // reports a terminal state or the external owner cancels this future.
 
         let msg_disp = match msg {
             Some(m) if !m.is_empty() => format!(" msg=\"{m}\""),
@@ -323,7 +307,13 @@ pub(crate) async fn wait_for_ssh_endpoint_with_observer(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use serde_json::json;
     use wiremock::matchers::{method, path};
@@ -392,7 +382,6 @@ mod tests {
 
         let policy = LifecyclePolicy {
             poll_interval: Duration::from_millis(1),
-            state_timeout: Duration::from_millis(1),
             ..LifecyclePolicy::default()
         };
 
@@ -439,7 +428,6 @@ mod tests {
 
         let policy = LifecyclePolicy {
             poll_interval: Duration::from_secs(60),
-            state_timeout: Duration::from_secs(300),
             ..LifecyclePolicy::default()
         };
 
@@ -482,7 +470,8 @@ mod tests {
                     .set_delay(Duration::from_millis(50))
                     .set_body_json(json!({
                         "instances": {"actual_status": "loading", "intended_status": "running",
-                            "public_ipaddr": "127.0.0.1", "ssh_port": 22018}
+                            "ssh_host": "ssh9.vast.ai", "public_ipaddr": "127.0.0.1",
+                            "ssh_port": 22018}
                     })),
             )
             .mount(&server)
@@ -499,7 +488,7 @@ mod tests {
         assert_eq!(
             endpoint,
             RunningInstance {
-                ip: "127.0.0.1".to_owned(),
+                ip: "ssh9.vast.ai".to_owned(),
                 port: 22018
             }
         );
@@ -526,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_missing_after_running_grace_fails() {
+    async fn running_without_endpoint_remains_nonterminal() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v0/instances/"))
@@ -542,24 +531,34 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        let exact_queries = Arc::new(AtomicUsize::new(0));
+        let exact_queries_for_response = Arc::clone(&exact_queries);
         Mock::given(method("GET"))
             .and(path("/api/v0/instances/900/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "instances": {
-                    "actual_status": "running",
-                    "intended_status": "running"
-                }
-            })))
+            .respond_with(move |_: &wiremock::Request| {
+                let query = exact_queries_for_response.fetch_add(1, Ordering::SeqCst);
+                let (actual_status, status_msg) = if query < 12 {
+                    ("running", None)
+                } else {
+                    ("error", Some("provider startup failed"))
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "instances": {
+                        "actual_status": actual_status,
+                        "intended_status": "running",
+                        "status_msg": status_msg
+                    }
+                }))
+            })
             .mount(&server)
             .await;
 
         let policy = LifecyclePolicy {
             poll_interval: Duration::from_millis(1),
-            state_timeout: Duration::from_millis(1),
             ..LifecyclePolicy::default()
         };
 
-        let error = wait_for_ssh_endpoint_with_policy(
+        let result = wait_for_ssh_endpoint_with_policy(
             &reqwest::Client::new(),
             &server.uri(),
             "secret",
@@ -567,12 +566,12 @@ mod tests {
             "node-900",
             &policy,
         )
-        .await
-        .expect_err("running without endpoint past grace is terminal");
+        .await;
 
+        assert!(result.unwrap_err().contains("provider startup failed"));
         assert!(
-            error.contains("running without usable SSH endpoint"),
-            "error should identify endpoint classification: {error}"
+            exact_queries.load(Ordering::SeqCst) >= 13,
+            "missing endpoint must remain pending until provider terminal state"
         );
     }
     #[tokio::test]
@@ -590,7 +589,6 @@ mod tests {
 
         let policy = LifecyclePolicy {
             poll_interval: Duration::from_secs(60),
-            state_timeout: Duration::from_secs(300),
             ..LifecyclePolicy::default()
         };
 

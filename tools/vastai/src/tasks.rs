@@ -1,4 +1,4 @@
-use swactor_engine::EngineHandle;
+use swactor_engine::TaskSpawner;
 
 use crate::{ProviderInstanceStatus, VastClient};
 
@@ -34,7 +34,7 @@ pub enum VastLogStreamEvent {
 }
 
 pub fn spawn_instance_status_task<F>(
-    engine: &EngineHandle,
+    tasks: &TaskSpawner,
     client: VastClient,
     contract_id: u64,
     complete: F,
@@ -43,7 +43,7 @@ where
     F: FnOnce(Result<ProviderInstanceStatus, String>) + Send + 'static,
 {
     let (sender, mut cancelled) = tokio::sync::watch::channel(false);
-    engine.spawn(async move {
+    tasks.spawn(async move {
         let result = tokio::select! {
             biased;
             _ = cancelled.changed() => return,
@@ -57,7 +57,7 @@ where
 }
 
 pub fn spawn_log_stream_task<F>(
-    engine: &EngineHandle,
+    tasks: &TaskSpawner,
     client: VastClient,
     contract_id: u64,
     max_response_bytes: usize,
@@ -68,7 +68,7 @@ where
     F: FnMut(VastLogStreamEvent) -> bool + Send + 'static,
 {
     let (sender, mut cancelled) = tokio::sync::watch::channel(false);
-    engine.spawn(async move {
+    tasks.spawn(async move {
         let result_url = tokio::select! {
             biased;
             _ = cancelled.changed() => return,
@@ -159,72 +159,71 @@ mod tests {
     use serde_json::json;
     use swactor::config::RuntimeConfig;
     use swactor::runtime::RuntimeParts;
-    use swactor_engine::{Engine, TokioBackend, TokioConfig};
+    use swactor_engine::{BlockingWorkSender, Engine, TokioBackend, TokioConfig};
 
     use crate::test_http::{TestHttpRoute, TestHttpServer};
 
     use super::*;
 
-    fn test_engine() -> Engine {
-        Engine::new(
-            RuntimeParts::new(RuntimeConfig::default()),
-            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+    fn api_server(blocking: &BlockingWorkSender, log_url: &str) -> TestHttpServer {
+        TestHttpServer::start(
+            blocking,
+            vec![
+                TestHttpRoute::json(
+                    "PUT",
+                    "/api/v0/instances/request_logs/73/",
+                    200,
+                    json!({"result_url": log_url}),
+                ),
+                TestHttpRoute::json(
+                    "GET",
+                    "/api/v0/instances/73/",
+                    200,
+                    json!({"instances": {
+                        "actual_status": "running",
+                        "intended_status": "running"
+                    }}),
+                ),
+            ],
         )
-        .expect("actor engine")
-    }
-
-    fn api_server(log_url: &str) -> TestHttpServer {
-        TestHttpServer::start(vec![
-            TestHttpRoute::json(
-                "PUT",
-                "/api/v0/instances/request_logs/73/",
-                200,
-                json!({"result_url": log_url}),
-            ),
-            TestHttpRoute::json(
-                "GET",
-                "/api/v0/instances/73/",
-                200,
-                json!({"instances": {
-                    "actual_status": "running",
-                    "intended_status": "running"
-                }}),
-            ),
-        ])
         .expect("API server")
     }
 
     #[test]
     fn open_log_stream_does_not_block_status_and_is_cancellable() {
-        let log_server = TestHttpServer::start(vec![TestHttpRoute::open_raw(
-            "GET",
-            "/logs",
-            200,
-            b"first line\n".to_vec(),
-        )])
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+        )
+        .expect("actor engine");
+        let tasks = engine.task_spawner();
+        let blocking = engine.handle().blocking_work_sender();
+        let log_server = TestHttpServer::start(
+            &blocking,
+            vec![TestHttpRoute::open_raw(
+                "GET",
+                "/logs",
+                200,
+                b"first line\n".to_vec(),
+            )],
+        )
         .expect("log server");
-        let api_server = api_server(&format!("{}/logs", log_server.uri()));
+        let api_server = api_server(&blocking, &format!("{}/logs", log_server.uri()));
         let client = VastClient::with_base_url(api_server.uri(), "secret");
-        let engine = test_engine();
         let (log_tx, log_rx) = mpsc::channel();
-        let log_cancel = spawn_log_stream_task(
-            &engine.handle(),
-            client.clone(),
-            73,
-            1024,
-            1024,
-            move |event| log_tx.send(event).is_ok(),
-        );
+        let log_cancel =
+            spawn_log_stream_task(&tasks, client.clone(), 73, 1024, 1024, move |event| {
+                log_tx.send(event).is_ok()
+            });
         assert!(matches!(
             log_rx.recv(),
             Ok(VastLogStreamEvent::Chunk(bytes)) if bytes == b"first line\n"
         ));
 
         let (status_tx, status_rx) = mpsc::channel();
-        let _status_cancel =
-            spawn_instance_status_task(&engine.handle(), client, 73, move |result| {
-                let _ = status_tx.send(result);
-            });
+        let _status_cancel = spawn_instance_status_task(&tasks, client, 73, move |result| {
+            let _ = status_tx.send(result);
+        });
         let status = status_rx
             .recv()
             .expect("status completes while log response remains open")
@@ -235,18 +234,27 @@ mod tests {
 
     #[test]
     fn log_stream_enforces_response_and_message_caps() {
-        let log_server = TestHttpServer::start(vec![TestHttpRoute::open_raw(
-            "GET",
-            "/logs",
-            200,
-            b"0123456789".to_vec(),
-        )])
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            TokioBackend::new(TokioConfig::default()).expect("Tokio backend"),
+        )
+        .expect("actor engine");
+        let tasks = engine.task_spawner();
+        let blocking = engine.handle().blocking_work_sender();
+        let log_server = TestHttpServer::start(
+            &blocking,
+            vec![TestHttpRoute::open_raw(
+                "GET",
+                "/logs",
+                200,
+                b"0123456789".to_vec(),
+            )],
+        )
         .expect("log server");
-        let api_server = api_server(&format!("{}/logs", log_server.uri()));
+        let api_server = api_server(&blocking, &format!("{}/logs", log_server.uri()));
         let client = VastClient::with_base_url(api_server.uri(), "secret");
-        let engine = test_engine();
         let (event_tx, event_rx) = mpsc::channel();
-        let _cancel = spawn_log_stream_task(&engine.handle(), client, 73, 5, 3, move |event| {
+        let _cancel = spawn_log_stream_task(&tasks, client, 73, 5, 3, move |event| {
             event_tx.send(event).is_ok()
         });
         let mut bytes = Vec::new();

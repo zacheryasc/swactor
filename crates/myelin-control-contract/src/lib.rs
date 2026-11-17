@@ -1,11 +1,13 @@
 //! Versioned wire contracts shared by Myelin control-plane producers and clients.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROVISION_COUNT: u32 = 8;
+pub const MAX_CONTEXTUAL_ACK_GROUP: usize = 16;
+pub const MAX_CONTEXTUAL_EVENT_CURSORS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Versioned<T> {
@@ -37,13 +39,45 @@ impl<T> Versioned<T> {
 pub struct ContextualEventCursor {
     pub request_id: String,
     pub after_sequence: u64,
+    /// Required after the first observation; never reuse a cursor after restart.
+    pub execution_incarnation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextualEventsRequest {
     pub cursors: Vec<ContextualEventCursor>,
     #[serde(default)]
-    pub wait_ms: u64,
+    pub wait: bool,
+}
+
+impl ContextualEventsRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cursors.is_empty() || self.cursors.len() > MAX_CONTEXTUAL_EVENT_CURSORS {
+            return Err("contextual event cursor group is empty or too large".to_owned());
+        }
+        if self.cursors.iter().any(|cursor| {
+            cursor.request_id.is_empty()
+                || cursor
+                    .execution_incarnation
+                    .as_ref()
+                    .is_some_and(String::is_empty)
+                || (cursor.after_sequence != 0 && cursor.execution_incarnation.is_none())
+        }) {
+            return Err("invalid contextual event cursor".to_owned());
+        }
+        if self
+            .cursors
+            .iter()
+            .map(|cursor| &cursor.request_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.cursors.len()
+        {
+            return Err("duplicate contextual event cursor".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,11 +88,55 @@ pub struct ContextualEventsAckRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextualEventsAckBatchRequest {
+    pub acknowledgements: Vec<ContextualEventsAcknowledgement>,
+}
+
+impl ContextualEventsAckBatchRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.acknowledgements.is_empty()
+            || self.acknowledgements.len() > MAX_CONTEXTUAL_ACK_GROUP
+            || self.acknowledgements.iter().any(|ack| {
+                ack.request_id.is_empty()
+                    || ack.execution_incarnation.is_empty()
+                    || ack.through_sequence == 0
+            })
+            || self
+                .acknowledgements
+                .iter()
+                .map(|ack| &ack.request_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.acknowledgements.len()
+        {
+            return Err("invalid contextual acknowledgement group".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextualEventsAckRejection {
+    pub request_id: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextualEventsAckBatch {
+    pub acknowledged: Vec<ContextualEventsAcknowledgement>,
+    pub rejected: Vec<ContextualEventsAckRejection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlChangesRequest {
     pub generation: Option<String>,
     pub after_revision: Option<u64>,
     #[serde(default)]
-    pub wait_ms: u64,
+    pub wait: bool,
 }
 
 /// Identity of the exact binary deployment requested from a provider and
@@ -203,7 +281,6 @@ pub struct NodeStatus {
     pub phase: NodePhase,
     pub runtime: Option<NodeRuntimeStatus>,
     pub last_error: Option<String>,
-    pub last_seen_unix_ms: u64,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -341,6 +418,7 @@ pub struct ContextualProgramFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextualProcessSpec {
     pub command: String,
     #[serde(default)]
@@ -354,12 +432,12 @@ pub struct ContextualProcessSpec {
     pub read_prefixes: Vec<String>,
     #[serde(default)]
     pub write_prefixes: Vec<String>,
-    pub attach_timeout_ms: u64,
     #[serde(default)]
     pub staged_program: Option<ContextualProgramFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextualSpawnRequest {
     pub logical_node_id: u64,
     pub request_id: String,
@@ -368,9 +446,12 @@ pub struct ContextualSpawnRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextualStopRequest {
     pub control_request_id: String,
-    pub kill_after_ms: Option<u64>,
+    /// Explicitly cancel instead of requesting graceful native termination.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,7 +521,7 @@ pub enum ContextualProcessEventKind {
     LiveExecutions {
         executions: Vec<LiveContextualExecution>,
         #[serde(deserialize_with = "required_option")]
-        resources: Option<WorkerResourceSnapshot>,
+        resources: Option<Box<WorkerResourceSnapshot>>,
     },
     ControlUnavailable {
         error: String,
@@ -495,6 +576,88 @@ pub struct ContextualEventsBatch {
     pub missing: Vec<String>,
 }
 
+impl ContextualEventsBatch {
+    /// Validate a complete per-execution snapshot and return the next cursors.
+    /// Missing histories, stale incarnations, truncation, gaps, and duplicates
+    /// are errors rather than silently advancing the oracle.
+    pub fn advance_cursors(
+        &self,
+        request: &ContextualEventsRequest,
+    ) -> Result<Vec<ContextualEventCursor>, String> {
+        request.validate()?;
+        if !self.missing.is_empty() {
+            return Err(format!(
+                "contextual execution history is missing for {:?}",
+                self.missing
+            ));
+        }
+        let mut executions = self
+            .executions
+            .iter()
+            .map(|execution| (execution.request_id.as_str(), execution))
+            .collect::<BTreeMap<_, _>>();
+        if executions.len() != self.executions.len() {
+            return Err("duplicate contextual execution view".to_owned());
+        }
+        let mut advanced = Vec::with_capacity(request.cursors.len());
+        for cursor in &request.cursors {
+            let execution = executions
+                .remove(cursor.request_id.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "contextual execution {:?} is absent from batch",
+                        cursor.request_id
+                    )
+                })?;
+            execution.validate_cursor(cursor)?;
+            advanced.push(ContextualEventCursor {
+                request_id: cursor.request_id.clone(),
+                after_sequence: execution.next_sequence,
+                execution_incarnation: Some(execution.execution_incarnation.clone()),
+            });
+        }
+        if !executions.is_empty() {
+            return Err("contextual event batch contains an unrequested execution".to_owned());
+        }
+        Ok(advanced)
+    }
+}
+
+impl ContextualExecutionView {
+    fn validate_cursor(&self, cursor: &ContextualEventCursor) -> Result<(), String> {
+        if self.request_id != cursor.request_id
+            || cursor
+                .execution_incarnation
+                .as_ref()
+                .is_some_and(|incarnation| incarnation != &self.execution_incarnation)
+        {
+            return Err("contextual event cursor identity changed".to_owned());
+        }
+        if cursor.after_sequence > self.next_sequence {
+            return Err("contextual event cursor is ahead of producer history".to_owned());
+        }
+        if cursor.after_sequence < self.truncated_before {
+            return Err("contextual event history was truncated before the cursor".to_owned());
+        }
+        let expected = self
+            .next_sequence
+            .checked_sub(cursor.after_sequence)
+            .ok_or_else(|| "contextual event sequence underflow".to_owned())?;
+        if usize::try_from(expected).ok() != Some(self.events.len())
+            || self.events.iter().enumerate().any(|(offset, event)| {
+                event.sequence
+                    != cursor
+                        .after_sequence
+                        .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX))
+                    || event.observation.request_id != self.request_id
+            })
+        {
+            return Err("contextual event batch contains a sequence gap or wrong owner".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextualEventsAcknowledgement {
@@ -513,12 +676,21 @@ pub struct ControlRevision {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContextualControlReply {
-    Event { observation: ContextualProcessEvent },
-    Events { execution: ContextualExecutionView },
+    Event {
+        observation: ContextualProcessEvent,
+    },
+    Events {
+        execution: ContextualExecutionView,
+    },
     EventsBatch(ContextualEventsBatch),
+    /// The actor answered a fresh snapshot with no new records.
+    EventsIdle(ContextualEventsBatch),
+    AcknowledgedBatch(ContextualEventsAckBatch),
     Acknowledged(ContextualEventsAcknowledgement),
     ControlRevision(ControlRevision),
-    Rejected { error: String },
+    Rejected {
+        error: String,
+    },
 }
 
 /// Successful exact-node health observation. Unlike execution event history,
@@ -578,6 +750,14 @@ pub struct ResourceActor {
     pub stopping: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceExecutionOwnership {
+    pub tasks: u64,
+    pub actor_timers: u64,
+    pub blocking: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerResourceSnapshot {
@@ -592,8 +772,8 @@ pub struct WorkerResourceSnapshot {
     #[serde(deserialize_with = "required_option")]
     pub deployment_generation: Option<String>,
     pub actors: Vec<ResourceActor>,
+    pub execution_ownership: ResourceExecutionOwnership,
     pub arena: ResourceArena,
-    pub collection_elapsed_us: u64,
     pub transport: ResourceTransport,
 }
 
@@ -610,7 +790,6 @@ impl WorkerResourceSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ResourceArena {
     pub seq: u64,
-    pub sample_unix_ms: u64,
     pub capacity_bytes: u64,
     pub live_bytes: u64,
     pub free_bytes: u64,
@@ -713,6 +892,8 @@ pub struct RetainedBlobsReply {
     pub blobs: BTreeMap<String, RetainedBlob>,
     pub non_blobs: BTreeMap<String, RetainedNonBlob>,
 }
+
+pub const NAMESPACE_CLEANUP_MAX_PATHS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -839,7 +1020,6 @@ mod tests {
             phase: NodePhase::Running,
             runtime: Some(runtime()),
             last_error: None,
-            last_seen_unix_ms: 123,
         }
     }
 
@@ -894,9 +1074,13 @@ mod tests {
                 poisoned: false,
                 stopping: false,
             }],
+            execution_ownership: ResourceExecutionOwnership {
+                tasks: 1,
+                actor_timers: 2,
+                blocking: 0,
+            },
             arena: ResourceArena {
                 seq: 10,
-                sample_unix_ms: 456,
                 capacity_bytes: 4096,
                 live_bytes: 1024,
                 free_bytes: 3072,
@@ -906,7 +1090,6 @@ mod tests {
                 allocation_failures_total: 0,
                 release_failures_total: 0,
             },
-            collection_elapsed_us: 50,
             transport: ResourceTransport {
                 pending_sinks: 0,
                 pending_inbound: 0,
@@ -974,18 +1157,26 @@ mod tests {
         round_trip_versioned(ControlChangesRequest {
             generation: Some("control-1".to_owned()),
             after_revision: Some(8),
-            wait_ms: 100,
+            wait: true,
         });
         round_trip_versioned(ContextualEventsRequest {
             cursors: vec![ContextualEventCursor {
                 request_id: "execution-1".to_owned(),
                 after_sequence: 4,
+                execution_incarnation: Some("incarnation-1".to_owned()),
             }],
-            wait_ms: 100,
+            wait: true,
         });
         round_trip_versioned(ContextualEventsAckRequest {
             execution_incarnation: "incarnation-1".to_owned(),
             through_sequence: 5,
+        });
+        round_trip_versioned(ContextualEventsAckBatchRequest {
+            acknowledgements: vec![ContextualEventsAcknowledgement {
+                request_id: "execution-1".to_owned(),
+                execution_incarnation: "incarnation-1".to_owned(),
+                through_sequence: 5,
+            }],
         });
         round_trip_versioned(ProviderConfigurationRequest {
             api_key: Some("secret".to_owned()),
@@ -1023,7 +1214,6 @@ mod tests {
                 execution_id: "execution-1".to_owned(),
                 read_prefixes: vec!["/models".to_owned()],
                 write_prefixes: vec!["/cases/1".to_owned()],
-                attach_timeout_ms: 1_000,
                 staged_program: Some(ContextualProgramFile {
                     namespace_path: "/programs/1.py".to_owned(),
                 }),
@@ -1031,7 +1221,7 @@ mod tests {
         });
         round_trip_versioned(ContextualStopRequest {
             control_request_id: "stop-1".to_owned(),
-            kill_after_ms: Some(500),
+            force: true,
         });
         round_trip_versioned(RetainedBlobsRequest {
             schema_version: SCHEMA_VERSION,
@@ -1117,7 +1307,7 @@ mod tests {
                     started_pid: Some(123),
                     context_ready: true,
                 }],
-                resources: Some(resources()),
+                resources: Some(Box::new(resources())),
             },
             ContextualProcessEventKind::ControlUnavailable {
                 error: "unavailable".to_owned(),
@@ -1145,6 +1335,21 @@ mod tests {
                 request_id: "execution-1".to_owned(),
                 execution_incarnation: "incarnation-1".to_owned(),
                 through_sequence: 1,
+            }),
+            ContextualControlReply::EventsIdle(ContextualEventsBatch {
+                executions: Vec::new(),
+                missing: Vec::new(),
+            }),
+            ContextualControlReply::AcknowledgedBatch(ContextualEventsAckBatch {
+                acknowledged: vec![ContextualEventsAcknowledgement {
+                    request_id: "execution-1".to_owned(),
+                    execution_incarnation: "incarnation-1".to_owned(),
+                    through_sequence: 1,
+                }],
+                rejected: vec![ContextualEventsAckRejection {
+                    request_id: "stale".to_owned(),
+                    error: "incarnation mismatch".to_owned(),
+                }],
             }),
             ContextualControlReply::ControlRevision(ControlRevision {
                 generation: "control-1".to_owned(),
@@ -1243,6 +1448,40 @@ mod tests {
                 serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded, evidence);
         }
+    }
+
+    #[test]
+    fn event_batches_advance_only_complete_identity_matched_histories() {
+        let request = ContextualEventsRequest {
+            cursors: vec![ContextualEventCursor {
+                request_id: "execution-1".to_owned(),
+                after_sequence: 1,
+                execution_incarnation: Some("incarnation-1".to_owned()),
+            }],
+            wait: true,
+        };
+        let batch = ContextualEventsBatch {
+            executions: vec![execution_view(ContextualProcessEventKind::ContextReady)],
+            missing: Vec::new(),
+        };
+        assert_eq!(
+            batch.advance_cursors(&request).unwrap(),
+            vec![ContextualEventCursor {
+                request_id: "execution-1".to_owned(),
+                after_sequence: 2,
+                execution_incarnation: Some("incarnation-1".to_owned()),
+            }]
+        );
+
+        let mut stale = request.clone();
+        stale.cursors[0].execution_incarnation = Some("old-incarnation".to_owned());
+        assert!(batch.advance_cursors(&stale).is_err());
+        let mut truncated = batch.clone();
+        truncated.executions[0].truncated_before = 2;
+        assert!(truncated.advance_cursors(&request).is_err());
+        let mut gap = batch;
+        gap.executions[0].events[0].sequence = 2;
+        assert!(gap.advance_cursors(&request).is_err());
     }
 
     #[test]

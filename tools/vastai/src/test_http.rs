@@ -1,14 +1,15 @@
-//! Synchronous HTTP fixture owned by the provider-I/O substrate.
+//! Synchronous HTTP fixture driven by root-supplied blocking-I/O authority.
 //!
-//! The fixture accepts only declarative method/path/JSON routes. Domain tests
-//! cannot supply futures, callbacks, or other independently scheduled work.
+//! The fixture accepts declarative method/path/JSON routes, and joins its
+//! engine-owned worker during shutdown.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
+
+use swactor_engine::{BlockingWorkHandle, BlockingWorkSender};
 
 #[derive(Clone, Debug)]
 pub struct TestHttpRoute {
@@ -17,6 +18,7 @@ pub struct TestHttpRoute {
     status: u16,
     body: Vec<u8>,
     keep_open: bool,
+    start_at_request: usize,
 }
 
 impl TestHttpRoute {
@@ -27,6 +29,7 @@ impl TestHttpRoute {
             status,
             body: serde_json::to_vec(&body).expect("test HTTP JSON serializes"),
             keep_open: false,
+            start_at_request: 1,
         }
     }
 
@@ -37,6 +40,7 @@ impl TestHttpRoute {
             status,
             body: body.into(),
             keep_open: false,
+            start_at_request: 1,
         }
     }
 
@@ -47,7 +51,15 @@ impl TestHttpRoute {
             status,
             body: body.into(),
             keep_open: true,
+            start_at_request: 1,
         }
+    }
+
+    /// Selects this response from the given matching request onward.
+    /// Later thresholds take precedence over earlier routes.
+    pub fn starting_with_request(mut self, request: usize) -> Self {
+        self.start_at_request = request.max(1);
+        self
     }
 }
 
@@ -61,11 +73,14 @@ pub struct TestHttpServer {
     address: std::net::SocketAddr,
     requests: Arc<Mutex<Vec<TestHttpRequest>>>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Option<BlockingWorkHandle<()>>,
 }
 
 impl TestHttpServer {
-    pub fn start(routes: Vec<TestHttpRoute>) -> Result<Self, String> {
+    pub fn start(
+        blocking: &BlockingWorkSender,
+        routes: Vec<TestHttpRoute>,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind test HTTP server: {error}"))?;
         let address = listener
@@ -73,16 +88,18 @@ impl TestHttpServer {
             .map_err(|error| format!("read test HTTP address: {error}"))?;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_requests = Arc::clone(&requests);
-        let thread_stop = Arc::clone(&stop);
-        let join = std::thread::spawn(move || {
-            while let Ok((stream, _)) = listener.accept() {
-                if thread_stop.load(Ordering::Acquire) {
-                    break;
+        let worker_requests = Arc::clone(&requests);
+        let worker_stop = Arc::clone(&stop);
+        let join = blocking
+            .submit_joinable(move || {
+                while let Ok((stream, _)) = listener.accept() {
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    serve(stream, &routes, &worker_requests);
                 }
-                serve(stream, &routes, &thread_requests);
-            }
-        });
+            })
+            .map_err(|error| format!("start test HTTP worker: {error}"))?;
         Ok(Self {
             address,
             requests,
@@ -115,24 +132,33 @@ fn serve(mut stream: TcpStream, routes: &[TestHttpRoute], requests: &Mutex<Vec<T
     let Ok(request) = read_request(&mut stream) else {
         return;
     };
-    requests
-        .lock()
-        .expect("test HTTP requests")
-        .push(request.clone());
-    let route = routes.iter().find(|route| {
-        route.method == request.method
-            && request
-                .path
-                .split_once('?')
-                .map_or(request.path.as_str(), |(path, _)| path)
-                == route.path
-    });
+    let request_ordinal = {
+        let mut requests = requests.lock().expect("test HTTP requests");
+        requests.push(request.clone());
+        requests
+            .iter()
+            .filter(|prior| prior.method == request.method && prior.path == request.path)
+            .count()
+    };
+    let route = routes
+        .iter()
+        .filter(|route| {
+            route.method == request.method
+                && request
+                    .path
+                    .split_once('?')
+                    .map_or(request.path.as_str(), |(path, _)| path)
+                    == route.path
+                && request_ordinal >= route.start_at_request
+        })
+        .max_by_key(|route| route.start_at_request);
     let route = route.cloned().unwrap_or_else(|| TestHttpRoute {
         method: request.method,
         path: request.path,
         status: 404,
         body: b"{}".to_vec(),
         keep_open: false,
+        start_at_request: 1,
     });
     let status = route.status;
     let body = route.body.as_slice();

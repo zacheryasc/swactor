@@ -298,10 +298,12 @@ impl VastClient {
                 &self.http,
                 &self.base_url,
                 &self.api_key,
-                labels,
-                known_ids,
-                fresh_after,
-                std::time::Instant::now() + deadline,
+                crate::observation::OwnedCensusRequest {
+                    labels,
+                    known_ids,
+                    fresh_after,
+                    deadline: std::time::Instant::now() + deadline,
+                },
             ),
         )
         .await?
@@ -332,19 +334,19 @@ impl VastClient {
         known_ids: &std::collections::BTreeSet<u64>,
         unresolved_labels: &std::collections::BTreeSet<String>,
         deadline: Duration,
-        record_discovery: &mut (
-                 dyn FnMut(&std::collections::BTreeMap<u64, String>) -> Result<(), String> + Send
-             ),
+        record_discovery: &mut crate::teardown::DiscoveryRecorder<'_>,
     ) -> Result<crate::OwnedCensus, crate::teardown::CleanupFailure> {
         crate::teardown::cleanup_owned_reconciled_with_observer(
             &self.http,
             &self.base_url,
             &self.api_key,
             &self.observer,
-            labels,
-            known_ids,
-            unresolved_labels,
-            deadline,
+            crate::teardown::CleanupRequest {
+                labels,
+                known_ids,
+                unresolved_labels,
+                duration: deadline,
+            },
             record_discovery,
         )
         .await

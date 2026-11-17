@@ -18,8 +18,9 @@ pub struct NodeProvisionSpec {
     /// explicitly selected marketplace offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offer_criteria_json: Option<String>,
-    /// Desired deployment identity for this attempt. Providers that ship
-    /// artifacts must install exactly this identity before runtime ready.
+    /// Desired activation identity for this attempt. Providers may reuse
+    /// completely installed, digest-verified payload content, but must fence
+    /// stale incarnations and prove this generation's activation before ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment: Option<DeploymentIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

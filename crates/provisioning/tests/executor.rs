@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use provisioning::*;
 
@@ -25,7 +26,7 @@ struct QueuedSpawner {
 impl QueuedSpawner {
     fn run_all(&self) {
         loop {
-            let work = std::mem::take(&mut *self.work.lock().unwrap());
+            let work = std::mem::take(&mut *self.work.lock());
             if work.is_empty() {
                 return;
             }
@@ -36,7 +37,7 @@ impl QueuedSpawner {
     }
 
     fn len(&self) -> usize {
-        self.work.lock().unwrap().len()
+        self.work.lock().len()
     }
 }
 
@@ -44,7 +45,7 @@ impl BlockingEffectSpawner for QueuedSpawner {
     type SpawnError = Infallible;
 
     fn spawn_blocking(&self, work: BlockingEffectWork) -> Result<(), Self::SpawnError> {
-        self.work.lock().unwrap().push(work);
+        self.work.lock().push(work);
         Ok(())
     }
 }
@@ -80,7 +81,7 @@ impl EffectBackend for AdoptingBackend {
         if !matches!(effect.command, NodeManagerCommand::CreateLease(_)) {
             return Ok(outcome_for(effect));
         }
-        let mut live = self.lease.lock().unwrap();
+        let mut live = self.lease.lock();
         if let Some(lease) = live.as_ref() {
             return Ok(OperationOutcome::LeaseCreated(Box::new(lease.clone())));
         }
@@ -394,6 +395,77 @@ fn successful_outcomes_track_one_live_lease_and_bootstrap_per_attempt() {
     executor.drain_results();
     assert_eq!(
         executor.attempt_resources(attempt),
+        AttemptResources::default()
+    );
+}
+
+#[test]
+fn promoted_adoption_remains_physically_serialized_after_a_second_timeout() {
+    let spawner = QueuedSpawner::default();
+    let mut executor = IdempotentEffectExecutor::new(CountingBackend::default(), spawner.clone());
+    let first = create_effect("worker-0", 1, 1);
+    let second = create_effect("worker-0", 1, 2);
+    let third = create_effect("worker-0", 1, 3);
+    executor.submit(&first).unwrap();
+    assert!(executor.expire(first.operation, "first timeout"));
+    executor.drain_results();
+    executor.submit(&second).unwrap();
+    let first_work = { spawner.work.lock().remove(0) };
+    first_work();
+    assert!(
+        executor.drain_results().is_empty(),
+        "late completion is not a second caller result"
+    );
+    assert!(
+        executor
+            .attempt_resources(first.operation.attempt)
+            .lease_live,
+        "late successful allocation remains tracked for cleanup"
+    );
+    assert!(executor.expire(second.operation, "second timeout"));
+    executor.drain_results();
+    executor.submit(&third).unwrap();
+    assert_eq!(
+        spawner.len(),
+        1,
+        "third operation must wait for the promoted physical owner"
+    );
+    let second_work = { spawner.work.lock().remove(0) };
+    second_work();
+    assert!(executor.drain_results().is_empty());
+    spawner.run_all();
+    let results = executor.drain_results();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].operation, third.operation);
+    assert!(matches!(
+        results[0].result,
+        Ok(OperationOutcome::LeaseCreated(_))
+    ));
+}
+
+#[test]
+fn substrate_queue_shutdown_resolves_serialized_work_without_executing_it() {
+    let spawner = QueuedSpawner::default();
+    let mut executor = IdempotentEffectExecutor::new(CountingBackend::default(), spawner.clone());
+    let first = create_effect("worker-0", 1, 1);
+    let retry = create_effect("worker-0", 1, 2);
+    executor.submit(&first).unwrap();
+    assert!(executor.expire(first.operation, "timeout before substrate shutdown"));
+    executor.drain_results();
+    executor.submit(&retry).unwrap();
+    let abandoned = std::mem::take(&mut *spawner.work.lock());
+    drop(abandoned);
+    let results = executor.drain_results();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].operation, retry.operation);
+    assert!(results[0].result.is_err());
+    assert_eq!(
+        executor.operation_status(retry.operation),
+        ExecutorOperationStatus::Completed
+    );
+    assert_eq!(executor.backend().calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        executor.attempt_resources(retry.operation.attempt),
         AttemptResources::default()
     );
 }

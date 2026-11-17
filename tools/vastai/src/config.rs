@@ -12,7 +12,6 @@ pub const ENV_REQUIRE_VERIFIED: &str = "PP_REQUIRE_VERIFIED";
 pub const ENV_DROP_CHEAP_FRAC: &str = "PP_DROP_CHEAP_FRAC";
 pub const ENV_MAX_DPH_TOTAL: &str = "PP_MAX_DPH_TOTAL";
 pub const ENV_LEASE_PACE_MS: &str = "PP_LEASE_PACE_MS";
-pub const ENV_STATE_TIMEOUT_SECS: &str = "PP_STATE_TIMEOUT_SECS";
 pub const ENV_BLACKLIST_HOSTS: &str = "PP_BLACKLIST_HOSTS";
 pub const ENV_ASSUME_YES: &str = "PP_ASSUME_YES";
 
@@ -82,7 +81,7 @@ impl SelectionPolicy {
 }
 
 impl LifecyclePolicy {
-    /// Build lifecycle policy from environment, using caller-provided poll cadence.
+    /// Build lifecycle pacing from environment and caller-provided poll cadence.
     pub fn from_env(poll_interval: Duration) -> Self {
         Self {
             lease_pace: Duration::from_millis(
@@ -92,9 +91,6 @@ impl LifecyclePolicy {
                     .unwrap_or(600),
             ),
             poll_interval,
-            state_timeout: env_positive_u64(ENV_STATE_TIMEOUT_SECS)
-                .map(Duration::from_secs)
-                .unwrap_or_else(|| Self::default().state_timeout),
         }
     }
 }

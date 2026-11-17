@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::reconciler::{
     ExecutorResult, NodeAttemptId, OperationId, OperationKind, OperationOutcome, PlannedEffect,
 };
+use protocol_telemetry::{
+    ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
+use swactor::actor::ActorAddress;
 
 /// Blocking work accepted by an execution substrate.
 pub type BlockingEffectWork = Box<dyn FnOnce() + Send + 'static>;
@@ -158,6 +162,44 @@ struct ExecutorLedger {
     running_by_attempt: BTreeMap<NodeAttemptId, OperationId>,
     queued_by_attempt: BTreeMap<NodeAttemptId, OperationId>,
     resources: BTreeMap<NodeAttemptId, AttemptResources>,
+    transitions: Option<(ActorAddress, TransitionEmitter)>,
+}
+
+impl ExecutorLedger {
+    fn enter_operation(&mut self, operation: OperationId, entry: LedgerEntry, reason: Reason) {
+        let phase = |state| match state {
+            LedgerState::Queued => Phase::Queued,
+            LedgerState::Running => Phase::Running,
+            LedgerState::Completed => Phase::Completed,
+        };
+        if let Some((actor, emitter)) = &self.transitions {
+            let mut identity = [0; 16];
+            identity[..8].copy_from_slice(&operation.attempt.0.to_be_bytes());
+            identity[8..].copy_from_slice(&operation.sequence.to_be_bytes());
+            emitter.emit(TransitionRecord {
+                actor: *actor,
+                actor_type: ActorType::IdempotentEffectExecutor,
+                protocol: Protocol::ProvisioningExecutor,
+                operation: Some(identity),
+                generation: Some(operation.attempt.0),
+                incarnation: None,
+                previous: self
+                    .operations
+                    .get(&operation)
+                    .map_or(Phase::Created, |old| phase(old.state)),
+                next: phase(entry.state),
+                reason,
+                outcome: entry.result.as_ref().map(|result| {
+                    if result.result.is_ok() {
+                        Outcome::Success
+                    } else {
+                        Outcome::Failed
+                    }
+                }),
+            });
+        }
+        self.operations.insert(operation, entry);
+    }
 }
 
 /// Process-local executor that deduplicates operation submissions and runs each
@@ -192,6 +234,15 @@ where
             result_tx,
             result_rx,
         }
+    }
+
+    pub fn with_transitions(
+        self,
+        actor: ActorAddress,
+        transitions: Option<TransitionEmitter>,
+    ) -> Self {
+        lock_ledger(&self.ledger).transitions = transitions.map(|emitter| (actor, emitter));
+        self
     }
 
     pub fn backend(&self) -> &B {
@@ -233,9 +284,11 @@ where
                 operation,
                 result: Err(EffectError::ambiguous(reason)),
             };
-            ledger
-                .operations
-                .insert(operation, LedgerEntry::completed(effect, result.clone()));
+            ledger.enter_operation(
+                operation,
+                LedgerEntry::completed(effect, result.clone()),
+                Reason::Timeout,
+            );
             if ledger.in_flight_by_attempt.get(&operation.attempt) == Some(&operation) {
                 ledger.in_flight_by_attempt.remove(&operation.attempt);
             }
@@ -296,7 +349,7 @@ where
                 ledger.running_by_attempt.insert(attempt, effect.operation);
                 LedgerEntry::running(effect.clone())
             };
-            ledger.operations.insert(effect.operation, entry);
+            ledger.enter_operation(effect.operation, entry, Reason::Requested);
             ledger
                 .in_flight_by_attempt
                 .insert(attempt, effect.operation);
@@ -338,6 +391,31 @@ where
     }
 }
 
+/// Owns the accepted work while it sits in the substrate queue. Queue teardown
+/// must resolve both this operation and any serialized adoption waiting on it.
+struct PendingEffectWork {
+    effect: Option<PlannedEffect>,
+    ledger: Arc<Mutex<ExecutorLedger>>,
+    result_tx: Sender<ExecutorResult>,
+}
+
+impl Drop for PendingEffectWork {
+    fn drop(&mut self) {
+        let mut next = self.effect.take();
+        while let Some(effect) = next {
+            let (result, queued) = record_spawn_failure(
+                &self.ledger,
+                &effect,
+                "effect work owner stopped before execution".to_owned(),
+            );
+            if let Some(result) = result {
+                let _ = self.result_tx.send(result);
+            }
+            next = queued;
+        }
+    }
+}
+
 fn spawn_effect<B, S>(
     spawner: S,
     backend: Arc<B>,
@@ -350,11 +428,17 @@ where
     S: BlockingEffectSpawner,
 {
     let nested_spawner = spawner.clone();
+    let mut pending = PendingEffectWork {
+        effect: Some(submitted),
+        ledger: Arc::clone(&ledger),
+        result_tx: result_tx.clone(),
+    };
     spawner.spawn_blocking(Box::new(move || {
+        let submitted = pending.effect.as_ref().expect("pending effect");
         let operation = submitted.operation;
         let expected_kind = OperationKind::for_command(&submitted.command);
         let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.execute(&submitted)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.execute(submitted)))
                 .map_err(|panic| {
                     EffectError::definite(format!(
                         "effect backend panicked: {}",
@@ -378,6 +462,7 @@ where
             operation,
             result,
         };
+        let submitted = pending.effect.take().expect("completed effect");
         let (publish, next) = {
             let mut ledger = lock_ledger(&ledger);
             let publish = ledger
@@ -385,16 +470,19 @@ where
                 .get(&operation)
                 .is_some_and(|entry| entry.is_running() && entry.effect() == &submitted);
             if publish {
-                ledger.operations.insert(
+                ledger.enter_operation(
                     operation,
                     LedgerEntry::completed(submitted, executor_result.clone()),
+                    Reason::Completed,
                 );
                 if ledger.in_flight_by_attempt.get(&operation.attempt) == Some(&operation) {
                     ledger.in_flight_by_attempt.remove(&operation.attempt);
                 }
-                if let Ok(outcome) = &executor_result.result {
-                    update_resources(&mut ledger, operation.attempt, outcome);
-                }
+            }
+            // Physical completion still determines retained resource ownership
+            // after the caller has already received an ambiguous timeout.
+            if let Ok(outcome) = &executor_result.result {
+                update_resources(&mut ledger, operation.attempt, outcome);
             }
             if ledger.running_by_attempt.get(&operation.attempt) == Some(&operation) {
                 ledger.running_by_attempt.remove(&operation.attempt);
@@ -459,9 +547,10 @@ fn record_spawn_failure(
         result: Err(EffectError::definite(reason)),
     });
     if let Some(result) = result.as_ref() {
-        ledger.operations.insert(
+        ledger.enter_operation(
             operation,
             LedgerEntry::completed(effect.clone(), result.clone()),
+            Reason::Failed,
         );
     }
     if ledger.in_flight_by_attempt.get(&operation.attempt) == Some(&operation) {
@@ -481,9 +570,12 @@ fn promote_queued(ledger: &mut ExecutorLedger, attempt: NodeAttemptId) -> Option
         return None;
     }
     let effect = entry.effect;
-    ledger
-        .operations
-        .insert(operation, LedgerEntry::running(effect.clone()));
+    ledger.running_by_attempt.insert(attempt, operation);
+    ledger.enter_operation(
+        operation,
+        LedgerEntry::running(effect.clone()),
+        Reason::Started,
+    );
     Some(effect)
 }
 

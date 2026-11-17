@@ -65,8 +65,8 @@ pub struct PaidRetainedDeployment {
 }
 
 /// Immutable integer micro-dollar ceilings. `hourly_price_microusd` is the
-/// authorized aggregate hourly maximum used conservatively before selection;
-/// selected offers must also have zero metered transfer prices.
+/// authorized aggregate hourly maximum; bounded metered transfer is accounted
+/// against `maximum_cost_microusd` before provider acquisition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaidCleanupLimits {
@@ -257,6 +257,10 @@ pub struct PaidAdmissionSnapshot {
     /// Empty/missing census results never populate this set.
     #[serde(default)]
     pub rejected_creates: BTreeSet<u64>,
+    /// Consumed create slots proven absent by a fresh provider census after
+    /// execution closed. They remain permanently consumed.
+    #[serde(default)]
+    pub absent_creates: BTreeSet<u64>,
     /// Logical node -> the single initial logical bootstrap session.
     pub initial_bootstraps: BTreeMap<u64, PaidBootstrapReservation>,
     #[serde(default)]
@@ -278,7 +282,7 @@ pub struct PaidAdmissionSnapshot {
 
 impl PaidAdmissionSnapshot {
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 3 {
+        if self.schema_version != 4 {
             return Err("unsupported paid admission schema".to_owned());
         }
         if self.nodes.is_empty() {
@@ -289,6 +293,7 @@ impl PaidAdmissionSnapshot {
                 || !self.contracts.is_empty()
                 || !self.create_reservations.is_empty()
                 || !self.rejected_creates.is_empty()
+                || !self.absent_creates.is_empty()
                 || !self.initial_bootstraps.is_empty()
                 || !self.retained_deployments.is_empty()
             {
@@ -323,8 +328,8 @@ impl PaidAdmissionSnapshot {
         {
             return Err("invalid durable recovery ownership scope".to_owned());
         }
-        if let Some(owner) = &self.cleanup {
-            if owner.stop_unix_ms > self.deadline_unix_ms
+        if let Some(owner) = &self.cleanup
+            && (owner.stop_unix_ms > self.deadline_unix_ms
                 || owner.started_unix_ms >= owner.stop_unix_ms
                 || owner.limits.maximum_cost_microusd == 0
                 || owner.limits.hourly_price_microusd == 0
@@ -333,10 +338,9 @@ impl PaidAdmissionSnapshot {
                         || owner.orchestrator.is_none()
                         || owner.complete
                         || owner.spending_stopped
-                        || owner.retained_development_fixture))
-            {
-                return Err("invalid immutable paid cleanup limits".to_owned());
-            }
+                        || owner.retained_development_fixture)))
+        {
+            return Err("invalid immutable paid cleanup limits".to_owned());
         }
         let mut contracts = BTreeSet::new();
         for (&node_id, reservation) in &self.create_reservations {
@@ -348,12 +352,17 @@ impl PaidAdmissionSnapshot {
                 return Err("invalid paid create reservation".to_owned());
             }
         }
-        for node_id in &self.rejected_creates {
+        for node_id in self.rejected_creates.iter().chain(&self.absent_creates) {
             if !self.create_reservations.contains_key(node_id)
                 || self.contracts.contains_key(node_id)
             {
-                return Err("paid create rejection contradicts ownership accounting".to_owned());
+                return Err("paid create resolution contradicts ownership accounting".to_owned());
             }
+        }
+        if !self.rejected_creates.is_disjoint(&self.absent_creates)
+            || (!self.absent_creates.is_empty() && self.mode != PaidAdmissionMode::CleanupOnly)
+        {
+            return Err("paid create resolution is contradictory".to_owned());
         }
         for (&node_id, &contract_id) in &self.contracts {
             if !self.create_reservations.contains_key(&node_id)
@@ -406,6 +415,7 @@ impl PaidAdmissionSnapshot {
                 self.create_reservations.contains_key(&node.node_id)
                     && !self.contracts.contains_key(&node.node_id)
                     && !self.rejected_creates.contains(&node.node_id)
+                    && !self.absent_creates.contains(&node.node_id)
             })
             .map(|node| node.label.clone())
             .collect()
@@ -726,7 +736,9 @@ impl PaidFixtureAdmission {
             && self.cleanup_owner_active()?
             && matches!(
                 state.mode,
-                PaidAdmissionMode::Preparing | PaidAdmissionMode::Prepared
+                PaidAdmissionMode::Selecting
+                    | PaidAdmissionMode::Preparing
+                    | PaidAdmissionMode::Prepared
             )
         {
             Ok(())
@@ -916,9 +928,14 @@ impl PaidFixtureAdmission {
             return Err("retention requires an independent restart supervisor".to_owned());
         }
         self.update(false, |state, now| {
-            if !explicitly_authorized || state.mode != PaidAdmissionMode::Prepared {
+            if !explicitly_authorized
+                || !matches!(
+                    state.mode,
+                    PaidAdmissionMode::Preparing | PaidAdmissionMode::Prepared
+                )
+            {
                 return Err(
-                    "retention requires explicit development authorization and prepared admission"
+                    "retention requires explicit development authorization and an acquired fixture"
                         .to_owned(),
                 );
             }
@@ -1070,6 +1087,7 @@ impl PaidFixtureAdmission {
                 state.discovered_contracts.insert(contract, label.clone());
                 if !state.create_reservations.contains_key(&node.node_id)
                     || state.rejected_creates.contains(&node.node_id)
+                    || state.absent_creates.contains(&node.node_id)
                     || state
                         .contracts
                         .get(&node.node_id)
@@ -1200,6 +1218,26 @@ impl PaidFixtureAdmission {
         })
     }
 
+    /// Resolves ambiguous create slots only from a fresh successful provider
+    /// census after execution has closed and cleanup-only mode is active.
+    pub fn record_create_absence(&self, absent_labels: &BTreeSet<String>) -> Result<(), String> {
+        self.update(false, |state, _| {
+            if state.mode != PaidAdmissionMode::CleanupOnly {
+                return Err("paid create absence requires cleanup-only mode".to_owned());
+            }
+            for node in &state.nodes {
+                if absent_labels.contains(&node.label)
+                    && state.create_reservations.contains_key(&node.node_id)
+                    && !state.contracts.contains_key(&node.node_id)
+                    && !state.rejected_creates.contains(&node.node_id)
+                {
+                    state.absent_creates.insert(node.node_id);
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Records a late response or cleanup discovery even in deny-only mode.
     /// Re-observing the same mapping is idempotent; reuse or remapping is denied.
     pub fn record_contract(&self, node_id: u64, contract_id: u64) -> Result<(), String> {
@@ -1211,6 +1249,9 @@ impl PaidFixtureAdmission {
             }
             if state.rejected_creates.contains(&node_id) {
                 return Err("paid contract contradicts a definitive create rejection".to_owned());
+            }
+            if state.absent_creates.contains(&node_id) {
+                return Err("paid contract contradicts a settled create absence".to_owned());
             }
             if let Some(existing) = state.contracts.get(&node_id) {
                 return if *existing == contract_id {
@@ -1288,10 +1329,12 @@ impl PaidFixtureAdmission {
             serde_json::from_reader(open_private_file(&self.path, false)?)
                 .map_err(|error| format!("decode paid admission: {error}"))?;
         // Legacy reservations never imply rejection: keep every unresolved
-        // outcome ambiguous when adopting a schema-1 durable cleanup record.
+        // outcome ambiguous when adopting an older durable cleanup record.
         if state.schema_version <= 2 {
-            state.schema_version = 3;
             state.mode = PaidAdmissionMode::CleanupOnly;
+        }
+        if state.schema_version <= 3 {
+            state.schema_version = 4;
         }
         state.validate()?;
         Ok(state)
@@ -1315,7 +1358,7 @@ impl PaidFixtureAdmission {
                     owner.orchestrator_shutdown_pending = false;
                 }
                 self.persist(&state)?;
-                return Err("paid preparation deadline expired".to_owned());
+                return Err("paid fixture lifetime expired".to_owned());
             }
             if !state.cleanup.as_ref().is_some_and(|owner| {
                 owner.live_at(now)
@@ -1372,12 +1415,13 @@ fn new_snapshot(
     cleanup: Option<PaidCleanupOwnership>,
 ) -> PaidAdmissionSnapshot {
     PaidAdmissionSnapshot {
-        schema_version: 3,
+        schema_version: 4,
         run_id,
         nodes,
         contracts: BTreeMap::new(),
         create_reservations: BTreeMap::new(),
         rejected_creates: BTreeSet::new(),
+        absent_creates: BTreeSet::new(),
         initial_bootstraps: BTreeMap::new(),
         retained_deployments: BTreeMap::new(),
         mode,
@@ -1671,6 +1715,30 @@ mod tests {
     }
 
     #[test]
+    fn selecting_mode_accepts_live_cleanup_owner_before_offer_search() {
+        let fixture = Fixture::new();
+        let admission = PaidFixtureAdmission::create_cleanup_only(
+            fixture.path(),
+            42,
+            unix_ms().unwrap() + PAID_CLEANUP_RESERVE_MS + 60_000,
+            PaidProcessIdentity::current().unwrap(),
+            PaidCleanupLimits {
+                maximum_cost_microusd: 1_000_000,
+                hourly_price_microusd: 1_000_000,
+            },
+        )
+        .unwrap();
+        let _supervisor = admission.claim_cleanup_supervisor().unwrap();
+        let _owner = admission.claim_cleanup_owner().unwrap();
+
+        assert_eq!(
+            admission.snapshot().unwrap().mode,
+            PaidAdmissionMode::Selecting
+        );
+        assert!(admission.require_live_cleanup_owner().is_ok());
+    }
+
+    #[test]
     fn cleanup_reserve_is_inside_both_operator_ceilings() {
         let fixture = Fixture::new();
         let admission = fixture.create();
@@ -1777,7 +1845,17 @@ mod tests {
             "two live owners acquired one fixture"
         );
         fixture.1.borrow_mut().take();
-        assert!(!admission.cleanup_owner_active().unwrap());
+        // A concurrently spawning test process can briefly inherit the flock
+        // before exec closes its CLOEXEC descriptor. Require eventual release,
+        // which is the process-owner contract, without making the suite serial.
+        let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while admission.cleanup_owner_active().unwrap() {
+            assert!(
+                std::time::Instant::now() < release_deadline,
+                "cleanup owner lock remained active after its owner was dropped"
+            );
+            std::thread::yield_now();
+        }
         assert!(admission.require_live_cleanup_owner().is_err());
         let recovered = PaidFixtureAdmission::open(fixture.path()).unwrap();
         let owner = recovered.claim_cleanup_owner().unwrap();
@@ -1813,6 +1891,27 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_settles_ambiguous_create_absence_without_reopening_slot() {
+        let fixture = Fixture::new();
+        let admission = fixture.create();
+        reserve(&admission, 1).unwrap();
+        fixture.1.borrow_mut().take();
+        let recovered = PaidFixtureAdmission::open(fixture.path()).unwrap();
+        let owner = recovered.claim_cleanup_owner().unwrap();
+        assert!(owner.tick().unwrap());
+
+        let absent_labels = recovered.snapshot().unwrap().unresolved_create_labels();
+        recovered.record_create_absence(&absent_labels).unwrap();
+        recovered.complete_cleanup(&BTreeSet::new()).unwrap();
+
+        let snapshot = recovered.snapshot().unwrap();
+        assert_eq!(snapshot.absent_creates, BTreeSet::from([1]));
+        assert!(snapshot.unresolved_create_labels().is_empty());
+        assert!(snapshot.create_reservations.contains_key(&1));
+        assert!(reserve(&recovered, 1).is_err());
+    }
+
+    #[test]
     fn runner_loss_before_response_accounting_keeps_discovery_obligation() {
         let fixture = Fixture::new();
         let admission = fixture.create();
@@ -1835,6 +1934,32 @@ mod tests {
             .unwrap();
         assert!(admission.complete_cleanup(&BTreeSet::new()).is_err());
         admission.complete_cleanup(&BTreeSet::from([9001])).unwrap();
+    }
+
+    #[test]
+    fn retained_fixture_preserves_incomplete_preparation_after_runner_exit() {
+        let fixture = Fixture::new();
+        let admission = fixture.create();
+        reserve(&admission, 1).unwrap();
+        admission.retain_development_fixture(true).unwrap();
+        admission
+            .update(false, |state, _| {
+                state.cleanup.as_mut().unwrap().runner.start_ticks += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!fixture.1.borrow().as_ref().unwrap().tick().unwrap());
+        let snapshot = admission.snapshot().unwrap();
+        assert_eq!(snapshot.mode, PaidAdmissionMode::Preparing);
+        assert!(
+            snapshot
+                .cleanup
+                .as_ref()
+                .unwrap()
+                .retained_development_fixture
+        );
+        assert_eq!(snapshot.create_reservations.len(), 1);
     }
 
     #[test]
@@ -2019,11 +2144,13 @@ mod tests {
         let mut legacy = serde_json::to_value(admission.snapshot().unwrap()).unwrap();
         legacy["schema_version"] = serde_json::json!(1);
         legacy.as_object_mut().unwrap().remove("rejected_creates");
+        legacy.as_object_mut().unwrap().remove("absent_creates");
         fs::write(fixture.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
         let reopened = PaidFixtureAdmission::open(fixture.path()).unwrap();
         let snapshot = reopened.snapshot().unwrap();
         assert!(snapshot.create_reservations.contains_key(&1));
         assert!(snapshot.rejected_creates.is_empty());
+        assert!(snapshot.absent_creates.is_empty());
         assert!(reserve(&reopened, 1).is_err());
         reopened.record_contract(1, 9000).unwrap();
     }
@@ -2108,6 +2235,12 @@ mod tests {
 
     #[test]
     fn cloned_and_independent_handles_serialize_the_same_slot() {
+        let engine = swactor_engine::Engine::new(
+            swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+            swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let blocking = engine.handle().blocking_work_sender();
         let fixture = Fixture::new();
         let admission = fixture.create();
         let start = Arc::new(Barrier::new(12));
@@ -2119,10 +2252,14 @@ mod tests {
                 PaidFixtureAdmission::open(fixture.path()).unwrap()
             };
             let start = start.clone();
-            workers.push(std::thread::spawn(move || {
-                start.wait();
-                reserve(&handle, 1).is_ok()
-            }));
+            workers.push(
+                blocking
+                    .submit_joinable(move || {
+                        start.wait();
+                        reserve(&handle, 1).is_ok()
+                    })
+                    .unwrap(),
+            );
         }
         let successes = workers
             .into_iter()

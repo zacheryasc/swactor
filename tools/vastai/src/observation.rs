@@ -34,10 +34,20 @@ pub struct OwnedCensus {
     /// Cumulative owned identities seen during cleanup, including now-absent contracts.
     pub discovered_contract_labels: BTreeMap<u64, String>,
     pub missing_contract_ids: BTreeSet<u64>,
+    /// Exact owned labels absent from this fresh successful account listing.
+    pub missing_labels: BTreeSet<String>,
     pub generation: u64,
     pub request_started: Instant,
     pub observed_at: Instant,
     pub counters: ProviderObservationCounters,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OwnedCensusRequest<'a> {
+    pub labels: &'a BTreeSet<String>,
+    pub known_ids: &'a BTreeSet<u64>,
+    pub fresh_after: Instant,
+    pub deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -179,11 +189,14 @@ impl ProviderObserver {
         client: &reqwest::Client,
         base_url: &str,
         api_key: &str,
-        labels: &BTreeSet<String>,
-        known_ids: &BTreeSet<u64>,
-        fresh_after: Instant,
-        deadline: Instant,
+        request: OwnedCensusRequest<'_>,
     ) -> Result<OwnedCensus, String> {
+        let OwnedCensusRequest {
+            labels,
+            known_ids,
+            fresh_after,
+            deadline,
+        } = request;
         let timeout_at = tokio::time::Instant::from_std(deadline);
         let mut state = tokio::time::timeout_at(timeout_at, self.account.lock())
             .await
@@ -303,6 +316,7 @@ impl ProviderObserver {
             let mut instances = Vec::new();
             let mut contract_labels = BTreeMap::new();
             let mut missing_contract_ids = known_ids.clone();
+            let mut missing_labels = labels.clone();
             for instance in listing.instances {
                 if !known_ids.contains(&instance.id)
                     && !instance
@@ -319,6 +333,7 @@ impl ProviderObserver {
                     .filter(|label| labels.contains(*label))
                 {
                     contract_labels.insert(instance.id, label.clone());
+                    missing_labels.remove(label);
                 }
                 instances.push(instance.into());
             }
@@ -330,6 +345,7 @@ impl ProviderObserver {
                 discovered_contract_labels: contract_labels.clone(),
                 contract_labels,
                 missing_contract_ids,
+                missing_labels,
                 generation: state.generation,
                 request_started,
                 observed_at: Instant::now(),
@@ -345,6 +361,9 @@ impl ProviderObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::RuntimeParts;
+    use swactor_engine::{Engine, SteppingBackend};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -374,6 +393,12 @@ mod tests {
 
     #[tokio::test]
     async fn inherited_execution_deadline_contains_label_retries_but_not_reserved_cleanup() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("actor engine");
+        let blocking = engine.handle().blocking_work_sender();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v0/instances/"))
@@ -385,16 +410,20 @@ mod tests {
         let client = crate::VastClient::with_base_url(server.uri(), "secret")
             .with_execution_deadline(Some(Instant::now() + Duration::from_millis(100)));
         let worker = client.clone();
-        let pending = tokio::task::spawn_blocking(move || {
-            crate::BlockingVastClient::new(worker)
-                .unwrap()
-                .list_by_label_with_retry("owned", 10, Duration::from_secs(60))
-        });
-        let error = tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let pending = blocking
+            .submit_joinable(move || {
+                let result = crate::BlockingVastClient::new(worker)
+                    .unwrap()
+                    .list_by_label_with_retry("owned", 10, Duration::from_secs(60));
+                let _ = finished.send(());
+                result
+            })
+            .expect("submit label lookup");
+        let completion = tokio::time::timeout(Duration::from_secs(1), completion).await;
+        let result = pending.join().expect("label lookup worker");
+        completion.unwrap().unwrap();
+        let error = result.unwrap_err();
         assert!(error.contains("execution owner deadline"));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         let labels = BTreeSet::from(["owned".to_owned()]);
@@ -461,7 +490,7 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(AtomicUsize::new(0));
             let received = Arc::clone(&requests);
-            let server = tokio::spawn(async move {
+            let server = async move {
                 let mut connections = Vec::new();
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
@@ -481,7 +510,7 @@ mod tests {
                     // Retain the socket but withhold the declared body.
                     connections.push(stream);
                 }
-            });
+            };
             let client = crate::VastClient::with_base_url(url, "secret");
             let labels = BTreeSet::from(["owned".to_owned()]);
             let known = BTreeSet::new();
@@ -495,11 +524,20 @@ mod tests {
                     client.instance_status(73).await.map(|_| ())
                 }
             };
-            let first = tokio::time::timeout(Duration::from_millis(150), observe()).await;
-            let second = tokio::time::timeout(Duration::from_millis(150), observe()).await;
+            let (first, second) = {
+                let mut server = std::pin::pin!(server);
+                let first = tokio::select! {
+                    _ = &mut server => unreachable!("HTTP fixture runs until cancelled"),
+                    observation = tokio::time::timeout(Duration::from_millis(150), observe()) => observation,
+                };
+                let second = tokio::select! {
+                    _ = &mut server => unreachable!("HTTP fixture runs until cancelled"),
+                    observation = tokio::time::timeout(Duration::from_millis(150), observe()) => observation,
+                };
+                (first, second)
+            };
+            // The fixture future is dropped with all retained sockets.
             let request_count = requests.load(Ordering::SeqCst);
-            server.abort();
-            assert!(server.await.unwrap_err().is_cancelled());
             assert!(first.is_err() && second.is_err());
             assert_eq!(
                 request_count, 1,

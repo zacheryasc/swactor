@@ -97,6 +97,12 @@ impl BlockingVastClient {
         )?
     }
 
+    /// Paces repeated observations of one already-owned provider operation.
+    /// This never decides lifecycle success or failure.
+    pub fn pace_owned_reconciliation(&self, pace: Duration) {
+        self.runtime.block_on(tokio::time::sleep(pace));
+    }
+
     pub fn wait_for_ssh_endpoint(
         &self,
         contract_id: u64,
@@ -143,9 +149,7 @@ impl BlockingVastClient {
         known_ids: &std::collections::BTreeSet<u64>,
         unresolved_labels: &std::collections::BTreeSet<String>,
         deadline: Duration,
-        record_discovery: &mut (
-                 dyn FnMut(&std::collections::BTreeMap<u64, String>) -> Result<(), String> + Send
-             ),
+        record_discovery: &mut crate::teardown::DiscoveryRecorder<'_>,
     ) -> Result<crate::OwnedCensus, crate::teardown::CleanupFailure> {
         self.runtime.block_on(self.client.cleanup_owned_reconciled(
             labels,

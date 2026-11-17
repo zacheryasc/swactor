@@ -391,13 +391,30 @@ fn failed_bootstrap_attempt_rejects_late_join_and_close() {
 
 #[test]
 fn replacement_waits_for_cleanup_and_uses_a_fresh_attempt() {
+    use protocol_telemetry::{
+        ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, consumer::TransitionDecoder,
+    };
+    let endpoint = telemetry::TelemetryEndpoint::with_capacity(
+        telemetry::StreamId::new(
+            telemetry::NodeId::new("replacement"),
+            telemetry::Lifetime(1),
+        ),
+        128,
+        128,
+    )
+    .with_retention(128, 64 << 10);
+    let owner = swactor::actor::ActorAddress::new_random();
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(300);
     let mut initial_group = group("gpu", 1);
     let mut driver = ClusterDriver::new(
         shape(1, vec![initial_group.clone()]),
         RetryPolicy::default(),
     )
-    .unwrap();
+    .unwrap()
+    .with_transitions(
+        owner,
+        Some(TransitionEmitter::register(&endpoint.producer())),
+    );
     let create = only_effect(&mut driver, now);
     let old_attempt = create.operation.attempt;
     succeed(
@@ -459,6 +476,46 @@ fn replacement_waits_for_cleanup_and_uses_a_fresh_attempt() {
             .unwrap()
             .id,
         replacement_create.operation
+    );
+
+    endpoint.tick();
+    let retained =
+        endpoint.subscribe_retained("replacement-proof", telemetry::SubscriptionRequest::all());
+    let mut decoder = TransitionDecoder::from_snapshot(retained.snapshot());
+    let records: Vec<_> = retained
+        .drain_available()
+        .iter()
+        .filter_map(|event| decoder.observe(event).unwrap())
+        .filter(|observed| observed.record.protocol == Protocol::ProvisioningNode)
+        .collect();
+    let closed: Vec<_> = records
+        .iter()
+        .filter(|observed| {
+            observed.record.incarnation == Some(old_attempt.0)
+                && observed.record.next == Phase::Closed
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "old ownership must close exactly once");
+    assert_eq!(closed[0].record.outcome, Some(Outcome::Success));
+    assert_eq!(closed[0].record.generation, Some(3));
+    let restarted = records
+        .iter()
+        .find(|observed| {
+            observed.record.incarnation == Some(replacement_create.operation.attempt.0)
+                && observed.record.reason == Reason::Restarted
+        })
+        .expect("replacement lifecycle must be retained");
+    assert!(
+        closed[0].position < restarted.position,
+        "cleanup must precede replacement"
+    );
+    assert!(
+        records.iter().all(|observed| {
+            observed.record.actor == owner
+                && observed.record.actor_type == ActorType::ClusterDriver
+                && observed.record.outcome != Some(Outcome::Failed)
+        }),
+        "late old failure must not rewrite the retained replacement outcome"
     );
 }
 
