@@ -4,13 +4,14 @@ use std::cell::RefCell;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-use ::swactor::actor::{
+use swactor_core::actor::{
     Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest,
 };
-use ::swactor::config::RuntimeConfig;
-use ::swactor::runtime::{Inbox, Runtime, RuntimeParts};
+use swactor_core::config::RuntimeConfig;
+use swactor_core::runtime::{Inbox, Runtime, RuntimeParts};
 use swactor_engine::{Engine, SteppingBackend};
 
+mod async_bridge;
 mod context;
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
@@ -42,7 +43,7 @@ impl PyMsg {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn to_py_err(e: ::swactor::Error) -> PyErr {
+fn to_py_err(e: swactor_core::Error) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
@@ -448,6 +449,35 @@ fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
 }
 
 // ─── Module registration ─────────────────────────────────────────────────────
+/// Native composition capabilities used only by the contextual-workload
+/// executable. The executable, not this library, mints task authority.
+#[cfg(feature = "launcher")]
+pub mod launcher {
+    pub use swactor_core::config::RuntimeConfig;
+    pub use swactor_core::runtime::{Runtime, RuntimeParts};
+    pub use swactor_engine::{Engine, TaskSpawner, TokioBackend, TokioConfig};
+}
+
+/// Execute one generated contextual workload. Runtime construction and
+/// data-plane attachment remain native; Python only evaluates the supplied
+/// coroutine against the inherited context.
+pub fn run_contextual_source(
+    source: &str,
+    runtime: Runtime,
+    engine: Engine,
+    tasks: swactor_engine::TaskSpawner,
+) -> PyResult<()> {
+    Python::with_gil(|py| -> PyResult<()> {
+        // Bind imports to this executable's native classes and exceptions,
+        // rather than loading another copy from an installed extension.
+        let module = PyModule::new(py, "swactor")?;
+        register(&module)?;
+        py.import("sys")?
+            .getattr("modules")?
+            .set_item("swactor", module)
+    })?;
+    context::run_source(source, runtime, engine, tasks)
+}
 
 fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     context::register(m)?;

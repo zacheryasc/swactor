@@ -6,17 +6,21 @@ license = "AGPL-3.0-only"
 
 [lib]
 name = "swactor"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "myelin-e2e-python"
+path = "src/bin/myelin_e2e_python.rs"
+required-features = ["launcher"]
+test = false
 
 [features]
-# Builds the in-process debug data-plane host and contextual-process probe
-# used by the Python bootstrap tests (`cargo xtask python-test` compiles the
-# wheel with this feature). Off for normal debug and release builds so the
-# Python module never exposes test-only APIs.
-test-host = []
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+launcher = ["pyo3/auto-initialize"]
 
 [dependencies]
-swactor = { path = "../../.." }
+swactor-core = { package = "swactor", path = "../../.." }
 swactor-engine = { path = "../../engine", features = ["tokio"] }
 swactor-process = { path = "../../process" }
 swactor-process-context = { path = "../../process-context" }
@@ -24,13 +28,14 @@ swactor-transport = { path = "../../transport" }
 data-plane = { path = "../../data-plane" }
 distribution = { path = "../../distribution" }
 iroh-driver = { path = "../../iroh-driver" }
+base64 = "0.22"
+flate2 = "1"
 libc = "0.2"
 futures-lite = "2"
 iroh.workspace = true
 parking_lot = "0.12"
 serde_json = "1"
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py312"] }
-pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+pyo3 = { version = "0.23", features = ["abi3-py312"] }
 tokio.workspace = true
 
 [lints]
