@@ -81,15 +81,15 @@ impl RuntimeState {
             return;
         };
         match channel {
-            RUNTIME_ACTORS if self.accept_protocol_frame(&value) => {
+            RUNTIME_ACTORS if self.accept_protocol_frame(value) => {
                 match value.get("kind").and_then(Value::as_str) {
-                    Some("census") => self.apply_actors(&value, now),
-                    Some("activity") => self.apply_activity(&value, now),
-                    Some("vital") => self.apply_vital(&value, now),
-                    _ => self.apply_actors(&value, now),
+                    Some("census") => self.apply_actors(value, now),
+                    Some("activity") => self.apply_activity(value, now),
+                    Some("vital") => self.apply_vital(value, now),
+                    _ => self.apply_actors(value, now),
                 }
             }
-            RUNTIME_STATS => self.apply_stats(&value, now),
+            RUNTIME_STATS => self.apply_stats(value, now),
             _ => {}
         }
         self.push_history(now);

@@ -7,9 +7,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 use crate::store::DashboardStore;
 use crate::view::ViewRegistry;
@@ -22,7 +22,9 @@ pub(crate) struct AppState {
     pub views: Arc<ViewRegistry>,
     pub plugin_pages: Arc<Vec<PluginPage>>,
     pub page_script_urls: Arc<Vec<String>>,
-    pub shutdown_notify: Arc<tokio::sync::Notify>,
+    pub shutdown_requested: tokio::sync::watch::Sender<bool>,
+    pub ready:
+        tokio::sync::watch::Sender<Option<Result<std::net::SocketAddr, Arc<std::io::Error>>>>,
 }
 
 async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
@@ -34,12 +36,26 @@ pub(crate) async fn run_server(state: AppState, port: u16) {
 }
 
 pub(crate) async fn run_server_with_routes(state: AppState, port: u16, extra: Router) {
-    let listener = bind_listener(port)
-        .await
-        .expect("failed to bind HTTP server");
-    let shutdown = Arc::clone(&state.shutdown_notify);
+    let startup = async {
+        let listener = bind_listener(port).await?;
+        let address = listener.local_addr()?;
+        Ok::<_, std::io::Error>((listener, address))
+    }
+    .await;
+    let (listener, address) = match startup {
+        Ok(bound) => bound,
+        Err(error) => {
+            let error = Arc::new(error);
+            state.ready.send_replace(Some(Err(Arc::clone(&error))));
+            panic!("failed to bind HTTP server: {error}");
+        }
+    };
+    state.ready.send_replace(Some(Ok(address)));
+    let mut shutdown = state.shutdown_requested.subscribe();
     axum::serve(listener, router(state).merge(extra))
-        .with_graceful_shutdown(async move { shutdown.notified().await })
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.wait_for(|requested| *requested).await;
+        })
         .await
         .expect("HTTP server error");
 }
@@ -279,40 +295,20 @@ async fn view_page(Path(path): Path<String>, State(state): State<AppState>) -> R
 async fn frame_stream(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let mut rx = state.frames.subscribe();
-    let (tx, out) = mpsc::channel::<Event>(32);
-
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(frame) => {
-                    let Ok(json) = serde_json::to_string(&frame) else {
-                        continue;
-                    };
-                    if tx
-                        .send(Event::default().event("frame").data(json))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let json = serde_json::json!({ "skipped": skipped }).to_string();
-                    if tx
-                        .send(Event::default().event("lagged").data(json))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
+    let events = BroadcastStream::new(state.frames.subscribe()).filter_map(|frame| {
+        let event = match frame {
+            Ok(frame) => {
+                let json = serde_json::to_string(&frame).ok()?;
+                Event::default().event("frame").data(json)
             }
-        }
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                let json = serde_json::json!({ "skipped": skipped }).to_string();
+                Event::default().event("lagged").data(json)
+            }
+        };
+        Some(Ok(event))
     });
-
-    Sse::new(ReceiverStream::new(out).map(Ok)).keep_alive(KeepAlive::default())
+    Sse::new(events).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]
@@ -332,6 +328,20 @@ mod tests {
     #[cfg(feature = "demo-control")]
     use tower::util::ServiceExt;
 
+    #[tokio::test]
+    async fn shutdown_requested_before_listener_start_is_retained() {
+        let dashboard = crate::DashboardHandle::new(crate::DashboardConfig {
+            port: 0,
+            ..Default::default()
+        });
+        dashboard.shutdown();
+        dashboard.http_server().await;
+        // Startup remains observable even after the already-requested shutdown.
+        let address = dashboard.wait_until_ready().await.unwrap();
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        drop(listener);
+    }
+
     fn state_with_plugin(page: PluginPage) -> AppState {
         let views = Arc::new(ViewRegistry::new());
         let store = Arc::new(DashboardStore::new(1, Arc::clone(&views)));
@@ -342,7 +352,8 @@ mod tests {
             views,
             plugin_pages: Arc::new(vec![page]),
             page_script_urls: Arc::new(Vec::new()),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_requested: tokio::sync::watch::channel(false).0,
+            ready: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -374,7 +385,7 @@ mod tests {
         Mutex<std::sync::mpsc::Receiver<crate::control::ControlCommand>>,
     > = LazyLock::new(|| {
         let (sender, receiver) = std::sync::mpsc::channel();
-        crate::control::set_control_sender(sender);
+        crate::control::set_control_sender(sender).expect("install dashboard test control sink");
         Mutex::new(receiver)
     });
 
@@ -603,15 +614,11 @@ mod tests {
             let outcome = current_thread.block_on(async {
                 let mut responses = Vec::with_capacity(actions.len());
                 if concurrent {
-                    let mut requests = tokio::task::JoinSet::new();
-                    for (index, action) in actions.iter().cloned().enumerate() {
-                        requests.spawn(send_control_request(router(state.clone()), index, action));
-                    }
-                    while let Some(result) = requests.join_next().await {
-                        responses.push(
-                            result
-                                .map_err(|error| format!("dashboard request task failed: {error}"))??,
-                        );
+                    let requests = actions.iter().cloned().enumerate().map(|(index, action)| {
+                        send_control_request(router(state.clone()), index, action)
+                    });
+                    for result in futures_util::future::join_all(requests).await {
+                        responses.push(result?);
                     }
                 } else {
                     for (index, action) in actions.iter().cloned().enumerate() {

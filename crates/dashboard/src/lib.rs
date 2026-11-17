@@ -5,19 +5,22 @@ mod control_plane;
 mod demo_control;
 mod hardware_view;
 mod live_explorer;
+mod remote_telemetry;
 mod server;
 mod store;
 pub mod swactor;
 pub mod view;
 
 pub use control_plane::ControlPlaneView;
+pub use remote_telemetry::RemoteTelemetry;
 
 use std::sync::Arc;
+use std::{io, net::SocketAddr};
 
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use telemetry::frame::{ChannelContent, ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::store::DashboardStore;
 use crate::view::{DashboardView, ViewRegistry};
@@ -189,7 +192,8 @@ pub struct DashboardHandle {
     store: Arc<DashboardStore>,
     views: Arc<ViewRegistry>,
     page_script_urls: Arc<Vec<String>>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    shutdown_requested: watch::Sender<bool>,
+    ready: watch::Sender<Option<Result<SocketAddr, Arc<io::Error>>>>,
 }
 
 impl DashboardHandle {
@@ -214,7 +218,8 @@ impl DashboardHandle {
             store,
             page_script_urls: Arc::new(config.page_script_urls),
             views,
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_requested: watch::channel(false).0,
+            ready: watch::channel(None).0,
         }
     }
 
@@ -238,7 +243,23 @@ impl DashboardHandle {
 
     /// Stop the HTTP server.
     pub fn shutdown(&self) {
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_requested.send_replace(true);
+    }
+
+    /// Wait for the engine-hosted server to bind, returning its actual address.
+    ///
+    /// Port zero is supported. Bind failures are reported to observers, and
+    /// callers that subscribe after startup still receive the recorded result.
+    pub async fn wait_until_ready(&self) -> io::Result<SocketAddr> {
+        let mut ready = self.ready.subscribe();
+        let state = ready
+            .wait_for(Option::is_some)
+            .await
+            .expect("dashboard handle retains the readiness sender");
+        match state.as_ref().expect("dashboard startup result") {
+            Ok(address) => Ok(*address),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        }
     }
 
     /// Build the HTTP server future for an embedding runtime to poll directly.
@@ -249,7 +270,8 @@ impl DashboardHandle {
             views: Arc::clone(&self.views),
             plugin_pages: Arc::new(Vec::new()),
             page_script_urls: Arc::clone(&self.page_script_urls),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutdown_requested: self.shutdown_requested.clone(),
+            ready: self.ready.clone(),
         };
         let port = self.port;
         async move {
@@ -270,7 +292,8 @@ impl DashboardHandle {
             views: Arc::clone(&self.views),
             plugin_pages: Arc::new(Vec::new()),
             page_script_urls: Arc::clone(&self.page_script_urls),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutdown_requested: self.shutdown_requested.clone(),
+            ready: self.ready.clone(),
         };
         let port = self.port;
         async move {
@@ -296,25 +319,26 @@ impl DashboardHandle {
             views: Arc::clone(&self.views),
             plugin_pages: Arc::new(plugin_pages),
             page_script_urls: Arc::clone(&self.page_script_urls),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutdown_requested: self.shutdown_requested.clone(),
+            ready: self.ready.clone(),
         };
         let port = self.port;
         async move {
             server::run_server_with_routes(state, port, routes).await;
         }
     }
-    /// Schedule the dashboard HTTP server on its approved execution owner.
-    pub fn spawn(&self, engine: &swactor_engine::EngineHandle) {
-        engine.spawn(self.http_server());
+    /// Schedule the dashboard HTTP server through an explicitly supplied task capability.
+    pub fn spawn(&self, tasks: &swactor_engine::TaskSpawner) {
+        tasks.spawn(self.http_server());
     }
 
-    /// Schedule the dashboard HTTP server on its approved execution owner.
+    /// Schedule the dashboard HTTP server through an explicitly supplied task capability.
     pub fn spawn_with_plugins(
         &self,
-        engine: &swactor_engine::EngineHandle,
+        tasks: &swactor_engine::TaskSpawner,
         plugins: Vec<DashboardPlugin>,
     ) {
-        engine.spawn(self.http_server_with_plugins(plugins));
+        tasks.spawn(self.http_server_with_plugins(plugins));
     }
 }
 

@@ -10,7 +10,6 @@
 //! - `POST /control/kill` body `{"Kill":{"command_id":"...","node":"..."}}`
 //! - `POST /control/provision` body `{"Provision":{"command_id":"...","count":1}}`
 
-use std::sync::OnceLock;
 use std::sync::mpsc::Sender;
 
 use serde::Deserialize;
@@ -40,35 +39,72 @@ impl ControlCommand {
     }
 }
 
-static CONTROL_SENDER: OnceLock<Sender<ControlCommand>> = OnceLock::new();
+static CONTROL_SENDER: parking_lot::Mutex<Option<Sender<ControlCommand>>> =
+    parking_lot::Mutex::new(None);
 
 /// Install the sink that receives dashboard-issued control commands.
 ///
 /// Called once by the embedding demo before the HTTP server starts. Without a
 /// sink the control routes answer `503 Service Unavailable`.
-pub fn set_control_sender(sender: Sender<ControlCommand>) {
-    let _ = CONTROL_SENDER.set(sender);
+pub fn set_control_sender(sender: Sender<ControlCommand>) -> std::io::Result<()> {
+    let mut installed = CONTROL_SENDER.lock();
+    if installed.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "dashboard control sink already installed",
+        ));
+    }
+    *installed = Some(sender);
+    Ok(())
+}
+
+/// Composition-owned lifetime of the command reader. Drop before the engine:
+/// disconnecting the installed channel wakes the reader and joins its work.
+#[must_use = "retain the guard while dashboard control commands should be forwarded"]
+pub struct ActorSinkGuard {
+    forwarder: Option<swactor_engine::BlockingWorkHandle<()>>,
+}
+
+impl Drop for ActorSinkGuard {
+    fn drop(&mut self) {
+        CONTROL_SENDER.lock().take();
+        if let Some(forwarder) = self.forwarder.take() {
+            let _ = forwarder.join();
+        }
+    }
 }
 
 /// Install an actor destination for dashboard-issued control commands.
 ///
-/// The dashboard owns the blocking channel reader; each command becomes one
-/// typed actor observation.
+/// The engine owns the blocking channel reader; each command becomes one typed
+/// actor observation. The embedding composition owns the returned lifetime guard.
 pub fn install_actor_sink(
+    blocking: &swactor_engine::BlockingWorkSender,
     sender: swactor::runtime::ExternalSender,
     actor: swactor::actor::ActorAddress,
-) {
+) -> std::io::Result<ActorSinkGuard> {
+    let mut installed = CONTROL_SENDER.lock();
+    if installed.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "dashboard control sink already installed",
+        ));
+    }
     let (control_sender, receiver) = std::sync::mpsc::channel();
-    set_control_sender(control_sender);
-    drop(spawn_actor_sink_forwarder(receiver, sender, actor));
+    let forwarder = spawn_actor_sink_forwarder(blocking, receiver, sender, actor)?;
+    *installed = Some(control_sender);
+    Ok(ActorSinkGuard {
+        forwarder: Some(forwarder),
+    })
 }
 
 fn spawn_actor_sink_forwarder(
+    blocking: &swactor_engine::BlockingWorkSender,
     receiver: std::sync::mpsc::Receiver<ControlCommand>,
     sender: swactor::runtime::ExternalSender,
     actor: swactor::actor::ActorAddress,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> std::io::Result<swactor_engine::BlockingWorkHandle<()>> {
+    blocking.submit_joinable(move || {
         while let Ok(command) = receiver.recv() {
             if sender.send_to(actor, command).is_err() {
                 return;
@@ -79,7 +115,8 @@ fn spawn_actor_sink_forwarder(
 
 pub(crate) fn dispatch(command: ControlCommand) -> bool {
     CONTROL_SENDER
-        .get()
+        .lock()
+        .as_ref()
         .is_some_and(|sender| sender.send(command).is_ok())
 }
 
@@ -193,8 +230,9 @@ mod properties {
             });
             let runtime = parts.runtime().clone();
             let backend = SteppingBackend::new();
-            let _engine =
+            let engine =
                 Engine::new(parts, backend.clone()).expect("dashboard bridge stepping engine");
+            let blocking = engine.handle().blocking_work_sender();
             let observed = Arc::new(Mutex::new(Vec::new()));
             let probe = runtime
                 .spawn(CommandProbe {
@@ -212,7 +250,8 @@ mod properties {
 
             let (tx, rx) = std::sync::mpsc::channel();
             let forwarder =
-                spawn_actor_sink_forwarder(rx, runtime.create_sender(), probe);
+                spawn_actor_sink_forwarder(&blocking, rx, runtime.create_sender(), probe)
+                    .expect("start dashboard command forwarder");
             let commands = inputs
                 .iter()
                 .map(|(kind, value)| command(*kind, *value))
@@ -227,18 +266,18 @@ mod properties {
                 let left = commands[..split].to_vec();
                 let right = commands[split..].to_vec();
                 let left_tx = tx.clone();
-                let left_sender = std::thread::spawn(move || {
+                let left_sender = blocking.submit_joinable(move || {
                     left.into_iter()
                         .map(|command| left_tx.send(command).is_ok())
                         .collect::<Vec<_>>()
-                });
+                }).expect("start left dashboard sender");
                 let right_tx = tx.clone();
-                let right_sender = std::thread::spawn(move || {
+                let right_sender = blocking.submit_joinable(move || {
                     right
                         .into_iter()
                         .map(|command| right_tx.send(command).is_ok())
                         .collect::<Vec<_>>()
-                });
+                }).expect("start right dashboard sender");
                 let _ = left_sender.join().expect("join left dashboard sender");
                 let _ = right_sender.join().expect("join right dashboard sender");
             } else {
@@ -253,9 +292,9 @@ mod properties {
             drop(tx);
 
             let (done_tx, done_rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
+            let completion = blocking.submit_joinable(move || {
                 let _ = done_tx.send(forwarder.join());
-            });
+            }).expect("start dashboard forwarder completion observer");
             let forwarder_result = done_rx.recv_timeout(FORWARDER_BUDGET).unwrap_or_else(|error| {
                 panic!(
                     "dashboard bridge did not terminate after disconnect: {error}; \
@@ -264,6 +303,7 @@ mod properties {
                 )
             });
             forwarder_result.expect("dashboard bridge forwarder panicked");
+            completion.join().expect("join dashboard completion observer");
             for _ in 0..STEP_BUDGET {
                 backend.step();
             }
