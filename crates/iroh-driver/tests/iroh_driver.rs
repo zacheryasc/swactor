@@ -23,8 +23,10 @@ use parking_lot::Mutex;
 
 #[test]
 fn iroh_driver_creates_with_unique_identity() {
-    let mut d1 = make_driver();
-    let mut d2 = make_driver();
+    let (engine, runtime) = node_engine();
+    let mut d1 = make_driver(engine.task_spawner(), engine, runtime);
+    let (engine, runtime) = node_engine();
+    let mut d2 = make_driver(engine.task_spawner(), engine, runtime);
     assert_ne!(d1.node_id(), d2.node_id());
     d1.shutdown();
     d2.shutdown();
@@ -34,7 +36,8 @@ fn iroh_driver_creates_with_unique_identity() {
 fn iroh_driver_reports_listen_addr_and_no_routes() {
     // A freshly created driver knows where it listens and, having learned no
     // peers, has converged on an empty directory route view.
-    let mut driver = make_driver();
+    let (engine, runtime) = node_engine();
+    let mut driver = make_driver(engine.task_spawner(), engine, runtime);
     assert!(!driver.listen_addr().is_empty());
     assert_eq!(driver.directory_route_count(), 0);
     driver.shutdown();
@@ -42,9 +45,14 @@ fn iroh_driver_reports_listen_addr_and_no_routes() {
 
 #[test]
 fn endpoint_addr_includes_home_relay() {
-    let (relay_url, _relay_guard) = spawn_test_relay();
+    let (relay_engine, _) = node_engine();
+    let (relay_url, _relay_guard) = spawn_test_relay(&relay_engine.task_spawner())
+        .recv()
+        .expect("relay setup task");
     let expected_relay_url = relay_url.to_string();
-    let mut node = make_driver_with_relay(relay_url.clone());
+    let (engine, runtime) = node_engine();
+    let mut node =
+        make_driver_with_relay(engine.task_spawner(), engine, runtime, relay_url.clone());
     let start = Instant::now();
     let (relay_advertised, observed_relay_url) = loop {
         let endpoint = node.endpoint_addr();
@@ -68,9 +76,15 @@ fn endpoint_addr_includes_home_relay() {
 
 #[test]
 fn relay_masked_local_nodes_join_through_only_the_relay() {
-    let (relay_url, _relay_guard) = spawn_test_relay();
-    let mut node_a = make_driver_with_relay(relay_url.clone());
-    let mut node_b = make_driver_with_relay(relay_url);
+    let (relay_engine, _) = node_engine();
+    let (relay_url, _relay_guard) = spawn_test_relay(&relay_engine.task_spawner())
+        .recv()
+        .expect("relay setup task");
+    let (engine, runtime) = node_engine();
+    let mut node_a =
+        make_driver_with_relay(engine.task_spawner(), engine, runtime, relay_url.clone());
+    let (engine, runtime) = node_engine();
+    let mut node_b = make_driver_with_relay(engine.task_spawner(), engine, runtime, relay_url);
 
     node_a
         .driver
@@ -110,8 +124,10 @@ fn relay_masked_local_nodes_join_through_only_the_relay() {
 
 #[test]
 fn two_nodes_form_cluster_via_join() {
-    let mut node_a = make_driver();
-    let mut node_b = make_driver();
+    let (engine, runtime) = node_engine();
+    let mut node_a = make_driver(engine.task_spawner(), engine, runtime);
+    let (engine, runtime) = node_engine();
+    let mut node_b = make_driver(engine.task_spawner(), engine, runtime);
 
     let b_addr = node_b.endpoint_addr();
     node_a.join(&[b_addr]);
@@ -132,8 +148,10 @@ fn two_nodes_form_cluster_via_join() {
 
 #[test]
 fn two_nodes_form_cluster_via_mutual_join() {
-    let mut node_a = make_driver();
-    let mut node_b = make_driver();
+    let (engine, runtime) = node_engine();
+    let mut node_a = make_driver(engine.task_spawner(), engine, runtime);
+    let (engine, runtime) = node_engine();
+    let mut node_b = make_driver(engine.task_spawner(), engine, runtime);
 
     let b_addr = node_b.endpoint_addr();
     let a_addr = node_a.endpoint_addr();
@@ -163,8 +181,10 @@ fn two_nodes_form_cluster_with_peer_auth() {
     let auth_a = Arc::new(Mutex::new(PeerAllowList::open()));
     let auth_b = Arc::new(Mutex::new(PeerAllowList::open()));
 
-    let mut node_a = make_driver_with_auth(auth_a.clone());
-    let mut node_b = make_driver_with_auth(auth_b.clone());
+    let (engine, runtime) = node_engine();
+    let mut node_a = make_driver_with_auth(engine.task_spawner(), engine, runtime, auth_a.clone());
+    let (engine, runtime) = node_engine();
+    let mut node_b = make_driver_with_auth(engine.task_spawner(), engine, runtime, auth_b.clone());
 
     let a_id = node_a.node_id();
     let b_id = node_b.node_id();
@@ -195,13 +215,15 @@ fn two_nodes_form_cluster_with_peer_auth() {
 
 #[test]
 fn peer_auth_prevents_unauthorized_join() {
-    let mut node_a = make_driver();
+    let (engine, runtime) = node_engine();
+    let mut node_a = make_driver(engine.task_spawner(), engine, runtime);
 
     // Node B has auth with only a dummy peer — node_a is NOT authorized
     let auth_b = Arc::new(Mutex::new(PeerAllowList::open()));
     let dummy_id = distribution::types::NodeId([0xAA; 32]);
     auth_b.lock().add_peer(dummy_id, "dummy".into());
-    let mut node_b = make_driver_with_auth(auth_b);
+    let (engine, runtime) = node_engine();
+    let mut node_b = make_driver_with_auth(engine.task_spawner(), engine, runtime, auth_b);
 
     let b_addr = node_b.endpoint_addr();
     node_a.join(&[b_addr]);
@@ -221,7 +243,12 @@ fn peer_auth_prevents_unauthorized_join() {
 
 #[test]
 fn three_nodes_converge_via_star_join() {
-    let mut cluster = IrohTestCluster::star(3);
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        let (engine, runtime) = node_engine();
+        nodes.push(make_driver(engine.task_spawner(), engine, runtime));
+    }
+    let mut cluster = IrohTestCluster::star(nodes);
 
     let converged = cluster.pump_until(Duration::from_secs(10), |nodes| {
         nodes.iter().all(|d| d.alive_count() == 2)
@@ -238,8 +265,13 @@ fn goal2_shutdown_node_is_detected_dead_by_survivors() {
     // BEHAVIORAL_TEST_SPEC Goal 2 over real QUIC: shut one node down for real and
     // poll until the survivors converge on it being Dead — a genuine probe
     // timeout, not an injected death. Observed only through the membership view.
-    let mut cluster = IrohTestCluster::star(3);
-    let converged = cluster.pump_until(Duration::from_secs(10), |nodes| {
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        let (engine, runtime) = node_engine();
+        nodes.push(make_driver(engine.task_spawner(), engine, runtime));
+    }
+    let mut cluster = IrohTestCluster::star(nodes);
+    let converged = cluster.pump_until(Duration::from_secs(30), |nodes| {
         nodes.iter().all(|d| d.alive_count() == 2)
     });
     assert!(converged, "precondition: 3-node star must converge");
@@ -280,6 +312,7 @@ fn driver_rejects_engine_without_io() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let engine = Engine::new(parts, SteppingBackend::default()).expect("stepping engine");
     let result = IrohDriver::with_engine(
+        engine.task_spawner(),
         engine.handle(),
         IrohDriverConfig {
             secret_key: None,

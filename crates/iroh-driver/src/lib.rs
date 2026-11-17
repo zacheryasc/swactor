@@ -6,28 +6,36 @@
 
 // Engine boundary enforcement: disallowed scheduling/time/core-driving methods
 // are hard errors in this crate (ENGINE_SPEC.md §2). All engine-hosted
-// work goes through `EngineHandle`.
+// work goes through explicitly supplied `TaskSpawner` capabilities.
 #![deny(clippy::disallowed_methods)]
 
+#[cfg(feature = "data-plane")]
 pub mod blob_transfer;
+#[cfg(feature = "data-plane")]
 pub mod edge_transport;
 pub mod endpoint_advertisement;
 pub mod iroh_driver;
+#[cfg(feature = "data-plane")]
 pub mod stream_transport;
 pub mod telemetry_transport;
 
+#[cfg(feature = "data-plane")]
 pub use blob_transfer::{IrohBlobTransferReceiver, IrohBlobTransferSender};
 pub use endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 pub use iroh_driver::{
     ActorBridgeConfig, ActorRegistrar, ConnType, ConnectionObserver, ConnectionWatch,
-    EdgeConnector, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus, PeerConnector,
+    IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus, PeerConnector,
     TelemetryPublishHandle, conn_type_of, discover_lan_ips,
 };
+#[cfg(feature = "data-plane")]
+pub use iroh_driver::{EdgeConnector, IrohEdgePort};
 
+#[cfg(feature = "data-plane")]
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};
-pub use stream_transport::{IrohStreamTransport, STREAM_ALPN};
+#[cfg(feature = "data-plane")]
+pub use stream_transport::{IrohStreamResourceProbe, IrohStreamTransport, STREAM_ALPN};
 
 pub use telemetry_transport::{
     PullCollectorConfig, PullCollectorHandle, TELEMETRY_ALPN, TelemetryQuicHeader,

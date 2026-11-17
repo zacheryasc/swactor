@@ -1,13 +1,11 @@
 //! `RegistryActor` — the cluster name registry (`ClusterRegistry`) as an actor.
 //!
-//! Wraps the unchanged `ClusterRegistry` CRDT engine. Unlike the pre-actor design
-//! (where registry entries were packed into the SWIM piggyback), the registry now
-//! owns a standalone gossip frame ([`RegistryGossip`](crate::messages::RegistryGossip))
-//! and its own dissemination cadence, driven by `Tick`. SWIM is membership-only;
-//! the registry learns membership by subscribing to the SwimActor's
-//! `MembershipChanged` stream (adapted into [`RegistryIn::Membership`] by a small
-//! fanout actor), which drives tombstoning of dead nodes and anti-entropy when a
-//! node returns.
+//! Wraps the `ClusterRegistry` CRDT engine in a standalone
+//! [`RegistryGossip`](crate::messages::RegistryGossip) protocol. By default,
+//! dissemination and tombstone GC are driven by `Tick`. The opt-in
+//! [`RegistryActor::with_event_dissemination`] mode broadcasts winning mutations
+//! immediately and retains tombstones for late peers. Membership deltas drive
+//! dead-node tombstones and full snapshots on peer establishment.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock, Weak};
@@ -86,6 +84,8 @@ pub struct NameResolved {
     pub binding: Option<(ActorAddress, NodeId)>,
 }
 
+type RegistryWatcher = (String, Option<RegistryEntry>, Weak<dyn Fn() + Send + Sync>);
+
 pub struct RegistryActor {
     self_id: NodeId,
     registry: ClusterRegistry,
@@ -99,7 +99,8 @@ pub struct RegistryActor {
     /// Optional read-mirror the node's telemetry tick observes. Republished
     /// after each registry change. `None` when no one is observing.
     view: Option<RegistryView>,
-    watchers: Vec<(String, Option<RegistryEntry>, Weak<dyn Fn() + Send + Sync>)>,
+    watchers: Vec<RegistryWatcher>,
+    event_dissemination: bool,
 }
 
 impl RegistryActor {
@@ -116,7 +117,18 @@ impl RegistryActor {
             fanout_cursor: 0,
             view: None,
             watchers: Vec::new(),
+            event_dissemination: false,
         }
+    }
+
+    /// Broadcast every winning mutation to all alive peers without clock input.
+    /// Alive notifications and `SyncTo` send full snapshots, including retained
+    /// tombstones. `Tick` does not advance this mode or collect its tombstones:
+    /// discarding them without causal acknowledgement would resurrect old names.
+    pub fn with_event_dissemination(mut self) -> Self {
+        self.event_dissemination = true;
+        self.registry.enable_event_dissemination();
+        self
     }
 
     /// Install a read-mirror that this actor republishes after each change, so a
@@ -176,6 +188,32 @@ impl RegistryActor {
         }
     }
 
+    fn disseminate_mutations(&mut self, ctx: &Ctx) {
+        if !self.event_dissemination {
+            return;
+        }
+        // The engine enqueues only winning mutations, coalesced by name. Drain
+        // once even with no peers: a later connection gets the complete state.
+        let mut entries = self.registry.drain_pending();
+        loop {
+            let batch: Vec<_> = entries.by_ref().take(8).collect();
+            if batch.is_empty() {
+                break;
+            }
+            for peer in &self.alive {
+                if let Some(addr) = self.peer_directory.resolve(peer) {
+                    let _ = ctx.send(
+                        addr,
+                        RegistryIn::Gossip(RegistryGossip {
+                            entries: batch.clone(),
+                            delivery: None,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
     fn sync_to(&self, ctx: &Ctx, peer: NodeId) {
         let Some(addr) = self.peer_directory.resolve(&peer) else {
             return;
@@ -205,11 +243,14 @@ impl ActorInterface for RegistryActor {
         match msg {
             RegistryIn::Membership(m) => match m.state {
                 MemberState::Alive => {
-                    if m.node_id != self.self_id && self.alive.insert(m.node_id) {
-                        // A (re)joining peer: re-gossip everything so it catches up
-                        // on state accumulated while it was away.
-                        let size = self.cluster_size();
-                        self.registry.re_disseminate_all(size);
+                    if m.node_id != self.self_id {
+                        let joined = self.alive.insert(m.node_id);
+                        if self.event_dissemination {
+                            self.sync_to(ctx, m.node_id);
+                        } else if joined {
+                            let size = self.cluster_size();
+                            self.registry.re_disseminate_all(size);
+                        }
                     }
                 }
                 MemberState::Dead => {
@@ -217,6 +258,7 @@ impl ActorInterface for RegistryActor {
                     let size = self.cluster_size();
                     self.registry.tombstone_node(m.node_id, size);
                     self.publish();
+                    self.disseminate_mutations(ctx);
                 }
                 MemberState::Suspect => {}
             },
@@ -224,6 +266,7 @@ impl ActorInterface for RegistryActor {
                 let size = self.cluster_size();
                 self.registry.register(name, actor_addr, self.self_id, size);
                 self.publish();
+                self.disseminate_mutations(ctx);
             }
             RegistryIn::RegisterNameAt {
                 name,
@@ -234,6 +277,7 @@ impl ActorInterface for RegistryActor {
                 self.registry
                     .register_at(name, actor_addr, self.self_id, timestamp, size);
                 self.publish();
+                self.disseminate_mutations(ctx);
             }
             RegistryIn::DisseminateNameTo {
                 name,
@@ -266,6 +310,7 @@ impl ActorInterface for RegistryActor {
                 let size = self.cluster_size();
                 self.registry.unregister(&name, self.self_id, size);
                 self.publish();
+                self.disseminate_mutations(ctx);
             }
             RegistryIn::SyncTo { peer } => self.sync_to(ctx, peer),
             RegistryIn::WatchName { name, changed } => {
@@ -300,6 +345,7 @@ impl ActorInterface for RegistryActor {
                     Some(RegistryDelivery::Request { reply_to }) => {
                         self.registry.merge_batch(g.entries.iter().cloned(), size);
                         self.publish();
+                        self.disseminate_mutations(ctx);
                         for entry in g.entries {
                             if !entry.tombstone
                                 && self.registry.entries().any(|current| current == &entry)
@@ -321,16 +367,18 @@ impl ActorInterface for RegistryActor {
                     None => {
                         self.registry.merge_batch(g.entries, size);
                         self.publish();
+                        self.disseminate_mutations(ctx);
                     }
                 }
             }
             RegistryIn::NameAcknowledged { .. } => {}
-            RegistryIn::Tick => {
+            RegistryIn::Tick if !self.event_dissemination => {
                 self.registry.gc_tick();
                 self.disseminate(ctx);
                 // GC may have reaped tombstones; keep the mirror current.
                 self.publish();
             }
+            RegistryIn::Tick => {}
         }
     }
 }

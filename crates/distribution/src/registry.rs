@@ -117,6 +117,7 @@ pub struct ClusterRegistry {
     events: VecDeque<RegistryEvent>,
     config: RegistryConfig,
     tick_count: u64,
+    event_dissemination: bool,
 }
 
 impl ClusterRegistry {
@@ -128,7 +129,17 @@ impl ClusterRegistry {
             events: VecDeque::new(),
             config,
             tick_count: 0,
+            event_dissemination: false,
         }
+    }
+
+    pub(crate) fn enable_event_dissemination(&mut self) {
+        self.event_dissemination = true;
+    }
+
+    /// Consume winning mutations once, without spending a timed gossip budget.
+    pub(crate) fn drain_pending(&mut self) -> impl Iterator<Item = RegistryEntry> + '_ {
+        self.dissemination.drain(..).map(|pending| pending.entry)
     }
 
     /// Register a name → actor binding from the local node.
@@ -396,7 +407,11 @@ impl ClusterRegistry {
     }
 
     fn enqueue(&mut self, entry: RegistryEntry, cluster_size: usize) {
-        let budget = self.transmit_budget(cluster_size);
+        let budget = if self.event_dissemination {
+            0
+        } else {
+            self.transmit_budget(cluster_size)
+        };
 
         // Replace existing entry for same name if present.
         if let Some(existing) = self

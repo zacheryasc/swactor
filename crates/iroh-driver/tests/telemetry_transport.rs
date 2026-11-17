@@ -17,7 +17,7 @@ use telemetry::{
     StreamId, SubscriptionRequest, TelemetryEndpoint, TelemetrySnapshot, TelemetrySubscription,
 };
 
-/// Telemetry transport test scheduled through `EngineHandle`, not an ambient
+/// Telemetry transport test scheduled through `TaskSpawner`, not an ambient
 /// `#[tokio::test]` runtime (ENGINE_SPEC.md).
 #[test]
 fn iroh_telemetry_alpn_carries_catalog_and_numeric_frames() {
@@ -27,21 +27,21 @@ fn iroh_telemetry_alpn_carries_catalog_and_numeric_frames() {
         TokioBackend::new(TokioConfig::default()).expect("test backend"),
     )
     .expect("test engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
     let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let h = handle.clone();
-    handle.spawn(async move {
+    let nested_tasks = tasks.clone();
+    tasks.spawn(async move {
         let source = test_endpoint().await;
         let collector = test_endpoint().await;
         let collector_addr = endpoint_addr(&collector);
 
         // Accept the incoming connection through an engine-hosted task + oneshot,
-        // since EngineHandle::spawn is fire-and-forget (no JoinHandle).
+        // since TaskSpawner::spawn is fire-and-forget (no JoinHandle).
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         {
             let collector = collector.clone();
-            h.spawn(async move {
+            nested_tasks.spawn(async move {
                 let conn = collector
                     .accept()
                     .await
@@ -70,7 +70,7 @@ fn iroh_telemetry_alpn_carries_catalog_and_numeric_frames() {
         let header =
             TelemetryQuicHeader::from_snapshot([7; 16], b"token".to_vec(), subscription.snapshot())
                 .expect("header from subscription snapshot");
-        let wrote = write_available_subscription(&h, send, &header, &subscription)
+        let wrote = write_available_subscription(send, &header, &subscription)
             .await
             .expect("write subscription");
         assert_eq!(wrote.events, 2);
@@ -162,13 +162,16 @@ fn pull_collector_cancellation_interrupts_inflight_io() {
     )
     .expect("test engine");
     let handle = engine.handle();
+    let tasks = engine.task_spawner();
     let (resource_tx, resource_rx) = std::sync::mpsc::channel();
     let setup_handle = handle.clone();
-    handle.spawn(async move {
+    let setup_tasks = tasks.clone();
+    tasks.spawn(async move {
         let collector_endpoint = test_endpoint().await;
         let silent_peer = test_endpoint().await;
         let (header_tx, header_rx) = std::sync::mpsc::channel();
         let collector = spawn_pull_collector(
+            &setup_tasks,
             &setup_handle,
             PullCollectorConfig {
                 endpoint: collector_endpoint.clone(),
@@ -214,9 +217,11 @@ fn pull_replays_startup_and_disconnect_frames_without_duplicates() {
     )
     .expect("test engine");
     let handle = engine.handle();
+    let tasks = engine.task_spawner();
     let task_handle = handle.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    handle.spawn(async move {
+    let nested_tasks = tasks.clone();
+    tasks.spawn(async move {
         let timeout_handle = task_handle.clone();
         let result = timeout_handle
             .timeout(Duration::from_secs(15), async move {
@@ -247,8 +252,8 @@ fn pull_replays_startup_and_disconnect_frames_without_duplicates() {
                 {
                     let source = source.clone();
                     let endpoint = Arc::clone(&endpoint);
-                    let server_handle = task_handle.clone();
-                    task_handle.spawn(async move {
+                    let server_tasks = nested_tasks.clone();
+                    nested_tasks.spawn(async move {
                         let mut first_tx = Some(first_tx);
                         for _ in 0..2 {
                             let conn = source
@@ -260,17 +265,13 @@ fn pull_replays_startup_and_disconnect_frames_without_duplicates() {
                             if let Some(first_tx) = first_tx.take() {
                                 let _ = first_tx.send(conn.clone());
                             }
-                            spawn_pull_server(
-                                &server_handle,
-                                conn,
-                                Arc::clone(&endpoint),
-                                Duration::from_millis(1),
-                            );
+                            spawn_pull_server(&server_tasks, conn, Arc::clone(&endpoint));
                         }
                     });
                 }
                 let (header_tx, _header_rx) = std::sync::mpsc::channel();
                 let collector = spawn_pull_collector(
+                    &nested_tasks,
                     &task_handle,
                     PullCollectorConfig {
                         endpoint: sink.clone(),

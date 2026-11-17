@@ -13,7 +13,7 @@ use data_plane::stream_transport::{
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint as IrohEndpoint, EndpointAddr};
 use parking_lot::Mutex;
-use swactor_engine::EngineHandle;
+use swactor_engine::{EngineHandle, TaskSpawner};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -26,7 +26,6 @@ const PENDING_INBOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[derive(Clone)]
 struct TaskControl {
     wake: mpsc::Sender<()>,
-    progress_pending: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancellation: Arc<tokio::sync::Notify>,
 }
@@ -37,7 +36,6 @@ impl TaskControl {
         (
             Self {
                 wake,
-                progress_pending: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancellation: Arc::new(tokio::sync::Notify::new()),
             },
@@ -46,9 +44,9 @@ impl TaskControl {
     }
 
     fn progress(&self) {
-        if !self.progress_pending.swap(true, Ordering::AcqRel) {
-            let _ = self.wake.try_send(());
-        }
+        // The bounded channel is the coalescing state. A separate pending flag
+        // can lose a wake when progress races the receiver consuming its token.
+        let _ = self.wake.try_send(());
     }
 
     fn cancel(&self) {
@@ -70,7 +68,6 @@ impl TaskControl {
         if receiver.recv().await.is_none() {
             return false;
         }
-        self.progress_pending.store(false, Ordering::Release);
         !self.cancelled.load(Ordering::Acquire)
     }
 }
@@ -84,6 +81,81 @@ struct PendingInbound {
     stream: RecvStream,
     connection: Connection,
     token: u64,
+}
+
+/// Closed transport operations, never arbitrary futures or task authority.
+enum StreamCommand {
+    Accept(Connection),
+    Sink {
+        incarnation: StreamIncarnation,
+        recv: RecvStream,
+        pending: PendingSink,
+        control: TaskControl,
+        receiver: mpsc::Receiver<()>,
+    },
+    Source {
+        request: StreamSourceRequest,
+        peer: EndpointAddr,
+        control: TaskControl,
+        receiver: mpsc::Receiver<()>,
+    },
+    ExpirePending {
+        incarnation: StreamIncarnation,
+        token: u64,
+    },
+}
+
+impl StreamCommand {
+    fn start(self, tasks: &TaskSpawner, transport: IrohStreamTransport) {
+        match self {
+            Self::Accept(connection) => transport.run_accept_connection(tasks, connection),
+            Self::Sink {
+                incarnation,
+                recv,
+                pending,
+                control,
+                receiver,
+            } => {
+                tasks.spawn(run_sink(
+                    incarnation,
+                    recv,
+                    pending.endpoint,
+                    pending.notifier,
+                    control,
+                    receiver,
+                ));
+            }
+            Self::Source {
+                request,
+                peer,
+                control,
+                receiver,
+            } => {
+                tasks.spawn(run_source(
+                    request.incarnation,
+                    transport.inner.endpoint.clone(),
+                    peer,
+                    request.endpoint,
+                    request.notifier,
+                    control,
+                    receiver,
+                ));
+            }
+            Self::ExpirePending { incarnation, token } => {
+                tasks.spawn(async move {
+                    transport.inner.engine.timer(PENDING_INBOUND_TIMEOUT).await;
+                    let mut state = transport.inner.state.lock();
+                    if state
+                        .pending_inbound
+                        .get(&incarnation)
+                        .is_some_and(|pending| pending.token == token)
+                    {
+                        state.pending_inbound.remove(&incarnation);
+                    }
+                });
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -108,28 +180,23 @@ struct Inner {
     local: LocalStreamTransport,
 }
 
-/// Cloneable adapter capability installed into `HostDataPlaneConfig`.
+/// Actor-safe transport command port installed into `HostDataPlaneConfig`.
+/// Only its external engine-hosted command owner retains task authority.
 #[derive(Clone)]
 pub struct IrohStreamTransport {
     inner: Arc<Inner>,
+    commands: mpsc::UnboundedSender<StreamCommand>,
 }
 
-impl IrohStreamTransport {
-    pub fn new(engine: EngineHandle, endpoint: IrohEndpoint) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                engine,
-                endpoint,
-                local: LocalStreamTransport::new(),
-                state: Mutex::new(TransportState::default()),
-            }),
-        }
-    }
+/// Read-only resource observation without transport command or task authority.
+#[derive(Clone)]
+pub struct IrohStreamResourceProbe {
+    inner: Arc<Inner>,
+}
 
-    /// Current ownership, read under the same lock as install/terminate.
-    /// Retired identity fences are history, not live transport resources.
-    pub fn resource_snapshot(&self) -> serde_json::Value {
-        let state = self.inner.state.lock();
+impl Inner {
+    fn resource_snapshot(&self) -> serde_json::Value {
+        let state = self.state.lock();
         serde_json::json!({
             "pending_sinks": state.pending_sinks.len(),
             "pending_inbound": state.pending_inbound.len(),
@@ -140,10 +207,57 @@ impl IrohStreamTransport {
             "retired_incarnations": state.retired.len(),
         })
     }
+}
+
+impl IrohStreamResourceProbe {
+    pub fn resource_snapshot(&self) -> serde_json::Value {
+        self.inner.resource_snapshot()
+    }
+}
+
+impl IrohStreamTransport {
+    pub fn new(tasks: TaskSpawner, engine: EngineHandle, endpoint: IrohEndpoint) -> Self {
+        let inner = Arc::new(Inner {
+            engine,
+            endpoint,
+            local: LocalStreamTransport::new(),
+            state: Mutex::new(TransportState::default()),
+        });
+        let (commands, mut receiver) = mpsc::unbounded_channel::<StreamCommand>();
+        let weak_inner = Arc::downgrade(&inner);
+        let weak_commands = commands.downgrade();
+        let owner_tasks = tasks.clone();
+        tasks.spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                let (Some(inner), Some(commands)) = (weak_inner.upgrade(), weak_commands.upgrade())
+                else {
+                    break;
+                };
+                command.start(&owner_tasks, IrohStreamTransport { inner, commands });
+            }
+        });
+        Self { inner, commands }
+    }
+
+    /// Current ownership, read under the same lock as install/terminate.
+    /// Retired identity fences are history, not live transport resources.
+    pub fn resource_snapshot(&self) -> serde_json::Value {
+        self.inner.resource_snapshot()
+    }
+
+    pub fn resource_probe(&self) -> IrohStreamResourceProbe {
+        IrohStreamResourceProbe {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 
     pub(crate) fn accept_connection(&self, connection: Connection) {
-        let transport = self.clone();
-        self.inner.engine.spawn(async move {
+        let _ = self.commands.send(StreamCommand::Accept(connection));
+    }
+
+    fn run_accept_connection(self, tasks: &TaskSpawner, connection: Connection) {
+        let transport = self;
+        tasks.spawn(async move {
             while let Ok(mut recv) = connection.accept_uni().await {
                 let mut preamble = [0_u8; PREAMBLE_LEN];
                 if !transport
@@ -223,30 +337,19 @@ impl IrohStreamTransport {
                 .or_default()
                 .push(control.clone());
         }
-        self.inner.engine.spawn(run_sink(
+        let _ = self.commands.send(StreamCommand::Sink {
             incarnation,
             recv,
-            pending.endpoint,
-            pending.notifier,
+            pending,
             control,
             receiver,
-        ));
+        });
     }
 
     fn schedule_pending_timeout(&self, incarnation: StreamIncarnation, token: u64) {
-        let engine = self.inner.engine.clone();
-        let transport = self.clone();
-        engine.clone().spawn(async move {
-            engine.timer(PENDING_INBOUND_TIMEOUT).await;
-            let mut state = transport.inner.state.lock();
-            if state
-                .pending_inbound
-                .get(&incarnation)
-                .is_some_and(|pending| pending.token == token)
-            {
-                state.pending_inbound.remove(&incarnation);
-            }
-        });
+        let _ = self
+            .commands
+            .send(StreamCommand::ExpirePending { incarnation, token });
     }
 
     fn progress_controls(&self, incarnation: StreamIncarnation) {
@@ -310,7 +413,6 @@ impl StreamTransport for IrohStreamTransport {
             return self.install_local_source(request);
         }
         let (control, receiver) = TaskControl::pair();
-        let endpoint = self.inner.endpoint.clone();
         let probe = request.endpoint.probe();
         {
             let mut state = self.inner.state.lock();
@@ -327,15 +429,12 @@ impl StreamTransport for IrohStreamTransport {
                 .push(control.clone());
             state.source_probes.insert(request.incarnation, probe);
         }
-        self.inner.engine.spawn(run_source(
-            request.incarnation,
-            endpoint,
+        let _ = self.commands.send(StreamCommand::Source {
+            request,
             peer,
-            request.endpoint,
-            request.notifier,
             control,
             receiver,
-        ));
+        });
         Ok(())
     }
 

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use iroh::{EndpointAddr, PublicKey, RelayMode};
 use parking_lot::Mutex;
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor_engine::{Engine, TaskSpawner, TokioBackend, TokioConfig};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
@@ -98,13 +98,13 @@ impl IrohNode {
     /// `OutboxPeerDirectory::new(router, outbox)`; spawn the 4 actors;
     /// `RouteViewTransport` + `OutboxRouteBinder`; `MembershipFanout` + `Subscribe`;
     /// the `routes` tag table; `enable_actor_bridge`).
-    fn from_config(config: IrohDriverConfig) -> Self {
-        // Per-node swactor runtime + codec + transport router. The runtime is
-        // created before the driver so the engine can own it; the driver needs
-        // the engine handle, and actors need the driver's node_id.
-        let parts = RuntimeParts::new(RuntimeConfig::default())
-            .with_extension(Arc::new(StdExtension::new()));
-        let rt = parts.runtime().clone();
+    fn from_config(
+        tasks: TaskSpawner,
+        engine: Engine,
+        rt: Runtime,
+        config: IrohDriverConfig,
+    ) -> Self {
+        // The test root supplies the runtime's engine and its task capability.
         let actor_codec = Arc::new(actor_codec_registry());
         let transport_router = Arc::new(TransportRouter::new());
         rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
@@ -112,17 +112,8 @@ impl IrohNode {
             Arc::clone(&transport_router),
         )));
 
-        // The engine owns the runtime workers (drives actor progression) and the
-        // Tokio substrate (schedules all iroh background work). The cloned
-        // `Runtime` handle remains available for actor spawning and sends.
-        let engine = Engine::new(
-            parts,
-            TokioBackend::new(TokioConfig::default()).expect("build test tokio backend"),
-        )
-        .expect("build test engine");
-
-        let mut driver =
-            IrohDriver::with_engine(engine.handle(), config).expect("failed to create iroh driver");
+        let mut driver = IrohDriver::with_engine(tasks.clone(), engine.handle(), config)
+            .expect("failed to create iroh driver");
         let node_id = driver.node_id();
 
         // The node's distribution config (SWIM/registry/metadata params).
@@ -223,18 +214,17 @@ impl IrohNode {
             route_view: Arc::clone(&route_view),
             outbox: Arc::clone(&outbox),
         });
-        // Engine-hosted adapter pump: drains ingress/egress/telemetry/edge on
-        // a timer so the synchronous test loop no longer pumps these by hand.
-        driver.install_actor_bridge_pump(Duration::from_millis(10));
+        // Engine-hosted adapter task wakes on ingress/egress/telemetry/edge
+        // activity; the synchronous test loop never pumps these by hand.
+        driver.install_actor_bridge();
 
         // Engine-hosted protocol tick injection + core progression. The pump
         // helpers only drain iroh queues; the engine drives actor ticks and
         // protocol injection (ENGINE_SPEC.md).
-        let ticker_handle = engine.handle();
-        let ticker_inner = ticker_handle.clone();
+        let ticker_engine = engine.handle();
         let ticker_rt = rt.clone();
-        ticker_handle.spawn(async move {
-            let mut interval = ticker_inner.interval(Duration::from_millis(10));
+        tasks.spawn(async move {
+            let mut interval = ticker_engine.interval(Duration::from_millis(10));
             loop {
                 (&mut interval).await;
                 let now = Instant::now();
@@ -305,37 +295,75 @@ impl IrohNode {
 
 // ─── Single-node helpers ────────────────────────────────────────────────────
 
-pub fn make_driver() -> IrohNode {
-    IrohNode::from_config(IrohDriverConfig {
-        secret_key: None,
-        relay_mode: RelayMode::Disabled,
-        bind_port: None,
-        node: test_config(),
-        peer_auth: None,
-        additional_alpns: vec![],
-    })
+/// Build the substrate without minting task authority; each test root does that.
+pub fn node_engine() -> (Engine, Runtime) {
+    let parts =
+        RuntimeParts::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig::default()).expect("build test tokio backend"),
+    )
+    .expect("build test engine");
+    (engine, runtime)
 }
 
-pub fn make_driver_with_auth(auth: Arc<Mutex<PeerAllowList>>) -> IrohNode {
-    IrohNode::from_config(IrohDriverConfig {
-        secret_key: None,
-        relay_mode: RelayMode::Disabled,
-        bind_port: None,
-        node: test_config(),
-        peer_auth: Some(auth),
-        additional_alpns: vec![],
-    })
+pub fn make_driver(tasks: TaskSpawner, engine: Engine, runtime: Runtime) -> IrohNode {
+    IrohNode::from_config(
+        tasks,
+        engine,
+        runtime,
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Disabled,
+            bind_port: None,
+            node: test_config(),
+            peer_auth: None,
+            additional_alpns: vec![],
+        },
+    )
 }
 
-pub fn make_driver_with_relay(relay_url: iroh::RelayUrl) -> IrohNode {
-    IrohNode::from_config(IrohDriverConfig {
-        secret_key: None,
-        relay_mode: RelayMode::Custom(relay_url.into()),
-        bind_port: None,
-        node: test_config(),
-        peer_auth: None,
-        additional_alpns: vec![],
-    })
+pub fn make_driver_with_auth(
+    tasks: TaskSpawner,
+    engine: Engine,
+    runtime: Runtime,
+    auth: Arc<Mutex<PeerAllowList>>,
+) -> IrohNode {
+    IrohNode::from_config(
+        tasks,
+        engine,
+        runtime,
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Disabled,
+            bind_port: None,
+            node: test_config(),
+            peer_auth: Some(auth),
+            additional_alpns: vec![],
+        },
+    )
+}
+
+pub fn make_driver_with_relay(
+    tasks: TaskSpawner,
+    engine: Engine,
+    runtime: Runtime,
+    relay_url: iroh::RelayUrl,
+) -> IrohNode {
+    IrohNode::from_config(
+        tasks,
+        engine,
+        runtime,
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Custom(relay_url.into()),
+            bind_port: None,
+            node: test_config(),
+            peer_auth: None,
+            additional_alpns: vec![],
+        },
+    )
 }
 
 /// Poll until `check_fn` holds over `a` and `b` or `timeout` elapses, sleeping
@@ -409,35 +437,24 @@ pub fn sees_dead(node: &IrohNode, peer_key: &PublicKey) -> bool {
 /// Guard that keeps the relay server alive while it exists.
 pub struct RelayGuard {
     _server: iroh_relay::server::Server,
-    _rt: tokio::runtime::Runtime,
 }
 
-/// Spawn a local HTTP relay server for tests. Returns the relay URL and a
-/// guard that shuts the server down on drop.
-pub fn spawn_test_relay() -> (iroh::RelayUrl, RelayGuard) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    let server = rt
-        .block_on(async {
-            let mut relay =
-                iroh_relay::server::RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
-            relay.key_cache_capacity = Some(256);
-            let mut config = iroh_relay::server::ServerConfig::default();
-            config.relay = Some(relay);
-            iroh_relay::server::Server::spawn(config).await
-        })
-        .unwrap();
-    let url = server.http_url().expect("relay has no HTTP URL");
-    (
-        url,
-        RelayGuard {
-            _server: server,
-            _rt: rt,
-        },
-    )
+/// Start relay setup on the supplied execution capability. The test root
+/// receives its URL and guard and retains the engine until the guard drops.
+pub fn spawn_test_relay(
+    tasks: &TaskSpawner,
+) -> std::sync::mpsc::Receiver<(iroh::RelayUrl, RelayGuard)> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    tasks.spawn(async move {
+        let mut relay = iroh_relay::server::RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
+        relay.key_cache_capacity = Some(256);
+        let mut config = iroh_relay::server::ServerConfig::default();
+        config.relay = Some(relay);
+        let server = iroh_relay::server::Server::spawn(config).await.unwrap();
+        let url = server.http_url().expect("relay has no HTTP URL");
+        let _ = sender.send((url, RelayGuard { _server: server }));
+    });
+    receiver
 }
 
 // ─── N-node cluster ─────────────────────────────────────────────────────────
@@ -449,17 +466,15 @@ pub struct IrohTestCluster {
 }
 
 impl IrohTestCluster {
-    /// Create N disconnected nodes (no joins).
-    pub fn disconnected(n: usize) -> Self {
-        let nodes = (0..n).map(|_| make_driver()).collect();
+    /// Group disconnected nodes composed by the test root.
+    pub fn disconnected(nodes: Vec<IrohNode>) -> Self {
         Self { nodes }
     }
 
-    /// Create N nodes connected in a star topology through node 0.
+    /// Connect nodes supplied by the test root in a star topology through node 0.
     /// Nodes 1..N join node 0 using its full `EndpointAddr`.
-    pub fn star(n: usize) -> Self {
-        assert!(n >= 2, "star cluster requires at least 2 nodes");
-        let mut nodes: Vec<IrohNode> = (0..n).map(|_| make_driver()).collect();
+    pub fn star(mut nodes: Vec<IrohNode>) -> Self {
+        assert!(nodes.len() >= 2, "star cluster requires at least 2 nodes");
 
         let addr_0 = nodes[0].endpoint_addr();
         for node in nodes.iter_mut().skip(1) {

@@ -43,6 +43,15 @@ pub struct MembershipTransition {
     pub member_state: Option<String>,
 }
 
+/// Causal transport membership transition, with no synthetic probe measurements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportMembershipTransition {
+    pub peer: String,
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
 /// One SWIM probe lifecycle event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwimProbeEvent {
@@ -157,6 +166,9 @@ impl Record for TransportInternals {
     const CHANNEL: &'static str = TRANSPORT_INTERNALS;
 }
 impl Record for MembershipTransition {
+    const CHANNEL: &'static str = MEMBERSHIP;
+}
+impl Record for TransportMembershipTransition {
     const CHANNEL: &'static str = MEMBERSHIP;
 }
 impl Record for SwimProbeEvent {

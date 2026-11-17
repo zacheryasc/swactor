@@ -4,9 +4,9 @@
 //! Uses iroh's QUIC-based peer-to-peer transport with built-in TLS, NAT
 //! hole-punching, and relay server fallback.
 //!
-//! The driver runs on a caller-supplied swactor [`EngineHandle`] — the single
-//! engine that owns the node's Tokio substrate. All accepts, reads, dials,
-//! writes, retries, and teardown are scheduled through that handle; the driver
+//! The driver receives explicit [`TaskSpawner`] and [`EngineHandle`]
+//! capabilities from the engine owning the node's Tokio substrate. Accepts,
+//! reads, dials, writes, retries, and teardown use the task capability; the driver
 //! stores no raw Tokio handle and performs no ambient-runtime detection
 //! (ENGINE_SPEC.md §7). Construct with
 //! [`IrohDriver::with_engine`].
@@ -16,12 +16,13 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+#[cfg(feature = "data-plane")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
-use swactor_engine::{Capabilities, EngineHandle};
+use swactor_engine::{Capabilities, EngineHandle, TaskSpawner};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use distribution::crypto::{Keypair, KeypairExt};
@@ -35,13 +36,17 @@ use distribution::swim::actor::SwimIn;
 use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
+#[cfg(feature = "data-plane")]
 use crate::edge_transport::spawn_edge_send_pump as spawn_edge_sender_task;
-use crate::edge_transport::{EDGE_ALPN, EdgeSendHandle, spawn_edge_recv_pump};
+#[cfg(feature = "data-plane")]
+use crate::edge_transport::{EDGE_ALPN, EdgeSendHandle, EdgeSendRequest, spawn_edge_recv_pump};
+#[cfg(feature = "data-plane")]
 use crate::stream_transport::{IrohStreamTransport, STREAM_ALPN};
 use crate::telemetry_transport::{
     TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
     spawn_subscription_writer,
 };
+#[cfg(feature = "data-plane")]
 use data_plane::edge_wire::WireEvent;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
@@ -78,6 +83,8 @@ const PENDING_ACTOR_FRAME_LIMIT: usize = 1_024;
 struct JoinResult {
     node_id: NodeId,
     conn: Connection,
+    /// Explicit `join` already sent the handshake on this connection.
+    join_sent: bool,
 }
 
 #[derive(Clone)]
@@ -86,6 +93,10 @@ struct CachedConnection {
     /// Full anti-entropy is owed once this connection proves it carries cluster
     /// traffic. Exec-child actor connections never send SWIM and need no maps.
     needs_sync: bool,
+    /// Admission survives duplicate-connection replacement until a real close.
+    cluster_member: bool,
+    /// An explicit or transport-initiated handshake is already queued/sent.
+    join_sent: bool,
     conn: Connection,
     /// Feeds this connection's ordered frame writer. One uni stream carries
     /// every frame to the peer so arrival order matches send order; a fresh
@@ -231,13 +242,18 @@ pub struct JoinStatus {
 
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
-/// Cloneable logical telemetry publisher transport. It hides the raw iroh
-/// endpoint and Tokio task handle from callers while leaving telemetry
-/// subscription/catalog semantics in the telemetry crate.
+/// Actor-safe logical telemetry publisher requests. The external command
+/// owner retains task authority; subscription/catalog semantics remain in
+/// the telemetry crate.
 #[derive(Clone)]
 pub struct TelemetryPublishHandle {
-    engine: EngineHandle,
-    endpoint: Endpoint,
+    requests: tokio_mpsc::UnboundedSender<TelemetryPublishRequest>,
+}
+
+struct TelemetryPublishRequest {
+    peer: EndpointAddr,
+    header: TelemetryQuicHeader,
+    subscription: telemetry::TelemetrySubscription,
 }
 
 impl TelemetryPublishHandle {
@@ -246,16 +262,12 @@ impl TelemetryPublishHandle {
         peer: EndpointAddr,
         header: TelemetryQuicHeader,
         subscription: telemetry::TelemetrySubscription,
-        idle_sleep: Duration,
     ) {
-        spawn_subscription_writer(
-            &self.engine,
-            self.endpoint.clone(),
+        let _ = self.requests.send(TelemetryPublishRequest {
             peer,
             header,
             subscription,
-            idle_sleep,
-        );
+        });
     }
 }
 
@@ -266,19 +278,23 @@ impl TelemetryPublishHandle {
 /// adapter pump so both can progress connections without `&mut self`.
 struct ConnCache {
     connections: HashMap<NodeId, CachedConnection>,
+    /// Authenticated cluster identities outlive any one cached connection.
+    /// Actor-only contextual children never enter this set.
+    known_cluster_peers: HashSet<NodeId>,
     next_generation: u64,
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
     peer_direct_addrs: HashMap<NodeId, Vec<SocketAddr>>,
 }
 
-/// Cloneable capability for opening application-owned data-plane edge streams
-/// without sharing the complete driver.
+#[cfg(feature = "data-plane")]
+/// Actor-safe request port for application-owned data-plane edge streams.
+/// Only the external edge command owner retains task authority.
 #[derive(Clone)]
 pub struct EdgeConnector {
-    engine: EngineHandle,
-    endpoint: Endpoint,
+    requests: tokio_mpsc::UnboundedSender<EdgeSendRequest>,
 }
 
+#[cfg(feature = "data-plane")]
 impl EdgeConnector {
     pub fn connect(
         &self,
@@ -286,14 +302,38 @@ impl EdgeConnector {
         edge_id: u64,
         timeout: Duration,
     ) -> Result<EdgeSendHandle, String> {
-        spawn_edge_sender_task(
-            self.engine.clone(),
-            self.endpoint.clone(),
-            peer,
-            edge_id,
-            Some(timeout),
-        )
+        let (handle, ready) = self.request(peer, edge_id)?;
+        ready
+            .recv_timeout(timeout)
+            .map_err(|error| format!("edge {edge_id} sender startup: {error}"))??;
+        Ok(handle)
     }
+
+    fn request(
+        &self,
+        peer: EndpointAddr,
+        edge_id: u64,
+    ) -> Result<
+        (
+            EdgeSendHandle,
+            std::sync::mpsc::Receiver<Result<(), String>>,
+        ),
+        String,
+    > {
+        let (handle, request, ready) = EdgeSendRequest::new(peer, edge_id);
+        self.requests
+            .send(request)
+            .map_err(|_| format!("edge {edge_id} execution owner stopped"))?;
+        Ok((handle, ready))
+    }
+}
+
+#[cfg(feature = "data-plane")]
+/// Actor-safe edge transport port: typed requests and inbound byte observations.
+#[derive(Clone)]
+pub struct IrohEdgePort {
+    connector: EdgeConnector,
+    events: Arc<Mutex<Vec<WireEvent>>>,
 }
 
 /// Cloneable capability for signing local actor-location claims.
@@ -328,20 +368,32 @@ pub struct ActorBridgeConfig {
     pub outbox: Outbox,
 }
 
-/// Cloneable handle for establishing actor-transport connections to peers
-/// without joining them into SWIM membership.
+/// Actor-safe connection requests. Only previously authenticated cluster peers
+/// rejoin membership; actor-only children stay excluded. The dialer owns tasks.
 #[derive(Clone)]
 pub struct PeerConnector {
+    requests: tokio_mpsc::UnboundedSender<EndpointAddr>,
+}
+
+impl PeerConnector {
+    pub fn connect(&self, peer: EndpointAddr) {
+        let _ = self.requests.send(peer);
+    }
+}
+
+struct PeerDialer {
     endpoint: Endpoint,
+    tasks: TaskSpawner,
     engine: EngineHandle,
     conns: Arc<Mutex<ConnCache>>,
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     wake: Arc<tokio::sync::Notify>,
     changes: tokio::sync::watch::Sender<u64>,
+    bridge: Option<Arc<ActorBridge>>,
 }
 
-impl PeerConnector {
+impl PeerDialer {
     /// Establish a connection to `peer` in the background. Addresses already
     /// advertised for its node id are retained and used for later redials.
     pub fn connect(&self, peer: EndpointAddr) {
@@ -371,7 +423,8 @@ impl PeerConnector {
         let endpoint = self.endpoint.clone();
         let pending = Arc::clone(&self.pending_joins);
         let engine = self.engine.clone();
-        self.engine.spawn(async move {
+        let bridge = self.bridge.clone();
+        self.tasks.spawn(async move {
             let _guard = guard;
             run_until_closed(changes, async {
                 let mut delay = Duration::from_secs(2);
@@ -388,10 +441,17 @@ impl PeerConnector {
                         )
                         .await
                     {
-                        pending.lock().push(JoinResult { node_id, conn });
+                        pending.lock().push(JoinResult {
+                            node_id,
+                            conn,
+                            join_sent: false,
+                        });
                         wake.notify_one();
                         return;
                     }
+                }
+                if let Some(bridge) = bridge {
+                    bridge.dial_failed(node_id);
                 }
             })
             .await;
@@ -410,13 +470,6 @@ impl PeerConnector {
             }
             if let Some(relay) = seed_addr.relay_urls().next() {
                 cache.peer_relay_urls.insert(seed_node_id, relay.clone());
-            }
-            if cache
-                .connections
-                .get(&seed_node_id)
-                .is_some_and(|cached| cached.conn.close_reason().is_some())
-            {
-                cache.connections.remove(&seed_node_id);
             }
             (
                 cache
@@ -453,7 +506,7 @@ impl Drop for DialGuard {
     }
 }
 
-async fn run_until_closed<T>(
+pub(crate) async fn run_until_closed<T>(
     mut changes: tokio::sync::watch::Receiver<u64>,
     operation: impl Future<Output = T>,
 ) -> Option<T> {
@@ -496,9 +549,42 @@ impl Drop for ConnectionWatch {
 /// Cloneable observation capability without ownership of the driver lifecycle.
 #[derive(Clone)]
 pub struct ConnectionObserver {
-    engine: EngineHandle,
+    requests: tokio_mpsc::UnboundedSender<ConnectionWatchRequest>,
     conns: Arc<Mutex<ConnCache>>,
     changes: tokio::sync::watch::Sender<u64>,
+}
+
+struct ConnectionWatchRequest {
+    changed: Arc<dyn Fn() + Send + Sync>,
+    changes: tokio::sync::watch::Receiver<u64>,
+    cancelled: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ConnectionWatchRequest {
+    fn start(self, tasks: &TaskSpawner) {
+        let Self {
+            changed,
+            mut changes,
+            mut cancelled,
+        } = self;
+        tasks.spawn(async move {
+            loop {
+                if *cancelled.borrow() || *changes.borrow_and_update() == 0 {
+                    break;
+                }
+                changed();
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => break,
+                    result = changes.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl ConnectionObserver {
@@ -516,24 +602,12 @@ impl ConnectionObserver {
     /// Subscribe before the initial observation, then wake on cache changes.
     /// Callbacks only enqueue observations; the actor rechecks its own state.
     pub fn watch_connections(&self, changed: Arc<dyn Fn() + Send + Sync>) -> ConnectionWatch {
-        let mut changes = self.changes.subscribe();
-        let (cancellation, mut cancelled) = tokio::sync::watch::channel(false);
-        self.engine.spawn(async move {
-            loop {
-                if *cancelled.borrow() || *changes.borrow_and_update() == 0 {
-                    break;
-                }
-                changed();
-                tokio::select! {
-                    biased;
-                    _ = cancelled.changed() => break,
-                    result = changes.changed() => {
-                        if result.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
+        let changes = self.changes.subscribe();
+        let (cancellation, cancelled) = tokio::sync::watch::channel(false);
+        let _ = self.requests.send(ConnectionWatchRequest {
+            changed,
+            changes,
+            cancelled,
         });
         ConnectionWatch { cancellation }
     }
@@ -542,12 +616,12 @@ impl ConnectionObserver {
 /// iroh P2P network transport bridge.
 ///
 /// Bridges the actorized distribution protocol (running on a swactor runtime)
-/// to iroh's async QUIC transport. Runs on a caller-supplied swactor
-/// runtime; the async loop uses [`Self::close`] for teardown.
-/// [`EngineHandle`] — the single engine that owns the node's Tokio substrate.
+/// to iroh's async QUIC transport. Runs on caller-supplied [`TaskSpawner`] and
+/// [`EngineHandle`] capabilities from the engine owning the node's substrate.
 /// All accepts, reads, dials, writes, retries, and adapter progression
-/// (actor-bridge, telemetry, edge) are scheduled through that handle as
-/// engine-hosted work via [`Self::install_actor_bridge_pump`]; the driver stores
+/// (actor-bridge, telemetry, edge) use the task capability; the engine handle
+/// provides time and substrate capabilities. [`Self::install_actor_bridge`]
+/// owns engine-hosted adapter progression; the driver stores
 /// no raw Tokio handle. Endpoint construction and [`Self::shutdown`] are hosted
 /// as engine tasks, never requiring the caller to enter or possess the raw
 /// substrate runtime; the async loop uses [`Self::close`] for teardown.
@@ -557,10 +631,11 @@ pub struct IrohDriver {
     /// ([`Self::register_actor`]) and is the source of [`Self::node_id`].
     keypair: Keypair,
     endpoint: Endpoint,
-    /// The swactor engine that owns the node's Tokio substrate. All background
-    /// iroh work is scheduled through this handle; it never exposes the raw
-    /// Tokio runtime (ENGINE_SPEC.md §7).
+    /// Explicit authority for engine-hosted I/O and supporting tasks.
+    tasks: TaskSpawner,
+    /// Engine clocks, timers, and substrate capabilities (ENGINE_SPEC.md §7).
     engine: EngineHandle,
+    #[cfg(feature = "data-plane")]
     stream_transport: Arc<IrohStreamTransport>,
     conns: Arc<Mutex<ConnCache>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
@@ -577,15 +652,17 @@ pub struct IrohDriver {
     other_accepted_conns: OtherAcceptedConnections,
     /// Completed telemetry QUIC reads from driver-owned TELEMETRY_ALPN adapters.
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
+    #[cfg(feature = "data-plane")]
     /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
     edge_events: Arc<Mutex<Vec<WireEvent>>>,
     /// When set, TELEMETRY_ALPN connections are NOT claimed by the
     /// driver-owned telemetry ingress; the application drains them via
     /// [`Self::drain_accepted_for_alpn`] (e.g. to serve pulls itself).
     retain_telemetry_conns: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "data-plane")]
     next_edge_stream_group: Arc<AtomicU64>,
     /// Frames read by per-connection reader tasks, drained by the engine-hosted
-    /// adapter pump ([`Self::install_actor_bridge_pump`]). This decouples network
+    /// adapter task ([`Self::install_actor_bridge`]). This decouples network
     /// reads from the state machine. Each entry is `(dest, type_tag, payload,
     /// from)` — `dest` is the destination actor address carried on the wire
     /// (`DIRECTORY.md` §5).
@@ -605,7 +682,9 @@ pub struct IrohDriver {
     actor_bridge: Option<Arc<ActorBridge>>,
     wake: Arc<tokio::sync::Notify>,
     changes: tokio::sync::watch::Sender<u64>,
+    #[cfg(feature = "data-plane")]
     edge_activity: tokio::sync::watch::Sender<()>,
+    ingress_activity: tokio::sync::watch::Sender<()>,
 }
 
 /// State the driver needs to shuttle frames between iroh and the swactor runtime
@@ -631,6 +710,8 @@ struct ActorBridge {
     route_view: RouteView,
     /// The actors' shared outbound queue; drained by the engine-hosted pump.
     outbox: Outbox,
+    /// Frames retained only for the current bounded connection attempt.
+    pending_outbound: Mutex<VecDeque<OutFrame>>,
 }
 
 impl ActorBridge {
@@ -646,6 +727,44 @@ impl ActorBridge {
         if let Some(&registry) = self.routes.get("swactor_dist::RegistryGossip") {
             let _ = self.rt.send_to(registry, RegistryIn::SyncTo { peer });
         }
+        if let Some(&metadata) = self.routes.get("swactor_dist::MetadataGossip") {
+            let _ = self.rt.send_to(
+                metadata,
+                distribution::node_metadata_actor::MetadataIn::SyncTo { peer },
+            );
+        }
+    }
+
+    fn peer_disconnected(&self, peer: NodeId) {
+        let _ = self
+            .rt
+            .send_to(self.swim_addr, SwimIn::TransportDisconnected { peer });
+    }
+
+    fn peer_failed(&self, peer: NodeId) {
+        let _ = self
+            .rt
+            .send_to(self.swim_addr, SwimIn::SendFailed { to: peer });
+    }
+
+    fn dial_failed(&self, peer: NodeId) {
+        // Fresh actor requests remain in `outbox`; only frames already waiting
+        // on this exhausted attempt are discarded. Otherwise the next pump
+        // wake would turn the same failed frame into an unbounded dial loop.
+        self.pending_outbound
+            .lock()
+            .retain(|frame| frame.to != peer);
+        self.peer_failed(peer);
+    }
+
+    fn peer_closed(&self, peer: NodeId, cluster_member: bool) {
+        if cluster_member {
+            self.peer_disconnected(peer);
+        } else {
+            // Release a pending first admission, without admitting actor-only
+            // children or starting a new dial from this failure observation.
+            self.peer_failed(peer);
+        }
     }
 }
 
@@ -653,19 +772,20 @@ impl IrohDriver {
     /// Create a new iroh driver running on a caller-supplied swactor engine.
     ///
     /// The driver schedules all background work — accept loop, reads, dials,
-    /// writes, retries — through `engine` and validates that it provides the
-    /// task and native I/O capabilities before any endpoint or background work
-    /// created (ENGINE_SPEC.md).
+    /// writes, retries — through `tasks`. Both capabilities must come from the
+    /// same engine; its task, timer, and native I/O support is validated before
+    /// any endpoint or background work is created (ENGINE_SPEC.md).
     ///
     /// Endpoint construction runs as an engine-hosted task; this constructor
     /// blocks on a synchronous channel until the endpoint is bound (or fails),
     /// so callers need not enter or possess the raw substrate runtime
     /// (ENGINE_SPEC.md).
     pub fn with_engine(
+        tasks: TaskSpawner,
         engine: EngineHandle,
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(engine, config)
+        Self::build(tasks, engine, config)
     }
 
     /// Shared constructor body.
@@ -674,6 +794,7 @@ impl IrohDriver {
     /// supported as endpoint configuration; this driver no longer starts relay
     /// servers itself.
     fn build(
+        tasks: TaskSpawner,
         engine: EngineHandle,
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -703,8 +824,10 @@ impl IrohDriver {
         let additional_alpns = config.additional_alpns;
         let secret_key = config.secret_key;
         let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel::<Result<Endpoint, String>>();
-        engine.spawn(async move {
-            let mut all_alpns = vec![ALPN.to_vec(), STREAM_ALPN.to_vec()];
+        tasks.spawn(async move {
+            let mut all_alpns = vec![ALPN.to_vec()];
+            #[cfg(feature = "data-plane")]
+            all_alpns.push(STREAM_ALPN.to_vec());
             all_alpns.extend(additional_alpns);
             let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal);
             if let Some(port) = config.bind_port {
@@ -722,12 +845,6 @@ impl IrohDriver {
             // Staging relays keep full WebPKI verification.
             if custom_relay {
                 builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
-                // Relay-only: drop direct IP transports so the endpoint neither
-                // advertises nor chases direct addresses. Without this, iroh learns
-                // a peer's NAT-obscured/container-local direct addr via discovery
-                // and prefers it over the relay, black-holing all data. Applied to
-                // every endpoint so neither side has a direct addr to publish.
-                builder = builder.clear_ip_transports();
             }
 
             if let Some(key) = secret_key {
@@ -743,7 +860,12 @@ impl IrohDriver {
                 format!("engine endpoint-bind task dropped: {e}").into()
             })?
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        let stream_transport = Arc::new(IrohStreamTransport::new(engine.clone(), endpoint.clone()));
+        #[cfg(feature = "data-plane")]
+        let stream_transport = Arc::new(IrohStreamTransport::new(
+            tasks.clone(),
+            engine.clone(),
+            endpoint.clone(),
+        ));
         let relay_url = endpoint
             .addr()
             .relay_urls()
@@ -761,57 +883,74 @@ impl IrohDriver {
         let accepted_conns: AcceptedConnections = Arc::new(Mutex::new(Vec::new()));
         let other_accepted_conns: OtherAcceptedConnections = Arc::new(Mutex::new(Vec::new()));
         let telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>> = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "data-plane")]
         let edge_events: Arc<Mutex<Vec<WireEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(tokio::sync::Notify::new());
         let (changes, _) = tokio::sync::watch::channel(1);
+        #[cfg(feature = "data-plane")]
         let (edge_activity, _) = tokio::sync::watch::channel(());
+        let (ingress_activity, _) = tokio::sync::watch::channel(());
         {
             let ep = endpoint.clone();
             let peer_auth = config.peer_auth.clone();
             let swim_buf = Arc::clone(&accepted_conns);
             let other_buf = Arc::clone(&other_accepted_conns);
+            #[cfg(feature = "data-plane")]
             let accepted_streams = Arc::clone(&stream_transport);
             let wake = Arc::clone(&wake);
-            engine.spawn(async move {
-                while let Some(incoming) = ep.accept().await {
-                    let remote = match incoming.remote_addr() {
-                        iroh::endpoint::IncomingAddr::Ip(addr) => Some(addr),
-                        _ => None,
-                    };
-                    if let Ok(conn) = incoming.await {
-                        let remote_id = conn.remote_id();
-                        let node_id = NodeId(*remote_id.as_bytes());
-                        // Peer auth check
-                        let allowed = match &peer_auth {
-                            None => true,
-                            Some(auth) => auth.lock().is_allowed(&node_id),
+            let ingress_activity = ingress_activity.clone();
+            let changes = changes.subscribe();
+            tasks.spawn(async move {
+                run_until_closed(changes, async {
+                    while let Some(incoming) = ep.accept().await {
+                        let remote = match incoming.remote_addr() {
+                            iroh::endpoint::IncomingAddr::Ip(addr) => Some(addr),
+                            _ => None,
                         };
-                        if !allowed {
-                            conn.close(0u32.into(), b"unauthorized");
-                            continue;
+                        if let Ok(conn) = incoming.await {
+                            let remote_id = conn.remote_id();
+                            let node_id = NodeId(*remote_id.as_bytes());
+                            // Peer auth check
+                            let allowed = match &peer_auth {
+                                None => true,
+                                Some(auth) => auth.lock().is_allowed(&node_id),
+                            };
+                            if !allowed {
+                                conn.close(0u32.into(), b"unauthorized");
+                                continue;
+                            }
+                            // Route by negotiated ALPN.
+                            let negotiated_alpn = conn.alpn().to_vec();
+                            if negotiated_alpn == ALPN {
+                                swim_buf.lock().push((node_id, conn, remote));
+                            } else {
+                                #[cfg(feature = "data-plane")]
+                                if negotiated_alpn == STREAM_ALPN {
+                                    accepted_streams.accept_connection(conn);
+                                    wake.notify_one();
+                                    continue;
+                                }
+                                other_buf.lock().push((node_id, negotiated_alpn, conn));
+                                ingress_activity.send_replace(());
+                            }
+                            wake.notify_one();
                         }
-                        // Route by negotiated ALPN.
-                        let negotiated_alpn = conn.alpn().to_vec();
-                        if negotiated_alpn == ALPN {
-                            swim_buf.lock().push((node_id, conn, remote));
-                        } else if negotiated_alpn == STREAM_ALPN {
-                            accepted_streams.accept_connection(conn);
-                        } else {
-                            other_buf.lock().push((node_id, negotiated_alpn, conn));
-                        }
-                        wake.notify_one();
                     }
-                }
+                })
+                .await;
             });
         }
 
         Ok(Self {
             keypair,
             endpoint,
+            tasks,
             engine,
+            #[cfg(feature = "data-plane")]
             stream_transport,
             conns: Arc::new(Mutex::new(ConnCache {
                 connections: HashMap::new(),
+                known_cluster_peers: HashSet::new(),
                 next_generation: 1,
                 peer_relay_urls: HashMap::new(),
                 peer_direct_addrs: HashMap::new(),
@@ -820,10 +959,12 @@ impl IrohDriver {
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             dialing: Arc::new(Mutex::new(HashSet::new())),
             accepted_conns,
+            #[cfg(feature = "data-plane")]
             edge_events,
             retain_telemetry_conns: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             other_accepted_conns,
             telemetry_reads,
+            #[cfg(feature = "data-plane")]
             next_edge_stream_group: Arc::new(AtomicU64::new(1)),
             incoming: Arc::new(Mutex::new(Vec::new())),
             evict: Arc::new(Mutex::new(Vec::new())),
@@ -832,7 +973,9 @@ impl IrohDriver {
             actor_bridge: None,
             wake,
             changes,
+            #[cfg(feature = "data-plane")]
             edge_activity,
+            ingress_activity,
         })
     }
 
@@ -842,17 +985,31 @@ impl IrohDriver {
     }
 
     pub fn peer_connector(&self) -> PeerConnector {
-        PeerConnector {
+        let dialer = PeerDialer {
             endpoint: self.endpoint.clone(),
+            tasks: self.tasks.clone(),
             engine: self.engine.clone(),
             conns: Arc::clone(&self.conns),
             pending_joins: Arc::clone(&self.pending_joins),
             dialing: Arc::clone(&self.dialing),
             wake: Arc::clone(&self.wake),
             changes: self.changes.clone(),
-        }
+            bridge: self.actor_bridge.clone(),
+        };
+        let (requests, mut receiver) = tokio_mpsc::unbounded_channel();
+        let changes = self.changes.subscribe();
+        self.tasks.spawn(async move {
+            run_until_closed(changes, async {
+                while let Some(peer) = receiver.recv().await {
+                    dialer.connect(peer);
+                }
+            })
+            .await;
+        });
+        PeerConnector { requests }
     }
 
+    #[cfg(feature = "data-plane")]
     pub fn stream_transport(&self) -> Arc<IrohStreamTransport> {
         Arc::clone(&self.stream_transport)
     }
@@ -894,37 +1051,63 @@ impl IrohDriver {
         self.telemetry_reads.lock().drain(..).collect()
     }
 
+    /// Actor-safe observation queue; it carries no endpoint or task authority.
+    pub fn telemetry_reads_handle(&self) -> Arc<Mutex<Vec<TelemetryQuicRead>>> {
+        Arc::clone(&self.telemetry_reads)
+    }
+
+    /// Subscribe before draining accepted ALPN connections or telemetry reads.
+    /// Notifications coalesce; the corresponding queues remain authoritative.
+    pub fn ingress_changed(&self) -> tokio::sync::watch::Receiver<()> {
+        self.ingress_activity.subscribe()
+    }
+
     /// Start a driver-owned telemetry subscription writer task.
     pub fn publish_telemetry_subscription(
         &self,
         peer: EndpointAddr,
         header: TelemetryQuicHeader,
         subscription: telemetry::TelemetrySubscription,
-        idle_sleep: Duration,
     ) {
         spawn_subscription_writer(
-            &self.engine,
+            &self.tasks,
             self.endpoint.clone(),
             peer,
             header,
             subscription,
-            idle_sleep,
         );
     }
 
-    /// Return a cloneable logical telemetry transport handle for publisher actors.
+    /// Return an actor-safe logical telemetry publisher request port.
     pub fn telemetry_publish_handle(&self) -> TelemetryPublishHandle {
-        TelemetryPublishHandle {
-            engine: self.engine.clone(),
-            endpoint: self.endpoint.clone(),
-        }
+        let (requests, mut receiver) = tokio_mpsc::unbounded_channel::<TelemetryPublishRequest>();
+        let tasks = self.tasks.clone();
+        let endpoint = self.endpoint.clone();
+        let changes = self.changes.subscribe();
+        self.tasks.spawn(async move {
+            run_until_closed(changes, async {
+                while let Some(request) = receiver.recv().await {
+                    spawn_subscription_writer(
+                        &tasks,
+                        endpoint.clone(),
+                        request.peer,
+                        request.header,
+                        request.subscription,
+                    );
+                }
+            })
+            .await;
+        });
+        TelemetryPublishHandle { requests }
     }
 
+    #[cfg(feature = "data-plane")]
     /// Drain logical edge transport events emitted by driver-owned byte pumps.
     pub fn drain_edge_events(&self) -> Vec<WireEvent> {
         self.edge_events.lock().drain(..).collect()
     }
 
+    #[cfg(feature = "data-plane")]
     /// Clone of the shared edge-event queue, so callers outside the driver
     /// (e.g. a job worker) can drain `EDGE_ALPN` byte events from their own
     /// thread/task without going through `&self`.
@@ -932,32 +1115,63 @@ impl IrohDriver {
         Arc::clone(&self.edge_events)
     }
 
+    #[cfg(feature = "data-plane")]
     pub fn edge_events_changed(&self) -> tokio::sync::watch::Receiver<()> {
         self.edge_activity.subscribe()
     }
 
+    #[cfg(feature = "data-plane")]
     pub fn edge_connector(&self) -> EdgeConnector {
-        EdgeConnector {
-            engine: self.engine.clone(),
-            endpoint: self.endpoint.clone(),
+        let (requests, mut receiver) = tokio_mpsc::unbounded_channel();
+        let tasks = self.tasks.clone();
+        let engine = self.engine.clone();
+        let endpoint = self.endpoint.clone();
+        let events = Arc::clone(&self.edge_events);
+        let activity = self.edge_activity.clone();
+        let changes = self.changes.subscribe();
+        self.tasks.spawn(async move {
+            run_until_closed(changes.clone(), async {
+                while let Some(request) = receiver.recv().await {
+                    spawn_edge_sender_task(
+                        &tasks,
+                        engine.clone(),
+                        endpoint.clone(),
+                        request,
+                        Arc::clone(&events),
+                        activity.clone(),
+                        changes.clone(),
+                    );
+                }
+            })
+            .await;
+        });
+        EdgeConnector { requests }
+    }
+
+    #[cfg(feature = "data-plane")]
+    /// Obtain edge commands and observations without retaining task authority.
+    pub fn edge_port(&self) -> IrohEdgePort {
+        IrohEdgePort {
+            connector: self.edge_connector(),
+            events: Arc::clone(&self.edge_events),
         }
     }
 
+    #[cfg(feature = "data-plane")]
     /// Start a driver-owned EDGE_ALPN send pump and return its logical byte input handle.
     pub fn spawn_edge_send_pump(
         &self,
         peer: EndpointAddr,
         edge_id: u64,
     ) -> Result<EdgeSendHandle, String> {
-        spawn_edge_sender_task(
-            self.engine.clone(),
-            self.endpoint.clone(),
-            peer,
-            edge_id,
-            None,
-        )
+        let (handle, ready) = self.edge_connector().request(peer, edge_id)?;
+        ready
+            .recv()
+            .map_err(|error| format!("edge {edge_id} sender startup channel closed: {error}"))??;
+        Ok(handle)
     }
 
+    #[cfg(feature = "data-plane")]
     /// Start an EDGE_ALPN send pump with a bounded connection handshake.
     pub fn spawn_edge_send_pump_timeout(
         &self,
@@ -965,13 +1179,7 @@ impl IrohDriver {
         edge_id: u64,
         timeout: std::time::Duration,
     ) -> Result<EdgeSendHandle, String> {
-        spawn_edge_sender_task(
-            self.engine.clone(),
-            self.endpoint.clone(),
-            peer,
-            edge_id,
-            Some(timeout),
-        )
+        self.edge_connector().connect(peer, edge_id, timeout)
     }
 
     /// The node's identity.
@@ -1155,8 +1363,19 @@ impl IrohDriver {
     /// Retain connection observation without retaining the driver or its
     /// shutdown obligations.
     pub fn connection_observer(&self) -> ConnectionObserver {
+        let (requests, mut receiver) = tokio_mpsc::unbounded_channel::<ConnectionWatchRequest>();
+        let tasks = self.tasks.clone();
+        let changes = self.changes.subscribe();
+        self.tasks.spawn(async move {
+            run_until_closed(changes, async {
+                while let Some(request) = receiver.recv().await {
+                    request.start(&tasks);
+                }
+            })
+            .await;
+        });
         ConnectionObserver {
-            engine: self.engine.clone(),
+            requests,
             conns: Arc::clone(&self.conns),
             changes: self.changes.clone(),
         }
@@ -1188,7 +1407,7 @@ impl IrohDriver {
         }
     }
 
-    /// Establish a connection to `peer` without joining its SWIM membership.
+    /// Establish an actor connection, restoring membership only for known cluster peers.
     ///
     /// Contextual child processes need only a routable transport to their
     /// host worker: replies ride the same bidirectional connection back.
@@ -1219,13 +1438,6 @@ impl IrohDriver {
             }
             if let Some(relay) = seed_addr.relay_urls().next() {
                 cache.peer_relay_urls.insert(seed_node_id, relay.clone());
-            }
-            if cache
-                .connections
-                .get(&seed_node_id)
-                .is_some_and(|cached| cached.conn.close_reason().is_some())
-            {
-                cache.connections.remove(&seed_node_id);
             }
             (
                 cache
@@ -1260,6 +1472,7 @@ impl IrohDriver {
         let seed_node_id = NodeId(*seed_addr.id.as_bytes());
         let pending = Arc::clone(&self.pending_joins);
         let statuses = Arc::clone(&self.join_statuses);
+        let bridge = self.actor_bridge.clone();
 
         let has_relay = seed_addr.relay_urls().next().is_some();
         let direct_addr_count = seed_addr.ip_addrs().count();
@@ -1268,7 +1481,7 @@ impl IrohDriver {
         let engine = self.engine.clone();
         let changes = self.changes.subscribe();
         let wake = Arc::clone(&self.wake);
-        self.engine.spawn(async move {
+        self.tasks.spawn(async move {
             run_until_closed(changes, async {
                 let mut delay = Duration::from_secs(2);
                 let max_delay = Duration::from_secs(30);
@@ -1359,6 +1572,7 @@ impl IrohDriver {
                                     pending.lock().push(JoinResult {
                                         node_id: seed_node_id,
                                         conn,
+                                        join_sent: true,
                                     });
                                     wake.notify_one();
                                     return;
@@ -1392,6 +1606,9 @@ impl IrohDriver {
                         },
                     );
                 }
+                if let Some(bridge) = bridge {
+                    bridge.dial_failed(seed_node_id);
+                }
             })
             .await;
         });
@@ -1412,14 +1629,16 @@ impl IrohDriver {
         let tag = tag.to_vec();
         let peer = NodeId(*addr.id.as_bytes());
         let endpoint = self.endpoint.clone();
+        let tasks = self.tasks.clone();
         let engine = self.engine.clone();
         let conns = Arc::clone(&self.conns);
         let pending_joins = Arc::clone(&self.pending_joins);
         let evict = Arc::clone(&self.evict);
         let bridge = self.actor_bridge.clone();
         let changes = self.changes.subscribe();
-        self.engine.spawn(async move {
-            run_until_closed(changes, async {
+        let wake = Arc::clone(&self.wake);
+        self.tasks.spawn(async move {
+            run_until_closed(changes.clone(), async {
                 let dest = peer_addr(peer);
                 let mut delay = Duration::from_millis(250);
                 let max_delay = Duration::from_secs(2);
@@ -1433,7 +1652,11 @@ impl IrohDriver {
                             if cached.conn.close_reason().is_none() {
                                 Some(cached.conn.clone())
                             } else {
-                                cache.connections.remove(&peer);
+                                if let Some(removed) = cache.connections.remove(&peer)
+                                    && let Some(bridge) = &bridge
+                                {
+                                    bridge.peer_closed(peer, removed.cluster_member);
+                                }
                                 None
                             }
                         } else {
@@ -1449,18 +1672,24 @@ impl IrohDriver {
                         cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
                         let conn = result.conn.clone();
                         let writer = spawn_ordered_frame_writer(
-                            &engine,
+                            &tasks,
                             &evict,
                             bridge.as_ref(),
-                            peer,
-                            generation,
+                            FailedConnection {
+                                node_id: peer,
+                                generation,
+                            },
                             conn.clone(),
+                            Arc::clone(&wake),
+                            changes.clone(),
                         );
                         cache.connections.insert(
                             peer,
                             CachedConnection {
                                 generation,
                                 needs_sync: true,
+                                cluster_member: false,
+                                join_sent: result.join_sent,
                                 conn,
                                 writer,
                             },
@@ -1485,18 +1714,24 @@ impl IrohDriver {
                                     cache.next_generation =
                                         cache.next_generation.wrapping_add(1).max(1);
                                     let writer = spawn_ordered_frame_writer(
-                                        &engine,
+                                        &tasks,
                                         &evict,
                                         bridge.as_ref(),
-                                        peer,
-                                        generation,
+                                        FailedConnection {
+                                            node_id: peer,
+                                            generation,
+                                        },
                                         conn.clone(),
+                                        Arc::clone(&wake),
+                                        changes.clone(),
                                     );
                                     cache.connections.insert(
                                         peer,
                                         CachedConnection {
                                             generation,
                                             needs_sync: true,
+                                            cluster_member: false,
+                                            join_sent: false,
                                             conn: conn.clone(),
                                             writer,
                                         },
@@ -1526,7 +1761,11 @@ impl IrohDriver {
                         return;
                     }
                     // Write failed: evict so the next attempt re-dials.
-                    conns.lock().connections.remove(&peer);
+                    if let Some(removed) = conns.lock().connections.remove(&peer)
+                        && let Some(bridge) = &bridge
+                    {
+                        bridge.peer_closed(peer, removed.cluster_member);
+                    }
                     engine.timer(delay).await;
                     delay = (delay * 2).min(max_delay);
                 }
@@ -1539,7 +1778,7 @@ impl IrohDriver {
     /// Install the actor-bridge wiring so the driver shuttles frames between iroh
     /// and the swactor runtime — the seam by which the protocol actors send and
     /// receive over iroh. Frame progression is driven by the engine-hosted
-    /// adapter pump ([`Self::install_actor_bridge_pump`]).
+    /// adapter task ([`Self::install_actor_bridge`]).
     pub fn enable_actor_bridge(&mut self, config: ActorBridgeConfig) {
         let ActorBridgeConfig {
             runtime,
@@ -1562,6 +1801,7 @@ impl IrohDriver {
             relay_mirror,
             route_view,
             outbox,
+            pending_outbound: Mutex::new(VecDeque::new()),
         }));
     }
 
@@ -1573,7 +1813,7 @@ impl IrohDriver {
     pub fn wait_for_relay_endpoint(&self) -> Result<EndpointAddr, String> {
         let ready_endpoint = self.endpoint.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.engine.spawn(async move {
+        self.tasks.spawn(async move {
             ready_endpoint.online().await;
             let _ = tx.send(ready_endpoint.addr());
         });
@@ -1620,8 +1860,26 @@ impl IrohDriver {
         self.wake.notify_one();
         let (tx, rx) = std::sync::mpsc::channel();
         let endpoint = self.endpoint.clone();
-        self.engine.spawn(async move {
+        self.tasks.spawn(async move {
             endpoint.close().await;
+            let _ = tx.send(());
+        });
+        let _ = rx.recv();
+    }
+
+    /// Best-effort graceful shutdown bounded by `timeout`.
+    ///
+    /// Use only after the application protocol has acknowledged session
+    /// closure. This prevents QUIC close-notification retries from delaying
+    /// teardown while still giving the peer a chance to acknowledge them.
+    pub fn shutdown_bounded(&self, timeout: Duration) {
+        self.changes.send_replace(0);
+        self.wake.notify_one();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let endpoint = self.endpoint.clone();
+        let engine = self.engine.clone();
+        self.tasks.spawn(async move {
+            let _ = engine.timeout(timeout, endpoint.close()).await;
             let _ = tx.send(());
         });
         let _ = rx.recv();
@@ -1630,20 +1888,20 @@ impl IrohDriver {
     /// Keep TELEMETRY_ALPN connections unclaimed by the driver-owned
     /// telemetry ingress, so the application can drain them with
     /// [`Self::drain_accepted_for_alpn`] and serve pulls itself. Call
-    /// before [`Self::install_actor_bridge_pump`].
+    /// before [`Self::install_actor_bridge`].
     pub fn retain_telemetry_connections(&self) {
         self.retain_telemetry_conns
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Install engine-hosted interval tasks that drive adapter progression
-    /// (actor-bridge ingress/egress, telemetry ingress, edge ingress). After
-    /// this call, the application must not manually pump these adapters
-    /// (ENGINE_SPEC.md). Progression is scheduled on the engine the
-    /// driver already stores; a bound driver does not accept an unrelated
-    /// execution engine (ENGINE_SPEC.md).
-    pub fn install_actor_bridge_pump(&self, period: Duration) {
+    /// Install the engine-hosted, wake-driven adapter task for actor ingress
+    /// and egress, telemetry ingress, and edge ingress. Queue producers wake
+    /// the task after enqueueing; it drains existing work before waiting.
+    /// There is no periodic work while idle. The driver shutdown signal
+    /// cancels the task and its ingress readers.
+    pub fn install_actor_bridge(&self) {
         let pump = AdapterPump {
+            tasks: self.tasks.clone(),
             engine: self.engine.clone(),
             endpoint: self.endpoint.clone(),
             conns: Arc::clone(&self.conns),
@@ -1654,30 +1912,44 @@ impl IrohDriver {
             accepted_conns: Arc::clone(&self.accepted_conns),
             other_accepted_conns: Arc::clone(&self.other_accepted_conns),
             telemetry_reads: Arc::clone(&self.telemetry_reads),
+            #[cfg(feature = "data-plane")]
             edge_events: Arc::clone(&self.edge_events),
             retain_telemetry_conns: Arc::clone(&self.retain_telemetry_conns),
+            #[cfg(feature = "data-plane")]
             next_edge_stream_group: Arc::clone(&self.next_edge_stream_group),
             dialing: Arc::clone(&self.dialing),
             peer_auth: self.peer_auth.clone(),
             bridge: Arc::clone(self.actor_bridge.as_ref().expect("bridge installed")),
-            pending_outbound: Arc::new(Mutex::new(VecDeque::new())),
             wake: Arc::clone(&self.wake),
             changes: self.changes.clone(),
+            #[cfg(feature = "data-plane")]
             edge_activity: self.edge_activity.clone(),
+            ingress_activity: self.ingress_activity.clone(),
         };
-        let engine = self.engine.clone();
-        engine.clone().spawn(async move {
-            let mut interval = engine.interval(period);
-            loop {
-                tokio::select! {
-                    _ = &mut interval => {},
-                    _ = pump.wake.notified() => {},
+        let changes = self.changes.subscribe();
+        #[cfg(feature = "data-plane")]
+        let mut edge_activity = self.edge_activity.subscribe();
+        let mut ingress_activity = self.ingress_activity.subscribe();
+        self.tasks.spawn(async move {
+            run_until_closed(changes, async {
+                loop {
+                    pump.run_pump_cycle();
+                    // Notify retains a permit when an enqueue races the drain.
+                    // Watches are subscribed before the first reconciliation.
+                    #[cfg(feature = "data-plane")]
+                    tokio::select! {
+                        _ = pump.wake.notified() => {},
+                        _ = edge_activity.changed() => {},
+                        _ = ingress_activity.changed() => {},
+                    }
+                    #[cfg(not(feature = "data-plane"))]
+                    tokio::select! {
+                        _ = pump.wake.notified() => {},
+                        _ = ingress_activity.changed() => {},
+                    }
                 }
-                if *pump.changes.borrow() == 0 {
-                    break;
-                }
-                pump.run_pump_cycle();
-            }
+            })
+            .await;
         });
     }
 }
@@ -1687,13 +1959,14 @@ impl IrohDriver {
 /// Cloneable handles for the engine-hosted adapter pump task.
 ///
 /// Held inside the spawned engine task installed by
-/// [`IrohDriver::install_actor_bridge_pump`]; each pump cycle folds completed
+/// [`IrohDriver::install_actor_bridge`]; each wake-driven cycle folds completed
 /// joins/accepts into the connection cache, decodes inbound frames into actor
 /// messages, drains the actors' outbound queue onto the wire, and drives the
 /// driver-owned telemetry/edge ingress adapters. All shared state is behind
 /// `Arc<Mutex<…>>` / `Arc<AtomicU64>`, so the pump needs only `&self`.
 #[derive(Clone)]
 struct AdapterPump {
+    tasks: TaskSpawner,
     engine: EngineHandle,
     endpoint: Endpoint,
     conns: Arc<Mutex<ConnCache>>,
@@ -1704,16 +1977,19 @@ struct AdapterPump {
     accepted_conns: AcceptedConnections,
     other_accepted_conns: OtherAcceptedConnections,
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
+    #[cfg(feature = "data-plane")]
     edge_events: Arc<Mutex<Vec<WireEvent>>>,
     retain_telemetry_conns: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "data-plane")]
     next_edge_stream_group: Arc<AtomicU64>,
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     bridge: Arc<ActorBridge>,
-    pending_outbound: Arc<Mutex<VecDeque<OutFrame>>>,
     wake: Arc<tokio::sync::Notify>,
     changes: tokio::sync::watch::Sender<u64>,
+    #[cfg(feature = "data-plane")]
     edge_activity: tokio::sync::watch::Sender<()>,
+    ingress_activity: tokio::sync::watch::Sender<()>,
 }
 
 impl AdapterPump {
@@ -1724,14 +2000,14 @@ impl AdapterPump {
         // Fold completed background join connections into the cache (+ read).
         let joins: Vec<JoinResult> = self.pending_joins.lock().drain(..).collect();
         for result in joins {
-            self.cache_connection(result.node_id, result.conn, None);
+            self.cache_connection(result.node_id, result.conn, None, result.join_sent);
         }
 
         // Fold connections accepted from remote peers into the cache (+ read).
         let accepted: Vec<(NodeId, Connection, Option<SocketAddr>)> =
             self.accepted_conns.lock().drain(..).collect();
         for (node_id, conn, remote) in accepted {
-            self.cache_connection(node_id, conn, remote);
+            self.cache_connection(node_id, conn, remote, false);
         }
         let evicted: Vec<FailedConnection> = self.evict.lock().drain(..).collect();
         for failed in evicted {
@@ -1742,13 +2018,14 @@ impl AdapterPump {
                     .get(&failed.node_id)
                     .is_some_and(|cached| cached.generation == failed.generation);
                 if still_current {
-                    cache.connections.remove(&failed.node_id);
-                    true
+                    cache.connections.remove(&failed.node_id)
                 } else {
-                    false
+                    None
                 }
             };
-            if removed {
+            if let Some(removed) = removed {
+                self.bridge
+                    .peer_closed(failed.node_id, removed.cluster_member);
                 self.changes.send_modify(|revision| {
                     if *revision != 0 {
                         *revision = revision.wrapping_add(1).max(1);
@@ -1766,18 +2043,34 @@ impl AdapterPump {
     /// one survives, or each side closes the other's connection and the pair
     /// is left with nothing. The rule is symmetric and locally computable:
     /// keep the connection initiated by the lesser node id, close the other.
-    fn cache_connection(&self, node_id: NodeId, conn: Connection, remote: Option<SocketAddr>) {
+    fn cache_connection(
+        &self,
+        node_id: NodeId,
+        conn: Connection,
+        remote: Option<SocketAddr>,
+        join_sent: bool,
+    ) {
         if conn.close_reason().is_some() {
+            // A dial can complete and close before the pump installs its
+            // reader. Do not strand first admission, or disturb a replacement.
+            if !self.conns.lock().connections.contains_key(&node_id) {
+                self.bridge.peer_failed(node_id);
+            }
             return;
         }
         let generation = {
             let mut cache = self.conns.lock();
+            let cluster_member = cache.connections.get(&node_id).is_some_and(|cached| {
+                cached.cluster_member && cached.conn.close_reason().is_none()
+            });
             if cache
                 .connections
                 .get(&node_id)
                 .is_some_and(|existing| existing.conn.close_reason().is_some())
             {
-                cache.connections.remove(&node_id);
+                if let Some(removed) = cache.connections.remove(&node_id) {
+                    self.bridge.peer_closed(node_id, removed.cluster_member);
+                }
             }
             if let Some(existing) = cache.connections.get(&node_id) {
                 if existing.conn.stable_id() == conn.stable_id() {
@@ -1830,18 +2123,38 @@ impl AdapterPump {
             let generation = cache.next_generation;
             cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
             let writer = spawn_ordered_frame_writer(
-                &self.engine,
+                &self.tasks,
                 &self.evict,
                 Some(&self.bridge),
-                node_id,
-                generation,
+                FailedConnection {
+                    node_id,
+                    generation,
+                },
                 conn.clone(),
+                Arc::clone(&self.wake),
+                self.changes.subscribe(),
             );
+            let needs_join = cache.known_cluster_peers.contains(&node_id) && !join_sent;
+            if needs_join {
+                // Queue before publishing the writer: ordinary pending actor
+                // traffic cannot overtake this connection's one re-handshake.
+                let _ = writer.send(OutFrame {
+                    to: node_id,
+                    dest: peer_addr(node_id),
+                    type_tag: "swactor_dist::JoinRequest".to_owned(),
+                    payload: serde_json::to_vec(&JoinRequest {
+                        from: self.self_node,
+                    })
+                    .expect("serialize JoinRequest"),
+                });
+            }
             cache.connections.insert(
                 node_id,
                 CachedConnection {
                     generation,
                     needs_sync: true,
+                    cluster_member,
+                    join_sent: join_sent || needs_join,
                     conn: conn.clone(),
                     writer,
                 },
@@ -1884,6 +2197,9 @@ impl AdapterPump {
             let Ok(boxed) = self.bridge.codec.decode(&tag, &payload) else {
                 continue;
             };
+            if !directory_sender_is_verified(&boxed, from) {
+                continue;
+            }
             if dest == self.bridge.self_peer_addr {
                 // Gossip: route by tag to the protocol actor that owns it.
                 // Direct SWIM frames carry their sender in plaintext; a
@@ -1894,14 +2210,56 @@ impl AdapterPump {
                     if !swim_sender_is_verified(&boxed, from) {
                         continue;
                     }
-                    let needs_sync = self
-                        .conns
-                        .lock()
-                        .connections
-                        .get_mut(&from)
-                        .is_some_and(|cached| std::mem::take(&mut cached.needs_sync));
+                    if let Some(SwimIn::MembershipGossip(gossip)) = boxed.downcast_ref::<SwimIn>() {
+                        let mut cache = self.conns.lock();
+                        for peer in std::iter::once(&gossip.from).chain(gossip.peers.iter()) {
+                            if !peer.direct_addrs.is_empty() {
+                                cache
+                                    .peer_direct_addrs
+                                    .insert(peer.node_id, peer.direct_addrs.clone());
+                            }
+                            if let Some(relay) =
+                                peer.relay_url.as_ref().and_then(|url| url.parse().ok())
+                            {
+                                cache.peer_relay_urls.insert(peer.node_id, relay);
+                            }
+                        }
+                    }
+                    let needs_sync = {
+                        let mut cache = self.conns.lock();
+                        cache.known_cluster_peers.insert(from);
+                        cache.connections.get_mut(&from).is_some_and(|cached| {
+                            cached.cluster_member = true;
+                            std::mem::take(&mut cached.needs_sync)
+                        })
+                    };
                     if needs_sync {
                         self.bridge.peer_connected(from);
+                        let peer = {
+                            let cache = self.conns.lock();
+                            MembershipPeer {
+                                node_id: from,
+                                direct_addrs: cache
+                                    .peer_direct_addrs
+                                    .get(&from)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                relay_url: cache
+                                    .peer_relay_urls
+                                    .get(&from)
+                                    .map(ToString::to_string),
+                            }
+                        };
+                        let endpoint = self.endpoint.addr();
+                        let local = MembershipPeer {
+                            node_id: self.self_node,
+                            direct_addrs: endpoint.ip_addrs().copied().collect(),
+                            relay_url: endpoint.relay_urls().next().map(ToString::to_string),
+                        };
+                        let _ = self.bridge.rt.send_to(
+                            self.bridge.swim_addr,
+                            SwimIn::TransportConnected { peer, local },
+                        );
                     }
                 }
                 if let Some(&addr) = self.bridge.routes.get(&tag) {
@@ -1919,10 +2277,11 @@ impl AdapterPump {
     /// this prevents one-shot lifecycle messages from disappearing during
     /// ordinary connection replacement.
     fn drain_outbox(&self) {
-        let mut frames = {
-            let mut pending = self.pending_outbound.lock();
-            std::mem::take(&mut *pending)
-        };
+        // Serialize this synchronous pass with terminal dial failure, so an
+        // exhaustion cannot clear the queue while its frames are temporarily
+        // drained and then have those stale frames reinstated afterward.
+        let mut pending = self.bridge.pending_outbound.lock();
+        let mut frames = std::mem::take(&mut *pending);
         frames.extend(self.bridge.outbox.lock().unwrap().drain(..));
         let mut retry = VecDeque::new();
         for frame in frames {
@@ -1932,7 +2291,7 @@ impl AdapterPump {
                 retry.push_back(frame);
             }
         }
-        *self.pending_outbound.lock() = retry;
+        *pending = retry;
     }
     /// Enqueue an already-encoded frame onto the peer's ordered writer. A
     /// connection cache miss starts or continues a background dial and
@@ -1948,6 +2307,18 @@ impl AdapterPump {
             Ok(cached) => cached,
             Err(_) => return Some(frame),
         };
+        if frame.type_tag == "swactor_dist::JoinRequest" {
+            let mut cache = self.conns.lock();
+            let Some(current) = cache.connections.get_mut(&frame.to) else {
+                return Some(frame);
+            };
+            if current.generation != cached.generation {
+                return Some(frame);
+            }
+            if std::mem::replace(&mut current.join_sent, true) {
+                return None;
+            }
+        }
         let _ = cached.writer.send(frame);
         None
     }
@@ -1971,13 +2342,13 @@ impl AdapterPump {
 
         // Check for cached connection that's still open
         {
-            let mut cache = self.conns.lock();
+            let cache = self.conns.lock();
             if let Some(cached) = cache.connections.get(&node_id) {
                 if cached.conn.close_reason().is_none() {
                     return Ok(cached.clone());
                 }
-                // Connection closed, remove it
-                cache.connections.remove(&node_id);
+                // Preserve the generation until the reader's eviction is folded,
+                // so transport membership observes this closed connection.
             }
         }
 
@@ -2030,7 +2401,8 @@ impl AdapterPump {
         let guard = DialGuard { node_id, dialing };
         let wake = Arc::clone(&self.wake);
         let changes = self.changes.subscribe();
-        self.engine.spawn(async move {
+        let bridge = Arc::clone(&self.bridge);
+        self.tasks.spawn(async move {
             let _guard = guard;
             run_until_closed(changes, async {
                 const ATTEMPTS: u32 = 3;
@@ -2043,15 +2415,20 @@ impl AdapterPump {
                         )
                         .await;
                     if let Ok(Ok(conn)) = result {
-                        pending.lock().push(JoinResult { node_id, conn });
+                        pending.lock().push(JoinResult {
+                            node_id,
+                            conn,
+                            join_sent: false,
+                        });
                         wake.notify_one();
-                        break;
+                        return;
                     }
                     if attempt < ATTEMPTS {
                         let backoff = if attempt == 1 { 200 } else { 600 };
                         engine.timer(Duration::from_millis(backoff)).await;
                     }
                 }
+                bridge.dial_failed(node_id);
             })
             .await;
         });
@@ -2066,27 +2443,31 @@ impl AdapterPump {
         let incoming = Arc::clone(&self.incoming);
         let evict = Arc::clone(&self.evict);
         let wake = Arc::clone(&self.wake);
-        self.engine.spawn(async move {
-            loop {
-                match conn.accept_uni().await {
-                    Ok(mut recv) => {
-                        while let Ok((dest, tag, payload)) = read_message(&mut recv).await {
-                            incoming
-                                .lock()
-                                .push((dest, tag, payload, node_id, generation));
+        let changes = self.changes.subscribe();
+        self.tasks.spawn(async move {
+            run_until_closed(changes, async {
+                loop {
+                    match conn.accept_uni().await {
+                        Ok(mut recv) => {
+                            while let Ok((dest, tag, payload)) = read_message(&mut recv).await {
+                                incoming
+                                    .lock()
+                                    .push((dest, tag, payload, node_id, generation));
+                                wake.notify_one();
+                            }
+                        }
+                        Err(_) => {
+                            evict.lock().push(FailedConnection {
+                                node_id,
+                                generation,
+                            });
                             wake.notify_one();
+                            break;
                         }
                     }
-                    Err(_) => {
-                        evict.lock().push(FailedConnection {
-                            node_id,
-                            generation,
-                        });
-                        wake.notify_one();
-                        break;
-                    }
                 }
-            }
+            })
+            .await;
         });
     }
 
@@ -2116,17 +2497,26 @@ impl AdapterPump {
         };
         for (_node, conn) in drained {
             let reads = Arc::clone(&self.telemetry_reads);
-            self.engine.spawn(async move {
-                while let Ok(recv) = conn.accept_uni().await {
-                    match read_events_from_stream(recv).await {
-                        Ok(read) => reads.lock().push(read),
-                        Err(_) => break,
+            let activity = self.ingress_activity.clone();
+            let changes = self.changes.subscribe();
+            self.tasks.spawn(async move {
+                run_until_closed(changes, async {
+                    while let Ok(recv) = conn.accept_uni().await {
+                        match read_events_from_stream(recv).await {
+                            Ok(read) => {
+                                reads.lock().push(read);
+                                activity.send_replace(());
+                            }
+                            Err(_) => break,
+                        }
                     }
-                }
+                })
+                .await;
             });
         }
     }
 
+    #[cfg(feature = "data-plane")]
     /// Claim accepted MVP edge connections and read opaque edge bytes inside
     /// the driver.
     fn pump_edge_ingress(&self) {
@@ -2150,11 +2540,12 @@ impl AdapterPump {
                 .fetch_add(1, Ordering::Relaxed)
                 .max(1);
             spawn_edge_recv_pump(
-                self.engine.clone(),
+                self.tasks.clone(),
                 conn,
                 Arc::clone(&self.edge_events),
                 stream_group,
                 self.edge_activity.clone(),
+                self.changes.subscribe(),
             );
         }
     }
@@ -2173,55 +2564,59 @@ impl AdapterPump {
         self.pump_inbound();
         self.drain_outbox();
         self.pump_telemetry_ingress();
+        #[cfg(feature = "data-plane")]
         self.pump_edge_ingress();
     }
 }
 
 fn spawn_ordered_frame_writer(
-    engine: &EngineHandle,
+    tasks: &TaskSpawner,
     evict: &Arc<Mutex<Vec<FailedConnection>>>,
     bridge: Option<&Arc<ActorBridge>>,
-    node_id: NodeId,
-    generation: u64,
+    connection: FailedConnection,
     conn: Connection,
+    wake: Arc<tokio::sync::Notify>,
+    changes: tokio::sync::watch::Receiver<u64>,
 ) -> tokio_mpsc::UnboundedSender<OutFrame> {
     let (queue_tx, mut queue) = tokio_mpsc::unbounded_channel::<OutFrame>();
     let evict = Arc::clone(evict);
     let swim = bridge.map(|bridge| (bridge.rt.clone(), bridge.swim_addr));
-    engine.spawn(async move {
-        let mut stream: Option<iroh::endpoint::SendStream> = None;
-        while let Some(frame) = queue.recv().await {
-            let OutFrame {
-                to,
-                dest,
-                type_tag,
-                payload,
-            } = frame;
-            let result: Result<(), Box<dyn std::error::Error>> = async {
-                let send = match stream.as_mut() {
-                    Some(send) => send,
-                    None => {
-                        stream = Some(conn.open_uni().await?);
-                        stream.as_mut().expect("stream just assigned")
-                    }
-                };
-                write_message(send, dest, type_tag.as_bytes(), &payload).await?;
-                Ok(())
-            }
-            .await;
-            if result.is_err() {
-                if is_swim_tag(&type_tag)
-                    && let Some((runtime, swim_addr)) = &swim
-                {
-                    let _ = runtime.deliver_raw(*swim_addr, Box::new(SwimIn::SendFailed { to }));
+    tasks.spawn(async move {
+        run_until_closed(changes, async {
+            let mut stream: Option<iroh::endpoint::SendStream> = None;
+            while let Some(frame) = queue.recv().await {
+                let OutFrame {
+                    to,
+                    dest,
+                    type_tag,
+                    payload,
+                } = frame;
+                let result: Result<(), Box<dyn std::error::Error>> = async {
+                    let send = match stream.as_mut() {
+                        Some(send) => send,
+                        None => {
+                            stream = Some(conn.open_uni().await?);
+                            stream.as_mut().expect("stream just assigned")
+                        }
+                    };
+                    write_message(send, dest, type_tag.as_bytes(), &payload).await?;
+                    Ok(())
                 }
-                evict.lock().push(FailedConnection {
-                    node_id,
-                    generation,
-                });
-                return;
+                .await;
+                if result.is_err() {
+                    if is_swim_tag(&type_tag)
+                        && let Some((runtime, swim_addr)) = &swim
+                    {
+                        let _ =
+                            runtime.deliver_raw(*swim_addr, Box::new(SwimIn::SendFailed { to }));
+                    }
+                    evict.lock().push(connection);
+                    wake.notify_one();
+                    return;
+                }
             }
-        }
+        })
+        .await;
     });
     queue_tx
 }
@@ -2238,6 +2633,7 @@ fn is_swim_tag(tag: &str) -> bool {
             | "swactor_dist::IndirectAck"
             | "swactor_dist::JoinRequest"
             | "swactor_dist::JoinResponse"
+            | "swactor_dist::MembershipGossip"
     )
 }
 
@@ -2269,6 +2665,17 @@ fn swim_sender_is_verified(message: &Box<dyn Any + Send>, carrier: NodeId) -> bo
         SwimIn::Ack(ack) => ack.from == carrier,
         SwimIn::PingReq(request) => request.from == carrier,
         SwimIn::JoinRequest(join) => join.from == carrier,
+        SwimIn::MembershipGossip(gossip) => gossip.from.node_id == carrier,
+        _ => true,
+    }
+}
+
+/// Route readiness must be acknowledged by the authenticated host itself.
+/// Unlike ordinary directory gossip, offers and acknowledgements are direct.
+fn directory_sender_is_verified(message: &Box<dyn Any + Send>, carrier: NodeId) -> bool {
+    match message.downcast_ref::<DirectoryIn>() {
+        Some(DirectoryIn::RouteOffer(offer)) => offer.claim.node_id == carrier,
+        Some(DirectoryIn::RouteAck(ack)) => ack.from == carrier,
         _ => true,
     }
 }
@@ -2336,6 +2743,10 @@ async fn read_message(
 }
 
 #[cfg(test)]
+#[path = "iroh_driver_reconnect_tests.rs"]
+mod reconnect_tests;
+
+#[cfg(test)]
 mod recovery_tests {
     use super::*;
     use distribution::directory_actor::DirectoryActor;
@@ -2400,6 +2811,7 @@ mod recovery_tests {
                 relay_mirror: Arc::new(RwLock::new(HashMap::new())),
                 route_view,
                 outbox,
+                pending_outbound: Mutex::new(VecDeque::new()),
             };
             (engine, backend, bridge, names)
         };
@@ -2586,10 +2998,11 @@ mod recovery_tests {
 
 // ─── Data-plane edge transport port ────────────────────────────────────────
 
-/// The driver as a data-plane byte transport: open one writer per outbound
-/// edge and expose inbound edge-stream events. All edge semantics live in
-/// the data-plane crate's edge runtime; this impl is deliberately thin.
-impl data_plane::edge_wire::EdgeTransport for IrohDriver {
+#[cfg(feature = "data-plane")]
+/// Open one writer per outbound edge and expose inbound edge-stream events.
+/// Opening enqueues the handshake without blocking the actor; writes queue
+/// behind it, and an unsuccessful pump closes its byte input and completion.
+impl data_plane::edge_wire::EdgeTransport for IrohEdgePort {
     type Writer = EdgeSendHandle;
     type PeerAddr = EndpointAddr;
 
@@ -2598,10 +3011,12 @@ impl data_plane::edge_wire::EdgeTransport for IrohDriver {
         edge_id: data_plane::ids::EdgeId,
         peer: &EndpointAddr,
     ) -> Result<Self::Writer, String> {
-        self.spawn_edge_send_pump(peer.clone(), edge_id.0)
+        self.connector
+            .request(peer.clone(), edge_id.0)
+            .map(|(writer, _ready)| writer)
     }
 
     fn drain_events(&mut self) -> Vec<data_plane::edge_wire::WireEvent> {
-        self.drain_edge_events()
+        self.events.lock().drain(..).collect()
     }
 }

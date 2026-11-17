@@ -4,7 +4,7 @@
 //! per unidirectional stream, followed by opaque byte chunks. Object-record
 //! parsing, ring ownership, and edge semantics stay in the data-plane crate,
 //! which drives this transport through the `data_plane::edge_wire` port
-//! (`IrohDriver` implements `EdgeTransport`).
+//! (`IrohEdgePort` implements `EdgeTransport`).
 
 use std::sync::Arc;
 
@@ -13,9 +13,11 @@ use data_plane::ids::{EdgeId, StreamId};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
 use parking_lot::Mutex;
-use swactor_engine::EngineHandle;
+use swactor_engine::{EngineHandle, TaskSpawner};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc as tokio_mpsc;
+
+use crate::iroh_driver::run_until_closed;
 
 pub const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
 
@@ -36,6 +38,42 @@ struct EdgeSendOwner(tokio::sync::watch::Sender<bool>);
 impl Drop for EdgeSendOwner {
     fn drop(&mut self) {
         self.0.send_replace(true);
+    }
+}
+
+/// One edge pump request. The sender owns no executor or task capability.
+pub(crate) struct EdgeSendRequest {
+    peer: EndpointAddr,
+    edge_id: u64,
+    rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+    ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
+    completion_tx: std::sync::mpsc::Sender<Result<(), String>>,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+}
+
+impl EdgeSendRequest {
+    pub(crate) fn new(
+        peer: EndpointAddr,
+        edge_id: u64,
+    ) -> (EdgeSendHandle, Self, CompletionReceiver) {
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let handle = EdgeSendHandle {
+            tx,
+            completion: Arc::new(Mutex::new(Some(completion_rx))),
+            owner: Arc::new(EdgeSendOwner(cancel)),
+        };
+        let request = Self {
+            peer,
+            edge_id,
+            rx,
+            ready_tx,
+            completion_tx,
+            cancellation,
+        };
+        (handle, request, ready_rx)
     }
 }
 
@@ -95,19 +133,24 @@ impl EdgeWriter for EdgeSendHandle {
 }
 
 pub(crate) fn spawn_edge_send_pump(
+    tasks: &TaskSpawner,
     engine: EngineHandle,
     endpoint: Endpoint,
-    peer: EndpointAddr,
-    edge_id: u64,
-    ready_timeout: Option<std::time::Duration>,
-) -> Result<EdgeSendHandle, String> {
-    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let (completion_tx, completion_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let engine_handle = engine.clone();
-    let (cancel, mut cancellation) = tokio::sync::watch::channel(false);
-    let owner = Arc::new(EdgeSendOwner(cancel));
-    engine.spawn(async move {
+    request: EdgeSendRequest,
+    events: Arc<Mutex<Vec<WireEvent>>>,
+    activity: tokio::sync::watch::Sender<()>,
+    changes: tokio::sync::watch::Receiver<u64>,
+) {
+    let EdgeSendRequest {
+        peer,
+        edge_id,
+        mut rx,
+        ready_tx,
+        completion_tx,
+        mut cancellation,
+    } = request;
+    let engine_handle = engine;
+    tasks.spawn(async move {
         let operation = async {
             macro_rules! open_edge_stream {
                 () => {{
@@ -184,87 +227,86 @@ pub(crate) fn spawn_edge_send_pump(
         let result: Result<(), String> = tokio::select! {
             biased;
             _ = cancellation.changed() => Err(format!("edge {edge_id} owner cancelled")),
-            result = operation => result,
+            result = run_until_closed(changes, operation) => {
+                result.unwrap_or_else(|| Err(format!("edge {edge_id} driver closed")))
+            },
         };
         if let Err(error) = &result {
             let _ = ready_tx.send(Err(error.clone()));
+            events.lock().push(WireEvent::StreamFault {
+                edge_id: Some(EdgeId(edge_id)),
+                stream_id: None,
+                reason: WireFault::WriteError,
+            });
+            activity.send_replace(());
         }
         let _ = completion_tx.send(result);
     });
-    match ready_timeout {
-        Some(timeout) => ready_rx
-            .recv_timeout(timeout)
-            .map_err(|error| format!("edge {edge_id} sender startup: {error}"))??,
-        None => ready_rx
-            .recv()
-            .map_err(|error| format!("edge {edge_id} sender startup channel closed: {error}"))??,
-    }
-    Ok(EdgeSendHandle {
-        tx,
-        completion: Arc::new(Mutex::new(Some(completion_rx))),
-        owner,
-    })
 }
 
 pub(crate) fn spawn_edge_recv_pump(
-    engine: EngineHandle,
+    tasks: TaskSpawner,
     conn: Connection,
     events: Arc<Mutex<Vec<WireEvent>>>,
     stream_group: u64,
     activity: tokio::sync::watch::Sender<()>,
+    changes: tokio::sync::watch::Receiver<u64>,
 ) {
-    engine.spawn(async move {
-        let mut next_uni_stream_id = stream_group << 32;
-        while let Ok(mut recv) = conn.accept_uni().await {
-            next_uni_stream_id = next_uni_stream_id.saturating_add(1);
-            let current_stream_id = StreamId(next_uni_stream_id);
-            let mut preamble = [0u8; 8];
-            if recv.read_exact(&mut preamble).await.is_err() {
-                events.lock().push(WireEvent::StreamFault {
-                    edge_id: None,
-                    stream_id: Some(current_stream_id),
-                    reason: WireFault::ProtocolError,
+    tasks.spawn(async move {
+        run_until_closed(changes, async {
+            let mut next_uni_stream_id = stream_group << 32;
+            while let Ok(mut recv) = conn.accept_uni().await {
+                next_uni_stream_id = next_uni_stream_id.saturating_add(1);
+                let current_stream_id = StreamId(next_uni_stream_id);
+                let mut preamble = [0u8; 8];
+                if recv.read_exact(&mut preamble).await.is_err() {
+                    events.lock().push(WireEvent::StreamFault {
+                        edge_id: None,
+                        stream_id: Some(current_stream_id),
+                        reason: WireFault::ProtocolError,
+                    });
+                    activity.send_replace(());
+                    continue;
+                }
+                let edge_id = EdgeId(u64::from_le_bytes(preamble));
+                events.lock().push(WireEvent::StreamArrived {
+                    edge_id,
+                    stream_id: current_stream_id,
                 });
                 activity.send_replace(());
-                continue;
-            }
-            let edge_id = EdgeId(u64::from_le_bytes(preamble));
-            events.lock().push(WireEvent::StreamArrived {
-                edge_id,
-                stream_id: current_stream_id,
-            });
-            activity.send_replace(());
-            let mut chunk = vec![0u8; 4096];
-            loop {
-                match recv.read(&mut chunk).await {
-                    Ok(Some(0)) | Ok(None) => {
-                        events.lock().push(WireEvent::StreamEnded {
-                            edge_id,
-                            stream_id: current_stream_id,
-                        });
-                        activity.send_replace(());
-                        break;
-                    }
-                    Ok(Some(n)) => {
-                        events.lock().push(WireEvent::BytesRead {
-                            edge_id,
-                            stream_id: current_stream_id,
-                            bytes: chunk[..n].to_vec(),
-                        });
-                        activity.send_replace(());
-                    }
-                    Err(_) => {
-                        events.lock().push(WireEvent::StreamFault {
-                            edge_id: Some(edge_id),
-                            stream_id: Some(current_stream_id),
-                            reason: WireFault::ReadError,
-                        });
-                        activity.send_replace(());
-                        break;
+                let mut chunk = vec![0u8; 4096];
+                loop {
+                    match recv.read(&mut chunk).await {
+                        Ok(Some(0)) | Ok(None) => {
+                            events.lock().push(WireEvent::StreamEnded {
+                                edge_id,
+                                stream_id: current_stream_id,
+                            });
+                            activity.send_replace(());
+                            break;
+                        }
+                        Ok(Some(n)) => {
+                            events.lock().push(WireEvent::BytesRead {
+                                edge_id,
+                                stream_id: current_stream_id,
+                                bytes: chunk[..n].to_vec(),
+                            });
+                            activity.send_replace(());
+                        }
+                        Err(_) => {
+                            events.lock().push(WireEvent::StreamFault {
+                                edge_id: Some(edge_id),
+                                stream_id: Some(current_stream_id),
+                                reason: WireFault::ReadError,
+                            });
+                            activity.send_replace(());
+                            break;
+                        }
                     }
                 }
             }
-        }
+        })
+        .await;
     });
 }
 

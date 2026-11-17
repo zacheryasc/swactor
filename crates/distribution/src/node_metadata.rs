@@ -33,6 +33,7 @@ pub struct NodeMetadataDisseminator {
     pending: Vec<PendingEntry>,
     lambda: usize,
     local_generation: u64,
+    event_dissemination: bool,
 }
 
 impl NodeMetadataDisseminator {
@@ -42,7 +43,21 @@ impl NodeMetadataDisseminator {
             pending: Vec::new(),
             lambda,
             local_generation: 0,
+            event_dissemination: false,
         }
+    }
+
+    pub(crate) fn enable_event_dissemination(&mut self) {
+        self.event_dissemination = true;
+    }
+
+    /// Consume winning mutations once, without spending a timed gossip budget.
+    pub(crate) fn drain_pending(&mut self) -> impl Iterator<Item = NodeMetadataEntry> + '_ {
+        self.pending.drain(..).map(|pending| pending.entry)
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &NodeMetadataEntry> {
+        self.store.values()
     }
 
     /// Set this node's metadata and enqueue for dissemination.
@@ -53,6 +68,13 @@ impl NodeMetadataDisseminator {
         node_name: Option<String>,
         cluster_size: usize,
     ) {
+        if self.event_dissemination {
+            // A replacement connection can restore our pre-restart generation.
+            // The next local mutation must supersede that recovered winner.
+            self.local_generation = self
+                .local_generation
+                .max(self.peer_version(&node_id).unwrap_or(0));
+        }
         self.local_generation += 1;
         let entry = NodeMetadataEntry {
             node_id,
@@ -145,7 +167,11 @@ impl NodeMetadataDisseminator {
     }
 
     fn enqueue(&mut self, entry: NodeMetadataEntry, cluster_size: usize) {
-        let budget = self.transmit_budget(cluster_size);
+        let budget = if self.event_dissemination {
+            0
+        } else {
+            self.transmit_budget(cluster_size)
+        };
 
         // Replace existing pending entry for same node if present.
         if let Some(existing) = self

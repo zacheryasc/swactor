@@ -21,7 +21,9 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 
 use crate::crypto::verify_directory_entry;
-use crate::messages::{Ack, IndirectAck, JoinRequest, JoinResponse, Ping, PingReq};
+use crate::messages::{
+    Ack, IndirectAck, JoinRequest, JoinResponse, MembershipGossip, MembershipPeer, Ping, PingReq,
+};
 use crate::types::{DirectoryEntry, MemberState, NodeId};
 
 use super::node::{NodeAction, SwimNode, SwimObserver};
@@ -120,7 +122,18 @@ pub enum SwimIn {
     IndirectAck(IndirectAck),
     JoinRequest(JoinRequest),
     JoinResponse(JoinResponse),
+    /// Event-mode membership roster and explicit departure.
+    MembershipGossip(MembershipGossip),
     // local control (§6.2)
+    /// Authenticated cluster traffic established this transport incarnation.
+    TransportConnected {
+        peer: MembershipPeer,
+        local: MembershipPeer,
+    },
+    /// The current authenticated cluster transport was closed or evicted.
+    TransportDisconnected {
+        peer: NodeId,
+    },
     /// The clock. The only source of `now`; every temporal guard keys off it (§4.2).
     Tick {
         now: Instant,
@@ -360,6 +373,10 @@ impl ActorInterface for SwimActor {
             SwimIn::Subscribe { observer } => {
                 self.subscribers.push(observer);
             }
+            // Transport membership uses these observations independently of SWIM.
+            SwimIn::MembershipGossip(_)
+            | SwimIn::TransportConnected { .. }
+            | SwimIn::TransportDisconnected { .. } => {}
         }
     }
 }

@@ -253,6 +253,215 @@ mod node_metadata_engine {
     }
 }
 
+mod event_metadata_recovery {
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    use distribution::messages::MetadataGossip;
+    use distribution::node_metadata::{NodeMetadataDisseminator, NodeMetadataEntry};
+    use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
+    use distribution::swim::actor::{MembershipChanged, SharedPeerDirectory};
+    use distribution::transport_bridge::RelayMirror;
+    use distribution::types::{MemberState, NodeId};
+    use swactor::actor::ActorAddress;
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts};
+    use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
+
+    const SELF_ID: NodeId = NodeId([41; 32]);
+    const PEER_ID: NodeId = NodeId([42; 32]);
+
+    struct MetadataHarness {
+        rt: Runtime,
+        _engine: Engine,
+        backend: SteppingBackend,
+        actor: ActorAddress,
+        gossip: Inbox<MetadataIn>,
+        mirror: RelayMirror,
+    }
+
+    impl MetadataHarness {
+        fn new() -> Self {
+            let parts = RuntimeParts::new(RuntimeConfig::default())
+                .with_extension(Arc::new(StdExtension::new()));
+            let rt = parts.runtime().clone();
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).unwrap();
+            let gossip: Inbox<MetadataIn> = rt.new_inbox().unwrap();
+            let directory = SharedPeerDirectory::new();
+            directory.bind(PEER_ID, *gossip.addr(), 0);
+            let mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
+            let actor = rt
+                .spawn(
+                    MetadataActor::new(SELF_ID, 3, Arc::new(directory), mirror.clone())
+                        .with_event_dissemination(),
+                )
+                .unwrap();
+            let harness = Self {
+                rt,
+                _engine: engine,
+                backend,
+                actor,
+                gossip,
+                mirror,
+            };
+            harness.send(MetadataIn::Membership(MembershipChanged {
+                node_id: PEER_ID,
+                state: MemberState::Alive,
+                incarnation: 1,
+            }));
+            harness
+        }
+
+        fn send(&self, message: MetadataIn) {
+            self.rt.send_to(self.actor, message).unwrap();
+            self.backend.step();
+        }
+
+        fn publication(&self) -> NodeMetadataEntry {
+            let Some(MetadataIn::Gossip(mut gossip)) = self.gossip.try_recv() else {
+                panic!("expected an immediate metadata publication");
+            };
+            assert_eq!(gossip.entries.len(), 1);
+            assert!(self.gossip.try_recv().is_none(), "publish only one winner");
+            gossip.entries.pop().unwrap()
+        }
+    }
+
+    fn restored_entry(generation: u64) -> NodeMetadataEntry {
+        NodeMetadataEntry {
+            node_id: SELF_ID,
+            relay_url: Some("relay://restored".into()),
+            node_name: Some("restored-name".into()),
+            generation,
+        }
+    }
+
+    fn assert_restored_self_reasserts(
+        settings: impl IntoIterator<Item = MetadataIn>,
+        generation: u64,
+        relay: Option<&str>,
+        name: &str,
+    ) {
+        let harness = MetadataHarness::new();
+        for setting in settings {
+            harness.send(setting);
+            harness.publication();
+        }
+        let restored = restored_entry(generation);
+        let mut peer = NodeMetadataDisseminator::new(3);
+        peer.apply_incoming(vec![restored.clone()], 2);
+
+        harness.send(MetadataIn::Gossip(MetadataGossip {
+            entries: vec![restored.clone()],
+        }));
+        let winner = harness.publication();
+        assert_eq!(winner.node_id, SELF_ID);
+        assert_eq!(winner.generation, generation + 1);
+        assert_eq!(winner.relay_url.as_deref(), relay);
+        assert_eq!(winner.node_name.as_deref(), Some(name));
+        assert_eq!(
+            harness
+                .mirror
+                .read()
+                .unwrap()
+                .get(&SELF_ID)
+                .map(String::as_str),
+            relay,
+            "the dial mirror must never publish the stale configured field"
+        );
+
+        peer.apply_incoming(vec![winner.clone()], 2);
+        assert_eq!(peer.relay_url(&SELF_ID), relay);
+        assert_eq!(peer.node_name(&SELF_ID), Some(name));
+        assert_eq!(peer.peer_version(&SELF_ID), Some(winner.generation));
+
+        harness.send(MetadataIn::Gossip(MetadataGossip {
+            entries: vec![winner.clone()],
+        }));
+        assert!(
+            harness.gossip.try_recv().is_none(),
+            "matching echo must settle"
+        );
+        harness.send(MetadataIn::Gossip(MetadataGossip {
+            entries: vec![restored],
+        }));
+        assert!(
+            harness.gossip.try_recv().is_none(),
+            "older conflict must settle"
+        );
+        harness.send(MetadataIn::SyncTo { peer: PEER_ID });
+        assert_eq!(harness.publication(), winner);
+    }
+
+    #[test]
+    fn configured_relay_supersedes_equal_and_higher_restored_self_generations() {
+        for generation in [1, 9] {
+            assert_restored_self_reasserts(
+                [MetadataIn::SetRelayUrl {
+                    url: Some("relay://configured".into()),
+                }],
+                generation,
+                Some("relay://configured"),
+                "restored-name",
+            );
+        }
+    }
+
+    #[test]
+    fn configured_name_supersedes_equal_and_higher_restored_self_generations() {
+        for generation in [1, 9] {
+            assert_restored_self_reasserts(
+                [MetadataIn::SetNodeName {
+                    name: "configured-name".into(),
+                }],
+                generation,
+                Some("relay://restored"),
+                "configured-name",
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_relay_removal_and_name_both_survive_restored_self_gossip() {
+        for generation in [2, 9] {
+            assert_restored_self_reasserts(
+                [
+                    MetadataIn::SetRelayUrl { url: None },
+                    MetadataIn::SetNodeName {
+                        name: "configured-name".into(),
+                    },
+                ],
+                generation,
+                None,
+                "configured-name",
+            );
+        }
+    }
+
+    #[test]
+    fn matching_entry_in_same_batch_cannot_hide_equal_generation_conflict() {
+        let harness = MetadataHarness::new();
+        harness.send(MetadataIn::SetRelayUrl {
+            url: Some("relay://configured".into()),
+        });
+        let authored = harness.publication();
+        let mut matching = restored_entry(9);
+        matching.relay_url.clone_from(&authored.relay_url);
+        harness.send(MetadataIn::Gossip(MetadataGossip {
+            entries: vec![restored_entry(4), restored_entry(9), matching],
+        }));
+        let winner = harness.publication();
+        assert_eq!(winner.generation, 10);
+        assert_eq!(winner.relay_url, authored.relay_url);
+        assert_eq!(winner.node_name.as_deref(), Some("restored-name"));
+        harness.send(MetadataIn::Gossip(MetadataGossip {
+            entries: vec![winner],
+        }));
+        assert!(harness.gossip.try_recv().is_none());
+    }
+}
+
 mod standalone_gossip_transport {
     //! Actorized registry/metadata/directory gossip over one codec and transport, proving
     //! standalone frames converge without piggybacking on SWIM.

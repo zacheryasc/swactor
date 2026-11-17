@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod crypto;
 pub mod directory_actor;
+pub mod membership_actor;
 pub mod messages;
 pub mod node;
 pub mod node_metadata;

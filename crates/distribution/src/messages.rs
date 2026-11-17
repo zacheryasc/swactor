@@ -107,6 +107,29 @@ impl NetworkMessage for JoinResponse {
     }
 }
 
+/// Dial hints learned from an authenticated cluster connection or peer roster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipPeer {
+    pub node_id: NodeId,
+    pub direct_addrs: Vec<std::net::SocketAddr>,
+    pub relay_url: Option<String>,
+}
+
+/// Authenticated event-mode roster discovery and explicit peer departure.
+/// Roster hints do not prove liveness: receivers establish their own connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipGossip {
+    pub from: MembershipPeer,
+    pub peers: Vec<MembershipPeer>,
+    pub leaving: bool,
+}
+
+impl NetworkMessage for MembershipGossip {
+    fn type_tag() -> &'static str {
+        "swactor_dist::MembershipGossip"
+    }
+}
+
 // ─── Membership Dissemination ───────────────────────────────────────────────
 
 /// A single membership update, piggybacked on protocol messages.
@@ -180,6 +203,34 @@ impl NetworkMessage for DirectoryGossip {
     }
 }
 
+/// Ask a peer to install this signed actor claim as a reply route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryRouteOffer {
+    pub claim: DirectoryEntry,
+    pub attempt: u64,
+}
+
+impl NetworkMessage for DirectoryRouteOffer {
+    fn type_tag() -> &'static str {
+        "swactor_dist::DirectoryRouteOffer"
+    }
+}
+
+/// Confirms the exact offered claim is winning, published, and route-bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryRouteAck {
+    pub from: NodeId,
+    pub actor: ActorAddress,
+    pub generation: u64,
+    pub attempt: u64,
+}
+
+impl NetworkMessage for DirectoryRouteAck {
+    fn type_tag() -> &'static str {
+        "swactor_dist::DirectoryRouteAck"
+    }
+}
+
 /// Build a `CodecRegistry` with all distribution protocol messages registered.
 pub fn distribution_codec_registry() -> CodecRegistry {
     let mut cr = CodecRegistry::new();
@@ -198,11 +249,17 @@ pub fn distribution_codec_registry() -> CodecRegistry {
         .expect("unique codec registration");
     cr.register::<JoinResponse, _>(JsonCodec::<JoinResponse>::default())
         .expect("unique codec registration");
+    cr.register::<MembershipGossip, _>(JsonCodec::<MembershipGossip>::default())
+        .expect("unique codec registration");
     cr.register::<RegistryGossip, _>(JsonCodec::<RegistryGossip>::default())
         .expect("unique codec registration");
     cr.register::<MetadataGossip, _>(JsonCodec::<MetadataGossip>::default())
         .expect("unique codec registration");
     cr.register::<DirectoryGossip, _>(JsonCodec::<DirectoryGossip>::default())
+        .expect("unique codec registration");
+    cr.register::<DirectoryRouteOffer, _>(JsonCodec::<DirectoryRouteOffer>::default())
+        .expect("unique codec registration");
+    cr.register::<DirectoryRouteAck, _>(JsonCodec::<DirectoryRouteAck>::default())
         .expect("unique codec registration");
     cr
 }
@@ -241,9 +298,15 @@ pub fn actor_codec_registry() -> CodecRegistry {
             SwimIn::JoinResponse(jr) => {
                 ("swactor_dist::JoinResponse", json(serde_json::to_vec(jr))?)
             }
+            SwimIn::MembershipGossip(gossip) => (
+                MembershipGossip::type_tag(),
+                json(serde_json::to_vec(gossip))?,
+            ),
             // Local-control variants (§6.2) never leave the node.
             SwimIn::Tick { .. }
             | SwimIn::SendFailed { .. }
+            | SwimIn::TransportConnected { .. }
+            | SwimIn::TransportDisconnected { .. }
             | SwimIn::Join { .. }
             | SwimIn::Leave
             | SwimIn::Subscribe { .. } => {
@@ -279,6 +342,10 @@ pub fn actor_codec_registry() -> CodecRegistry {
         Ok(SwimIn::JoinResponse(d(b)?))
     })
     .expect("unique codec decoder registration");
+    cr.register_decoder::<SwimIn>(MembershipGossip::type_tag(), |b| {
+        Ok(SwimIn::MembershipGossip(d(b)?))
+    })
+    .expect("unique codec decoder registration");
 
     // ── Registry: RegistryIn::Gossip ⇄ RegistryGossip frame ──
     use crate::registry_actor::RegistryIn;
@@ -310,18 +377,36 @@ pub fn actor_codec_registry() -> CodecRegistry {
     })
     .expect("unique codec decoder registration");
 
-    // ── Directory: DirectoryIn::Gossip ⇄ DirectoryGossip frame ──
+    // ── Directory: gossip and causal reply-route readiness ──
     use crate::directory_actor::DirectoryIn;
     cr.register_encoder::<DirectoryIn>(|msg| match msg {
         DirectoryIn::Gossip(g) => Ok((
             DirectoryGossip::type_tag().to_string(),
             serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
         )),
-        _ => Err(Error::from("DirectoryIn: only Gossip is network-encodable")),
+        DirectoryIn::RouteOffer(offer) => Ok((
+            DirectoryRouteOffer::type_tag().to_string(),
+            serde_json::to_vec(offer).map_err(|e| Error::from(format!("encode: {e}")))?,
+        )),
+        DirectoryIn::RouteAck(ack) => Ok((
+            DirectoryRouteAck::type_tag().to_string(),
+            serde_json::to_vec(ack).map_err(|e| Error::from(format!("encode: {e}")))?,
+        )),
+        _ => Err(Error::from(
+            "DirectoryIn: local-only control variant is not network-encodable",
+        )),
     })
     .expect("unique codec encoder registration");
     cr.register_decoder::<DirectoryIn>(DirectoryGossip::type_tag(), |b| {
         Ok(DirectoryIn::Gossip(d(b)?))
+    })
+    .expect("unique codec decoder registration");
+    cr.register_decoder::<DirectoryIn>(DirectoryRouteOffer::type_tag(), |b| {
+        Ok(DirectoryIn::RouteOffer(d(b)?))
+    })
+    .expect("unique codec decoder registration");
+    cr.register_decoder::<DirectoryIn>(DirectoryRouteAck::type_tag(), |b| {
+        Ok(DirectoryIn::RouteAck(d(b)?))
     })
     .expect("unique codec decoder registration");
 

@@ -4,9 +4,9 @@
 //! It is the fourth standalone gossip actor, a peer of [`SwimActor`], [`RegistryActor`],
 //! and [`MetadataActor`] — not a layer above them. It owns one signed claim per
 //! actor (a [`DirectoryEntry`], the spec's `Claim`), converges that location map
-//! across the cluster by lazy round-robin gossip on `Tick`, and publishes a
-//! [`RouteView`] read-mirror the egress consults to route an application message to
-//! an actor it knows only by address (`DIRECTORY.md` §5).
+//! across the cluster by timed gossip or opt-in mutation-driven broadcasts, and
+//! publishes a [`RouteView`] read-mirror the egress consults to route an application
+//! message to an actor it knows only by address (`DIRECTORY.md` §5).
 //!
 //! It differs from the registry/metadata template in only three ways:
 //!  1. it stores signed claims directly (no wrapped CRDT engine), one per actor;
@@ -14,10 +14,10 @@
 //!  3. it publishes a [`RouteView`] (`ActorAddress → NodeId`) instead of a
 //!     [`RelayMirror`](crate::transport_bridge::RelayMirror) (`NodeId → relay URL`).
 //!
-//! Routing is **blind, best-effort**: there are no acks, no retries, no awaited
-//! replies. The single wire-crossing edge is [`DirectoryIn::Gossip`]; every other
-//! variant is local control. Like SWIM, the actor reads no ambient clock — time
-//! enters only as `Tick`.
+//! Application routing remains blind and best-effort. Callers that need a causal
+//! reply-route barrier can use [`DirectoryIn::EnsureRoute`]: its one-shot offer is
+//! acknowledged only after the peer has published and bound the exact claim.
+//! The actor reads no ambient clock; only the default timed mode uses `Tick`.
 //!
 //! [`SwimActor`]: crate::swim::actor::SwimActor
 //! [`RegistryActor`]: crate::registry_actor::RegistryActor
@@ -32,7 +32,7 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 
 use crate::crypto::verify_directory_entry;
-use crate::messages::DirectoryGossip;
+use crate::messages::{DirectoryGossip, DirectoryRouteAck, DirectoryRouteOffer};
 use crate::swim::actor::{MembershipChanged, PeerDirectory};
 use crate::transport_bridge::{RouteBinder, RouteView};
 use crate::types::{DirectoryEntry, MemberState, NodeId};
@@ -42,15 +42,15 @@ const FANOUT: u32 = 3;
 /// Budget ceiling, in multiples of [`FANOUT`]: a claim is sent at most
 /// `FANOUT * MAX_ROUNDS` times before it stops being re-pushed.
 const MAX_ROUNDS: u32 = 8;
-/// Claims shipped in a single gossip batch per `Tick`.
+/// Maximum claims per gossip frame in either dissemination mode.
 const BATCH: usize = 16;
 /// Dead hosts are hidden from the published [`RouteView`], but their signed
 /// claims stay cached so a false-dead peer can become routable again as soon as
 /// SWIM reports it Alive. Claim deletion requires a future explicit tombstone or
 /// owner-side lifecycle signal; raw `Tick` cadence is not a safe GC clock.
-/// Everything the `DirectoryActor` receives, as one enum. Only [`Gossip`](DirectoryIn::Gossip)
-/// crosses the wire (it carries the registered `DirectoryGossip` tag); the rest
-/// are local control — see [`crate::messages::actor_codec_registry`].
+/// Everything the `DirectoryActor` receives, as one enum. Gossip and the
+/// route-offer/ack handshake cross the wire; all other variants are local
+/// control — see [`crate::messages::actor_codec_registry`].
 #[derive(Clone)]
 pub enum DirectoryIn {
     /// Local: a host-signed claim for an actor spawned on this node. The host is
@@ -58,6 +58,21 @@ pub enum DirectoryIn {
     Register(DirectoryEntry),
     /// Gossip from a peer: a batch of signed claims to merge.
     Gossip(DirectoryGossip),
+    /// A signed reply-route claim whose exact installation needs acknowledgment.
+    RouteOffer(DirectoryRouteOffer),
+    /// A peer's acknowledgment of an exact route installation attempt.
+    RouteAck(DirectoryRouteAck),
+    /// Local: offer a locally signed reply route once for this attempt. A new
+    /// request supersedes the actor's previous target/attempt. The caller owns
+    /// the callback and starts a fresh attempt after authority/connection changes.
+    /// Exact acknowledgment completes with `Ok(())`; local validation, binding,
+    /// or send failure completes with `Err(())` without retrying.
+    EnsureRoute {
+        claim: DirectoryEntry,
+        peer: NodeId,
+        attempt: u64,
+        completed: Weak<dyn Fn(Result<(), ()>) + Send + Sync>,
+    },
     /// Membership delta, adapted from the SwimActor's `MembershipChanged` stream.
     Membership(MembershipChanged),
     /// Local diagnostic read (`DIRECTORY.md` §5): resolve `actor`'s host from the
@@ -67,9 +82,9 @@ pub enum DirectoryIn {
         actor: ActorAddress,
         reply: ActorAddress,
     },
-    /// Local: re-arm every cached claim for dissemination. A restarted peer
-    /// keeps the same node id, so membership never transitions and ordinary
-    /// gossip has no rejoin edge to tell it that the peer lost its map.
+    /// Local: send all cached claims to alive peers in event mode, or re-arm
+    /// them for timed dissemination. A stable-id restart need not produce a
+    /// membership transition even though the peer lost its map.
     Resync,
     /// Local: send the cached signed claims directly over a newly established
     /// peer connection. A stable-id restart need not produce a membership delta,
@@ -108,16 +123,29 @@ impl DirectoryClaims {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct RouteRequest {
+    peer: NodeId,
+    actor: ActorAddress,
+    generation: u64,
+    attempt: u64,
+}
+
+struct AwaitingRoute {
+    request: RouteRequest,
+    completed: Weak<dyn Fn(Result<(), ()>) + Send + Sync>,
+    settled: bool,
+}
+
 pub struct DirectoryActor {
     self_id: NodeId,
-    /// The location map: one signed claim per actor. The only writer is [`Self::merge_one`].
+    /// The location map: one signed claim per actor. Written only after signature verification.
     map: DirectoryClaims,
     /// Alive peers (excludes self), folded from the membership stream — the
     /// dissemination fan-out set and the `cluster_size` budget basis.
     alive: BTreeSet<NodeId>,
-    /// Actors still owing dissemination → remaining sends. A freshly authored or
-    /// freshly-superseded claim is armed here; budget decays to zero in steady
-    /// state, so a settled cluster goes quiet.
+    /// Changed claims waiting for dissemination. Values count remaining sends
+    /// in timed mode; event mode ignores them and drains each changed key once.
     hot: HashMap<ActorAddress, u32>,
     /// Round-robins the gossip target across `alive`, one per `Tick`.
     cursor: usize,
@@ -136,6 +164,11 @@ pub struct DirectoryActor {
     /// these entries.
     pinned_routes: RouteView,
     watchers: Vec<Weak<dyn Fn() + Send + Sync>>,
+    /// Verified inbound offers awaiting actual membership/route publication.
+    pending_offers: HashSet<RouteRequest>,
+    /// Only the latest target/attempt for each local reply actor may complete.
+    awaiting_routes: HashMap<ActorAddress, AwaitingRoute>,
+    event_dissemination: bool,
 }
 
 impl DirectoryActor {
@@ -173,14 +206,26 @@ impl DirectoryActor {
             bound_remote: HashSet::new(),
             pinned_routes,
             watchers: Vec::new(),
+            pending_offers: HashSet::new(),
+            awaiting_routes: HashMap::new(),
+            event_dissemination: false,
         }
+    }
+
+    /// Broadcast winning signed claims to every alive peer without clock input.
+    /// Alive notifications and `SyncTo` send all cached claims, including claims
+    /// hidden while their hosts are dead. Host death changes reachability, not
+    /// ownership; this protocol has no signed claim-removal message.
+    pub fn with_event_dissemination(mut self) -> Self {
+        self.event_dissemination = true;
+        self
     }
 
     pub fn claims(&self) -> DirectoryClaims {
         self.map.clone()
     }
 
-    /// Merge one claim under the supersession rule — the only writer of `map`.
+    /// Verify and merge one claim under the supersession rule.
     ///
     /// A claim wins iff it is strictly newer by `(generation, node_id)`: a higher
     /// generation supersedes; at equal generation the larger `node_id` is the
@@ -192,6 +237,10 @@ impl DirectoryActor {
         if !verify_directory_entry(&claim) {
             return false; // not signed by the host it names — drop it
         }
+        self.merge_verified(claim)
+    }
+
+    fn merge_verified(&mut self, claim: DirectoryEntry) -> bool {
         let mut map = self.map.entries.write();
         let supersedes = match map.get(&claim.actor_addr) {
             None => true,
@@ -201,30 +250,167 @@ impl DirectoryActor {
             }
         };
         if supersedes {
-            let budget = self.budget();
+            let budget = if self.event_dissemination {
+                0
+            } else {
+                self.budget()
+            };
             self.hot.insert(claim.actor_addr, budget); // arm for dissemination
             map.insert(claim.actor_addr, claim);
         }
         supersedes
     }
 
-    fn register(&mut self, claim: DirectoryEntry) {
+    fn register(&mut self, ctx: &Ctx, claim: DirectoryEntry) {
         let changed = self.merge_one(claim);
-        self.republish(changed);
+        self.republish(ctx, changed);
+        self.disseminate_mutations(ctx);
     }
 
-    fn merge_batch(&mut self, claims: Vec<DirectoryEntry>) {
+    fn merge_batch(&mut self, ctx: &Ctx, claims: Vec<DirectoryEntry>) {
         let mut changed = false;
         for c in claims {
             changed |= self.merge_one(c);
         }
-        self.republish(changed);
+        self.republish(ctx, changed);
+        self.disseminate_mutations(ctx);
     }
 
-    fn on_membership(&mut self, change: MembershipChanged) {
+    fn ensure_route(
+        &mut self,
+        ctx: &Ctx,
+        claim: DirectoryEntry,
+        peer: NodeId,
+        attempt: u64,
+        completed: Weak<dyn Fn(Result<(), ()>) + Send + Sync>,
+    ) {
+        self.awaiting_routes
+            .retain(|_, pending| pending.completed.strong_count() != 0);
+        if completed.strong_count() == 0 {
+            return;
+        }
+        let valid_claim = claim.node_id == self.self_id && verify_directory_entry(&claim);
+        let request = RouteRequest {
+            peer,
+            actor: claim.actor_addr,
+            generation: claim.generation,
+            attempt,
+        };
+        if let Some(pending) = self.awaiting_routes.get_mut(&claim.actor_addr)
+            && pending.request == request
+        {
+            pending.completed = completed;
+            if !valid_claim {
+                self.complete_route(request.actor, Err(()));
+            }
+            return;
+        }
+        self.awaiting_routes.insert(
+            claim.actor_addr,
+            AwaitingRoute {
+                request,
+                completed,
+                settled: false,
+            },
+        );
+        let failed = if !valid_claim {
+            true
+        } else if let Some(addr) = self.peer_directory.resolve(&peer) {
+            ctx.send(
+                addr,
+                DirectoryIn::RouteOffer(DirectoryRouteOffer { claim, attempt }),
+            )
+            .is_err()
+        } else {
+            true
+        };
+        if failed {
+            self.complete_route(request.actor, Err(()));
+        }
+    }
+
+    fn on_route_offer(&mut self, ctx: &Ctx, offer: DirectoryRouteOffer) {
+        if !verify_directory_entry(&offer.claim) {
+            return;
+        }
+        self.pending_offers.insert(RouteRequest {
+            peer: offer.claim.node_id,
+            actor: offer.claim.actor_addr,
+            generation: offer.claim.generation,
+            attempt: offer.attempt,
+        });
+        let changed = self.merge_verified(offer.claim);
+        // Even an unchanged winning claim needs publication and a causal ACK.
+        self.republish(ctx, changed);
+        self.disseminate_mutations(ctx);
+    }
+
+    fn on_route_ack(&mut self, ack: DirectoryRouteAck) {
+        let Some(pending) = self.awaiting_routes.get(&ack.actor) else {
+            return;
+        };
+        if pending.settled
+            || pending.request.peer != ack.from
+            || pending.request.generation != ack.generation
+            || pending.request.attempt != ack.attempt
+        {
+            return;
+        }
+        self.complete_route(ack.actor, Ok(()));
+    }
+
+    fn complete_route(&mut self, actor: ActorAddress, result: Result<(), ()>) {
+        let Some(pending) = self.awaiting_routes.get_mut(&actor) else {
+            return;
+        };
+        if pending.settled {
+            return;
+        }
+        pending.settled = true;
+        if let Some(completed) = pending.completed.upgrade() {
+            completed(result);
+        }
+    }
+
+    /// Called only after publication has finished installing every route binder.
+    fn acknowledge_routes(&mut self, ctx: &Ctx) {
+        if self.pending_offers.is_empty() {
+            return;
+        }
+        let map = self.map.entries.read();
+        let view = self.route_view.read().expect("route view poisoned");
+        self.pending_offers.retain(|request| {
+            let winning = map.get(&request.actor).is_some_and(|claim| {
+                claim.node_id == request.peer && claim.generation == request.generation
+            });
+            if !winning {
+                return false;
+            }
+            if view.get(&request.actor) != Some(&request.peer)
+                || !self.bound_remote.contains(&request.actor)
+            {
+                return true;
+            }
+            let Some(addr) = self.peer_directory.resolve(&request.peer) else {
+                return true;
+            };
+            ctx.send(
+                addr,
+                DirectoryIn::RouteAck(DirectoryRouteAck {
+                    from: self.self_id,
+                    actor: request.actor,
+                    generation: request.generation,
+                    attempt: request.attempt,
+                }),
+            )
+            .is_err()
+        });
+    }
+
+    fn on_membership(&mut self, ctx: &Ctx, change: MembershipChanged) {
         match change.state {
             MemberState::Alive if change.node_id != self.self_id => {
-                if self.alive.insert(change.node_id) {
+                if self.alive.insert(change.node_id) && !self.event_dissemination {
                     // A (re)joining peer: re-arm every held claim so the returning
                     // peer is caught up — without a full-cluster reflood (only the
                     // actors we hold, and only via the lazy push).
@@ -241,10 +427,20 @@ impl DirectoryActor {
                 // Keep the signed claim cached so a false-dead host can recover
                 // without depending on wall-clock or pump-tick based GC.
                 self.alive.remove(&change.node_id);
+                self.pending_offers
+                    .retain(|request| request.peer != change.node_id);
+                self.awaiting_routes
+                    .retain(|_, pending| pending.request.peer != change.node_id);
             }
             _ => {} // Suspect, or self: ignore (suspicion is SWIM's transient state)
         }
-        self.republish(false);
+        self.republish(ctx, false);
+        if self.event_dissemination
+            && change.state == MemberState::Alive
+            && change.node_id != self.self_id
+        {
+            self.sync_to(ctx, change.node_id);
+        }
     }
 
     fn tick(&mut self, ctx: &Ctx) {
@@ -270,6 +466,36 @@ impl DirectoryActor {
         }
     }
 
+    fn disseminate_mutations(&mut self, ctx: &Ctx) {
+        if !self.event_dissemination || self.hot.is_empty() {
+            return;
+        }
+        // `hot` contains only changed winners. Draining its keys once, rather
+        // than spending a budget, makes duplicate gossip a terminal no-op.
+        let map = self.map.entries.read();
+        let mut actors = self.hot.drain();
+        loop {
+            let claims: Vec<_> = actors
+                .by_ref()
+                .take(BATCH)
+                .filter_map(|(actor, _)| map.get(&actor).cloned())
+                .collect();
+            if claims.is_empty() {
+                break;
+            }
+            for peer in &self.alive {
+                if let Some(addr) = self.peer_directory.resolve(peer) {
+                    let _ = ctx.send(
+                        addr,
+                        DirectoryIn::Gossip(DirectoryGossip {
+                            claims: claims.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
     fn sync_to(&self, ctx: &Ctx, peer: NodeId) {
         let Some(addr) = self.peer_directory.resolve(&peer) else {
             return;
@@ -290,7 +516,7 @@ impl DirectoryActor {
     /// never routes to a host SWIM has buried; the claim remains cached for
     /// recovery. Actors that left the remotely-routed set are unbound so the
     /// binder and transport router do not grow without bound.
-    fn republish(&mut self, claims_changed: bool) {
+    fn republish(&mut self, ctx: &Ctx, claims_changed: bool) {
         let pinned = self
             .pinned_routes
             .read()
@@ -332,6 +558,7 @@ impl DirectoryActor {
             self.route_binder.ensure_routable(actor);
         }
         self.bound_remote = remote;
+        self.acknowledge_routes(ctx);
         if changed || claims_changed {
             self.watchers.retain(|watcher| {
                 if let Some(watcher) = watcher.upgrade() {
@@ -380,9 +607,17 @@ impl ActorInterface for DirectoryActor {
 
     fn handle(&mut self, ctx: &Ctx, msg: DirectoryIn) {
         match msg {
-            DirectoryIn::Register(claim) => self.register(claim),
-            DirectoryIn::Gossip(batch) => self.merge_batch(batch.claims),
-            DirectoryIn::Membership(change) => self.on_membership(change),
+            DirectoryIn::Register(claim) => self.register(ctx, claim),
+            DirectoryIn::Gossip(batch) => self.merge_batch(ctx, batch.claims),
+            DirectoryIn::RouteOffer(offer) => self.on_route_offer(ctx, offer),
+            DirectoryIn::RouteAck(ack) => self.on_route_ack(ack),
+            DirectoryIn::EnsureRoute {
+                claim,
+                peer,
+                attempt,
+                completed,
+            } => self.ensure_route(ctx, claim, peer, attempt, completed),
+            DirectoryIn::Membership(change) => self.on_membership(ctx, change),
             DirectoryIn::SyncTo { peer } => self.sync_to(ctx, peer),
             DirectoryIn::WatchRoutes { changed } => {
                 self.watchers.retain(|watcher| watcher.strong_count() != 0);
@@ -392,14 +627,22 @@ impl ActorInterface for DirectoryActor {
                 }
             }
             DirectoryIn::Resync => {
-                let budget = self.budget();
-                let actors: Vec<ActorAddress> = self.map.entries.read().keys().copied().collect();
-                for actor in actors {
-                    self.hot.insert(actor, budget);
+                if self.event_dissemination {
+                    for peer in &self.alive {
+                        self.sync_to(ctx, *peer);
+                    }
+                } else {
+                    let budget = self.budget();
+                    let actors: Vec<ActorAddress> =
+                        self.map.entries.read().keys().copied().collect();
+                    for actor in actors {
+                        self.hot.insert(actor, budget);
+                    }
                 }
-                self.republish(false);
+                self.republish(ctx, false);
             }
-            DirectoryIn::Tick => self.tick(ctx),
+            DirectoryIn::Tick if !self.event_dissemination => self.tick(ctx),
+            DirectoryIn::Tick => {}
             DirectoryIn::Resolve { actor, reply } => {
                 let host = self
                     .route_view

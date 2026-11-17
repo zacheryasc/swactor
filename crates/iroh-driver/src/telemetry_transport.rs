@@ -9,7 +9,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use swactor::actor::ActorAddress;
 use swactor::runtime::ExternalSender;
-use swactor_engine::EngineHandle;
+use swactor_engine::{EngineHandle, TaskSpawner};
 use telemetry::frame::{
     ChannelDescriptor, ChannelId, ChannelRef, FrameDelivery, Position, StreamDescriptor, StreamId,
     TelemetryEvent,
@@ -82,13 +82,11 @@ pub async fn read_pull_request(
 /// connection. One request per connection; the task exits when the writer
 /// ends or the connection fails.
 pub fn spawn_pull_server(
-    engine: &EngineHandle,
+    tasks: &TaskSpawner,
     conn: Connection,
     endpoint: std::sync::Arc<telemetry::TelemetryEndpoint>,
-    idle_sleep: Duration,
 ) {
-    let engine_handle = engine.clone();
-    engine.spawn(async move {
+    tasks.spawn(async move {
         let Ok(mut recv) = conn.accept_uni().await else {
             return;
         };
@@ -107,7 +105,7 @@ pub fn spawn_pull_server(
         tokio::select! {
             _ = conn.closed() => {}
             _ = write_subscription_until_closed(
-                &engine_handle, send, header, subscription, idle_sleep,
+                send, header, subscription,
             ) => {}
         }
     });
@@ -166,23 +164,30 @@ pub struct PullCollectorConfig {
 /// the first EOF leaves a healthy node permanently stale, which is especially
 /// easy to trigger while several freshly-bootstrapped nodes answer at once.
 pub fn spawn_pull_collector(
+    tasks: &TaskSpawner,
     engine: &EngineHandle,
     config: PullCollectorConfig,
     on_header: std::sync::mpsc::Sender<TelemetryQuicHeader>,
 ) -> PullCollectorHandle {
-    spawn_pull_collector_with_sink(engine, config, PullHeaderSink::Channel(on_header))
+    spawn_pull_collector_with_sink(tasks, engine, config, PullHeaderSink::Channel(on_header))
 }
 
 /// Supervisor side variant that delivers each connection header directly to
 /// an actor. Transport owns the subscription task; the actor owns how the
 /// stream identity changes domain state.
 pub fn spawn_pull_collector_to_actor(
+    tasks: &TaskSpawner,
     engine: &EngineHandle,
     config: PullCollectorConfig,
     sender: ExternalSender,
     actor: ActorAddress,
 ) -> PullCollectorHandle {
-    spawn_pull_collector_with_sink(engine, config, PullHeaderSink::Actor { sender, actor })
+    spawn_pull_collector_with_sink(
+        tasks,
+        engine,
+        config,
+        PullHeaderSink::Actor { sender, actor },
+    )
 }
 
 enum PullHeaderSink {
@@ -203,6 +208,7 @@ impl PullHeaderSink {
 }
 
 fn spawn_pull_collector_with_sink(
+    tasks: &TaskSpawner,
     engine: &EngineHandle,
     config: PullCollectorConfig,
     on_header: PullHeaderSink,
@@ -218,7 +224,7 @@ fn spawn_pull_collector_with_sink(
     let (cancellation, mut cancellation_rx) = tokio::sync::watch::channel(false);
     let (completion, completion_rx) = tokio::sync::watch::channel(false);
     let engine_handle = engine.clone();
-    engine.spawn(async move {
+    tasks.spawn(async move {
         let _completion = PullCollectorCompletion(completion);
         let peer_id = peer.id.to_string();
         let mut retry_delay = Duration::from_millis(250);
@@ -393,42 +399,38 @@ pub struct TelemetryQuicRead {
 }
 
 pub fn spawn_subscription_writer(
-    engine: &EngineHandle,
+    tasks: &TaskSpawner,
     endpoint: Endpoint,
     peer: EndpointAddr,
     header: TelemetryQuicHeader,
     subscription: TelemetrySubscription,
-    idle_sleep: Duration,
 ) {
-    let engine_handle = engine.clone();
-    engine.spawn(async move {
+    tasks.spawn(async move {
         let Ok(conn) = endpoint.connect(peer, TELEMETRY_ALPN).await else {
             return;
         };
         let Ok(send) = conn.open_uni().await else {
             return;
         };
-        let _ =
-            write_subscription_until_closed(&engine_handle, send, header, subscription, idle_sleep)
-                .await;
+        tokio::select! {
+            _ = conn.closed() => {}
+            _ = write_subscription_until_closed(send, header, subscription) => {}
+        }
     });
 }
 
 pub async fn write_available_subscription(
-    engine: &EngineHandle,
     send: SendStream,
     header: &TelemetryQuicHeader,
     subscription: &TelemetrySubscription,
 ) -> Result<TelemetryQuicWriteStats, BoxError> {
-    write_subscription_inner(engine, send, header, subscription, None).await
+    write_subscription_inner(send, header, subscription).await
 }
 
 pub async fn write_subscription_until_closed(
-    engine: &EngineHandle,
     mut send: SendStream,
     header: TelemetryQuicHeader,
     subscription: TelemetrySubscription,
-    idle_sleep: Duration,
 ) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_header(&mut send, &header).await?;
     let mut stats = TelemetryQuicWriteStats::default();
@@ -441,7 +443,7 @@ pub async fn write_subscription_until_closed(
         if dropped != 0 {
             return Err(format!("telemetry subscription dropped {dropped} events").into());
         }
-        match subscription.try_recv() {
+        match subscription.recv_async().await {
             Ok(first) => {
                 take_event_batch(first, &subscription, &mut events);
                 let written =
@@ -450,8 +452,13 @@ pub async fn write_subscription_until_closed(
                 stats.events += written.events;
                 stats.bytes += written.bytes;
             }
-            Err(TryRecvError::Empty) => engine.timer(idle_sleep).await,
-            Err(TryRecvError::Disconnected) => break,
+            Err(_) => {
+                let dropped = subscription.dropped();
+                if dropped != 0 {
+                    return Err(format!("telemetry subscription dropped {dropped} events").into());
+                }
+                break;
+            }
         }
     }
     send.finish()?;
@@ -459,11 +466,9 @@ pub async fn write_subscription_until_closed(
 }
 
 async fn write_subscription_inner(
-    engine: &EngineHandle,
     mut send: SendStream,
     header: &TelemetryQuicHeader,
     subscription: &TelemetrySubscription,
-    idle_sleep: Option<Duration>,
 ) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_header(&mut send, header).await?;
     let mut stats = TelemetryQuicWriteStats::default();
@@ -485,10 +490,7 @@ async fn write_subscription_inner(
                 stats.events += written.events;
                 stats.bytes += written.bytes;
             }
-            Err(TryRecvError::Empty) => match idle_sleep {
-                Some(delay) => engine.timer(delay).await,
-                None => break,
-            },
+            Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
         }
     }
@@ -705,11 +707,11 @@ pub async fn read_next_uni_from_connection(
 }
 
 pub fn spawn_connection_reader(
-    engine: &EngineHandle,
+    tasks: &TaskSpawner,
     conn: Connection,
     sink: std::sync::mpsc::Sender<TelemetryEvent>,
 ) {
-    engine.spawn(async move {
+    tasks.spawn(async move {
         loop {
             let recv = match conn.accept_uni().await {
                 Ok(recv) => recv,

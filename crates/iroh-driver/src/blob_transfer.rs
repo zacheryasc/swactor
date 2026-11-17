@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
-use swactor_engine::{BlockingWorkSender, EngineHandle};
+use swactor_engine::{BlockingWorkSender, EngineHandle, TaskSpawner};
 
 use crate::iroh_driver::EdgeConnector;
 
@@ -145,25 +145,29 @@ impl IrohBlobTransferReceiver {
         }
     }
 
+    /// Drain queued transfer events on arrival, stopping with the owning driver.
     pub fn install_pump(
         self: &Arc<Self>,
-        engine: &EngineHandle,
+        tasks: &TaskSpawner,
+        mut connections: tokio::sync::watch::Receiver<u64>,
         runtime: Runtime,
-        period: Duration,
         mut activity: tokio::sync::watch::Receiver<()>,
     ) {
         let receiver = Arc::clone(self);
-        let engine = engine.clone();
-        engine.clone().spawn(async move {
-            let mut interval = engine.interval(period);
+        tasks.spawn(async move {
             loop {
+                if *connections.borrow_and_update() == 0 {
+                    break;
+                }
+                receiver.drain(&runtime);
                 tokio::select! {
-                    _ = &mut interval => {},
+                    changed = connections.changed() => {
+                        if changed.is_err() { break; }
+                    },
                     changed = activity.changed() => {
                         if changed.is_err() { break; }
                     },
                 }
-                receiver.drain(&runtime);
             }
         });
     }

@@ -15,7 +15,7 @@ use iroh_driver::{
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Runtime, RuntimeParts};
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor_engine::{Engine, TaskSpawner, TokioBackend, TokioConfig};
 use swactor_transport::{CodecRegistry, CodecRemoteSink, TransportRouter};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -44,7 +44,7 @@ struct Node {
     driver: IrohDriver,
 }
 
-fn node() -> Node {
+fn node_engine() -> (Engine, Runtime) {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let runtime = parts.runtime().clone();
     let engine = Engine::new(
@@ -52,7 +52,12 @@ fn node() -> Node {
         TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
     )
     .expect("engine");
+    (engine, runtime)
+}
+
+fn node(tasks: TaskSpawner, engine: Engine, runtime: Runtime) -> Node {
     let mut driver = IrohDriver::with_engine(
+        tasks,
         engine.handle(),
         IrohDriverConfig {
             secret_key: None,
@@ -76,7 +81,7 @@ fn node() -> Node {
         route_view: Arc::new(RwLock::new(HashMap::new())),
         outbox: Arc::new(Default::default()),
     });
-    driver.install_actor_bridge_pump(Duration::from_millis(5));
+    driver.install_actor_bridge();
     Node {
         engine,
         runtime,
@@ -86,16 +91,19 @@ fn node() -> Node {
 
 #[test]
 fn real_iroh_transfer_delivers_exact_file_bytes() {
-    let source = node();
-    let destination = node();
+    let (engine, runtime) = node_engine();
+    let source = node(engine.task_spawner(), engine, runtime);
+    let (engine, runtime) = node_engine();
+    let destination_tasks = engine.task_spawner();
+    let destination = node(destination_tasks.clone(), engine, runtime);
     let receiver = Arc::new(IrohBlobTransferReceiver::new(
         destination.driver.endpoint_addr(),
         destination.driver.edge_events_handle(),
     ));
     receiver.install_pump(
-        &destination.engine.handle(),
+        &destination_tasks,
+        destination.driver.connection_changes(),
         destination.runtime.clone(),
-        Duration::from_millis(5),
         destination.driver.edge_events_changed(),
     );
     let sender = IrohBlobTransferSender::new(
@@ -203,7 +211,8 @@ fn real_iroh_transfer_delivers_exact_file_bytes() {
 }
 #[test]
 fn same_runtime_transfer_bypasses_iroh_self_connection() {
-    let node = node();
+    let (engine, runtime) = node_engine();
+    let node = node(engine.task_spawner(), engine, runtime);
     let receiver = IrohBlobTransferReceiver::new(
         node.driver.endpoint_addr(),
         node.driver.edge_events_handle(),

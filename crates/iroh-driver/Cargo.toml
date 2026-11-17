@@ -8,11 +8,15 @@ license = "AGPL-3.0-only"
 name = "iroh_driver"
 path = "src/lib.rs"
 
+[features]
+default = ["data-plane"]
+data-plane = ["dep:data-plane"]
+
 [dependencies]
 swactor = { path = "../..", features = ["serde", "transport"] }
 swactor-engine = { path = "../engine" }
 swactor-transport = { path = "../transport" }
-data-plane = { path = "../data-plane" }
+data-plane = { path = "../data-plane", optional = true }
 distribution = { path = "../distribution" }
 telemetry = { path = "../telemetry" }
 crossbeam-channel = "0.5"

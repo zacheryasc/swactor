@@ -12,7 +12,7 @@ use data_plane::stream_transport::{
     StreamTransportNotifier,
 };
 
-use common::iroh::make_driver;
+use common::iroh::{make_driver, node_engine};
 
 struct ChannelNotifier(Sender<StreamTransportEvent>);
 
@@ -31,24 +31,25 @@ fn arena(node: u64) -> ArenaManager {
     .expect("arena")
 }
 
-fn recv_until(receiver: &Receiver<StreamTransportEvent>, expected: StreamTransportEvent) {
-    loop {
-        let event = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("transport event deadline");
-        if event == expected {
-            return;
-        }
-        if let StreamTransportEvent::Fault(reason) = event {
-            panic!("unexpected stream fault: {reason}");
-        }
-    }
-}
-
 #[test]
 fn iroh_adapter_satisfies_ordering_and_terminal_contract() {
-    let source_node = make_driver();
-    let sink_node = make_driver();
+    let recv_until = |receiver: &Receiver<StreamTransportEvent>, expected: StreamTransportEvent| {
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("transport event deadline");
+            if event == expected {
+                return;
+            }
+            if let StreamTransportEvent::Fault(reason) = event {
+                panic!("unexpected stream fault: {reason}");
+            }
+        }
+    };
+    let (engine, runtime) = node_engine();
+    let source_node = make_driver(engine.task_spawner(), engine, runtime);
+    let (engine, runtime) = node_engine();
+    let sink_node = make_driver(engine.task_spawner(), engine, runtime);
     let source_transport = source_node.driver.stream_transport();
     let sink_transport = sink_node.driver.stream_transport();
 
@@ -138,7 +139,21 @@ fn iroh_adapter_satisfies_ordering_and_terminal_contract() {
 
 #[test]
 fn iroh_adapter_uses_in_process_transport_for_its_own_endpoint() {
-    let node = make_driver();
+    let recv_until = |receiver: &Receiver<StreamTransportEvent>, expected: StreamTransportEvent| {
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("transport event deadline");
+            if event == expected {
+                return;
+            }
+            if let StreamTransportEvent::Fault(reason) = event {
+                panic!("unexpected stream fault: {reason}");
+            }
+        }
+    };
+    let (engine, runtime) = node_engine();
+    let node = make_driver(engine.task_spawner(), engine, runtime);
     let transport = node.driver.stream_transport();
     let mut source_arena = arena(3);
     let source_handle = install(
