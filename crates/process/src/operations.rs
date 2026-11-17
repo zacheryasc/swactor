@@ -4,8 +4,11 @@
 //! actual process creation, waiting, and signaling stays behind this substrate
 //! boundary.
 
+#[cfg(target_os = "linux")]
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
+#[cfg(target_os = "linux")]
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
@@ -14,11 +17,14 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use swactor::actor::ActorAddress;
 use swactor::runtime::ExternalSender;
+use swactor_engine::{BlockingWorkHandle, BlockingWorkSender, OwnedIoThread};
 
 pub fn command_output(command: &mut Command) -> io::Result<Output> {
     command.output()
@@ -30,10 +36,15 @@ pub fn command_output(command: &mut Command) -> io::Result<Output> {
 /// [`SupervisedChild`], without requiring an actor mailbox to make progress.
 /// Timeout kills and reaps the owned child before returning.
 #[cfg(target_os = "linux")]
-pub fn command_output_until(command: &mut Command, deadline: Instant) -> io::Result<Output> {
+pub fn command_output_until(
+    blocking: &BlockingWorkSender,
+    command: &mut Command,
+    deadline: Instant,
+) -> io::Result<Output> {
     let output = Arc::new(Mutex::new(CapturedCommandOutput::default()));
     let (finished, completion) = std::sync::mpsc::channel();
     let owner = SupervisedChild::spawn_observed(
+        blocking,
         command.stdin(std::process::Stdio::null()),
         None,
         Some(deadline),
@@ -80,6 +91,83 @@ pub fn command_output_until(command: &mut Command, deadline: Instant) -> io::Res
         stdout: std::mem::take(&mut output.stdout),
         stderr: std::mem::take(&mut output.stderr),
     })
+}
+
+/// Capture an owned command until its actual exit and both output streams close.
+/// Unwinding cancels the process group and joins all command work.
+#[cfg(target_os = "linux")]
+pub fn command_output_owned(
+    blocking: &BlockingWorkSender,
+    command: &mut Command,
+) -> io::Result<Output> {
+    let output = Arc::new(Mutex::new(CapturedCommandOutput::default()));
+    let (finished, completion) = std::sync::mpsc::channel();
+    let owner = SupervisedChild::spawn_observed(
+        blocking,
+        command.stdin(std::process::Stdio::null()),
+        None,
+        None,
+        SupervisedOutputObserver::Capture {
+            output: Arc::clone(&output),
+            finished,
+        },
+    )?;
+    let completed = completion.recv();
+    drop(owner);
+    let status = completed
+        .map_err(|_| io::Error::other("process owner finished without an exit result"))?
+        .map_err(io::Error::other)?;
+    let mut output = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(error) = output.error.take() {
+        return Err(error);
+    }
+    Ok(Output {
+        status,
+        stdout: std::mem::take(&mut output.stdout),
+        stderr: std::mem::take(&mut output.stderr),
+    })
+}
+
+/// Stream a command's output while retaining joined process-group ownership.
+/// The callback runs on the calling thread; its panic cancels the command.
+#[cfg(target_os = "linux")]
+pub fn command_status_observed(
+    blocking: &BlockingWorkSender,
+    command: &mut Command,
+    mut observe: impl FnMut(ProcessStreamObservation),
+) -> io::Result<ExitStatus> {
+    let (events, observations) = std::sync::mpsc::channel();
+    let owner = SupervisedChild::spawn_observed(
+        blocking,
+        command,
+        None,
+        None,
+        SupervisedOutputObserver::Channel { events },
+    )?;
+    let result = loop {
+        match observations.recv() {
+            Ok(CommandObservation::Stream(observation)) => {
+                let error = match &observation {
+                    ProcessStreamObservation::Error { error, .. } => Some(error.clone()),
+                    _ => None,
+                };
+                observe(observation);
+                if let Some(error) = error {
+                    break Err(io::Error::other(error));
+                }
+            }
+            Ok(CommandObservation::Exited(result)) => break result.map_err(io::Error::other),
+            Err(_) => {
+                break Err(io::Error::other(
+                    "process owner finished without an exit result",
+                ));
+            }
+        }
+    };
+    drop(owner);
+    result
 }
 
 pub fn command_status(command: &mut Command) -> io::Result<ExitStatus> {
@@ -141,12 +229,14 @@ pub enum ProcessStreamObservation {
 }
 
 pub struct LineReaderHandle {
-    join: JoinHandle<()>,
+    join: Option<BlockingWorkHandle<()>>,
 }
 
 impl LineReaderHandle {
     pub fn join(self) {
-        let _ = self.join.join();
+        if let Some(join) = self.join {
+            let _ = join.join();
+        }
     }
 }
 
@@ -175,6 +265,7 @@ fn read_process_lines<R: Read>(
 
 /// Read one child stream and deliver typed observations to an actor relay.
 pub fn spawn_line_reader<R>(
+    blocking: &BlockingWorkSender,
     stream: ProcessStream,
     reader: R,
     sender: ExternalSender,
@@ -183,12 +274,45 @@ pub fn spawn_line_reader<R>(
 where
     R: Read + Send + 'static,
 {
-    let join = thread::spawn(move || {
+    let observer = sender.clone();
+    let join = match blocking.submit_joinable(move || {
+        read_process_lines(stream, reader, |observation| {
+            observer.send_to(actor, observation).is_ok()
+        });
+    }) {
+        Ok(join) => Some(join),
+        Err(error) => {
+            let _ = sender.send_to(
+                actor,
+                ProcessStreamObservation::Error {
+                    stream,
+                    error: error.to_string(),
+                },
+            );
+            let _ = sender.send_to(actor, ProcessStreamObservation::Closed { stream });
+            None
+        }
+    };
+    LineReaderHandle { join }
+}
+
+/// Read a stream under an explicit resource owner, independently of pool work.
+/// The owner must make the reader reach EOF or cancel it before joining.
+pub fn spawn_owned_line_reader<R>(
+    blocking: &BlockingWorkSender,
+    stream: ProcessStream,
+    reader: R,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) -> io::Result<OwnedIoThread<()>>
+where
+    R: Read + Send + 'static,
+{
+    blocking.spawn_owned_thread("process-owned-line-reader", move || {
         read_process_lines(stream, reader, |observation| {
             sender.send_to(actor, observation).is_ok()
         });
-    });
-    LineReaderHandle { join }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,23 +320,16 @@ pub struct ProcessStopSignal;
 
 /// Wait for an embedding process-control channel and notify an actor once.
 pub fn spawn_stop_channel_wait(
+    blocking: &BlockingWorkSender,
     receiver: Receiver<()>,
     sender: ExternalSender,
     actor: ActorAddress,
 ) {
-    drop(spawn_stop_channel_wait_thread(receiver, sender, actor));
-}
-
-fn spawn_stop_channel_wait_thread(
-    receiver: Receiver<()>,
-    sender: ExternalSender,
-    actor: ActorAddress,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+    let _ = blocking.submit(Box::new(move || {
         if receiver.recv().is_ok() {
             let _ = sender.send_to(actor, ProcessStopSignal);
         }
-    })
+    }));
 }
 
 /// Wait for SIGINT/SIGTERM and notify an actor once.
@@ -221,19 +338,31 @@ fn spawn_stop_channel_wait_thread(
 /// therefore publish readiness immediately after a successful return without
 /// racing the operating system's default signal action.
 #[cfg(target_os = "linux")]
-pub fn spawn_os_stop_signal_wait(sender: ExternalSender, actor: ActorAddress) -> io::Result<()> {
+pub fn spawn_os_stop_signal_wait(
+    blocking: &BlockingWorkSender,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) -> io::Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::signal::SIGINT,
         signal_hook::consts::signal::SIGTERM,
     ])?;
-    thread::spawn(move || {
-        if signals.forever().next().is_some() {
-            let _ = sender.send_to(actor, ProcessStopSignal);
-        }
-    });
+    blocking
+        .submit(Box::new(move || {
+            if signals.forever().next().is_some() {
+                let _ = sender.send_to(actor, ProcessStopSignal);
+            }
+        }))
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "process signal watcher engine stopped",
+            )
+        })?;
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -241,45 +370,43 @@ pub struct ProcessIdentity {
     pub process_group_leader: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl ProcessIdentity {
     pub fn matches(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else {
-                return false;
-            };
-            let Some((_, tail)) = stat.rsplit_once(')') else {
-                return false;
-            };
-            let mut fields = tail.split_whitespace();
-            let state = fields.next();
-            let _parent_pid = fields.next();
-            let process_group = fields.next().and_then(|value| value.parse::<u32>().ok());
-            if state == Some("Z") || self.process_group_leader && process_group != Some(self.pid) {
-                return false;
-            }
-            let Ok(environ) = std::fs::read(format!("/proc/{}/environ", self.pid)) else {
-                return false;
-            };
-            self.environment.iter().all(|(key, value)| {
-                environ.split(|byte| *byte == 0).any(|entry| {
-                    entry
-                        .strip_prefix(format!("{key}=").as_bytes())
-                        .is_some_and(|actual| actual == value.as_bytes())
-                })
-            })
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else {
+            return false;
+        };
+        let Some((_, tail)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let mut fields = tail.split_whitespace();
+        let state = fields.next();
+        let _parent_pid = fields.next();
+        let process_group = fields.next().and_then(|value| value.parse::<u32>().ok());
+        if state == Some("Z") || self.process_group_leader && process_group != Some(self.pid) {
+            return false;
         }
-        #[cfg(not(target_os = "linux"))]
-        false
+        let Ok(environ) = std::fs::read(format!("/proc/{}/environ", self.pid)) else {
+            return false;
+        };
+        self.environment.iter().all(|(key, value)| {
+            environ.split(|byte| *byte == 0).any(|entry| {
+                entry
+                    .strip_prefix(format!("{key}=").as_bytes())
+                    .is_some_and(|actual| actual == value.as_bytes())
+            })
+        })
     }
 }
 
+#[cfg(target_os = "linux")]
 pub struct FollowProcessFile {
     file: File,
     identity: ProcessIdentity,
     poll_interval: Duration,
 }
 
+#[cfg(target_os = "linux")]
 impl FollowProcessFile {
     pub fn new(file: File, identity: ProcessIdentity, poll_interval: Duration) -> Self {
         Self {
@@ -290,6 +417,7 @@ impl FollowProcessFile {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Read for FollowProcessFile {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -345,24 +473,72 @@ fn wait_process_fds<const N: usize>(
     Ok(std::array::from_fn(|index| descriptors[index].revents != 0))
 }
 
+/// Wait for descriptor readiness, closure, or a descriptor error.
+///
+/// This operation has no clock or wake cadence. Owners must consume the
+/// readiness event (or finish the operation) before waiting on the same
+/// level-triggered descriptor again.
+#[cfg(target_os = "linux")]
+pub fn wait_readable<const N: usize>(fds: &[Option<&OwnedFd>; N]) -> io::Result<[bool; N]> {
+    if fds.iter().all(Option::is_none) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no readiness descriptors",
+        ));
+    }
+    let mut descriptors: [libc::pollfd; N] = std::array::from_fn(|index| libc::pollfd {
+        fd: fds[index].map_or(-1, AsRawFd::as_raw_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    loop {
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                -1,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptors
+            .iter()
+            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+        {
+            return Err(io::Error::other("process readiness descriptor failed"));
+        }
+        return Ok(std::array::from_fn(|index| descriptors[index].revents != 0));
+    }
+}
+
 /// A cancellable exit subscription. Dropping it joins its observer without
 /// stopping the process, so adopted workers may outlive their observation.
 #[cfg(target_os = "linux")]
 pub struct ProcessWatch {
     cancel: Arc<OwnedFd>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<OwnedIoThread<()>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for ProcessWatch {
     fn drop(&mut self) {
         let value = 1_u64;
-        unsafe {
-            libc::write(
-                self.cancel.as_raw_fd(),
-                (&value as *const u64).cast(),
-                std::mem::size_of::<u64>(),
-            );
+        loop {
+            let result = unsafe {
+                libc::write(
+                    self.cancel.as_raw_fd(),
+                    (&value as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -372,56 +548,58 @@ impl Drop for ProcessWatch {
 
 #[cfg(target_os = "linux")]
 pub fn watch_process(
+    blocking: &BlockingWorkSender,
     identity: ProcessIdentity,
     child: Option<Arc<Mutex<Option<Child>>>>,
     sender: ExternalSender,
     actor: ActorAddress,
 ) -> io::Result<ProcessWatch> {
-    let exit = process_exit_fd(identity.pid).ok();
+    let exit = match process_exit_fd(identity.pid) {
+        Ok(exit) => Some(exit),
+        Err(_) if child.is_none() && !identity.matches() => None,
+        Err(error) => return Err(error),
+    };
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let cancel = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
     let cancelled = Arc::clone(&cancel);
-    let thread = thread::Builder::new().spawn(move || {
-        let mut error = None;
-        let status = loop {
-            if let Some(child) = &child {
-                let mut slot = child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(child) = slot.as_mut() else {
-                    return;
-                };
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        *slot = None;
-                        break status.code();
-                    }
-                    Ok(None) => {}
-                    Err(reason) => {
-                        error = Some(reason.to_string());
-                        break None;
-                    }
-                }
-            } else if !identity.matches() {
-                break None;
+    let thread = blocking.spawn_owned_thread("process-exit-observer", move || {
+        let observation = (|| -> io::Result<Option<i32>> {
+            if child.is_none() && !identity.matches() {
+                return Ok(None);
             }
-            let delay = if exit.is_some() {
-                Duration::from_secs(30)
-            } else {
-                Duration::from_millis(100)
+            let Some(exit) = exit else {
+                return Ok(None);
             };
-            match wait_process_fds(&[exit.as_ref(), Some(&cancelled)], delay) {
-                Ok(ready) if ready[1] => return,
-                Ok(ready) if ready[0] && child.is_none() => break None,
-                Ok(_) => {}
-                Err(reason) => {
-                    error = Some(reason.to_string());
-                    break None;
-                }
+            if wait_readable(&[Some(&exit), Some(&cancelled)])?[1] {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "process observation cancelled",
+                ));
             }
+            let Some(child) = &child else {
+                return Ok(None);
+            };
+            let mut slot = child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(child) = slot.as_mut() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "process already reaped by owner",
+                ));
+            };
+            terminate_owned_child(child);
+            let status = child.wait()?;
+            *slot = None;
+            Ok(status.code())
+        })();
+        let (status, error) = match observation {
+            Ok(status) => (status, None),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return,
+            Err(error) => (None, Some(error.to_string())),
         };
         let _ = sender.send_to(actor, ProcessExitObservation { status, error });
     })?;
@@ -431,54 +609,58 @@ pub fn watch_process(
     })
 }
 
-/// Send a best-effort shutdown command without blocking on stdin, then observe
-/// exit until the absolute deadline. Kill and reap the owned group on expiry.
+/// Deliver a graceful shutdown request, then wait for the owned child to exit.
+/// A concurrent `cancel_shared_child` remains able to force cancellation.
 #[cfg(target_os = "linux")]
 pub fn stop_shared_child_with_input(
     child: &Arc<Mutex<Option<Child>>>,
     stdin: &mut std::process::ChildStdin,
     input: &[u8],
-    deadline: Instant,
 ) -> io::Result<Option<ExitStatus>> {
-    let fd = stdin.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0 {
-        let _ = stdin.write_all(input);
-        let _ = stdin.flush();
-    }
-    let exit = child
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .and_then(|child| process_exit_fd(child.id()).ok());
-    loop {
+    let exit = {
         let mut slot = child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(child) = slot.as_mut() else {
             return Ok(None);
         };
-        if let Some(status) = child.try_wait()? {
-            *slot = None;
-            return Ok(Some(status));
-        }
-        if Instant::now() >= deadline {
-            terminate_owned_child(child);
-            let status = child.wait()?;
-            *slot = None;
-            return Ok(Some(status));
-        }
-        drop(slot);
-        let left = deadline.saturating_duration_since(Instant::now());
-        wait_process_fds(
-            &[exit.as_ref()],
-            if exit.is_some() {
-                left
-            } else {
-                left.min(Duration::from_millis(50))
-            },
-        )?;
+        process_exit_fd(child.id())?
+    };
+    // No child mutex is held while writing or awaiting completion. Cancellation
+    // can close the group's pipe readers and wake both operations.
+    match stdin.write_all(input).and_then(|()| stdin.flush()) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(error) => return Err(error),
     }
+    wait_readable(&[Some(&exit)])?;
+    let mut slot = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(child) = slot.as_mut() else {
+        return Ok(None);
+    };
+    // The leader has completed gracefully. Dispose of any remaining group
+    // members before reaping releases its process-group identity.
+    terminate_owned_child(child);
+    let status = child.wait()?;
+    *slot = None;
+    Ok(Some(status))
+}
+
+/// Force-cancel a shared owned child, reap it, and wake graceful waiters.
+#[cfg(target_os = "linux")]
+pub fn cancel_shared_child(child: &Arc<Mutex<Option<Child>>>) -> io::Result<Option<ExitStatus>> {
+    let mut slot = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(child) = slot.as_mut() else {
+        return Ok(None);
+    };
+    terminate_owned_child(child);
+    let status = child.wait()?;
+    *slot = None;
+    Ok(Some(status))
 }
 
 #[cfg(target_os = "linux")]
@@ -504,7 +686,7 @@ pub enum SupervisedProcessObservation {
 #[cfg(target_os = "linux")]
 pub struct SupervisedChild {
     child: Arc<Mutex<Option<Child>>>,
-    waiter: Option<JoinHandle<()>>,
+    waiter: Option<OwnedIoThread<()>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -513,6 +695,12 @@ struct CapturedCommandOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     error: Option<io::Error>,
+}
+
+#[cfg(target_os = "linux")]
+enum CommandObservation {
+    Stream(ProcessStreamObservation),
+    Exited(Result<ExitStatus, String>),
 }
 
 #[cfg(target_os = "linux")]
@@ -527,16 +715,23 @@ enum SupervisedOutputObserver {
         output: Arc<Mutex<CapturedCommandOutput>>,
         finished: std::sync::mpsc::Sender<Result<ExitStatus, String>>,
     },
+    Channel {
+        events: std::sync::mpsc::Sender<CommandObservation>,
+    },
 }
 
 #[cfg(target_os = "linux")]
 impl SupervisedOutputObserver {
     fn close_stream(&self, stream: ProcessStream) {
-        if let Self::Actor { sender, actor, .. } = self {
-            let _ = sender.send_to(
-                *actor,
-                SupervisedProcessObservation::Stream(ProcessStreamObservation::Closed { stream }),
-            );
+        let observation = ProcessStreamObservation::Closed { stream };
+        match self {
+            Self::Actor { sender, actor, .. } => {
+                let _ = sender.send_to(*actor, SupervisedProcessObservation::Stream(observation));
+            }
+            Self::Channel { events } => {
+                let _ = events.send(CommandObservation::Stream(observation));
+            }
+            Self::Capture { .. } => {}
         }
     }
 
@@ -558,17 +753,21 @@ impl SupervisedOutputObserver {
             Self::Capture { finished, .. } => {
                 let _ = finished.send(result);
             }
+            Self::Channel { events } => {
+                let _ = events.send(CommandObservation::Exited(result));
+            }
         }
     }
 }
 
 #[cfg(target_os = "linux")]
 fn spawn_supervised_reader<R: Read + Send + 'static>(
+    blocking: &BlockingWorkSender,
     stream: ProcessStream,
     mut reader: R,
     observer: SupervisedOutputObserver,
-) -> io::Result<JoinHandle<()>> {
-    thread::Builder::new().spawn(move || match observer {
+) -> io::Result<OwnedIoThread<()>> {
+    blocking.spawn_owned_thread("process-output-reader", move || match observer {
         SupervisedOutputObserver::Actor { sender, actor, .. } => {
             read_process_lines(stream, reader, |observation| {
                 sender
@@ -590,23 +789,29 @@ fn spawn_supervised_reader<R: Read + Send + 'static>(
                 output.error = Some(error);
             }
         }
+        SupervisedOutputObserver::Channel { events } => {
+            read_process_lines(stream, reader, |observation| {
+                events.send(CommandObservation::Stream(observation)).is_ok()
+            });
+        }
     })
 }
 
 #[cfg(target_os = "linux")]
 impl SupervisedChild {
     pub fn spawn(
+        blocking: &BlockingWorkSender,
         command: &mut Command,
         input: Option<Arc<[u8]>>,
-        deadline: Option<Instant>,
         sender: ExternalSender,
         actor: ActorAddress,
         operation: u64,
     ) -> io::Result<Self> {
         Self::spawn_observed(
+            blocking,
             command,
             input,
-            deadline,
+            None,
             SupervisedOutputObserver::Actor {
                 sender,
                 actor,
@@ -616,6 +821,7 @@ impl SupervisedChild {
     }
 
     fn spawn_observed(
+        blocking: &BlockingWorkSender,
         command: &mut Command,
         input: Option<Arc<[u8]>>,
         deadline: Option<Instant>,
@@ -674,16 +880,27 @@ impl SupervisedChild {
         });
         let child = Arc::new(Mutex::new(Some(child)));
         let owned = Arc::clone(&child);
-        let waiter = match thread::Builder::new().spawn(move || {
+        let io_work = blocking.clone();
+        let waiter = match blocking.spawn_owned_thread("process-owner", move || {
             let mut setup_error = None;
             let readers = [
                 (
                     ProcessStream::Stdout,
-                    spawn_supervised_reader(ProcessStream::Stdout, stdout, observer.clone()),
+                    spawn_supervised_reader(
+                        &io_work,
+                        ProcessStream::Stdout,
+                        stdout,
+                        observer.clone(),
+                    ),
                 ),
                 (
                     ProcessStream::Stderr,
-                    spawn_supervised_reader(ProcessStream::Stderr, stderr, observer.clone()),
+                    spawn_supervised_reader(
+                        &io_work,
+                        ProcessStream::Stderr,
+                        stderr,
+                        observer.clone(),
+                    ),
                 ),
             ]
             .map(|(stream, reader)| {
@@ -700,9 +917,9 @@ impl SupervisedChild {
                 )
             });
             let writer = stdin.and_then(|(mut stdin, bytes)| {
-                match thread::Builder::new()
-                    .spawn(move || stdin.write_all(&bytes).and_then(|()| stdin.flush()))
-                {
+                match io_work.spawn_owned_thread("process-input-writer", move || {
+                    stdin.write_all(&bytes).and_then(|()| stdin.flush())
+                }) {
                     Ok(writer) => Some(writer),
                     Err(error) => {
                         setup_error = Some(error.to_string());
@@ -712,12 +929,9 @@ impl SupervisedChild {
             });
             let waited = if let Some(error) = setup_error {
                 Err(error)
-            } else {
+            } else if let Some(deadline) = deadline {
                 loop {
-                    let left = deadline
-                        .map_or(Duration::from_millis(i32::MAX as u64), |deadline| {
-                            deadline.saturating_duration_since(Instant::now())
-                        });
+                    let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         break Err("process owner deadline expired; pending child exit".to_owned());
                     }
@@ -727,6 +941,10 @@ impl SupervisedChild {
                         Err(error) => break Err(error.to_string()),
                     }
                 }
+            } else {
+                wait_readable(&[Some(&exit)])
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             };
             let status = {
                 let mut slot = owned
@@ -793,134 +1011,136 @@ impl Drop for SupervisedChild {
             .child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(mut child) = slot.take() {
-            terminate_owned_child(&mut child);
-            let _ = child.wait();
+        if let Some(child) = slot.as_mut() {
+            terminate_owned_child(child);
         }
         drop(slot);
         if let Some(waiter) = self.waiter.take() {
             let _ = waiter.join();
         }
+        // Recover ownership even if the waiter panicked before it could reap.
+        if let Some(mut child) = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            terminate_owned_child(&mut child);
+            let _ = child.wait();
+        }
     }
 }
 
 pub fn spawn_shared_child_wait(
+    blocking: &BlockingWorkSender,
     child: Arc<Mutex<Option<Child>>>,
     poll_interval: Duration,
     sender: ExternalSender,
     actor: ActorAddress,
-) {
-    thread::spawn(move || {
-        loop {
-            let observation = {
-                let mut slot = child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(child) = slot.as_mut() else {
-                    return;
-                };
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        *slot = None;
-                        Some(ProcessExitObservation {
-                            status: status.code(),
-                            error: None,
-                        })
+) -> Result<(), Arc<Mutex<Option<Child>>>> {
+    blocking
+        .submit_owned((child, sender), move |(child, sender)| {
+            loop {
+                let observation = {
+                    let mut slot = child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let Some(child) = slot.as_mut() else {
+                        return;
+                    };
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            *slot = None;
+                            Some(ProcessExitObservation {
+                                status: status.code(),
+                                error: None,
+                            })
+                        }
+                        Ok(None) => None,
+                        Err(error) => Some(ProcessExitObservation {
+                            status: None,
+                            error: Some(error.to_string()),
+                        }),
                     }
-                    Ok(None) => None,
-                    Err(error) => Some(ProcessExitObservation {
-                        status: None,
-                        error: Some(error.to_string()),
-                    }),
+                };
+                if let Some(observation) = observation {
+                    let _ = sender.send_to(actor, observation);
+                    return;
                 }
-            };
-            if let Some(observation) = observation {
-                let _ = sender.send_to(actor, observation);
-                return;
+                thread::sleep(poll_interval);
             }
-            thread::sleep(poll_interval);
-        }
-    });
+        })
+        .map_err(|(child, sender)| {
+            let _ = sender.send_to(
+                actor,
+                ProcessExitObservation {
+                    status: None,
+                    error: Some("process wait engine stopped".to_owned()),
+                },
+            );
+            child
+        })
+}
+
+/// Request graceful process-group termination and await the leader's exit.
+#[cfg(target_os = "linux")]
+pub fn terminate_process_group(identity: &ProcessIdentity) -> Result<(), String> {
+    signal_process_group_and_wait(identity, libc::SIGTERM)
+}
+
+/// Explicitly cancel a process group and await its leader's exit.
+#[cfg(target_os = "linux")]
+pub fn cancel_process_group(identity: &ProcessIdentity) -> Result<(), String> {
+    signal_process_group_and_wait(identity, libc::SIGKILL)
 }
 
 #[cfg(target_os = "linux")]
-pub fn terminate_process_group(
-    identity: &ProcessIdentity,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<(), String> {
+fn signal_process_group_and_wait(identity: &ProcessIdentity, signal: i32) -> Result<(), String> {
     if !identity.matches() {
         return Ok(());
     }
-    let exit = process_exit_fd(identity.pid).ok();
+    let exit = match process_exit_fd(identity.pid) {
+        Ok(exit) => exit,
+        Err(_) if !identity.matches() => return Ok(()),
+        Err(error) => return Err(format!("observe process group {}: {error}", identity.pid)),
+    };
     if !identity.matches() {
         return Ok(());
     }
-    if unsafe { libc::kill(-(identity.pid as i32), libc::SIGTERM) } != 0 && identity.matches() {
-        return Err(format!(
-            "terminate process group {}: {}",
-            identity.pid,
-            io::Error::last_os_error()
-        ));
-    }
-    let deadline = Instant::now() + timeout;
-    while identity.matches() && Instant::now() < deadline {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if wait_process_fds(
-            &[exit.as_ref()],
-            if exit.is_some() {
-                left
-            } else {
-                left.min(poll_interval)
-            },
-        )
-        .map_err(|error| format!("wait process group {}: {error}", identity.pid))?[0]
-        {
-            return Ok(());
+    if unsafe { libc::kill(-(identity.pid as i32), signal) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!("signal process group {}: {error}", identity.pid));
         }
     }
-    if identity.matches() {
-        if unsafe { libc::kill(-(identity.pid as i32), libc::SIGKILL) } != 0 && identity.matches() {
-            return Err(format!(
-                "kill process group {}: {}",
-                identity.pid,
-                io::Error::last_os_error()
-            ));
+    wait_readable(&[Some(&exit)])
+        .map_err(|error| format!("wait process group {}: {error}", identity.pid))?;
+    // Reap when this adapter still happens to be the parent (e.g. re-adoption
+    // in the same daemon). ECHILD is normal for an externally adopted worker.
+    loop {
+        let result = unsafe { libc::waitpid(identity.pid as i32, std::ptr::null_mut(), 0) };
+        if result >= 0 {
+            break;
         }
-        if let Some(exit) = &exit {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(format!(
-                        "process group {} did not exit after KILL",
-                        identity.pid
-                    ));
-                }
-                if wait_process_fds(&[Some(exit)], left).map_err(|error| {
-                    format!("observe killed process group {}: {error}", identity.pid)
-                })?[0]
-                {
-                    break;
-                }
-            }
-        } else if identity.matches() {
-            return Err(format!(
-                "process group {} exit cannot be confirmed",
-                identity.pid
-            ));
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => break,
+            _ => return Err(format!("reap process group {}: {error}", identity.pid)),
         }
     }
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub fn spawn_identity_exit_wait(
+    blocking: &BlockingWorkSender,
     identity: ProcessIdentity,
     poll_interval: Duration,
     sender: ExternalSender,
     actor: ActorAddress,
 ) {
-    thread::spawn(move || {
+    if let Err(sender) = blocking.submit_owned(sender, move |sender| {
         while identity.matches() {
             thread::sleep(poll_interval);
         }
@@ -931,7 +1151,15 @@ pub fn spawn_identity_exit_wait(
                 error: None,
             },
         );
-    });
+    }) {
+        let _ = sender.send_to(
+            actor,
+            ProcessExitObservation {
+                status: None,
+                error: Some("process identity watcher engine stopped".to_owned()),
+            },
+        );
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -942,8 +1170,13 @@ pub struct CommandOutputObservation {
     pub error: Option<String>,
 }
 
-pub fn spawn_command_output(mut command: Command, sender: ExternalSender, actor: ActorAddress) {
-    thread::spawn(move || {
+pub fn spawn_command_output(
+    blocking: &BlockingWorkSender,
+    mut command: Command,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) {
+    if let Err(sender) = blocking.submit_owned(sender, move |sender| {
         let observation = match command.output() {
             Ok(output) => CommandOutputObservation {
                 status: output.status.code(),
@@ -959,35 +1192,72 @@ pub fn spawn_command_output(mut command: Command, sender: ExternalSender, actor:
             },
         };
         let _ = sender.send_to(actor, observation);
-    });
+    }) {
+        let _ = sender.send_to(
+            actor,
+            CommandOutputObservation {
+                status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                error: Some("process command output engine stopped".to_owned()),
+            },
+        );
+    }
 }
 
-pub fn spawn_detached_command_status(mut command: Command, label: impl Into<String>) {
+pub fn spawn_detached_command_status(
+    blocking: &BlockingWorkSender,
+    mut command: Command,
+    label: impl Into<String>,
+) {
     let label = label.into();
-    thread::spawn(move || {
+    if let Err(label) = blocking.submit_owned(label, move |label| {
         if let Err(error) = command.status() {
             eprintln!("{label}: {error}");
         }
-    });
+    }) {
+        eprintln!("{label}: process command engine stopped");
+    }
 }
 
-pub fn spawn_child_wait(mut child: Child, sender: ExternalSender, actor: ActorAddress) {
-    thread::spawn(move || {
-        let observation = match child.wait() {
-            Ok(status) => ProcessExitObservation {
-                status: status.code(),
-                error: None,
-            },
-            Err(error) => ProcessExitObservation {
-                status: None,
-                error: Some(error.to_string()),
-            },
-        };
-        let _ = sender.send_to(actor, observation);
-    });
+/// Transfer a child to an engine-owned waiter.
+///
+/// On rejected submission, notify the observer of failure and return the live
+/// child to the caller, which remains responsible for stopping and reaping it.
+pub fn spawn_child_wait(
+    blocking: &BlockingWorkSender,
+    child: Child,
+    sender: ExternalSender,
+    actor: ActorAddress,
+) -> Result<(), Child> {
+    blocking
+        .submit_owned((child, sender), move |(mut child, sender)| {
+            let observation = match child.wait() {
+                Ok(status) => ProcessExitObservation {
+                    status: status.code(),
+                    error: None,
+                },
+                Err(error) => ProcessExitObservation {
+                    status: None,
+                    error: Some(error.to_string()),
+                },
+            };
+            let _ = sender.send_to(actor, observation);
+        })
+        .map_err(|(child, sender)| {
+            let _ = sender.send_to(
+                actor,
+                ProcessExitObservation {
+                    status: None,
+                    error: Some("process wait engine stopped".to_owned()),
+                },
+            );
+            child
+        })
 }
 
 pub fn spawn_mapped_line_reader<R, M, L, E>(
+    blocking: &BlockingWorkSender,
     reader: R,
     sender: ExternalSender,
     actor: ActorAddress,
@@ -1000,23 +1270,33 @@ pub fn spawn_mapped_line_reader<R, M, L, E>(
     L: Fn(String) -> M + Send + 'static,
     E: Fn(String) -> M + Send + 'static,
 {
-    thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            match line {
-                Ok(line) => {
-                    let _ = sender.send_to(actor, line_message(line));
-                }
-                Err(error) => {
-                    let _ = sender.send_to(actor, error_message(error.to_string()));
-                    break;
+    if let Err((sender, error_message, closed_message)) = blocking.submit_owned(
+        (sender, error_message, closed_message),
+        move |(sender, error_message, closed_message)| {
+            for line in BufReader::new(reader).lines() {
+                match line {
+                    Ok(line) => {
+                        let _ = sender.send_to(actor, line_message(line));
+                    }
+                    Err(error) => {
+                        let _ = sender.send_to(actor, error_message(error.to_string()));
+                        break;
+                    }
                 }
             }
-        }
+            let _ = sender.send_to(actor, closed_message);
+        },
+    ) {
+        let _ = sender.send_to(
+            actor,
+            error_message("process line reader engine stopped".to_owned()),
+        );
         let _ = sender.send_to(actor, closed_message);
-    });
+    }
 }
 
 pub fn spawn_mapped_line_channel<R, M, L, E>(
+    blocking: &BlockingWorkSender,
     reader: R,
     sender: std::sync::mpsc::Sender<M>,
     line_message: L,
@@ -1028,34 +1308,45 @@ pub fn spawn_mapped_line_channel<R, M, L, E>(
     L: Fn(String) -> M + Send + 'static,
     E: Fn(String) -> M + Send + 'static,
 {
-    thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            let message = match line {
-                Ok(line) => line_message(line),
-                Err(error) => {
-                    let _ = sender.send(error_message(error.to_string()));
-                    break;
+    if let Err((sender, error_message, closed_message)) = blocking.submit_owned(
+        (sender, error_message, closed_message),
+        move |(sender, error_message, closed_message)| {
+            for line in BufReader::new(reader).lines() {
+                let message = match line {
+                    Ok(line) => line_message(line),
+                    Err(error) => {
+                        let _ = sender.send(error_message(error.to_string()));
+                        break;
+                    }
+                };
+                if sender.send(message).is_err() {
+                    return;
                 }
-            };
-            if sender.send(message).is_err() {
-                return;
             }
-        }
+            let _ = sender.send(closed_message);
+        },
+    ) {
+        let _ = sender.send(error_message(
+            "process line reader engine stopped".to_owned(),
+        ));
         let _ = sender.send(closed_message);
-    });
+    }
 }
 
-pub fn spawn_line_channel<R>(reader: R, sender: std::sync::mpsc::Sender<String>)
-where
+pub fn spawn_line_channel<R>(
+    blocking: &BlockingWorkSender,
+    reader: R,
+    sender: std::sync::mpsc::Sender<String>,
+) where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
+    let _ = blocking.submit(Box::new(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             if sender.send(line).is_err() {
                 return;
             }
         }
-    });
+    }));
 }
 
 fn forward_stdin_command<R>(
@@ -1079,12 +1370,13 @@ fn forward_stdin_command<R>(
 }
 
 pub fn spawn_stdin_command_wait(
+    blocking: &BlockingWorkSender,
     command: &'static str,
     trigger_on_eof: bool,
     sender: ExternalSender,
     actor: ActorAddress,
 ) {
-    thread::spawn(move || {
+    let _ = blocking.submit(Box::new(move || {
         forward_stdin_command(
             std::io::stdin().lock(),
             command,
@@ -1092,39 +1384,36 @@ pub fn spawn_stdin_command_wait(
             sender,
             actor,
         );
-    });
+    }));
 }
 
+#[cfg(target_os = "linux")]
 pub fn find_process_identities_by_environment(
     environment: &[(String, String)],
     process_group_leader: bool,
 ) -> io::Result<Vec<ProcessIdentity>> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut matches = Vec::new();
-        for entry in std::fs::read_dir("/proc")?.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let identity = ProcessIdentity {
-                pid,
-                environment: environment.to_vec(),
-                process_group_leader,
-            };
-            if identity.matches() {
-                matches.push(identity);
-            }
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let identity = ProcessIdentity {
+            pid,
+            environment: environment.to_vec(),
+            process_group_leader,
+        };
+        if identity.matches() {
+            matches.push(identity);
         }
-        Ok(matches)
     }
-    #[cfg(not(target_os = "linux"))]
-    Ok(Vec::new())
+    Ok(matches)
 }
 
+#[cfg(target_os = "linux")]
 pub fn find_process_identities_with_retry(
     environment: &[(String, String)],
     process_group_leader: bool,
@@ -1191,7 +1480,7 @@ impl Drop for BoundUnixSocketPath {
 
 #[cfg(unix)]
 pub fn spawn_unix_stream_listener<H, F>(
-    engine: swactor_engine::EngineHandle,
+    tasks: swactor_engine::TaskSpawner,
     path: impl AsRef<Path>,
     handler: H,
 ) -> io::Result<()>
@@ -1208,8 +1497,8 @@ where
         drop(bound_path);
         return Err(error);
     }
-    let connection_engine = engine.clone();
-    engine.spawn(async move {
+    let connection_tasks = tasks.clone();
+    tasks.spawn(async move {
         let _bound_path = bound_path;
         let listener = match tokio::net::UnixListener::from_std(listener) {
             Ok(listener) => listener,
@@ -1221,7 +1510,7 @@ where
         loop {
             match listener.accept().await {
                 Ok((stream, _address)) => {
-                    connection_engine.spawn(handler.clone()(stream));
+                    connection_tasks.spawn(handler.clone()(stream));
                 }
                 Err(error) => {
                     eprintln!("Unix stream listener stopped: {error}");
@@ -1247,6 +1536,7 @@ mod properties {
     use swactor::actor::{ActorInterface, Ctx};
     use swactor::config::RuntimeConfig;
     use swactor::runtime::{Runtime, RuntimeParts, SingleThreadRuntime};
+    use swactor_engine::{Engine, SteppingBackend};
 
     use super::*;
 
@@ -1254,7 +1544,149 @@ mod properties {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn owned_command_completes_inside_the_only_blocking_pool_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            swactor_engine::TokioBackend::from_runtime(runtime),
+        )
+        .unwrap();
+        let handle = engine.handle();
+        let blocking = handle.blocking_work_sender();
+        let command_work = blocking.clone();
+        let output = blocking
+            .submit_joinable(move || {
+                command_output_owned(
+                    &command_work,
+                    Command::new("/bin/sh").args([
+                        "-c",
+                        "printf 'ready\\n'; dd if=/dev/zero bs=65536 count=2 2>/dev/null; printf 'rejected\\n' >&2; exit 7",
+                    ]),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(&output.stdout[..6], b"ready\n");
+        assert_eq!(output.stdout.len(), 6 + 131_072);
+        assert!(output.stdout[6..].iter().all(|byte| *byte == 0));
+        assert_eq!(output.stderr, b"rejected\n");
+        assert_eq!(handle.ownership_snapshot().blocking, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn graceful_shared_stop_preserves_child_cleanup_and_exit_status() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r line; printf '%s\\n' \"$line\"; exit 7"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let status = stop_shared_child_with_input(&child, &mut stdin, b"shutdown\n").unwrap();
+        assert_eq!(status.and_then(|status| status.code()), Some(7));
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"shutdown\n");
+        assert!(child.lock().is_ok_and(|child| child.is_none()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_cancellation_releases_a_pending_graceful_stop() {
+        use std::os::unix::process::ExitStatusExt;
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s\\n' \"$line\"; IFS= read -r next",
+            ])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let child = Arc::new(Mutex::new(Some(child)));
+        let graceful_child = Arc::clone(&child);
+        let graceful = engine
+            .handle()
+            .blocking_work_sender()
+            .submit_joinable(move || {
+                stop_shared_child_with_input(&graceful_child, &mut stdin, b"shutdown\n")
+            })
+            .unwrap();
+        let mut accepted = String::new();
+        output.read_line(&mut accepted).unwrap();
+        assert_eq!(accepted, "shutdown\n");
+        let cancelled = cancel_shared_child(&child).unwrap().unwrap();
+        assert_eq!(cancelled.signal(), Some(libc::SIGKILL));
+        assert!(graceful.join().unwrap().unwrap().is_none());
+        assert!(child.lock().is_ok_and(|child| child.is_none()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_command_callback_panic_cancels_and_reaps_the_child() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .unwrap();
+        let mut pid = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "printf '%s\\n' \"$$\"; IFS= read -r line"])
+                .stdin(std::process::Stdio::piped());
+            let _ = command_status_observed(
+                &engine.handle().blocking_work_sender(),
+                &mut command,
+                |observation| {
+                    if let ProcessStreamObservation::Line {
+                        stream: ProcessStream::Stdout,
+                        line,
+                    } = observation
+                    {
+                        pid = Some(line.parse::<i32>().unwrap());
+                        panic!("consumer rejected command output");
+                    }
+                },
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            unsafe { libc::kill(pid.expect("observed child PID"), 0) },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bounded_command_output_kills_and_reaps_a_withheld_response() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
+        let blocking = engine.handle().blocking_work_sender();
         let pid_path = std::env::temp_dir().join(format!(
             "swactor-command-deadline-{}-{}.pid",
             std::process::id(),
@@ -1272,7 +1704,8 @@ mod properties {
             ])
             .arg(&pid_path);
         let started = Instant::now();
-        let result = command_output_until(&mut command, started + Duration::from_secs(1));
+        let result =
+            command_output_until(&blocking, &mut command, started + Duration::from_secs(1));
         let elapsed = started.elapsed();
         let pid = std::fs::read_to_string(&pid_path);
         let _ = std::fs::remove_file(&pid_path);
@@ -1299,27 +1732,38 @@ mod properties {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_command_output_drains_raw_bytes_and_inherited_pipes_on_rejection() {
+    fn owned_command_output_drains_raw_bytes_and_inherited_pipes_on_rejection() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
+        let blocking = engine.handle().blocking_work_sender();
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
-            "printf '\\000\\377partial'; printf 'rejected\\n' >&2; sleep 30 & exit 7",
+            "printf '\\000\\377partial'; printf 'rejected\\n' >&2; sh -c 'kill -STOP $$' & exit 7",
         ]);
-        let started = Instant::now();
-        let output = command_output_until(&mut command, started + Duration::from_secs(2)).unwrap();
+        let output = command_output_owned(&blocking, &mut command).unwrap();
 
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout, b"\0\xffpartial");
         assert_eq!(output.stderr, b"rejected\n");
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_command_output_does_not_spawn_after_owner_expiry() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
+        let blocking = engine.handle().blocking_work_sender();
         // A nonexistent executable distinguishes pre-spawn expiry from a
         // freshly minted command lifetime that attempts execution anyway.
         let error = command_output_until(
+            &blocking,
             &mut Command::new("/definitely/not/a/real/bounded-command"),
             Instant::now(),
         )
@@ -1342,7 +1786,7 @@ mod properties {
         let backend = swactor_engine::SteppingBackend::new();
         let engine = swactor_engine::Engine::new(parts, backend).expect("stepping engine");
 
-        spawn_unix_stream_listener(engine.handle(), &path, |_stream| async {})
+        spawn_unix_stream_listener(engine.task_spawner(), &path, |_stream| async {})
             .expect("bind test Unix listener");
         assert!(path.exists(), "listener path was never created");
 
@@ -1386,10 +1830,12 @@ mod properties {
         }
     }
 
+    #[cfg(unix)]
     struct ExitProbe {
         observations: Arc<ParkingMutex<Vec<ProcessExitObservation>>>,
     }
 
+    #[cfg(unix)]
     impl ActorInterface for ExitProbe {
         type Incoming = ProcessExitObservation;
         type Response = ();
@@ -1718,6 +2164,12 @@ mod properties {
     #[cfg(unix)]
     #[test]
     fn trivial_real_child_exit_has_a_hard_timeout() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
+        let blocking = engine.handle().blocking_work_sender();
         let (runtime, mut host) = runtime_host();
         let observations = Arc::new(ParkingMutex::new(Vec::new()));
         let actor = runtime
@@ -1728,7 +2180,8 @@ mod properties {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 0"]);
         let child = command_spawn(&mut command).expect("spawn trivial child");
-        spawn_child_wait(child, runtime.create_sender(), actor);
+        spawn_child_wait(&blocking, child, runtime.create_sender(), actor)
+            .expect("live engine accepts process waiter");
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while observations.lock().is_empty() && Instant::now() < deadline {
@@ -1748,6 +2201,78 @@ mod properties {
              actor_census={:?}",
             runtime.stats().actors
         );
+        assert_eq!(quiescence_violation(&runtime), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_child_wait_returns_reapable_child_and_reports_failure() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
+        let blocking = engine.handle().blocking_work_sender();
+        drop(engine);
+        let (runtime, mut host) = runtime_host();
+        let observations = Arc::new(ParkingMutex::new(Vec::new()));
+        let observer = runtime
+            .spawn(ExitProbe {
+                observations: Arc::clone(&observations),
+            })
+            .unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 7"]);
+        let child = command_spawn(&mut command).expect("spawn child before rejected handoff");
+        let mut child = spawn_child_wait(&blocking, child, runtime.create_sender(), observer)
+            .expect_err("stopped engine must return child ownership");
+        assert_eq!(child.wait().expect("reap returned child").code(), Some(7));
+        drive(&mut host);
+        let observations = observations.lock();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].status, None);
+        assert!(observations[0].error.is_some());
+        assert_eq!(quiescence_violation(&runtime), None);
+    }
+
+    #[test]
+    fn rejected_output_work_reports_error_and_closes_stream() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
+        let blocking = engine.handle().blocking_work_sender();
+        drop(engine);
+        let (runtime, mut host) = runtime_host();
+        let observations = Arc::new(ParkingMutex::new(Vec::new()));
+        let observer = runtime
+            .spawn(StreamProbe {
+                observations: Arc::clone(&observations),
+                closes_left: 1,
+            })
+            .unwrap();
+        let reader = spawn_line_reader(
+            &blocking,
+            ProcessStream::Stdout,
+            Cursor::new(b"must not be read\n"),
+            runtime.create_sender(),
+            observer,
+        );
+        reader.join();
+        drive(&mut host);
+        assert!(matches!(
+            observations.lock().as_slice(),
+            [
+                ProcessStreamObservation::Error {
+                    stream: ProcessStream::Stdout,
+                    ..
+                },
+                ProcessStreamObservation::Closed {
+                    stream: ProcessStream::Stdout
+                },
+            ]
+        ));
         assert_eq!(quiescence_violation(&runtime), None);
     }
 
@@ -1803,6 +2328,11 @@ mod properties {
         fn generated_stream_observations_close_once_and_stay_closed(
             actions in prop::collection::vec(stream_action_strategy(), 0..=32),
         ) {
+            let engine = Engine::new(
+                RuntimeParts::new(RuntimeConfig::default()),
+                SteppingBackend::new(),
+            ).expect("process test engine");
+            let blocking = engine.handle().blocking_work_sender();
             let (runtime, mut host) = runtime_host();
             let observations = Arc::new(ParkingMutex::new(Vec::new()));
             let actor = runtime
@@ -1825,9 +2355,9 @@ mod properties {
                     .map(|action| action.action.clone()),
             );
             let stdout_handle =
-                spawn_line_reader(ProcessStream::Stdout, stdout, sender.clone(), actor);
+                spawn_line_reader(&blocking, ProcessStream::Stdout, stdout, sender.clone(), actor);
             let stderr_handle =
-                spawn_line_reader(ProcessStream::Stderr, stderr, sender, actor);
+                spawn_line_reader(&blocking, ProcessStream::Stderr, stderr, sender, actor);
             stdout_handle.join();
             stderr_handle.join();
             drive(&mut host);
@@ -1944,6 +2474,12 @@ mod properties {
         fn generated_stop_notifications_are_delivered_at_most_once(
             actions in prop::collection::vec(stop_action_strategy(), 0..=32),
         ) {
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(
+                RuntimeParts::new(RuntimeConfig::default()),
+                backend.clone(),
+            ).expect("process test engine");
+            let blocking = engine.handle().blocking_work_sender();
             let (runtime, mut host) = runtime_host();
             let count = Arc::new(AtomicUsize::new(0));
             let actor = runtime
@@ -1953,8 +2489,7 @@ mod properties {
                 .expect("spawn process signal probe");
             let (sender, receiver) = mpsc::channel();
             let mut sender = Some(sender);
-            let waiter =
-                spawn_stop_channel_wait_thread(receiver, runtime.create_sender(), actor);
+            spawn_stop_channel_wait(&blocking, receiver, runtime.create_sender(), actor);
             let mut expected = 0;
             let mut rejected = Vec::new();
             for (index, action) in actions.iter().enumerate() {
@@ -1974,7 +2509,7 @@ mod properties {
                 }
             }
             drop(sender);
-            waiter.join().expect("join process stop waiter");
+            backend.join_blocking().expect("join process stop waiter");
             drive(&mut host);
             if expected == 0 {
                 runtime.stop_actor(actor).expect("stop unused signal probe");

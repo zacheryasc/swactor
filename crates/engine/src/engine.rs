@@ -1,8 +1,10 @@
-//! Composite engine and cloneable scheduler handle.
+//! Composite engine and explicit execution capabilities.
 
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::poll_fn;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use crate::backend::{Capabilities, EngineError, ExecutionBackend};
@@ -13,13 +15,14 @@ use swactor::runtime::{ExternalSender, Runtime, RuntimeParts};
 /// The composite engine: retains a configured core runtime handle and its
 /// execution backend, and owns one core-driving loop per worker.
 ///
-/// Construct with [`Engine::new`]; obtain a scheduler handle with
-/// [`Engine::handle`].
+/// Construct with [`Engine::new`]; obtain clock/substrate access with
+/// [`Engine::handle`] and task authority with [`Engine::task_spawner`].
 pub struct Engine {
     backend: Arc<dyn ExecutionBackend>,
     /// Retained so the engine owns the runtime handle it drives for its full
     /// lifetime. Core workers are moved into substrate tasks at construction.
     _runtime: Runtime,
+    ownership: Arc<OwnershipCounters>,
 }
 
 impl Engine {
@@ -43,10 +46,11 @@ impl Engine {
         Ok(Engine {
             backend,
             _runtime: runtime,
+            ownership: Arc::new(OwnershipCounters::default()),
         })
     }
 
-    /// Return a clonable handle for scheduling engine work.
+    /// Return a clonable handle for engine time and blocking-I/O submission.
     ///
     /// The handle holds a *weak* backend reference, so handles — and engine
     /// work that captures them — never keep the backend alive. Dropping the
@@ -55,30 +59,129 @@ impl Engine {
     pub fn handle(&self) -> EngineHandle {
         EngineHandle {
             backend: Arc::downgrade(&self.backend),
+            ownership: Arc::clone(&self.ownership),
+        }
+    }
+
+    /// Mint task authority at a binary entrypoint or test composition root.
+    ///
+    /// Pass this capability explicitly to adapters that own engine-hosted work.
+    /// Actors must not own or receive it. Like [`EngineHandle`], it retains the
+    /// backend weakly and cannot extend the engine's lifetime.
+    pub fn task_spawner(&self) -> TaskSpawner {
+        TaskSpawner {
+            backend: Arc::downgrade(&self.backend),
+            ownership: Arc::clone(&self.ownership),
         }
     }
 }
 
-/// A cloneable scheduler handle.
+/// Cloneable engine clock and substrate access, without task-creation authority.
 ///
-/// Schedules work and reads engine time without exposing the underlying
-/// backend; in particular it never hands out a raw `tokio::runtime::Handle`.
-/// The handle holds a **weak** backend reference: it does not keep the engine
-/// or its backend alive. Using a handle after its engine has been dropped
-/// degrades gracefully — scheduled work is dropped, timers never fire, and
-/// capability checks report no capabilities — rather than retaining the
-/// backend (ENGINE_SPEC.md).
+/// This handle never exposes the underlying runtime and holds the backend
+/// weakly. After engine shutdown, timers never fire and capability checks
+/// report no capabilities.
 #[derive(Clone)]
 pub struct EngineHandle {
     backend: Weak<dyn ExecutionBackend>,
+    ownership: Arc<OwnershipCounters>,
 }
-/// A clonable substrate route for one-shot blocking I/O work.
+
+/// Explicit authority to schedule engine-owned asynchronous work.
 ///
-/// Domain actors decide which effect to execute; this handle only moves its
-/// mechanics onto the engine backend's dedicated blocking pool.
+/// Only an [`Engine`] can mint this capability. Composition roots supply it
+/// to execution adapters, never to actors or actor messages. A retained clone
+/// does not keep the engine alive.
+#[derive(Clone)]
+pub struct TaskSpawner {
+    backend: Weak<dyn ExecutionBackend>,
+    ownership: Arc<OwnershipCounters>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineOwnershipSnapshot {
+    pub tasks: u64,
+    pub actor_timers: u64,
+    pub blocking: u64,
+}
+
+#[derive(Default)]
+struct OwnershipCounters {
+    tasks: AtomicU64,
+    actor_timers: AtomicU64,
+    blocking: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum OwnershipKind {
+    Task,
+    ActorTimer,
+    Blocking,
+}
+
+struct OwnershipGuard {
+    counters: Arc<OwnershipCounters>,
+    kind: OwnershipKind,
+}
+
+impl OwnershipCounters {
+    fn begin(self: &Arc<Self>, kind: OwnershipKind) -> OwnershipGuard {
+        let counter = match kind {
+            OwnershipKind::Task => &self.tasks,
+            OwnershipKind::ActorTimer => &self.actor_timers,
+            OwnershipKind::Blocking => &self.blocking,
+        };
+        counter.fetch_add(1, Ordering::AcqRel);
+        OwnershipGuard {
+            counters: Arc::clone(self),
+            kind,
+        }
+    }
+
+    fn snapshot(&self) -> EngineOwnershipSnapshot {
+        EngineOwnershipSnapshot {
+            tasks: self.tasks.load(Ordering::Acquire),
+            actor_timers: self.actor_timers.load(Ordering::Acquire),
+            blocking: self.blocking.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl Drop for OwnershipGuard {
+    fn drop(&mut self) {
+        let counter = match self.kind {
+            OwnershipKind::Task => &self.counters.tasks,
+            OwnershipKind::ActorTimer => &self.counters.actor_timers,
+            OwnershipKind::Blocking => &self.counters.blocking,
+        };
+        let previous = counter.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0, "engine ownership counter underflow");
+    }
+}
+impl TaskSpawner {
+    /// Schedule cooperative work, discarding it if the engine has stopped.
+    pub fn spawn<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if let Some(backend) = self.backend.upgrade() {
+            let guard = self.ownership.begin(OwnershipKind::Task);
+            backend.spawn(Box::pin(async move {
+                let _guard = guard;
+                task.await;
+            }));
+        }
+    }
+}
+
+/// A clonable engine capability for explicitly owned blocking I/O work.
+///
+/// Finite work uses the backend's blocking pool; resource-owned joined I/O
+/// has independent progress so it cannot deadlock a caller using that pool.
 #[derive(Clone)]
 pub struct BlockingWorkSender {
     backend: Weak<dyn ExecutionBackend>,
+    ownership: Arc<OwnershipCounters>,
 }
 
 impl BlockingWorkSender {
@@ -89,8 +192,177 @@ impl BlockingWorkSender {
         let Some(backend) = self.backend.upgrade() else {
             return Err(work);
         };
-        backend.spawn_blocking(work);
+        let guard = self.ownership.begin(OwnershipKind::Blocking);
+        backend.spawn_blocking(Box::new(move || {
+            let _guard = guard;
+            work();
+        }));
         Ok(())
+    }
+
+    /// Submit owned I/O state, returning it unchanged if the engine has stopped.
+    ///
+    /// Unlike constructing an erased closure first, this preserves resource
+    /// ownership on rejection without an extra shared allocation.
+    pub fn submit_owned<T, F>(&self, value: T, work: F) -> Result<(), T>
+    where
+        T: Send + 'static,
+        F: FnOnce(T) + Send + 'static,
+    {
+        let Some(backend) = self.backend.upgrade() else {
+            return Err(value);
+        };
+        let guard = self.ownership.begin(OwnershipKind::Blocking);
+        backend.spawn_blocking(Box::new(move || {
+            let _guard = guard;
+            work(value);
+        }));
+        Ok(())
+    }
+
+    /// Submit blocking work whose completion must be joined by its I/O owner.
+    ///
+    /// Panics are returned by [`BlockingWorkHandle::join`]. If queued work is
+    /// discarded during backend shutdown, joining also returns an error rather
+    /// than waiting forever. Actors must observe completion through messages,
+    /// not call `join` from a handler.
+    pub fn submit_joinable<F, T>(&self, work: F) -> std::io::Result<BlockingWorkHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(backend) = self.backend.upgrade() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "engine stopped",
+            ));
+        };
+        let inner = Arc::new((Mutex::new(None), Condvar::new()));
+        let mut completion = BlockingCompletion {
+            inner: Arc::clone(&inner),
+            completed: false,
+            ownership: Some(self.ownership.begin(OwnershipKind::Blocking)),
+        };
+        backend.spawn_blocking(Box::new(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            drop(completion.ownership.take());
+            completion.completed = true;
+            *completion.inner.0.lock() = Some(result);
+            completion.inner.1.notify_all();
+        }));
+        Ok(BlockingWorkHandle { inner })
+    }
+
+    /// Start resource-owned I/O that must progress independently of the
+    /// backend's bounded blocking pool.
+    ///
+    /// The engine accounts for the thread, but its resource owner must retain
+    /// the returned handle and release any I/O cancellation/EOF condition before
+    /// joining or dropping it. Dropping the handle joins; it never detaches.
+    pub fn spawn_owned_thread<F, T>(
+        &self,
+        name: &'static str,
+        work: F,
+    ) -> std::io::Result<OwnedIoThread<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(backend) = self.backend.upgrade() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "engine stopped",
+            ));
+        };
+        if !backend.capabilities().blocking {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "engine has no blocking I/O capability",
+            ));
+        }
+        let ownership = self.ownership.begin(OwnershipKind::Blocking);
+        let join = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _ownership = ownership;
+                work()
+            })?;
+        Ok(OwnedIoThread { join: Some(join) })
+    }
+}
+
+/// An engine-accounted I/O thread whose resource owner must join completion.
+/// Unlike a raw join handle, dropping this value also joins the thread.
+#[must_use = "retain the I/O owner until its cancellation or completion is joined"]
+pub struct OwnedIoThread<T> {
+    join: Option<std::thread::JoinHandle<T>>,
+}
+
+impl<T> OwnedIoThread<T> {
+    pub fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    pub fn join(mut self) -> std::thread::Result<T> {
+        self.join
+            .take()
+            .expect("owned I/O thread already joined")
+            .join()
+    }
+}
+
+impl<T> Drop for OwnedIoThread<T> {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+type BlockingResult<T> = Arc<(Mutex<Option<std::thread::Result<T>>>, Condvar)>;
+
+/// Completion of engine-owned blocking work, without exposing an OS thread.
+pub struct BlockingWorkHandle<T> {
+    inner: BlockingResult<T>,
+}
+
+impl<T> BlockingWorkHandle<T> {
+    /// Whether work has completed, panicked, or been discarded during shutdown.
+    pub fn is_finished(&self) -> bool {
+        self.inner.0.lock().is_some()
+    }
+
+    /// Wait for the terminal result. Never call this from an actor handler.
+    pub fn join(self) -> std::thread::Result<T> {
+        let mut result = self.inner.0.lock();
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            self.inner.1.wait(&mut result);
+        }
+    }
+}
+
+struct BlockingCompletion<T> {
+    inner: BlockingResult<T>,
+    completed: bool,
+    ownership: Option<OwnershipGuard>,
+}
+
+impl<T> Drop for BlockingCompletion<T> {
+    fn drop(&mut self) {
+        drop(self.ownership.take());
+        if self.completed {
+            return;
+        }
+        let mut result = self.inner.0.lock();
+        if result.is_none() {
+            *result = Some(Err(Box::new("engine discarded pending blocking work")));
+            self.inner.1.notify_all();
+        }
     }
 }
 
@@ -99,20 +371,47 @@ impl BlockingWorkSender {
 /// Cancellation is idempotent. A timer may already have fired when cancellation
 /// races its deadline, so actor messages should still carry an operation or
 /// generation identity that lets the receiver reject stale work.
+#[derive(Debug)]
+struct TimerCancellation {
+    cancelled: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl TimerCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(waker) = self.waker.lock().take() {
+            waker.wake();
+        }
+    }
+
+    fn register(&self, waker: &Waker) {
+        let mut slot = self.waker.lock();
+        if slot
+            .as_ref()
+            .is_none_or(|current| !current.will_wake(waker))
+        {
+            *slot = Some(waker.clone());
+        }
+    }
+}
+
+/// Cancellation handle for an engine-owned actor message timer.
 #[derive(Clone, Debug)]
 pub struct ActorTimer {
-    cancelled: Arc<AtomicBool>,
+    cancellation: Arc<TimerCancellation>,
 }
 
 impl ActorTimer {
-    /// Prevent this timer from delivering future messages.
+    /// Prevent this timer from delivering future messages and wake its owner so
+    /// cancellation releases the timer without waiting for its deadline.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancellation.cancel();
     }
 
     /// Report whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancellation.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -218,22 +517,11 @@ impl EngineHandle {
         self.backend.upgrade()
     }
 
-    /// Schedule `task` as cooperative engine work.
-    ///
-    /// A no-op once the owning engine has been dropped: the work is discarded
-    /// rather than keeping the backend alive.
-    pub fn spawn<F>(&self, task: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        if let Some(backend) = self.backend() {
-            backend.spawn(Box::pin(task));
-        }
-    }
     /// Create a route to the backend's dedicated blocking-I/O pool.
     pub fn blocking_work_sender(&self) -> BlockingWorkSender {
         BlockingWorkSender {
             backend: self.backend.clone(),
+            ownership: Arc::clone(&self.ownership),
         }
     }
 
@@ -274,17 +562,33 @@ impl EngineHandle {
     where
         M: Message,
     {
-        let actor_timer = ActorTimer {
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
-        let cancelled = Arc::clone(&actor_timer.cancelled);
-        let timer = self.timer(delay);
-        self.spawn(async move {
-            timer.await;
-            if !cancelled.load(Ordering::Acquire) {
-                let _ = sender.send_to(actor, message);
-            }
+        let cancellation = Arc::new(TimerCancellation {
+            cancelled: AtomicBool::new(false),
+            waker: Mutex::new(None),
         });
+        let actor_timer = ActorTimer {
+            cancellation: Arc::clone(&cancellation),
+        };
+        let mut timer = Box::pin(self.timer(delay));
+        if let Some(backend) = self.backend() {
+            let guard = self.ownership.begin(OwnershipKind::ActorTimer);
+            backend.spawn(Box::pin(poll_fn(move |cx| {
+                let _guard = &guard;
+                if cancellation.cancelled.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                cancellation.register(cx.waker());
+                if cancellation.cancelled.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                if Future::poll(timer.as_mut(), cx).is_ready() {
+                    let _ = sender.send_to(actor, message.clone());
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })));
+        }
         actor_timer
     }
 
@@ -302,37 +606,48 @@ impl EngineHandle {
     where
         M: Message,
     {
+        let cancellation = Arc::new(TimerCancellation {
+            cancelled: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        });
         let actor_timer = ActorTimer {
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::clone(&cancellation),
         };
-        let cancelled = Arc::clone(&actor_timer.cancelled);
         let handle = self.clone();
         let mut interval = Box::pin(handle.interval(period));
-        self.spawn(std::future::poll_fn(move |cx| {
-            if cancelled.load(Ordering::Acquire) {
-                return std::task::Poll::Ready(());
-            }
-            match std::future::Future::poll(interval.as_mut(), cx) {
-                std::task::Poll::Ready(()) => {
-                    if cancelled.load(Ordering::Acquire)
-                        || sender.send_to(actor, message.clone()).is_err()
-                    {
-                        std::task::Poll::Ready(())
-                    } else {
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
+        if let Some(backend) = self.backend() {
+            let guard = self.ownership.begin(OwnershipKind::ActorTimer);
+            backend.spawn(Box::pin(poll_fn(move |cx| {
+                let _guard = &guard;
+                if cancellation.cancelled.load(Ordering::Acquire) {
+                    return Poll::Ready(());
                 }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        }));
+                cancellation.register(cx.waker());
+                if cancellation.cancelled.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                match Future::poll(interval.as_mut(), cx) {
+                    Poll::Ready(()) => {
+                        if cancellation.cancelled.load(Ordering::Acquire)
+                            || sender.send_to(actor, message.clone()).is_err()
+                        {
+                            Poll::Ready(())
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            })));
+        }
         actor_timer
     }
     /// Race `future` against an engine timer.
     ///
     /// Resolves to `Ok` with the future's output if it completes within
     /// `duration`, or [`Err(Elapsed)`](crate::Elapsed) when the timer fires
-    pub fn timeout<F: std::future::Future>(&self, duration: Duration, future: F) -> Timeout<F> {
+    pub fn timeout<F: Future>(&self, duration: Duration, future: F) -> Timeout<F> {
         Timeout::new(self.timer(duration), future)
     }
 
@@ -355,6 +670,13 @@ impl EngineHandle {
             Some(backend) => backend.capabilities(),
             None => Capabilities::NONE,
         }
+    }
+
+    /// Snapshot explicitly scheduled work. Core driver tasks are infrastructure
+    /// and are intentionally excluded; task-spawner work, actor timers, and
+    /// blocking submissions have visible ownership here.
+    pub fn ownership_snapshot(&self) -> EngineOwnershipSnapshot {
+        self.ownership.snapshot()
     }
 
     /// Validate that this engine satisfies `required` before starting work.

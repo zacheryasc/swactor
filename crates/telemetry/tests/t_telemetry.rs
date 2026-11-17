@@ -1,7 +1,9 @@
 use std::sync::Arc;
-use std::thread;
 
 use serde::{Deserialize, Serialize};
+use swactor::config::RuntimeConfig;
+use swactor::runtime::RuntimeParts;
+use swactor_engine::{Engine, SteppingBackend};
 use telemetry::frame::Frame;
 use telemetry::ingest::Consumer;
 use telemetry::mux::Mux;
@@ -64,24 +66,34 @@ fn mux_assigns_positions_when_drained() {
 
 #[test]
 fn mux_concurrent_producers_assign_unique_positions_on_drain() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("engine");
+    let blocking_work = engine.handle().blocking_work_sender();
     let mux = Arc::new(Mux::unbounded(stream()));
 
-    let mut threads = Vec::new();
+    let mut producers = Vec::new();
     for producer in 0..4u8 {
         let mux = Arc::clone(&mux);
-        threads.push(thread::spawn(move || {
-            let mut accepted = 0;
-            for seq in 0..32u8 {
-                if mux.submit(LOG_CHANNEL, vec![producer, seq]) {
-                    accepted += 1;
-                }
-            }
-            accepted
-        }));
+        producers.push(
+            blocking_work
+                .submit_joinable(move || {
+                    let mut accepted = 0;
+                    for seq in 0..32u8 {
+                        if mux.submit(LOG_CHANNEL, vec![producer, seq]) {
+                            accepted += 1;
+                        }
+                    }
+                    accepted
+                })
+                .expect("submit producer"),
+        );
     }
-    let accepted: usize = threads
+    let accepted: usize = producers
         .into_iter()
-        .map(|thread| thread.join().expect("producer thread completes"))
+        .map(|producer| producer.join().expect("producer work completes"))
         .sum();
 
     assert_eq!(accepted, 128);

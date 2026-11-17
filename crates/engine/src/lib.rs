@@ -15,7 +15,10 @@ mod time;
 mod tokio;
 
 pub use backend::{BoxTask, BoxTimer, BoxWork, Capabilities, EngineError, ExecutionBackend};
-pub use engine::{ActorCompletion, ActorTimer, BlockingWorkSender, Engine, EngineHandle};
+pub use engine::{
+    ActorCompletion, ActorTimer, BlockingWorkHandle, BlockingWorkSender, Engine, EngineHandle,
+    EngineOwnershipSnapshot, OwnedIoThread, TaskSpawner,
+};
 pub use stepping::SteppingBackend;
 pub use time::{Elapsed, EngineInstant, Interval, Timeout, Timer};
 

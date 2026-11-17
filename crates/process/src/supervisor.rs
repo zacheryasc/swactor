@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
@@ -7,70 +7,22 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::SegQueue;
+use swactor_engine::{BlockingWorkSender, OwnedIoThread};
 
 #[cfg(unix)]
 use crate::resources::ProcessSpawnResources;
+use crate::stdin::{ProcessInput, ProcessInputWriter};
 use crate::types::{ExitStatus, ProcessSpec, Signal};
+use crate::terminal::TerminalSession;
+use crate::supervisor_common::{
+    ThreadCommand, ThreadEvent, ThreadEventSink, join_output_readers, spawn_output_reader,
+};
+#[cfg(test)]
+use crate::supervisor_common::{ThreadEventReceiver, thread_event_channel};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ThreadCommand {
-    Stop { kill_after: Option<Duration> },
-    ShutdownNow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ThreadEvent {
-    Started { pid: u32 },
-    SpawnFailed { error: String },
-    Exited { status: ExitStatus },
-    Output { stderr: bool, bytes: Vec<u8> },
-    Error { error: String },
-    ThreadFinished,
-}
-
-#[derive(Clone)]
-pub(crate) struct ThreadEventSink {
-    queue: Arc<SegQueue<ThreadEvent>>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-pub(crate) struct ThreadEventReceiver {
-    queue: Arc<SegQueue<ThreadEvent>>,
-}
-
-pub(crate) fn thread_event_channel(
-    wake: impl Fn() + Send + Sync + 'static,
-) -> (ThreadEventSink, ThreadEventReceiver) {
-    let queue = Arc::new(SegQueue::new());
-    (
-        ThreadEventSink {
-            queue: queue.clone(),
-            wake: Arc::new(wake),
-        },
-        ThreadEventReceiver { queue },
-    )
-}
-
-impl ThreadEventSink {
-    pub(crate) fn push(&self, event: ThreadEvent) {
-        self.queue.push(event);
-        (self.wake)();
-    }
-}
-
-impl ThreadEventReceiver {
-    pub(crate) fn drain(&self) -> Vec<ThreadEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = self.queue.pop() {
-            events.push(event);
-        }
-        events
-    }
-}
 
 #[derive(Clone)]
 struct WakeFd(Arc<WakeFdInner>);
@@ -159,9 +111,9 @@ impl Drop for WakeFdInner {
 fn poll_command_wake(
     wake: &WakeFd,
     child_exit: Option<RawFd>,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> io::Result<bool> {
-    let timeout_ms = poll_timeout_ms(timeout);
+    let timeout_ms = timeout.map_or(-1, poll_timeout_ms);
     let mut pollfds = [
         libc::pollfd {
             fd: wake.fd(),
@@ -221,15 +173,17 @@ fn is_would_block(err: &io::Error) -> bool {
 pub(crate) struct ProcessThreadHandle {
     commands: Arc<SegQueue<ThreadCommand>>,
     wake: WakeFd,
-    join: Option<JoinHandle<()>>,
+    join: Option<OwnedIoThread<()>>,
 }
 
 pub(crate) struct ProcessSupervisorThread;
 
 impl ProcessSupervisorThread {
     pub(crate) fn start(
+        blocking: &BlockingWorkSender,
         spec: ProcessSpec,
         #[cfg(unix)] resources: ProcessSpawnResources,
+        input: Option<ProcessInput>,
         events: ThreadEventSink,
     ) -> Result<ProcessThreadHandle, swactor::Error> {
         let commands = Arc::new(SegQueue::new());
@@ -241,17 +195,28 @@ impl ProcessSupervisorThread {
 
         let thread_commands = commands.clone();
         let thread_wake = wake.clone();
-        let join = thread::Builder::new()
-            .name("swactor-process-supervisor".to_owned())
-            .spawn(move || {
-                supervisor_thread_main(
-                    spec,
-                    #[cfg(unix)]
-                    resources,
-                    events,
-                    thread_commands,
-                    thread_wake,
-                )
+        let io_work = blocking.clone();
+        let join = blocking
+            .spawn_owned_thread("process-supervisor", move || {
+                let failure_events = events.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    supervisor_thread_main(
+                        &io_work,
+                        spec,
+                        #[cfg(unix)]
+                        resources,
+                        input,
+                        events,
+                        thread_commands,
+                        thread_wake,
+                    );
+                }));
+                if result.is_err() {
+                    failure_events.push(ThreadEvent::Error {
+                        error: "process supervisor thread panicked".to_owned(),
+                    });
+                    failure_events.push(ThreadEvent::ThreadFinished);
+                }
             })
             .map_err(|err| {
                 swactor::Error::from(format!("failed to start process supervisor thread: {err}"))
@@ -305,7 +270,9 @@ impl ProcessThreadHandle {
 impl Drop for ProcessThreadHandle {
     fn drop(&mut self) {
         let _ = self.shutdown_now();
-        let _ = self.join_if_finished();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -340,19 +307,85 @@ enum CommandOutcome {
     Error(String),
 }
 
+/// Unwind ownership is installed before any observer callback or I/O setup.
+/// Declare this after reader handles so kill/reap precedes all worker joins.
+struct ChildOwner {
+    child: Option<Child>,
+    input_writer: Option<ProcessInputWriter>,
+    terminal_session: bool,
+}
+
+impl ChildOwner {
+    fn kill_owned_tree(&mut self) -> Result<(), String> {
+        self.shutdown_terminal_input();
+        let Some(child) = self.child.as_ref() else { return Ok(()); };
+        let _ = send_signal(child.id(), Signal::Kill);
+        #[cfg(target_os = "linux")]
+        if self.terminal_session {
+            crate::terminal::cancel_session(child.id()).map_err(|error| {
+                format!("cancel terminal session: {error}")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn shutdown_terminal_input(&mut self) {
+        if let Some(writer) = &mut self.input_writer {
+            writer.shutdown_terminal();
+        }
+    }
+
+    fn finish_input(&mut self) -> Result<(), String> {
+        self.input_writer.take().map_or(Ok(()), |mut writer| {
+            writer.finish().map_err(|error| error.to_string())
+        })
+    }
+}
+
+impl std::ops::Deref for ChildOwner {
+    type Target = Option<Child>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ChildOwner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for ChildOwner {
+    fn drop(&mut self) {
+        let _ = self.kill_owned_tree();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = self.finish_input();
+    }
+}
+
 fn supervisor_thread_main(
+    blocking: &BlockingWorkSender,
     spec: ProcessSpec,
     #[cfg(unix)] resources: ProcessSpawnResources,
+    mut input: Option<ProcessInput>,
     events: ThreadEventSink,
     commands: Arc<SegQueue<ThreadCommand>>,
     wake: WakeFd,
 ) {
     let mut state = SupervisorState::Spawning;
-    let mut child: Option<Child>;
+    let mut output_threads = Vec::new();
+    let mut child = ChildOwner {
+        child: None,
+        input_writer: None,
+        terminal_session: input.as_ref().is_some_and(|input| input.terminal_size.is_some()),
+    };
     let pid: Option<u32>;
     let mut kill_deadline: Option<Instant> = None;
     let mut kill_sent = false;
-    let mut output_threads = Vec::new();
     debug_assert!(matches!(state, SupervisorState::Spawning));
 
     let mut cmd = Command::new(&spec.command);
@@ -363,30 +396,102 @@ fn supervisor_thread_main(
     if let Some(dir) = &spec.working_dir {
         cmd.current_dir(dir);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
+    let terminal_io = (|| -> io::Result<_> {
+        if let Some(size) = input.as_ref().and_then(|input| input.terminal_size) {
+            let terminal = TerminalSession::new(size)?;
+            terminal.configure_command(&mut cmd)?;
+            Ok(Some(terminal.into_io()?))
+        } else {
+            cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.process_group(0);
+            Ok(None)
+        }
+    })();
+    let (mut terminal_reader, mut terminal_writer) = match terminal_io {
+        Ok(Some((reader, writer))) => (Some(reader), Some(writer)),
+        Ok(None) => (None, None),
+        Err(error) => {
+            drop(input.take());
+            events.push(ThreadEvent::SpawnFailed { error: error.to_string() });
+            events.push(ThreadEvent::ThreadFinished);
+            return;
+        }
+    };
     #[cfg(unix)]
     resources.configure_command(&mut cmd);
 
-    match cmd.spawn() {
-        Ok(mut spawned_child) => {
+    let spawned = cmd.spawn();
+    drop(cmd);
+    #[cfg(unix)]
+    drop(resources);
+    match spawned {
+        Ok(spawned_child) => {
+            *child = Some(spawned_child);
+            let spawned_child = child.as_mut().expect("spawned child is owned");
             let child_pid = spawned_child.id();
-            if let Some(stdout) = spawned_child.stdout.take() {
-                output_threads.push(spawn_output_reader(stdout, events.clone(), false));
-            }
-            if let Some(stderr) = spawned_child.stderr.take() {
-                output_threads.push(spawn_output_reader(stderr, events.clone(), true));
-            }
-            pid = Some(child_pid);
-            child = Some(spawned_child);
             events.push(ThreadEvent::Started { pid: child_pid });
+            let readers = (|| -> io::Result<()> {
+                if let Some(reader) = terminal_reader.take() {
+                    output_threads.push(spawn_output_reader(blocking, reader, events.clone(), false)?);
+                }
+                if let Some(stdout) = spawned_child.stdout.take() {
+                    output_threads.push(spawn_output_reader(
+                        blocking,
+                        stdout,
+                        events.clone(),
+                        false,
+                    )?);
+                }
+                if let Some(stderr) = spawned_child.stderr.take() {
+                    output_threads.push(spawn_output_reader(
+                        blocking,
+                        stderr,
+                        events.clone(),
+                        true,
+                    )?);
+                }
+                Ok(())
+            })();
+            pid = Some(child_pid);
             state = SupervisorState::Running;
+            if let Err(error) = readers {
+                drop(input.take());
+                finish_with_error(
+                    &events,
+                    &mut state,
+                    &mut child,
+                    &mut output_threads,
+                    format!("failed to start process output reader: {error}"),
+                );
+                return;
+            }
+            if let Some(input) = input.take() {
+                let writer = if let Some(terminal) = terminal_writer.take() {
+                    input.spawn_terminal_writer(blocking, terminal)
+                } else {
+                    let stdin = child.as_mut().expect("spawned child is owned")
+                        .stdin.take().expect("supervisor configures piped stdin");
+                    input.spawn_writer(blocking, stdin)
+                };
+                match writer {
+                    Ok(writer) => child.input_writer = Some(writer),
+                    Err(error) => {
+                        finish_with_error(
+                            &events,
+                            &mut state,
+                            &mut child,
+                            &mut output_threads,
+                            format!("failed to start process input writer: {error}"),
+                        );
+                        return;
+                    }
+                }
+            }
 
             match drain_queued_commands(
-                child_pid,
+                &mut child,
                 &commands,
                 &mut state,
                 &mut kill_deadline,
@@ -404,6 +509,7 @@ fn supervisor_thread_main(
             }
         }
         Err(err) => {
+            drop(input.take());
             events.push(ThreadEvent::SpawnFailed {
                 error: err.to_string(),
             });
@@ -414,13 +520,22 @@ fn supervisor_thread_main(
 
     let child_pid = pid.expect("supervisor pid stored after successful spawn");
     let child_exit = child_exit_fd(child_pid);
+    #[cfg(target_os = "linux")]
+    if child_exit.is_none() {
+        finish_with_error(
+            &events,
+            &mut state,
+            &mut child,
+            &mut output_threads,
+            format!("subscribe to child exit: {}", io::Error::last_os_error()),
+        );
+        return;
+    }
     loop {
         let timeout = if child_exit.is_some() {
-            kill_deadline.map_or(Duration::from_millis(i32::MAX as u64), |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            })
+            kill_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
         } else {
-            command_poll_timeout(kill_deadline)
+            Some(command_poll_timeout(kill_deadline))
         };
         match poll_command_wake(&wake, child_exit.as_ref().map(AsRawFd::as_raw_fd), timeout) {
             Ok(true) => {
@@ -436,7 +551,7 @@ fn supervisor_thread_main(
                 }
 
                 match drain_queued_commands(
-                    child_pid,
+                    &mut child,
                     &commands,
                     &mut state,
                     &mut kill_deadline,
@@ -524,13 +639,15 @@ fn command_poll_timeout(kill_deadline: Option<Instant>) -> Duration {
 }
 
 fn drain_queued_commands(
-    pid: u32,
+    child: &mut ChildOwner,
     commands: &SegQueue<ThreadCommand>,
     state: &mut SupervisorState,
     kill_deadline: &mut Option<Instant>,
     kill_sent: &mut bool,
 ) -> CommandOutcome {
     while let Some(command) = commands.pop() {
+        child.shutdown_terminal_input();
+        let pid = child.as_ref().expect("commands follow child creation").id();
         match apply_thread_command(pid, command, state, kill_deadline, kill_sent) {
             CommandOutcome::Continue => {}
             outcome => return outcome,
@@ -615,62 +732,51 @@ fn send_kill_or_observe_exit(pid: u32) -> CommandOutcome {
     }
 }
 
-fn spawn_output_reader(
-    mut reader: impl Read + Send + 'static,
-    events: ThreadEventSink,
-    stderr: bool,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut buffer = vec![0_u8; 4_096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => events.push(ThreadEvent::Output {
-                    stderr,
-                    bytes: buffer[..read].to_vec(),
-                }),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    })
-}
-
-fn join_output_readers(readers: &mut Vec<JoinHandle<()>>) {
-    for reader in readers.drain(..) {
-        let _ = reader.join();
-    }
-}
 
 fn finish_with_exit(
     events: &ThreadEventSink,
     state: &mut SupervisorState,
-    child: &mut Option<Child>,
-    output_threads: &mut Vec<JoinHandle<()>>,
+    child: &mut ChildOwner,
+    output_threads: &mut Vec<OwnedIoThread<()>>,
     status: ExitStatus,
 ) {
     *state = SupervisorState::Done;
     debug_assert!(matches!(*state, SupervisorState::Done));
-    let _ = child.take();
+    // Keep the unreaped leader's group/session identity pinned through cleanup.
+    let tree_result = child.kill_owned_tree();
+    let reaped = if let Some(mut process) = child.take() {
+        process
+            .wait()
+            .map(|_| ())
+            .map_err(|error| format!("reap completed process: {error}"))
+    } else {
+        Ok(())
+    };
+    let input_result = child.finish_input();
     join_output_readers(output_threads);
-    events.push(ThreadEvent::Exited { status });
+    match tree_result.and(reaped).and(input_result) {
+        Ok(()) => events.push(ThreadEvent::Exited { status }),
+        Err(error) => events.push(ThreadEvent::Error { error }),
+    }
     events.push(ThreadEvent::ThreadFinished);
 }
 
 fn finish_with_error(
     events: &ThreadEventSink,
     state: &mut SupervisorState,
-    child: &mut Option<Child>,
-    output_threads: &mut Vec<JoinHandle<()>>,
+    child: &mut ChildOwner,
+    output_threads: &mut Vec<OwnedIoThread<()>>,
     error: String,
 ) {
     *state = SupervisorState::Done;
     debug_assert!(matches!(*state, SupervisorState::Done));
+    let _ = child.kill_owned_tree();
     if let Some(child) = child.as_mut() {
         let _ = child.kill();
         let _ = child.wait();
     }
     let _ = child.take();
+    let _ = child.finish_input();
     join_output_readers(output_threads);
     events.push(ThreadEvent::Error { error });
     events.push(ThreadEvent::ThreadFinished);
@@ -700,36 +806,32 @@ fn send_signal(pid: u32, signal: Signal) -> Result<(), String> {
     }
 }
 
-fn decode_wait_status(status: libc::c_int) -> ExitStatus {
-    if libc::WIFEXITED(status) {
-        ExitStatus::Code(libc::WEXITSTATUS(status))
-    } else if libc::WIFSIGNALED(status) {
-        ExitStatus::Signal(libc::WTERMSIG(status))
-    } else {
-        ExitStatus::Unknown
-    }
-}
-
 fn try_wait_pid(pid: u32) -> Result<Option<ExitStatus>, String> {
     loop {
-        let mut status: libc::c_int = 0;
-        let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-
+        let mut info: libc::siginfo_t = unsafe { mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
         if result == 0 {
-            return Ok(None);
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            let status = unsafe { info.si_status() };
+            return Ok(Some(match info.si_code {
+                libc::CLD_EXITED => ExitStatus::Code(status),
+                libc::CLD_KILLED | libc::CLD_DUMPED => ExitStatus::Signal(status),
+                _ => ExitStatus::Unknown,
+            }));
         }
-        if result == pid as libc::pid_t {
-            return Ok(Some(decode_wait_status(status)));
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(format!("observe process {pid}: {error}"));
         }
-        if result > 0 {
-            return Ok(Some(ExitStatus::Unknown));
-        }
-
-        let err = std::io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(format!("waitpid({pid}) failed: {err}"));
     }
 }
 
@@ -739,6 +841,9 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use swactor::runtime::{RuntimeConfig, RuntimeParts};
+    use swactor_engine::{Engine, SteppingBackend};
 
     fn spec(command: &str, args: Vec<&str>) -> ProcessSpec {
         ProcessSpec {
@@ -752,6 +857,143 @@ mod tests {
 
     fn shell_spec(script: &str) -> ProcessSpec {
         spec("sh", vec!["-c", script])
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_panic_reaps_child_before_publishing_terminal_failure() {
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .unwrap();
+        let (wake, ready) = std::sync::mpsc::channel();
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let (events, receiver) = thread_event_channel(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                panic!("startup observer failure");
+            }
+            let _ = wake.send(());
+        });
+        let owner = ProcessSupervisorThread::start(
+            &engine.handle().blocking_work_sender(),
+            shell_spec("kill -STOP $$"),
+            ProcessSpawnResources::default(),
+            None,
+            events,
+        )
+        .unwrap();
+        let mut observed = Vec::new();
+        loop {
+            ready.recv().unwrap();
+            observed.extend(receiver.drain());
+            if observed
+                .iter()
+                .any(|event| matches!(event, ThreadEvent::ThreadFinished))
+            {
+                break;
+            }
+        }
+        drop(owner);
+        let pid = observed
+            .iter()
+            .find_map(|event| match event {
+                ThreadEvent::Started { pid } => Some(*pid),
+                _ => None,
+            })
+            .expect("child started before injected observer panic");
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, ThreadEvent::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, ThreadEvent::Exited { .. }))
+        );
+        assert_eq!(engine.handle().ownership_snapshot().blocking, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_completes_inside_the_only_blocking_pool_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            swactor_engine::TokioBackend::from_runtime(runtime),
+        )
+        .unwrap();
+        let engine_handle = engine.handle();
+        let blocking = engine_handle.blocking_work_sender();
+        let supervisor_work = blocking.clone();
+        let events = blocking
+            .submit_joinable(move || {
+                let (wake, ready) = std::sync::mpsc::channel();
+                let (events, receiver) = thread_event_channel(move || {
+                    let _ = wake.send(());
+                });
+                let owner = ProcessSupervisorThread::start(
+                    &supervisor_work,
+                    shell_spec("printf 'stdout'; printf 'stderr' >&2; exit 7"),
+                    ProcessSpawnResources::default(),
+                    None,
+                    events,
+                )
+                .unwrap();
+                let mut observed = Vec::new();
+                loop {
+                    ready.recv().unwrap();
+                    observed.extend(receiver.drain());
+                    if observed
+                        .iter()
+                        .any(|event| matches!(event, ThreadEvent::ThreadFinished))
+                    {
+                        break;
+                    }
+                }
+                drop(owner);
+                observed
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ThreadEvent::Exited {
+                status: ExitStatus::Code(7)
+            }
+        )));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        for event in events {
+            match event {
+                ThreadEvent::Output {
+                    stderr: false,
+                    bytes,
+                } => stdout.extend(bytes),
+                ThreadEvent::Output {
+                    stderr: true,
+                    bytes,
+                } => stderr.extend(bytes),
+                ThreadEvent::Error { error } | ThreadEvent::SpawnFailed { error } => {
+                    panic!("{error}")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(stdout, b"stdout");
+        assert_eq!(stderr, b"stderr");
+        assert_eq!(engine_handle.ownership_snapshot().blocking, 0);
     }
 
     fn collect_until_finished(
@@ -787,96 +1029,6 @@ mod tests {
                 "supervisor thread did not finish before join timeout"
             );
             thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn thread_command_and_event_shapes_match_target_contract() {
-        let stop_with_deadline = ThreadCommand::Stop {
-            kill_after: Some(Duration::from_millis(10)),
-        };
-        assert_eq!(
-            stop_with_deadline,
-            ThreadCommand::Stop {
-                kill_after: Some(Duration::from_millis(10))
-            }
-        );
-        match stop_with_deadline {
-            ThreadCommand::Stop {
-                kill_after: Some(duration),
-            } => assert_eq!(duration, Duration::from_millis(10)),
-            _ => panic!("expected stop command with deadline"),
-        }
-
-        let stop_without_deadline = ThreadCommand::Stop { kill_after: None };
-        assert_eq!(
-            stop_without_deadline,
-            ThreadCommand::Stop { kill_after: None }
-        );
-        match stop_without_deadline {
-            ThreadCommand::Stop { kill_after: None } => {}
-            _ => panic!("expected stop command without deadline"),
-        }
-
-        assert_eq!(ThreadCommand::ShutdownNow, ThreadCommand::ShutdownNow);
-        match ThreadCommand::ShutdownNow {
-            ThreadCommand::ShutdownNow => {}
-            _ => panic!("expected shutdown command"),
-        }
-
-        let started = ThreadEvent::Started { pid: 42 };
-        assert_eq!(started, ThreadEvent::Started { pid: 42 });
-        match started {
-            ThreadEvent::Started { pid } => assert_eq!(pid, 42),
-            _ => panic!("expected started event"),
-        }
-
-        let spawn_failed = ThreadEvent::SpawnFailed {
-            error: "spawn failed".to_owned(),
-        };
-        assert_eq!(
-            spawn_failed,
-            ThreadEvent::SpawnFailed {
-                error: "spawn failed".to_owned()
-            }
-        );
-        match spawn_failed {
-            ThreadEvent::SpawnFailed { error } => assert_eq!(error, "spawn failed"),
-            _ => panic!("expected spawn failed event"),
-        }
-
-        let exited = ThreadEvent::Exited {
-            status: ExitStatus::Code(7),
-        };
-        assert_eq!(
-            exited,
-            ThreadEvent::Exited {
-                status: ExitStatus::Code(7)
-            }
-        );
-        match exited {
-            ThreadEvent::Exited { status } => assert_eq!(status, ExitStatus::Code(7)),
-            _ => panic!("expected exited event"),
-        }
-
-        let error = ThreadEvent::Error {
-            error: "lost".to_owned(),
-        };
-        assert_eq!(
-            error,
-            ThreadEvent::Error {
-                error: "lost".to_owned()
-            }
-        );
-        match error {
-            ThreadEvent::Error { error } => assert_eq!(error, "lost"),
-            _ => panic!("expected error event"),
-        }
-
-        assert_eq!(ThreadEvent::ThreadFinished, ThreadEvent::ThreadFinished);
-        match ThreadEvent::ThreadFinished {
-            ThreadEvent::ThreadFinished => {}
-            _ => panic!("expected thread finished event"),
         }
     }
 
@@ -926,7 +1078,7 @@ mod tests {
             .expect("shutdown command should queue");
 
         assert!(
-            poll_command_wake(&wake, None, Duration::ZERO).expect("wake poll should succeed"),
+            poll_command_wake(&wake, None, Some(Duration::ZERO)).expect("wake poll should succeed"),
             "wake fd should be readable after queued commands"
         );
         wake.drain().expect("wake fd should drain");
@@ -943,9 +1095,16 @@ mod tests {
     #[test]
     fn supervisor_reports_started_exited_and_finished() {
         let (sink, receiver) = thread_event_channel(|| {});
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
         let mut handle = ProcessSupervisorThread::start(
+            &engine.handle().blocking_work_sender(),
             shell_spec("exit 7"),
             ProcessSpawnResources::new(),
+            None,
             sink,
         )
         .expect("supervisor should start");
@@ -970,9 +1129,16 @@ mod tests {
     #[test]
     fn supervisor_reports_spawn_failed_and_finished() {
         let (sink, receiver) = thread_event_channel(|| {});
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
         let mut handle = ProcessSupervisorThread::start(
+            &engine.handle().blocking_work_sender(),
             spec("/definitely/not/a/real/binary", vec![]),
             ProcessSpawnResources::new(),
+            None,
             sink,
         )
         .expect("supervisor should start");
@@ -999,9 +1165,16 @@ mod tests {
     #[test]
     fn supervisor_captures_stdout_and_stderr_before_lifecycle_completion() {
         let (sink, receiver) = thread_event_channel(|| {});
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
         let mut handle = ProcessSupervisorThread::start(
+            &engine.handle().blocking_work_sender(),
             shell_spec("echo stdout; echo stderr >&2; exit 0"),
             ProcessSpawnResources::new(),
+            None,
             sink,
         )
         .expect("supervisor should start");
@@ -1035,9 +1208,16 @@ mod tests {
     #[test]
     fn supervisor_stop_escalates_to_kill_after_deadline() {
         let (sink, receiver) = thread_event_channel(|| {});
+        let engine = Engine::new(
+            RuntimeParts::new(RuntimeConfig::default()),
+            SteppingBackend::new(),
+        )
+        .expect("process test engine");
         let mut handle = ProcessSupervisorThread::start(
+            &engine.handle().blocking_work_sender(),
             shell_spec("trap '' TERM; printf 'ready\\n'; while true; do sleep 1; done"),
             ProcessSpawnResources::new(),
+            None,
             sink,
         )
         .expect("supervisor should start");

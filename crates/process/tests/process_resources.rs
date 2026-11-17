@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorInterface, Ctx};
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
+use swactor_engine::{BlockingWorkSender, Engine, SteppingBackend};
 use swactor_process::{
     ExitStatus, ProcessOutput, ProcessOutputConfig, ProcessResourceError, ProcessSpawnResources,
     ProcessSpec, spawn_local_process, spawn_local_process_with_resources,
@@ -15,6 +16,7 @@ use swactor_process::{
 const CHILD_BOOTSTRAP_FD: RawFd = 198;
 
 struct SpawnOnce {
+    blocking: BlockingWorkSender,
     spec: Option<ProcessSpec>,
     resources: Option<ProcessSpawnResources>,
     output: Option<ProcessOutputConfig>,
@@ -27,6 +29,7 @@ impl ActorInterface for SpawnOnce {
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
         spawn_local_process_with_resources(
+            &self.blocking,
             ctx,
             &self.sender,
             self.spec.take().expect("process spec"),
@@ -40,6 +43,7 @@ impl ActorInterface for SpawnOnce {
     fn handle(&mut self, _ctx: &Ctx<'_>, _message: ()) {}
 }
 struct SpawnNativeOnce {
+    blocking: BlockingWorkSender,
     spec: Option<ProcessSpec>,
     output: Option<ProcessOutputConfig>,
     sender: swactor::runtime::ExternalSender,
@@ -51,6 +55,7 @@ impl ActorInterface for SpawnNativeOnce {
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
         spawn_local_process(
+            &self.blocking,
             ctx,
             &self.sender,
             self.spec.take().expect("process spec"),
@@ -120,6 +125,7 @@ fn python_spec(script: &str, args: Vec<String>, label: &str) -> ProcessSpec {
 }
 
 fn spawn_once(
+    blocking: &BlockingWorkSender,
     runtime: &Runtime,
     spec: ProcessSpec,
     resources: ProcessSpawnResources,
@@ -127,6 +133,7 @@ fn spawn_once(
 ) {
     runtime
         .spawn(SpawnOnce {
+            blocking: blocking.clone(),
             spec: Some(spec),
             resources: Some(resources),
             output: Some(ProcessOutputConfig::disabled(*output.addr())),
@@ -173,9 +180,16 @@ fn descriptor_mapping_survives_exec_and_source_stays_cloexec() {
     let flags = unsafe { libc::fcntl(source_fd, libc::F_GETFD) };
     assert_ne!(flags & libc::FD_CLOEXEC, 0);
 
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (runtime, mut runtime_host) = runtime_host();
     let output = runtime.new_inbox::<ProcessOutput>().expect("output inbox");
     spawn_once(
+        &blocking,
         &runtime,
         python_spec(
             "import os,sys\nsource=int(sys.argv[1])\ntry:\n os.fstat(source)\nexcept OSError:\n os.write(198,b'mapped')\nelse:\n raise SystemExit(3)",
@@ -212,9 +226,16 @@ fn concurrent_children_receive_only_their_own_descriptor() {
         .expect("resource B");
 
     let script = "import os,sys\nfor value in sys.argv[1:3]:\n try:\n  os.fstat(int(value))\n except OSError:\n  pass\n else:\n  raise SystemExit(3)\nos.write(198,sys.argv[3].encode())";
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (runtime, mut runtime_host) = runtime_host();
     let output = runtime.new_inbox::<ProcessOutput>().expect("output inbox");
     spawn_once(
+        &blocking,
         &runtime,
         python_spec(
             script,
@@ -225,6 +246,7 @@ fn concurrent_children_receive_only_their_own_descriptor() {
         &output,
     );
     spawn_once(
+        &blocking,
         &runtime,
         python_spec(
             script,
@@ -242,10 +264,17 @@ fn concurrent_children_receive_only_their_own_descriptor() {
 
 #[test]
 fn native_spawn_receives_no_contextual_descriptor() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (runtime, mut runtime_host) = runtime_host();
     let output = runtime.new_inbox::<ProcessOutput>().expect("output inbox");
     runtime
         .spawn(SpawnNativeOnce {
+            blocking,
             spec: Some(python_spec(
                 "import os\ntry:\n os.fstat(198)\nexcept OSError:\n raise SystemExit(0)\nraise SystemExit(3)",
                 Vec::new(),

@@ -17,6 +17,7 @@ pub enum ExitStatus {
     Unknown,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Signal {
     Terminate,

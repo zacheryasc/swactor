@@ -9,9 +9,15 @@ default = ["tokio"]
 tokio = ["dep:tokio"]
 
 [dependencies]
-swactor = { path = "../.." }
 parking_lot = "0.12"
 tokio = { workspace = true, optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+swactor = { path = "../.." }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+swactor = { path = "../..", default-features = false, features = ["wasm", "std"] }
+web-time = "1"
 
 [dev-dependencies]
 proptest = "1"

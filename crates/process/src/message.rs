@@ -6,6 +6,8 @@ pub enum ProcessCommand {
     Stop {
         kill_after: Option<std::time::Duration>,
     },
+    /// Cancel the owned attempt immediately and report its actual reaped exit.
+    Cancel,
 }
 
 /// Public managed-process outputs.

@@ -7,13 +7,14 @@ pub mod storage;
 
 use std::time::Duration;
 
-use swactor_engine::EngineHandle;
+use swactor_engine::{EngineHandle, TaskSpawner};
 
 /// Run a stateful blocking sampler on the engine without creating an actor.
 ///
 /// Sampling never overlaps: the next interval is armed only after the previous
 /// blocking sample has returned and `observed` has consumed its result.
 pub fn spawn_blocking_sampler<State, Sample, Started, Observed>(
+    tasks: TaskSpawner,
     engine: EngineHandle,
     period: Duration,
     state: State,
@@ -26,11 +27,10 @@ pub fn spawn_blocking_sampler<State, Sample, Started, Observed>(
     Started: FnOnce() + Send + 'static,
     Observed: FnMut(u64, Sample) + Send + 'static,
 {
-    let task_engine = engine.clone();
-    engine.spawn(async move {
+    tasks.spawn(async move {
         started();
-        let blocking_work = task_engine.blocking_work_sender();
-        let mut interval = task_engine.interval(period);
+        let blocking_work = engine.blocking_work_sender();
+        let mut interval = engine.interval(period);
         let mut state = state;
         let mut seq = 0_u64;
 
@@ -75,6 +75,7 @@ mod tests {
         let (observed_tx, observed_rx) = mpsc::channel();
 
         spawn_blocking_sampler(
+            engine.task_spawner(),
             engine.handle(),
             Duration::from_millis(1),
             0_u64,

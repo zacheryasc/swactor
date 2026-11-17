@@ -7,6 +7,7 @@ use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::{
     ExternalSender, Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
 };
+use swactor_engine::{BlockingWorkSender, Engine, SteppingBackend};
 use swactor_process::{
     ExitStatus, ProcessCommand, ProcessOutput, ProcessOutputConfig, ProcessSpec,
     send_process_command, spawn_local_process,
@@ -28,17 +29,20 @@ enum SpawnReply {
     Failed(String),
 }
 
-struct SpawnerActor;
+struct SpawnerActor {
+    blocking: BlockingWorkSender,
+}
 
 impl ActorInterface for SpawnerActor {
     type Incoming = SpawnRequest;
     type Response = ();
 
     fn handle(&mut self, ctx: &Ctx, msg: SpawnRequest) {
-        let reply = match spawn_local_process(ctx, &msg.sender, msg.spec, msg.output) {
-            Ok(addr) => SpawnReply::Spawned(addr),
-            Err(err) => SpawnReply::Failed(err.to_string()),
-        };
+        let reply =
+            match spawn_local_process(&self.blocking, ctx, &msg.sender, msg.spec, msg.output) {
+                Ok(addr) => SpawnReply::Spawned(addr),
+                Err(err) => SpawnReply::Failed(err.to_string()),
+            };
         let _ = ctx.send(msg.reply_to, reply);
     }
 }
@@ -184,6 +188,12 @@ fn has_exited(outputs: &[ProcessOutput], status: ExitStatus) -> bool {
     })
 }
 
+fn has_stdout(outputs: &[ProcessOutput], expected: &[u8]) -> bool {
+    outputs.iter().any(|output| {
+        matches!(output, ProcessOutput::Stdout(bytes) if bytes.windows(expected.len()).any(|window| window == expected))
+    })
+}
+
 fn has_spawn_failed(outputs: &[ProcessOutput]) -> bool {
     outputs
         .iter()
@@ -231,11 +241,17 @@ fn channel_names(endpoint: &TelemetryEndpoint) -> Vec<String> {
 
 #[test]
 fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_telemetry() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
     let endpoint = TelemetryEndpoint::new(stage2_stream());
     let subscription = endpoint.subscribe_all("process-stage2-lifecycle");
 
@@ -331,11 +347,17 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_telemetry() {
 
 #[test]
 fn spawn_failure_maps_to_public_spawn_failed_output() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -393,11 +415,17 @@ fn spawn_failure_maps_to_public_spawn_failed_output() {
 
 #[test]
 fn command_basename_is_default_lifecycle_label_source() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
     let endpoint = TelemetryEndpoint::new(stage2_stream());
 
     send_spawn(
@@ -437,11 +465,17 @@ fn command_basename_is_default_lifecycle_label_source() {
 
 #[test]
 fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
     let endpoint = TelemetryEndpoint::new(stage2_stream());
 
     send_spawn(
@@ -508,11 +542,17 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
 
 #[test]
 fn stop_before_spawn_success_reports_started_then_exited() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -565,11 +605,17 @@ fn stop_before_spawn_success_reports_started_then_exited() {
 
 #[test]
 fn stop_before_spawn_failure_reports_only_spawn_failed() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -622,11 +668,17 @@ fn stop_before_spawn_failure_reports_only_spawn_failed() {
 
 #[test]
 fn stop_running_with_kill_after_escalates_to_kill() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -671,11 +723,17 @@ fn stop_running_with_kill_after_escalates_to_kill() {
 
 #[test]
 fn stop_running_without_kill_after_terminates_without_kill_escalation() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -722,11 +780,17 @@ fn stop_running_without_kill_after_terminates_without_kill_escalation() {
 
 #[test]
 fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -734,7 +798,10 @@ fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
         &sender,
         shell_spec(
             "sh",
-            vec!["-c", "trap 'exit 0' TERM; while true; do sleep 1; done"],
+            vec![
+                "-c",
+                "trap 'exit 0' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+            ],
             Some("deadline-suppresses-kill"),
         ),
         ProcessOutputConfig::disabled(*upstream.addr()),
@@ -750,6 +817,9 @@ fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
         &reply,
     ));
     drive_until(&mut host, None, &upstream, &mut outputs, has_started);
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
+        has_stdout(outputs, b"ready\n")
+    });
     send_process_command(
         &sender,
         process_addr,
@@ -778,11 +848,17 @@ fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
 
 #[test]
 fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -790,7 +866,10 @@ fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
         &sender,
         shell_spec(
             "sh",
-            vec!["-c", "trap '' TERM; while true; do sleep 1; done"],
+            vec![
+                "-c",
+                "trap '' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+            ],
             Some("duplicate-stop"),
         ),
         ProcessOutputConfig::disabled(*upstream.addr()),
@@ -806,6 +885,9 @@ fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
         &reply,
     ));
     drive_until(&mut host, None, &upstream, &mut outputs, has_started);
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
+        has_stdout(outputs, b"ready\n")
+    });
 
     let first_stop = Instant::now();
     send_process_command(
@@ -851,11 +933,17 @@ fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
 
 #[test]
 fn stop_after_terminal_output_emits_no_additional_output() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,
@@ -900,11 +988,17 @@ fn stop_after_terminal_output_emits_no_additional_output() {
 
 #[test]
 fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
     let endpoint = TelemetryEndpoint::with_capacity(stage2_stream(), 1, 16);
 
     send_spawn(
@@ -947,11 +1041,17 @@ fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
 
 #[test]
 fn stdout_and_stderr_are_delivered_without_affecting_lifecycle() {
+    let engine = Engine::new(
+        RuntimeParts::new(RuntimeConfig::default()),
+        SteppingBackend::new(),
+    )
+    .expect("process test engine");
+    let blocking = engine.handle().blocking_work_sender();
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
-    let spawner = rt.spawn(SpawnerActor).unwrap();
+    let spawner = rt.spawn(SpawnerActor { blocking }).unwrap();
 
     send_spawn(
         &rt,

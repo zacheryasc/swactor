@@ -344,11 +344,11 @@ fn stepping_supporting_work_progresses() {
     let parts = default_parts();
     let backend = SteppingBackend::new();
     let engine = Engine::new(parts, backend.clone()).expect("construct engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
     let done = Arc::new(AtomicBool::new(false));
     let done_clone = done.clone();
-    handle.spawn(async move {
+    tasks.spawn(async move {
         done_clone.store(true, SeqCst);
     });
 
@@ -374,12 +374,12 @@ fn stepping_core_and_supporting_work_both_progress() {
 
     let backend = SteppingBackend::new();
     let engine = Engine::new(parts, backend.clone()).expect("construct engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
     // Long-lived cooperative supporting work that yields between steps.
     let steps = Arc::new(AtomicUsize::new(0));
     let steps_clone = steps.clone();
-    handle.spawn(async move {
+    tasks.spawn(async move {
         for _ in 0..10 {
             steps_clone.fetch_add(1, SeqCst);
             yield_once().await;
@@ -434,7 +434,7 @@ fn stepping_timer_does_not_fire_before_advance() {
     let fired = Arc::new(AtomicBool::new(false));
     let fired_clone = fired.clone();
     let timer_handle = handle.clone();
-    handle.spawn(async move {
+    engine.task_spawner().spawn(async move {
         timer_handle.timer(Duration::from_secs(1)).await;
         fired_clone.store(true, SeqCst);
     });
@@ -458,7 +458,7 @@ fn stepping_timer_fires_after_virtual_time_advance() {
     let fired = Arc::new(AtomicBool::new(false));
     let fired_clone = fired.clone();
     let timer_handle = handle.clone();
-    handle.spawn(async move {
+    engine.task_spawner().spawn(async move {
         timer_handle.timer(Duration::from_millis(500)).await;
         fired_clone.store(true, SeqCst);
     });
@@ -531,6 +531,102 @@ fn cancelling_actor_message_timer_prevents_delivery() {
 
     assert!(timer.is_cancelled());
     assert_eq!(received.load(SeqCst), 0);
+}
+
+#[test]
+fn ownership_snapshot_tracks_and_releases_every_scheduled_work_kind() {
+    let (parts, runtime) = default_runtime_parts();
+    let actor = runtime
+        .spawn(RecordingProbe {
+            received: Arc::new(AtomicUsize::new(0)),
+        })
+        .unwrap();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let handle = engine.handle();
+    let task_done = Arc::new(AtomicBool::new(false));
+    let task_done_poll = Arc::clone(&task_done);
+    engine.task_spawner().spawn(std::future::poll_fn(move |_| {
+        if task_done_poll.load(SeqCst) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }));
+    let timer = handle.send_after(
+        Duration::from_secs(60),
+        runtime.create_sender(),
+        actor,
+        Probe,
+    );
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let blocking = handle
+        .blocking_work_sender()
+        .submit_joinable(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5))
+        })
+        .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        handle.ownership_snapshot(),
+        swactor_engine::EngineOwnershipSnapshot {
+            tasks: 1,
+            actor_timers: 1,
+            blocking: 1,
+        }
+    );
+
+    task_done.store(true, SeqCst);
+    timer.cancel();
+    release_tx.send(()).unwrap();
+    assert_eq!(blocking.join().unwrap(), Ok(()));
+    for _ in 0..4 {
+        backend.step();
+    }
+    assert_eq!(
+        handle.ownership_snapshot(),
+        swactor_engine::EngineOwnershipSnapshot::default()
+    );
+}
+
+#[test]
+fn owned_io_thread_join_and_panic_release_accounting_and_shutdown_rejects_work() {
+    let (parts, _) = default_runtime_parts();
+    let engine = Engine::new(parts, SteppingBackend::new()).unwrap();
+    let handle = engine.handle();
+    let blocking = handle.blocking_work_sender();
+    let (started, running) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let completed = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&completed);
+    let owner = blocking
+        .spawn_owned_thread("owned-io-regression", move || {
+            started.send(()).unwrap();
+            released.recv().unwrap();
+            finished.store(true, SeqCst);
+        })
+        .unwrap();
+    running.recv().unwrap();
+    assert_eq!(handle.ownership_snapshot().blocking, 1);
+    release.send(()).unwrap();
+    drop(owner);
+    assert!(completed.load(SeqCst));
+    assert_eq!(handle.ownership_snapshot().blocking, 0);
+
+    let panicked = blocking
+        .spawn_owned_thread("owned-io-panic-regression", || panic!("owned I/O failure"))
+        .unwrap();
+    assert!(panicked.join().is_err());
+    assert_eq!(handle.ownership_snapshot().blocking, 0);
+
+    drop(engine);
+    let rejected = blocking.spawn_owned_thread("after-engine-shutdown", || {
+        panic!("stopped engine executed rejected work");
+    });
+    assert!(matches!(rejected, Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe));
+    assert_eq!(handle.ownership_snapshot().blocking, 0);
 }
 
 #[test]
@@ -1278,9 +1374,9 @@ fn stepping_spawned_task_completing_is_removed_from_queue() {
     let parts = default_parts();
     let backend = SteppingBackend::new();
     let engine = Engine::new(parts, backend.clone()).expect("construct engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
-    handle.spawn(async {});
+    tasks.spawn(async {});
     for _ in 0..5 {
         backend.step();
     }
@@ -1352,6 +1448,8 @@ fn dropping_engine_releases_backend_even_with_live_handles() {
     .expect("tasks capability present");
     let handle = engine.handle();
     let _handle_clone = handle.clone();
+    let tasks = engine.task_spawner();
+    let _tasks_clone = tasks.clone();
 
     // Two strong refs: the test's `sentinel` and the backend's clone.
     assert_eq!(Arc::strong_count(&sentinel), 2);
@@ -1369,6 +1467,8 @@ fn dropping_engine_releases_backend_even_with_live_handles() {
     // reference.
     drop(handle);
     drop(_handle_clone);
+    drop(tasks);
+    drop(_tasks_clone);
     assert_eq!(Arc::strong_count(&sentinel), 1);
 }
 
@@ -1380,6 +1480,7 @@ fn handle_used_after_engine_drop_degrades_gracefully() {
     let parts = default_parts();
     let engine = Engine::new(parts, SteppingBackend::default()).unwrap();
     let handle = engine.handle();
+    let tasks = engine.task_spawner();
     // Live handle reports the stepping backend's capabilities.
     assert!(handle.capabilities().tasks);
     assert!(handle.capabilities().timers);
@@ -1395,7 +1496,7 @@ fn handle_used_after_engine_drop_degrades_gracefully() {
 
     // Scheduling work and creating primitives reject / no-op / never fire,
     // never panic, and never retain the backend.
-    handle.spawn(async {});
+    tasks.spawn(async {});
     assert!(
         handle
             .blocking_work_sender()
@@ -1404,4 +1505,63 @@ fn handle_used_after_engine_drop_degrades_gracefully() {
     );
     let _never_fires = handle.timer(Duration::from_secs(1));
     let _never_ticks = handle.interval(Duration::from_secs(1));
+}
+
+#[test]
+fn discarded_joinable_work_resolves_without_running() {
+    let engine = Engine::new(
+        default_parts(),
+        SentinelBackend {
+            _sentinel: Arc::new(()),
+        },
+    )
+    .unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&ran);
+    let work = engine
+        .handle()
+        .blocking_work_sender()
+        .submit_joinable(move || observed.store(true, SeqCst))
+        .unwrap();
+    assert!(work.is_finished());
+    assert!(work.join().is_err());
+    assert!(!ran.load(SeqCst));
+}
+
+#[test]
+fn joinable_work_preserves_results_and_panics() {
+    let engine = Engine::new(default_parts(), SteppingBackend::default()).unwrap();
+    let blocking = engine.handle().blocking_work_sender();
+    let completed = blocking.submit_joinable(|| 42_u32).unwrap();
+    assert_eq!(completed.join().unwrap(), 42);
+    let panicked = blocking
+        .submit_joinable(|| std::panic::panic_any(17_u32))
+        .unwrap();
+    assert_eq!(*panicked.join().unwrap_err().downcast::<u32>().unwrap(), 17);
+    drop(engine);
+    assert_eq!(
+        blocking.submit_joinable(|| ()).err().unwrap().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn task_capability_discards_pending_work_on_engine_shutdown() {
+    let engine = Engine::new(default_parts(), SteppingBackend::default()).unwrap();
+    let tasks = engine.task_spawner();
+    let captured = Arc::new(());
+    let work_capture = Arc::clone(&captured);
+    tasks.spawn(async move {
+        let _owned = work_capture;
+        std::future::pending::<()>().await;
+    });
+    assert_eq!(Arc::strong_count(&captured), 2);
+    drop(engine);
+    assert_eq!(Arc::strong_count(&captured), 1);
+    let after_shutdown = Arc::clone(&captured);
+    tasks.spawn(async move {
+        let _owned = after_shutdown;
+        std::future::pending::<()>().await;
+    });
+    assert_eq!(Arc::strong_count(&captured), 1);
 }

@@ -4,14 +4,19 @@
 use std::pin::Pin;
 use std::sync::Weak;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::time::Instant;
+#[cfg(target_family = "wasm")]
+pub(crate) use web_time::Instant;
 
 use crate::backend::{BoxTimer, ExecutionBackend};
 
 /// A monotonic engine time instant.
 ///
-/// Wraps [`std::time::Instant`] on the native Tokio backend. A later
-/// deterministic engine can substitute virtual time behind the same type
+/// Wraps [`std::time::Instant`] on native targets and `web_time::Instant` on
+/// WASM. The stepping backend advances virtual time behind the same type
 /// without changing engine-hosted code (see ENGINE_SPEC.md §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EngineInstant {

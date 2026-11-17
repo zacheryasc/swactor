@@ -2,15 +2,15 @@ use std::sync::{Arc, OnceLock};
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
+use swactor_engine::BlockingWorkSender;
 
 use crate::lifecycle::PreparedProcessOutput;
 use crate::message::{ProcessActorCommand, ProcessCommand, ProcessOutput};
 #[cfg(unix)]
 use crate::resources::ProcessSpawnResources;
-use crate::supervisor::{
-    ProcessSupervisorThread, ProcessThreadHandle, ThreadEvent, ThreadEventReceiver,
-    thread_event_channel,
-};
+use crate::stdin::ProcessInput;
+use crate::supervisor::{ProcessSupervisorThread, ProcessThreadHandle};
+use crate::supervisor_common::{ThreadEvent, ThreadEventReceiver, thread_event_channel};
 use crate::types::{ExitStatus, ProcessSpec};
 
 enum ProcessActorState {
@@ -40,31 +40,38 @@ impl ProcessDoneState {
 }
 
 pub(crate) struct ProcessActor {
+    blocking: BlockingWorkSender,
     spec: Option<ProcessSpec>,
     #[cfg(unix)]
     resources: Option<ProcessSpawnResources>,
     output: PreparedProcessOutput,
+    input: Option<ProcessInput>,
     sender: ExternalSender,
     addr_slot: Arc<OnceLock<ActorAddress>>,
     state: ProcessActorState,
     pid: Option<u32>,
     supervisor: Option<ProcessThreadHandle>,
     supervisor_events: Option<ThreadEventReceiver>,
+    cancellation_error: Option<String>,
 }
 
 impl ProcessActor {
     pub(crate) fn new(
+        blocking: BlockingWorkSender,
         spec: ProcessSpec,
         #[cfg(unix)] resources: ProcessSpawnResources,
         output: PreparedProcessOutput,
+        input: Option<ProcessInput>,
         sender: ExternalSender,
         addr_slot: Arc<OnceLock<ActorAddress>>,
     ) -> Self {
         Self {
+            blocking,
             spec: Some(spec),
             #[cfg(unix)]
             resources: Some(resources),
             output,
+            input,
             sender,
             addr_slot,
             state: ProcessActorState::Spawning {
@@ -73,10 +80,16 @@ impl ProcessActor {
             pid: None,
             supervisor: None,
             supervisor_events: None,
+            cancellation_error: None,
         }
     }
 
     fn emit_process_output(&self, ctx: &Ctx, output: ProcessOutput) {
+        if !matches!(&output, ProcessOutput::Stdout(_) | ProcessOutput::Stderr(_))
+            && let Some(observer) = &self.output.lifecycle_observer
+        {
+            observer(output.clone());
+        }
         let _ = ctx.send(self.output.upstream, output.clone());
         if let Some(mirror) = &self.output.mirror {
             mirror.submit(&output);
@@ -122,6 +135,24 @@ impl ProcessActor {
         }
         if let Some(error) = terminal_error {
             self.emit_terminal_error(ctx, error);
+        }
+    }
+
+    fn apply_cancel(&mut self, ctx: &Ctx) {
+        if matches!(self.state, ProcessActorState::Done(_)) {
+            return;
+        }
+        let result = self
+            .supervisor
+            .as_ref()
+            .expect("supervisor started before commands")
+            .shutdown_now();
+        match result {
+            Ok(()) => match &mut self.state {
+                ProcessActorState::Spawning { stop_requested } => *stop_requested = true,
+                state => *state = ProcessActorState::Stopping,
+            },
+            Err(error) => self.emit_terminal_error(ctx, error),
         }
     }
 
@@ -236,13 +267,9 @@ impl ProcessActor {
             return;
         }
 
-        self.emit_process_output(
-            ctx,
-            ProcessOutput::Error {
-                error: error.clone(),
-            },
-        );
-        self.state = ProcessActorState::Done(ProcessDoneState::SupervisorFailed(error));
+        // A command-route failure requests cancellation; it is not evidence that
+        // the native process has exited. on_stop joins and drains its real result.
+        self.cancellation_error = Some(error);
         ctx.stop_self();
     }
 }
@@ -267,9 +294,11 @@ impl ActorInterface for ProcessActor {
             .take()
             .expect("process resources already taken");
         match ProcessSupervisorThread::start(
+            &self.blocking,
             spec,
             #[cfg(unix)]
             resources,
+            self.input.take(),
             event_sink,
         ) {
             Ok(supervisor) => {
@@ -299,12 +328,29 @@ impl ActorInterface for ProcessActor {
                 self.apply_stop(ctx, kill_after);
                 self.drain_supervisor_events(ctx);
             }
+            ProcessActorCommand::Command(ProcessCommand::Cancel) => {
+                self.drain_supervisor_events(ctx);
+                self.apply_cancel(ctx);
+                self.drain_supervisor_events(ctx);
+            }
         }
     }
 
-    fn on_stop(&mut self, _ctx: &Ctx) {
-        if let Some(supervisor) = &self.supervisor {
-            let _ = supervisor.shutdown_now();
+    fn on_stop(&mut self, ctx: &Ctx) {
+        // The handle cancels and joins its owned supervisor on drop. Only after
+        // that barrier can output loss or command failure become terminal.
+        drop(self.supervisor.take());
+        self.drain_supervisor_events(ctx);
+        if !matches!(self.state, ProcessActorState::Done(_))
+            && let Some(error) = self.cancellation_error.take()
+        {
+            self.emit_process_output(
+                ctx,
+                ProcessOutput::Error {
+                    error: error.clone(),
+                },
+            );
+            self.state = ProcessActorState::Done(ProcessDoneState::SupervisorFailed(error));
         }
     }
 }

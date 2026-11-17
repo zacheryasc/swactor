@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Poll, Waker};
 use std::time::Instant;
 
 use crossbeam_channel::{
@@ -70,6 +71,13 @@ pub enum ChannelRegistrationError {
     ConflictingName { name: String },
 }
 
+/// Terminal outcome of an asynchronous subscription receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionRecvError {
+    Disconnected,
+    Dropped(u64),
+}
+
 /// Bounded future-event subscription.
 pub struct TelemetrySubscription {
     id: SubscriptionId,
@@ -78,6 +86,7 @@ pub struct TelemetrySubscription {
     snapshot: TelemetrySnapshot,
     replay: Option<Mutex<VecDeque<Arc<TelemetryEvent>>>>,
     rx: Receiver<TelemetryEvent>,
+    wake: Arc<Mutex<Option<Waker>>>,
     fanout: Weak<Mutex<FanoutState>>,
 }
 
@@ -129,6 +138,35 @@ impl TelemetrySubscription {
         self.pop_replay().map_or_else(|| self.rx.recv(), Ok)
     }
 
+    /// Wait for a queued event, overflow, or publisher disconnection without polling.
+    pub async fn recv_async(&self) -> Result<TelemetryEvent, SubscriptionRecvError> {
+        std::future::poll_fn(|ctx| {
+            let mut wake = self.wake.lock().expect("telemetry subscription wake poisoned");
+            let dropped = self.dropped();
+            if dropped != 0 {
+                *wake = None;
+                return Poll::Ready(Err(SubscriptionRecvError::Dropped(dropped)));
+            }
+            match self.try_recv() {
+                Ok(event) => {
+                    *wake = None;
+                    Poll::Ready(Ok(event))
+                }
+                Err(TryRecvError::Disconnected) => {
+                    *wake = None;
+                    Poll::Ready(Err(SubscriptionRecvError::Disconnected))
+                }
+                Err(TryRecvError::Empty) => {
+                    if wake.as_ref().is_none_or(|wake| !wake.will_wake(ctx.waker())) {
+                        *wake = Some(ctx.waker().clone());
+                    }
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
@@ -158,15 +196,37 @@ impl Drop for TelemetrySubscription {
     }
 }
 
+struct SubscriptionSender {
+    tx: Option<Sender<TelemetryEvent>>,
+    wake: Arc<Mutex<Option<Waker>>>,
+}
+
+impl SubscriptionSender {
+    fn notify(&self) {
+        let wake = self.wake.lock().expect("telemetry subscription wake poisoned").take();
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
+
+impl Drop for SubscriptionSender {
+    fn drop(&mut self) {
+        // Close the queue before waking a receiver so it cannot miss EOF.
+        drop(self.tx.take());
+        self.notify();
+    }
+}
+
 struct SubscriberSlot {
     name: String,
-    tx: Sender<TelemetryEvent>,
+    tx: Arc<SubscriptionSender>,
     dropped: u64,
 }
 
 struct FanoutTarget {
     id: SubscriptionId,
-    tx: Sender<TelemetryEvent>,
+    tx: Arc<SubscriptionSender>,
 }
 
 struct FanoutReport {
@@ -176,14 +236,14 @@ struct FanoutReport {
 }
 
 fn publish_to_target(
-    target: FanoutTarget,
+    target: &FanoutTarget,
     events: impl IntoIterator<Item = TelemetryEvent>,
 ) -> (usize, Option<FanoutReport>) {
     let mut delivered = 0;
     let mut dropped = 0;
     let mut disconnected = false;
     for event in events {
-        match target.tx.try_send(event) {
+        match target.tx.tx.as_ref().expect("live subscription sender").try_send(event) {
             Ok(()) => delivered += 1,
             Err(TrySendError::Full(_)) => dropped += 1,
             Err(TrySendError::Disconnected(_)) => {
@@ -248,6 +308,8 @@ impl DeliveryFanout {
     ) -> TelemetrySubscription {
         let name = name.into();
         let (tx, rx) = bounded(capacity.max(1));
+        let wake = Arc::new(Mutex::new(None));
+        let tx = Arc::new(SubscriptionSender { tx: Some(tx), wake: Arc::clone(&wake) });
         let mut state = self.state.lock().expect("telemetry fanout poisoned");
         let id = SubscriptionId(state.next_id);
         state.next_id = state.next_id.wrapping_add(1).max(1);
@@ -266,6 +328,7 @@ impl DeliveryFanout {
             snapshot,
             replay: None,
             rx,
+            wake,
             fanout: Arc::downgrade(&self.state),
         }
     }
@@ -331,14 +394,14 @@ impl DeliveryFanout {
         let mut delivered = 0;
         let mut reports = Vec::new();
         let last_target = targets.pop().expect("nonempty fanout targets");
-        for target in targets {
+        for target in &targets {
             let (target_delivered, report) = publish_to_target(target, events.iter().cloned());
             delivered += target_delivered;
             if let Some(report) = report {
                 reports.push(report);
             }
         }
-        let (target_delivered, report) = publish_to_target(last_target, events);
+        let (target_delivered, report) = publish_to_target(&last_target, events);
         delivered += target_delivered;
         if let Some(report) = report {
             reports.push(report);
@@ -357,6 +420,9 @@ impl DeliveryFanout {
                     state.subscribers.remove(&report.id);
                 }
             }
+        }
+        for target in targets.iter().chain(std::iter::once(&last_target)) {
+            target.tx.notify();
         }
 
         EndpointTick {

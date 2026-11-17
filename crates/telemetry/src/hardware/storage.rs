@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

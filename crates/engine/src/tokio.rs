@@ -41,7 +41,7 @@ impl Default for TokioConfig {
 /// The runtime's `Handle` is never exposed through
 /// [`EngineHandle`](crate::EngineHandle).
 pub struct TokioBackend {
-    pub(crate) runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
     core_idle_poll: Duration,
 }
 
@@ -50,9 +50,9 @@ impl TokioBackend {
     ///
     /// The runtime is owned and self-driving: its worker threads start at
     /// construction, so spawned tasks progress without an ambient runtime or a
-    /// `block_on` driver. Tokio cancels spawned tasks (including the
-    /// core-driving loop) on `Runtime::drop`, so dropping the backend is
-    /// deterministic.
+    /// `block_on` driver. Dropping the backend requests async task cancellation
+    /// without waiting for non-cancellable blocking I/O. Such I/O must have its
+    /// own cancellation/EOF protocol if its owner requires joined shutdown.
     // The engine's Tokio backend is the substrate owner: it is the one place
     // permitted to construct a Tokio runtime (ENGINE_SPEC.md §2).
     pub fn new(config: TokioConfig) -> Result<Self, EngineError> {
@@ -62,7 +62,7 @@ impl TokioBackend {
             .build()
             .map_err(|e| EngineError::BackendSetup(e.to_string()))?;
         Ok(Self {
-            runtime,
+            runtime: Some(runtime),
             core_idle_poll: config.core_idle_poll,
         })
     }
@@ -71,8 +71,19 @@ impl TokioBackend {
     /// Core drivers park for the default idle interval.
     pub fn from_runtime(runtime: tokio::runtime::Runtime) -> Self {
         Self {
-            runtime,
+            runtime: Some(runtime),
             core_idle_poll: TokioConfig::default().core_idle_poll,
+        }
+    }
+}
+
+impl Drop for TokioBackend {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            // Blocking syscalls cannot be cancelled by dropping their futures.
+            // Waiting for them here can deadlock engine teardown on stdin,
+            // process signals, or a peer that never closes its stream.
+            runtime.shutdown_background();
         }
     }
 }
@@ -82,14 +93,22 @@ impl TokioBackend {
 impl ExecutionBackend for TokioBackend {
     fn spawn(&self, task: BoxTask) {
         // The handle is used ephemerally and never stored or returned.
-        self.runtime.handle().spawn(task);
+        self.runtime
+            .as_ref()
+            .expect("live backend")
+            .handle()
+            .spawn(task);
     }
 
     fn spawn_blocking(&self, work: BoxWork) {
         // Routed onto the runtime's dedicated blocking pool — separate from
         // the async worker threads — so blocking work cannot starve actor
         // ticks (ENGINE_SPEC.md §8 progress independence).
-        self.runtime.handle().spawn_blocking(work);
+        self.runtime
+            .as_ref()
+            .expect("live backend")
+            .handle()
+            .spawn_blocking(work);
     }
 
     fn timer(&self, delay: Duration) -> BoxTimer {

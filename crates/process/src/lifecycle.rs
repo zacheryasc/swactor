@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::json;
 use swactor::actor::ActorAddress;
@@ -19,6 +19,7 @@ pub struct ProcessOutputConfig {
     upstream: ActorAddress,
     observability: ProcessLifecycleObservability,
     telemetry: Option<TelemetryProducer>,
+    lifecycle_observer: Option<Arc<dyn Fn(ProcessOutput) + Send + Sync>>,
 }
 
 impl ProcessOutputConfig {
@@ -27,6 +28,7 @@ impl ProcessOutputConfig {
             upstream,
             observability: ProcessLifecycleObservability::Disabled,
             telemetry: None,
+            lifecycle_observer: None,
         }
     }
 
@@ -35,7 +37,18 @@ impl ProcessOutputConfig {
             upstream,
             observability: ProcessLifecycleObservability::TelemetryMirror,
             telemetry: Some(producer),
+            lifecycle_observer: None,
         }
+    }
+
+    /// Observe native start and authoritative terminal completion independently
+    /// of the optional output relay. Byte streams remain on the output route.
+    pub fn with_lifecycle_observer(
+        mut self,
+        observer: Arc<dyn Fn(ProcessOutput) + Send + Sync>,
+    ) -> Self {
+        self.lifecycle_observer = Some(observer);
+        self
     }
 
     pub fn upstream(&self) -> ActorAddress {
@@ -50,6 +63,7 @@ impl ProcessOutputConfig {
 pub(crate) struct PreparedProcessOutput {
     pub(crate) upstream: ActorAddress,
     pub(crate) mirror: Option<LifecycleTelemetryMirror>,
+    pub(crate) lifecycle_observer: Option<Arc<dyn Fn(ProcessOutput) + Send + Sync>>,
     pub(crate) _label_reservation: Option<LifecycleLabelReservation>,
 }
 
@@ -114,6 +128,7 @@ pub(crate) fn prepare_process_output(
         ProcessLifecycleObservability::Disabled => Ok(PreparedProcessOutput {
             upstream: config.upstream,
             mirror: None,
+            lifecycle_observer: config.lifecycle_observer,
             _label_reservation: None,
         }),
         ProcessLifecycleObservability::TelemetryMirror => {
@@ -146,6 +161,7 @@ pub(crate) fn prepare_process_output(
                     producer,
                 }),
                 _label_reservation: Some(reservation),
+                lifecycle_observer: config.lifecycle_observer,
             })
         }
     }

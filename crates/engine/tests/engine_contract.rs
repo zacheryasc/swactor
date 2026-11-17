@@ -32,10 +32,10 @@ fn engine_runs_without_an_ambient_tokio_runtime() {
     let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
     let engine = Engine::new(parts, backend).expect("construct engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    handle.spawn(async move {
+    tasks.spawn(async move {
         let _ = tx.send(());
     });
 
@@ -74,10 +74,10 @@ fn spawned_supporting_work_runs() {
     let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
     let engine = Engine::new(parts, backend).expect("construct engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    handle.spawn(async move {
+    tasks.spawn(async move {
         let _ = tx.send(());
     });
 
@@ -99,13 +99,13 @@ fn actor_ticks_and_supporting_work_both_progress() {
 
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
     let engine = Engine::new(parts, backend).expect("construct engine");
-    let handle = engine.handle();
+    let tasks = engine.task_spawner();
 
     // Long-lived cooperative supporting work that yields between steps so it
     // stays active while the actor message is processed.
     let steps = Arc::new(AtomicUsize::new(0));
     let steps_for_task = steps.clone();
-    handle.spawn(async move {
+    tasks.spawn(async move {
         for _ in 0..200 {
             steps_for_task.fetch_add(1, SeqCst);
             yield_once().await;
@@ -142,6 +142,7 @@ fn runtime_ticks_are_never_concurrent() {
 
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
     let _engine = Engine::new(parts, backend).expect("construct engine");
+    let blocking = _engine.handle().blocking_work_sender();
 
     let sender = runtime.create_sender();
     const SENDERS: usize = 4;
@@ -153,11 +154,15 @@ fn runtime_ticks_are_never_concurrent() {
     let mut threads = Vec::new();
     for _ in 0..SENDERS {
         let sender = sender.clone();
-        threads.push(std::thread::spawn(move || {
-            for _ in 0..PER_SENDER {
-                let _ = sender.send_to(addr, Probe);
-            }
-        }));
+        threads.push(
+            blocking
+                .submit_joinable(move || {
+                    for _ in 0..PER_SENDER {
+                        let _ = sender.send_to(addr, Probe);
+                    }
+                })
+                .expect("submit concurrent sender"),
+        );
     }
     for t in threads {
         t.join().expect("sender thread panicked");
@@ -262,7 +267,7 @@ fn engine_timer_fires() {
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let timer_handle = handle.clone();
-    handle.spawn(async move {
+    engine.task_spawner().spawn(async move {
         timer_handle.timer(Duration::from_millis(20)).await;
         let _ = tx.send(());
     });
@@ -281,7 +286,7 @@ fn engine_interval_recurs() {
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let interval_handle = handle.clone();
-    handle.spawn(async move {
+    engine.task_spawner().spawn(async move {
         // `Interval` re-arms on each `Ready`, so awaiting it repeatedly yields
         // one ready per period. `Box::pin` lets us poll it in a loop.
         let mut interval = Box::pin(interval_handle.interval(Duration::from_millis(5)));
@@ -313,7 +318,7 @@ fn engine_timer_can_be_created_off_runtime() {
     let timer = handle.timer(Duration::from_millis(10));
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    handle.spawn(async move {
+    engine.task_spawner().spawn(async move {
         timer.await;
         let _ = tx.send(());
     });
@@ -431,4 +436,29 @@ fn tokio_backend_reports_configured_core_idle_poll() {
         configured,
         "backend must report its configured idle interval"
     );
+}
+
+#[test]
+fn engine_shutdown_does_not_wait_for_running_blocking_io() {
+    let engine = Engine::new(
+        default_parts(),
+        TokioBackend::new(TokioConfig::default()).unwrap(),
+    )
+    .unwrap();
+    let blocking = engine.handle().blocking_work_sender();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let work = blocking
+        .submit_joinable(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(DEADLINE)
+        })
+        .unwrap();
+    entered_rx.recv_timeout(DEADLINE).unwrap();
+    drop(engine);
+    // Waiting for blocking work in engine drop would consume the work's
+    // deadline before this owner can release it.
+    release_tx.send(()).unwrap();
+    assert_eq!(work.join().unwrap(), Ok(()));
+    assert!(blocking.submit_joinable(|| ()).is_err());
 }

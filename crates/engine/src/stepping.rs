@@ -24,12 +24,12 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
 use crate::backend::{BoxTask, BoxTimer, BoxWork, Capabilities, ExecutionBackend};
-use crate::time::EngineInstant;
+use crate::time::{EngineInstant, Instant};
 
 // ── Noop waker ──────────────────────────────────────────────────────────────
 
