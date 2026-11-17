@@ -183,6 +183,7 @@ impl ContractOracle {
     ) -> Result<(), InvariantViolation> {
         for output in outputs {
             match output {
+                ContextualProcessOutput::StopAcknowledged { .. } => {}
                 ContextualProcessOutput::Process(ProcessOutput::Started { .. }) => {
                     if facts.started || facts.terminal {
                         return violation("I9", "process start fact changed after resolution");

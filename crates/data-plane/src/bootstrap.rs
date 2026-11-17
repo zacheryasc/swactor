@@ -17,6 +17,7 @@
 //! | 40     | 24   | reserved (zero)               |
 
 pub mod channel;
+pub mod host_route;
 use std::fmt;
 
 /// `"SWBS"` read little-endian.

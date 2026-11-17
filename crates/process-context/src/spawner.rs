@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use protocol_telemetry::TransitionEmitter;
 use swactor::Error;
 use swactor::actor::{ActorAddress, Ctx};
 use swactor::runtime::ExternalSender;
@@ -25,6 +26,7 @@ pub struct ContextualProcessSpawner {
     provisioner: Arc<dyn ContextProvisioner>,
     next_execution_id: AtomicU64,
     default_kill_after: Option<Duration>,
+    transitions: Option<TransitionEmitter>,
 }
 
 impl ContextualProcessSpawner {
@@ -34,7 +36,13 @@ impl ContextualProcessSpawner {
             provisioner,
             next_execution_id: AtomicU64::new(1),
             default_kill_after: Some(Duration::from_secs(5)),
+            transitions: None,
         }
+    }
+
+    pub fn with_transitions(mut self, transitions: Option<TransitionEmitter>) -> Self {
+        self.transitions = transitions;
+        self
     }
 
     pub fn with_default_kill_after(mut self, kill_after: Option<Duration>) -> Self {
@@ -52,7 +60,10 @@ impl ContextualProcessSpawner {
         if spec.process.command.is_empty() {
             return Err(Error::from("contextual process command must not be empty"));
         }
-        if spec.attach_deadline.is_zero() {
+        if spec
+            .attach_deadline
+            .is_some_and(|deadline| deadline.is_zero())
+        {
             return Err(Error::from(
                 "contextual process attachment deadline must be nonzero",
             ));
@@ -60,10 +71,12 @@ impl ContextualProcessSpawner {
         spec.access
             .validate()
             .map_err(|error| Error::from(format!("invalid contextual session access: {error}")))?;
-        let execution_id = self.next_execution_id.fetch_add(1, Ordering::Relaxed);
-        if execution_id == 0 {
-            return Err(Error::from("contextual process execution ids exhausted"));
-        }
+        let execution_id = self
+            .next_execution_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| Error::from("contextual process execution ids exhausted"))?;
         let identity = ExecutionIdentity {
             execution_id,
             generation: 1,
@@ -76,6 +89,7 @@ impl ContextualProcessSpawner {
             engine: self.engine.clone(),
             sender: sender.clone(),
             default_kill_after: self.default_kill_after,
+            transitions: self.transitions.clone(),
         }))?;
         Ok(SpawnedContextualProcess { actor, identity })
     }

@@ -12,7 +12,7 @@ use data_plane::path::SessionAccess;
 use data_plane::protocol::{HostSessionIn, SessionCapability};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::{ExternalSender, Runtime, RuntimeConfig, RuntimeParts};
-use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor_process::{ProcessOutput, ProcessSpec};
 use swactor_process_context::{
     ContextProvisioner, ContextualProcessOutput, ContextualProcessOutputConfig,
@@ -103,21 +103,18 @@ impl ActorInterface for LaunchActor {
     fn handle(&mut self, _ctx: &Ctx<'_>, _message: ()) {}
 }
 
-fn run_probe(arguments: Vec<String>) -> Vec<ContextualProcessOutput> {
-    let parts = RuntimeParts::new(RuntimeConfig::default());
-    let runtime = parts.runtime().clone();
-    let engine = Engine::new(
-        parts,
-        TokioBackend::new(TokioConfig::default()).expect("tokio backend"),
-    )
-    .expect("engine");
+fn run_probe(
+    runtime: &Runtime,
+    engine: EngineHandle,
+    arguments: Vec<String>,
+) -> Vec<ContextualProcessOutput> {
     let output = runtime
         .new_inbox::<ContextualProcessOutput>()
         .expect("output inbox");
     let provisioner: Arc<dyn ContextProvisioner> = Arc::new(FakeProvisioner {
         runtime: runtime.clone(),
     });
-    let spawner = Arc::new(ContextualProcessSpawner::new(engine.handle(), provisioner));
+    let spawner = Arc::new(ContextualProcessSpawner::new(engine, provisioner));
     runtime
         .spawn(LaunchActor {
             spawner,
@@ -138,7 +135,7 @@ fn run_probe(arguments: Vec<String>) -> Vec<ContextualProcessOutput> {
                     read_prefixes: vec![],
                     write_prefixes: vec![],
                 },
-                attach_deadline: Duration::from_secs(5),
+                attach_deadline: Some(Duration::from_secs(5)),
             }),
             output: Some(ContextualProcessOutputConfig::disabled(*output.addr())),
         })
@@ -175,7 +172,10 @@ fn position(
 
 #[test]
 fn contextual_actor_reports_ready_before_native_exit() {
-    let outputs = run_probe(Vec::new());
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let outputs = run_probe(&runtime, engine.handle(), Vec::new());
     let started = position(&outputs, |output| {
         matches!(
             output,
@@ -196,7 +196,14 @@ fn contextual_actor_reports_ready_before_native_exit() {
 
 #[test]
 fn attachment_failure_is_resolved_before_native_exit() {
-    let outputs = run_probe(vec!["--fail-attachment".to_owned()]);
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let outputs = run_probe(
+        &runtime,
+        engine.handle(),
+        vec!["--fail-attachment".to_owned()],
+    );
     let failed = position(&outputs, |output| {
         matches!(output, ContextualProcessOutput::BootstrapFailed { .. })
     });
@@ -212,4 +219,173 @@ fn attachment_failure_is_resolved_before_native_exit() {
             .iter()
             .any(|output| matches!(output, ContextualProcessOutput::ContextReady))
     );
+}
+
+struct OutputChannel(std::sync::mpsc::Sender<ContextualProcessOutput>);
+
+impl ActorInterface for OutputChannel {
+    type Incoming = ContextualProcessOutput;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx<'_>, output: Self::Incoming) {
+        let terminal = matches!(
+            &output,
+            ContextualProcessOutput::Process(
+                ProcessOutput::Exited { .. }
+                    | ProcessOutput::SpawnFailed { .. }
+                    | ProcessOutput::Error { .. }
+            )
+        );
+        self.0.send(output).unwrap();
+        if terminal {
+            ctx.stop_self();
+        }
+    }
+}
+
+fn launch_event_probe(
+    runtime: &Runtime,
+    engine: EngineHandle,
+    argument: &str,
+) -> std::sync::mpsc::Receiver<ContextualProcessOutput> {
+    let (sender, output) = std::sync::mpsc::channel();
+    let upstream = runtime.spawn(OutputChannel(sender)).unwrap();
+    let spawner = Arc::new(ContextualProcessSpawner::new(
+        engine,
+        Arc::new(FakeProvisioner {
+            runtime: runtime.clone(),
+        }),
+    ));
+    runtime
+        .spawn(LaunchActor {
+            spawner,
+            sender: runtime.create_sender(),
+            spec: Some(ContextualProcessSpec::event_driven(
+                ProcessSpec {
+                    command: env!("CARGO_BIN_EXE_context_guest_probe").to_owned(),
+                    args: vec![argument.to_owned()],
+                    env: HashMap::new(),
+                    working_dir: None,
+                    label: None,
+                },
+                SessionAccess {
+                    execution_id: "event-probe".to_owned(),
+                    read_prefixes: vec![],
+                    write_prefixes: vec![],
+                },
+            )),
+            output: Some(ContextualProcessOutputConfig::disabled(upstream)),
+        })
+        .unwrap();
+    output
+}
+
+fn assert_native_reaped(pid: u32) {
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+struct CensusReply(swactor_engine::ActorCompletion<swactor::admin::ListActorsResponse>);
+
+impl ActorInterface for CensusReply {
+    type Incoming = swactor::admin::ListActorsResponse;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx<'_>, response: Self::Incoming) {
+        let _ = self.0.complete(response);
+        ctx.stop_self();
+    }
+}
+
+#[test]
+fn output_relay_loss_cancels_live_native_process_and_waits_for_real_reap() {
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let output = launch_event_probe(&runtime, engine.handle(), "--hold-context");
+    let mut pid = None;
+    loop {
+        match output.recv().unwrap() {
+            ContextualProcessOutput::Process(ProcessOutput::Started { pid: native }) => {
+                pid = Some(native)
+            }
+            ContextualProcessOutput::ContextReady => break,
+            other => panic!("unexpected output before ready: {other:?}"),
+        }
+    }
+    let pid = pid.expect("native process started");
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+    let census = swactor_engine::ActorCompletion::new();
+    let reply = runtime.spawn(CensusReply(census.clone())).unwrap();
+    let _request = runtime
+        .admin()
+        .list_actors_to(reply, |response| response)
+        .unwrap();
+    let actors = census.wait();
+    let relay = actors
+        .actors
+        .iter()
+        .find(|actor| actor.actor_type.ends_with("::ProcessOutputRelay"))
+        .expect("live native output relay")
+        .address;
+    runtime.stop_actor(relay).unwrap();
+    loop {
+        match output.recv().unwrap() {
+            ContextualProcessOutput::Process(
+                ProcessOutput::Stdout(_) | ProcessOutput::Stderr(_),
+            ) => {}
+            ContextualProcessOutput::Process(ProcessOutput::Exited { status }) => {
+                // Immediate cancellation first offers TERM, then sends KILL if
+                // the owned child is still live. Either real signal can win.
+                assert!(matches!(
+                    status,
+                    swactor_process::ExitStatus::Signal(signal)
+                        if signal == libc::SIGTERM || signal == libc::SIGKILL
+                ));
+                break;
+            }
+            other => panic!("observer loss must not fabricate native terminal output: {other:?}"),
+        }
+    }
+    assert_native_reaped(pid);
+}
+
+#[test]
+fn closed_bootstrap_peer_cancels_child_that_remains_live() {
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(parts, TokioBackend::new(TokioConfig::default()).unwrap()).unwrap();
+    let output = launch_event_probe(&runtime, engine.handle(), "--close-bootstrap-and-wait");
+    let mut pid = None;
+    let mut failed = false;
+    loop {
+        match output.recv().unwrap() {
+            ContextualProcessOutput::Process(ProcessOutput::Started { pid: native }) => {
+                pid = Some(native)
+            }
+            ContextualProcessOutput::BootstrapFailed { reason } => {
+                assert_eq!(
+                    reason,
+                    swactor_process_context::BootstrapFailure::ChannelClosed
+                );
+                failed = true;
+            }
+            ContextualProcessOutput::Process(ProcessOutput::Exited { status }) => {
+                assert!(
+                    failed,
+                    "bootstrap EOF must be observed before native termination"
+                );
+                assert_eq!(status, swactor_process::ExitStatus::Signal(libc::SIGTERM));
+                break;
+            }
+            other => panic!("unexpected bootstrap-close output: {other:?}"),
+        }
+    }
+    assert_native_reaped(pid.expect("native process started"));
 }

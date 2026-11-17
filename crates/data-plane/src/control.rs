@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use protocol_telemetry::TransitionEmitter;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor_engine::EngineHandle;
@@ -37,10 +38,12 @@ impl DataNamespaceService {
         source_sender: Arc<dyn BlobTransferSender>,
         source_publisher: Arc<dyn BlobSourcePublisher>,
         routes: Option<Arc<dyn HostRouteRegistrar>>,
+        transitions: Option<TransitionEmitter>,
     ) -> Result<Self, NamespaceError> {
         let recovery_runtime = runtime.clone();
         let recovery_sender = Arc::clone(&source_sender);
         let recovery_publisher = Arc::clone(&source_publisher);
+        let recovery_transitions = transitions.clone();
         let retire_retry = RetirementRetry::new(
             engine,
             runtime.create_sender(),
@@ -57,7 +60,8 @@ impl DataNamespaceService {
                         Arc::clone(&recovery_sender),
                         path,
                         expected_length,
-                    )?;
+                    )?
+                    .with_transitions(recovery_transitions.clone());
                     let source = recovery_runtime.spawn(source).map_err(|error| {
                         NamespaceError::SourceRecovery(format!(
                             "spawn recovered file source {}: {error}",
@@ -76,7 +80,8 @@ impl DataNamespaceService {
                 }
                 SourceRecovery::Actor { actor, node, .. } => Ok((*actor, *node)),
             },
-        )?;
+        )?
+        .with_transitions(transitions.clone());
         let authority_epoch = directory.authority_epoch();
         let directory = runtime.spawn(directory).map_err(|error| {
             NamespaceError::SourceRecovery(format!("spawn data directory: {error}"))
@@ -86,6 +91,7 @@ impl DataNamespaceService {
             directory: DirectoryClient::new(runtime, directory),
             source_sender,
             source_publisher,
+            transitions,
         };
         Ok(Self {
             directory,
@@ -113,6 +119,7 @@ pub struct DataPlaneControl {
     directory: DirectoryClient,
     source_sender: Arc<dyn BlobTransferSender>,
     source_publisher: Arc<dyn BlobSourcePublisher>,
+    transitions: Option<TransitionEmitter>,
 }
 
 pub enum RetainedNamespaceResources {
@@ -123,7 +130,6 @@ pub enum RetainedNamespaceResources {
 
 pub enum NamespaceCleanupStatus {
     Absent,
-    ActiveStream,
     Removed {
         quiescent_stream_revision: Option<u64>,
     },
@@ -182,7 +188,8 @@ impl DataPlaneControl {
             self.runtime.clone(),
             Arc::clone(&self.source_sender),
             registration.path(),
-        )?;
+        )?
+        .with_transitions(self.transitions.clone());
         let length = source.length();
         let recovery = source.recovery();
         let source = self
@@ -219,33 +226,22 @@ impl DataPlaneControl {
         Ok(())
     }
 
-    /// Remove one namespace entry only after any stream writer has quiesced,
-    /// then prove the committed directory state no longer contains the path.
-    pub async fn try_unregister_quiescent(
+    /// Remove an entry after its concrete stream-close event, without deleting
+    /// a replacement revision. Dropping the future cancels its parked waiter.
+    pub async fn unregister_when_quiescent(
         &self,
         path: DataPath,
     ) -> Result<NamespaceCleanupStatus, NamespaceError> {
-        let node = match self.directory.lookup(path.clone()).await {
-            Ok(node) => node,
-            Err(NamespaceError::PathNotFound(_)) => return Ok(NamespaceCleanupStatus::Absent),
-            Err(error) => return Err(error),
-        };
-        if node.kind == crate::namespace::EntryKind::Stream && node.active {
-            return Ok(NamespaceCleanupStatus::ActiveStream);
-        }
-        let quiescent_stream_revision =
-            (node.kind == crate::namespace::EntryKind::Stream).then_some(node.revision);
-        self.directory
-            .unregister(path.clone(), random_operation_id())
-            .await?;
-        match self.directory.lookup(path).await {
-            Err(NamespaceError::PathNotFound(_)) => Ok(NamespaceCleanupStatus::Removed {
-                quiescent_stream_revision,
+        match self
+            .directory
+            .unregister_when_quiescent(path, random_operation_id())
+            .await?
+        {
+            None => Ok(NamespaceCleanupStatus::Absent),
+            Some(node) => Ok(NamespaceCleanupStatus::Removed {
+                quiescent_stream_revision: (node.kind == crate::namespace::EntryKind::Stream)
+                    .then_some(node.revision),
             }),
-            Ok(_) => Err(NamespaceError::Protocol(
-                "namespace entry remained after unregister acknowledgement".to_owned(),
-            )),
-            Err(error) => Err(error),
         }
     }
 

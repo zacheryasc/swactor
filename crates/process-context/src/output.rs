@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::model::ContextualProcessOutput;
 use swactor::actor::ActorAddress;
 use swactor_process::ProcessOutputConfig;
 use telemetry::TelemetryProducer;
@@ -6,6 +9,7 @@ use telemetry::TelemetryProducer;
 pub struct ContextualProcessOutputConfig {
     upstream: ActorAddress,
     telemetry: Option<TelemetryProducer>,
+    lifecycle_observer: Option<Arc<dyn Fn(ContextualProcessOutput) + Send + Sync>>,
 }
 
 impl ContextualProcessOutputConfig {
@@ -13,6 +17,7 @@ impl ContextualProcessOutputConfig {
         Self {
             upstream,
             telemetry: None,
+            lifecycle_observer: None,
         }
     }
 
@@ -20,7 +25,31 @@ impl ContextualProcessOutputConfig {
         Self {
             upstream,
             telemetry: Some(producer),
+            lifecycle_observer: None,
         }
+    }
+
+    /// Observe lifecycle independently of a transient byte-output relay.
+    pub fn with_lifecycle_observer(
+        mut self,
+        observer: Arc<dyn Fn(ContextualProcessOutput) + Send + Sync>,
+    ) -> Self {
+        self.lifecycle_observer = Some(observer);
+        self
+    }
+
+    pub(crate) fn emit(&self, ctx: &swactor::actor::Ctx<'_>, output: ContextualProcessOutput) {
+        if !matches!(
+            &output,
+            ContextualProcessOutput::Process(
+                swactor_process::ProcessOutput::Stdout(_)
+                    | swactor_process::ProcessOutput::Stderr(_)
+            )
+        ) && let Some(observer) = &self.lifecycle_observer
+        {
+            observer(output.clone());
+        }
+        let _ = ctx.send(self.upstream, output);
     }
 
     pub fn upstream(&self) -> ActorAddress {

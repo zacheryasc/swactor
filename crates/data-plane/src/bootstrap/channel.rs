@@ -30,7 +30,6 @@ pub struct SessionBootstrap {
 #[derive(Debug)]
 pub struct BootstrapHost {
     socket: Option<OwnedFd>,
-    claimed: bool,
 }
 #[derive(Debug)]
 pub struct BootstrapCancellation {
@@ -39,7 +38,14 @@ pub struct BootstrapCancellation {
 
 #[derive(Debug)]
 pub struct BootstrapAttachment {
-    socket: Option<OwnedFd>,
+    phase: AttachmentPhase,
+}
+
+#[derive(Debug)]
+enum AttachmentPhase {
+    AwaitingResult(OwnedFd),
+    AwaitingAcknowledgement(OwnedFd),
+    Closed,
 }
 
 #[derive(Debug)]
@@ -145,13 +151,7 @@ pub fn bootstrap_channel() -> Result<(BootstrapHost, OwnedFd), BootstrapChannelE
     let host = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
     // SAFETY: same as above; this is the distinct peer descriptor.
     let child = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
-    Ok((
-        BootstrapHost {
-            socket: Some(host),
-            claimed: false,
-        },
-        child,
-    ))
+    Ok((BootstrapHost { socket: Some(host) }, child))
 }
 
 impl BootstrapHost {
@@ -177,14 +177,10 @@ impl BootstrapHost {
         material: &SessionBootstrap,
         arena_fd: RawFd,
     ) -> Result<BootstrapAttachment, BootstrapChannelError> {
-        if self.claimed {
-            return Err(BootstrapChannelError::AlreadyClaimed);
-        }
         let socket = self
             .socket
             .take()
             .ok_or(BootstrapChannelError::AlreadyClaimed)?;
-        self.claimed = true;
 
         let packet = recv_packet(socket.as_raw_fd())?;
         require_descriptor_count(&packet, 0)?;
@@ -195,19 +191,15 @@ impl BootstrapHost {
         let response = frame(RESPONSE_MAGIC, 0, &payload)?;
         send_packet(socket.as_raw_fd(), &response, Some(arena_fd))?;
         Ok(BootstrapAttachment {
-            socket: Some(socket),
+            phase: AttachmentPhase::AwaitingResult(socket),
         })
     }
 
     pub fn reject_claim(&mut self, reason: &str) -> Result<(), BootstrapChannelError> {
-        if self.claimed {
-            return Err(BootstrapChannelError::AlreadyClaimed);
-        }
         let socket = self
             .socket
             .take()
             .ok_or(BootstrapChannelError::AlreadyClaimed)?;
-        self.claimed = true;
 
         let packet = recv_packet(socket.as_raw_fd())?;
         require_descriptor_count(&packet, 0)?;
@@ -229,14 +221,15 @@ impl BootstrapCancellation {
 
 impl BootstrapAttachment {
     pub fn receive_result(&mut self) -> Result<AttachmentResult, BootstrapChannelError> {
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or(BootstrapChannelError::ChannelClosed)?;
+        let phase = std::mem::replace(&mut self.phase, AttachmentPhase::Closed);
+        let AttachmentPhase::AwaitingResult(socket) = phase else {
+            self.phase = phase;
+            return Err(BootstrapChannelError::ChannelClosed);
+        };
         let packet = recv_packet(socket.as_raw_fd())?;
         require_descriptor_count(&packet, 0)?;
         let (status, body) = parse_frame(&packet.bytes, ATTACHMENT_MAGIC)?;
-        match status {
+        let result = match status {
             0 if body.is_empty() => Ok(AttachmentResult::Succeeded),
             1 => String::from_utf8(body.to_vec())
                 .map(AttachmentResult::Failed)
@@ -247,14 +240,17 @@ impl BootstrapAttachment {
             _ => Err(BootstrapChannelError::Malformed(
                 "unknown attachment result status",
             )),
-        }
+        }?;
+        self.phase = AttachmentPhase::AwaitingAcknowledgement(socket);
+        Ok(result)
     }
 
     pub fn acknowledge(mut self) -> Result<(), BootstrapChannelError> {
-        let socket = self
-            .socket
-            .take()
-            .ok_or(BootstrapChannelError::ChannelClosed)?;
+        let AttachmentPhase::AwaitingAcknowledgement(socket) =
+            std::mem::replace(&mut self.phase, AttachmentPhase::Closed)
+        else {
+            return Err(BootstrapChannelError::ChannelClosed);
+        };
         let packet = frame(ATTACHMENT_ACK_MAGIC, 0, &[])?;
         send_packet(socket.as_raw_fd(), &packet, None)
     }

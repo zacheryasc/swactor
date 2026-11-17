@@ -331,3 +331,147 @@ fn recovery_rejects_a_changed_file_length() {
         matches!(recovered, Err(NamespaceError::SourceRecovery(reason)) if reason.contains("length"))
     );
 }
+
+#[test]
+fn stopped_source_resolves_transfer_and_retains_region_until_adapter_releases_it() {
+    use data_plane::source::BlobSourceRetirement;
+    use swactor::actor::ActorAddress;
+    use swactor_engine::SteppingBackend;
+
+    struct Retirement(Arc<AtomicU64>);
+    impl BlobSourceRetirement for Retirement {
+        fn retired(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn binding(&self) -> ActorAddress {
+            ActorAddress([42; 32])
+        }
+    }
+
+    let fixture = TestFile::new(b"retained-region");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let _engine = Engine::new(parts, backend.clone()).unwrap();
+    let sender = Arc::new(HeldSender {
+        request: Mutex::new(None),
+        starts: AtomicU64::new(0),
+    });
+    let retired = Arc::new(AtomicU64::new(0));
+    let source = runtime
+        .spawn(
+            FileBlobSourceActor::from_file_region(
+                runtime.clone(),
+                sender.clone(),
+                std::fs::File::open(&fixture.path).unwrap(),
+                0,
+                15,
+                Some(Arc::new(Retirement(retired.clone()))),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let destination = runtime.new_inbox::<BlobTransferEvent>().unwrap();
+    runtime
+        .send_to(
+            source,
+            BlobSourceIn::BeginTransfer {
+                offer: BlobTransferOffer {
+                    transfer_id: BlobTransferId(93),
+                    destination: *destination.addr(),
+                    failure_proxy: None,
+                    transport: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+    for _ in 0..32 {
+        backend.step();
+    }
+    let request = sender.request.lock().take().expect("adapter owns transfer");
+    runtime.stop_actor(source).unwrap();
+    for _ in 0..32 {
+        backend.step();
+    }
+    assert!(matches!(
+        destination.try_recv(),
+        Some(BlobTransferEvent::Failed {
+            transfer_id: BlobTransferId(93),
+            ..
+        })
+    ));
+    assert!(destination.try_recv().is_none());
+    assert_eq!(
+        retired.load(Ordering::SeqCst),
+        0,
+        "adapter still owns the backing region"
+    );
+    drop(request);
+    for _ in 0..32 {
+        backend.step();
+    }
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    assert!(
+        destination.try_recv().is_none(),
+        "late completion cannot resolve the caller twice"
+    );
+}
+
+#[test]
+fn dropped_adapter_request_completes_retirement_without_leaving_an_active_transfer() {
+    use swactor_engine::SteppingBackend;
+    let fixture = TestFile::new(b"pending");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let _engine = Engine::new(parts, backend.clone()).unwrap();
+    let sender = Arc::new(HeldSender {
+        request: Mutex::new(None),
+        starts: AtomicU64::new(0),
+    });
+    let source = runtime
+        .spawn(FileBlobSourceActor::open(runtime.clone(), sender.clone(), &fixture.path).unwrap())
+        .unwrap();
+    let destination = runtime.new_inbox::<BlobTransferEvent>().unwrap();
+    runtime
+        .send_to(
+            source,
+            BlobSourceIn::BeginTransfer {
+                offer: BlobTransferOffer {
+                    transfer_id: BlobTransferId(94),
+                    destination: *destination.addr(),
+                    failure_proxy: None,
+                    transport: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+    runtime
+        .send_to(source, BlobSourceIn::Retire { reply_to: None })
+        .unwrap();
+    for _ in 0..32 {
+        backend.step();
+    }
+    drop(sender.request.lock().take().expect("accepted transfer"));
+    for _ in 0..32 {
+        backend.step();
+    }
+    assert!(matches!(
+        destination.try_recv(),
+        Some(BlobTransferEvent::Failed {
+            transfer_id: BlobTransferId(94),
+            ..
+        })
+    ));
+    assert!(destination.try_recv().is_none());
+    assert!(
+        runtime.stop_actor(source).is_err(),
+        "retired source must have stopped"
+    );
+}

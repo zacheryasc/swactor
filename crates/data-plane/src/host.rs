@@ -5,8 +5,12 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+use protocol_telemetry::{
+    ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
+use swactor::actor::{ActorAddress, ActorExited, ActorInterface, Ctx};
 use swactor::runtime::{ExternalSender, Runtime};
+use swactor::std::CtxWatching;
 use swactor_engine::{ActorTimer, EngineHandle};
 
 use crate::arena::{
@@ -21,7 +25,7 @@ use crate::blob::{
 use crate::blob_transfer::{
     BlobTransferEvent, BlobTransferId, BlobTransferOffer, BlobTransferReceiver, BlobTransferSender,
 };
-use crate::byte_ring::{self, ByteRingSpec, PeerTermination, RingHandle, Role};
+use crate::byte_ring::{self, ByteRingSpec, PeerTermination, RingHandle, RingProbe, Role};
 use crate::mapped_arena::MappedArena;
 use crate::namespace::{
     BlobBinding as NamespaceBlobBinding, DataDirectoryIn, DataDirectoryOut, EntryKind,
@@ -45,6 +49,8 @@ const STREAM_RING_CAPACITY: u64 = 256 * 1024;
 const BLOB_ROUTE_RETRY: Duration = Duration::from_millis(100);
 const BLOB_ROUTE_RETRY_LIMIT: u16 = 300;
 const STREAM_PEER_OFFER_RETRY: Duration = Duration::from_millis(100);
+const STREAM_PEER_ROUTE_LOSS_GRACE: Duration = Duration::from_secs(2);
+const STREAM_PEER_TERMINATION_ROUTE_RETRY_LIMIT: u8 = 20;
 
 fn namespace_operation_id(address: ActorAddress) -> OperationId {
     let mut bytes = [0_u8; 16];
@@ -84,6 +90,9 @@ pub trait HostRouteRegistrar: Send + Sync + 'static {
     /// Drop one namespace read binding's claim on a remotely-hosted source.
     fn release_source(&self, _source: ActorAddress) {}
 
+    /// Whether this actor still has a registered route. Temporary transport
+    /// disconnection must remain routable here; false means the actor route
+    /// was revoked and no future actor acknowledgement can arrive.
     fn is_routable(&self, _actor: ActorAddress) -> bool {
         true
     }
@@ -114,6 +123,7 @@ pub struct HostDataPlaneConfig {
     pub source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
     pub route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
     pub stream_transport: Option<Arc<dyn StreamTransport>>,
+    pub transitions: Option<TransitionEmitter>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,9 +175,10 @@ pub struct HostDataPlaneSessionActor {
     route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
     stream_arena: Option<Arc<MappedArena>>,
     stream_transport: Option<Arc<dyn StreamTransport>>,
+    transitions: Option<TransitionEmitter>,
     child_session: Option<ActorAddress>,
     allocator: Option<ActorAddress>,
-    active_bindings: HashSet<ActorAddress>,
+    active_bindings: HashMap<ActorAddress, ActorAddress>,
     stream_bindings: HashMap<ActorAddress, ActorAddress>,
     pending_opens: HashMap<ActorAddress, PendingOpen>,
     open_lookups: HashMap<ActorAddress, ActorAddress>,
@@ -178,6 +189,32 @@ pub struct HostDataPlaneSessionActor {
 }
 
 impl HostDataPlaneSessionActor {
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: HostSessionState, reason: Reason) {
+        let previous = self.state;
+        self.state = next;
+        let phase = |state| match state {
+            HostSessionState::AwaitingAttachment => Phase::AwaitingAttachment,
+            HostSessionState::Running => Phase::Running,
+            HostSessionState::Revoked => Phase::Revoked,
+            HostSessionState::Closing => Phase::Closing,
+            HostSessionState::Closed => Phase::Closed,
+        };
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::HostDataPlaneSessionActor,
+                protocol: Protocol::HostSession,
+                operation: None,
+                generation: Some(self.session_generation),
+                incarnation: None,
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: (next == HostSessionState::Closed).then_some(Outcome::Success),
+            });
+        }
+    }
+
     pub fn new(config: HostDataPlaneConfig) -> Result<Self, DataPlaneError> {
         if config.arena_generation == 0 || config.session_generation == 0 {
             return Err(DataPlaneError::SessionFailed(
@@ -218,9 +255,10 @@ impl HostDataPlaneSessionActor {
             route_registrar: config.route_registrar,
             stream_arena,
             stream_transport: config.stream_transport,
+            transitions: config.transitions,
             child_session: None,
             allocator: None,
-            active_bindings: HashSet::new(),
+            active_bindings: HashMap::new(),
             stream_bindings: HashMap::new(),
             pending_opens: HashMap::new(),
             open_lookups: HashMap::new(),
@@ -335,6 +373,7 @@ impl HostDataPlaneSessionActor {
         };
         let binding = HostBlobBindingActor::namespace_read(NamespaceReadParams {
             addresses: HostBindingAddresses {
+                transitions: self.transitions.clone(),
                 host_session: ctx.self_addr(),
                 allocator: self.allocator.expect("allocator started"),
                 child_session,
@@ -350,7 +389,8 @@ impl HostDataPlaneSessionActor {
         });
         match ctx.spawn(binding) {
             Ok(binding) => {
-                self.active_bindings.insert(binding);
+                self.active_bindings.insert(binding, operation);
+                ctx.watch(binding);
             }
             Err(error) => self.send_open_failure(
                 ctx,
@@ -372,6 +412,7 @@ impl HostDataPlaneSessionActor {
         } = request;
         let binding = HostBlobBindingActor::write(
             HostBindingAddresses {
+                transitions: self.transitions.clone(),
                 host_session: ctx.self_addr(),
                 allocator: self.allocator.expect("allocator started"),
                 child_session,
@@ -386,7 +427,8 @@ impl HostDataPlaneSessionActor {
         );
         match ctx.spawn(binding) {
             Ok(binding) => {
-                self.active_bindings.insert(binding);
+                self.active_bindings.insert(binding, operation);
+                ctx.watch(binding);
             }
             Err(error) => {
                 if let (Some(namespace), Some(reservation)) = (&self.namespace, reservation) {
@@ -447,6 +489,9 @@ impl HostDataPlaneSessionActor {
             }
         };
         let binding = HostStreamBindingActor {
+            transitions: self.transitions.clone(),
+            session_generation: self.session_generation,
+            phase: StreamPhase::Resolving,
             runtime: self.runtime.clone(),
             engine: self.engine.clone(),
             sender: self.runtime.create_sender(),
@@ -465,29 +510,35 @@ impl HostDataPlaneSessionActor {
             transport,
             local_descriptor,
             ring: None,
+            ring_probe: None,
             ring_allocation_pending: true,
             matched: None,
             pending_displacements: HashMap::new(),
             fenced_displacements: HashSet::new(),
             pending_peer_terminations: HashMap::new(),
             peer_descriptor: None,
-            peer_offer_acknowledged: false,
-            transport_installed: false,
-            transport_ready: false,
-            transport_quiesced: false,
-            opened: false,
+            peer_was_local: false,
+            peer_state: StreamPeerState::Negotiating,
+            transport_state: StreamTransportState::Absent,
+            route_state: StreamRouteState::Unknown,
+            open_completion: StreamOpenCompletion::Owned,
             terminal: None,
             data_waiters: Vec::new(),
             capacity_waiters: Vec::new(),
+            progress_waiters: Vec::new(),
             close_waiters: Vec::new(),
-            release_started: false,
+            release: StreamRelease::NotStarted,
+            namespace_close_result: None,
             namespace_open: None,
             namespace_close: None,
-            peer_ack_pending: false,
             route_watch: None,
             offer_retry: None,
             termination_retry: None,
-            pending_peer_offer: None,
+            termination_route_retries: 0,
+            route_loss_timer: None,
+            route_loss_generation: 0,
+            pending_peer_offers: HashMap::new(),
+            detach_pending: false,
         };
         match ctx.spawn(binding) {
             Ok(binding) => {
@@ -504,6 +555,7 @@ impl HostDataPlaneSessionActor {
                     return;
                 }
                 self.stream_bindings.insert(operation, binding);
+                ctx.watch(binding);
             }
             Err(error) => self.send_open_failure(
                 ctx,
@@ -528,19 +580,24 @@ impl HostDataPlaneSessionActor {
         ) {
             return;
         }
-        self.state = HostSessionState::Revoked;
+        self.enter_phase(ctx, HostSessionState::Revoked, Reason::Cancelled);
         if revoke_child_route {
             self.revoke_child_route();
         }
         for lookup in self.open_lookups.drain().map(|(_, lookup)| lookup) {
             let _ = ctx.stop_actor(lookup);
         }
-        for operation in self
-            .namespace_operations
-            .drain()
-            .map(|(_, operation)| operation)
-        {
-            let _ = ctx.stop_actor(operation);
+        for (operation, actor) in self.namespace_operations.drain() {
+            let _ = ctx.stop_actor(actor);
+            if let Some(child) = self.child_session {
+                let _ = ctx.send(
+                    child,
+                    ChildSessionIn::NamespaceResolved {
+                        reply_to: operation,
+                        result: Err(DataPlaneError::SessionNotRunning),
+                    },
+                );
+            }
         }
         for (operation, pending) in self.pending_opens.drain() {
             let _ = ctx.send(
@@ -551,7 +608,7 @@ impl HostDataPlaneSessionActor {
                 },
             );
         }
-        for binding in self.active_bindings.iter().copied() {
+        for binding in self.active_bindings.keys().copied() {
             let _ = ctx.send(binding, HostBindingIn::SessionClosed);
         }
         for binding in self.stream_bindings.values().copied() {
@@ -576,7 +633,7 @@ impl HostDataPlaneSessionActor {
             self.close_replies.push(reply_to);
         }
         self.revoke_session(ctx, false);
-        self.state = HostSessionState::Closing;
+        self.enter_phase(ctx, HostSessionState::Closing, Reason::CloseRequested);
         self.maybe_finish_close(ctx);
     }
 
@@ -609,7 +666,7 @@ impl HostDataPlaneSessionActor {
             && self.open_lookups.is_empty()
             && self.namespace_operations.is_empty()
         {
-            self.state = HostSessionState::Closed;
+            self.enter_phase(ctx, HostSessionState::Closed, Reason::Completed);
             if let Some(allocator) = self.allocator.take() {
                 let _ = ctx.stop_actor(allocator);
             }
@@ -626,6 +683,701 @@ impl HostDataPlaneSessionActor {
             ctx.stop_self();
         }
     }
+    fn attach(
+        &mut self,
+        ctx: &Ctx<'_>,
+        child_session: ActorAddress,
+        arena_generation: u64,
+        session_capability: SessionCapability,
+        child_node: Option<[u8; 32]>,
+    ) {
+        let mut failure = if matches!(
+            self.state,
+            HostSessionState::Revoked | HostSessionState::Closing | HostSessionState::Closed
+        ) {
+            Some(AttachmentFailure::SessionClosed)
+        } else if self.child_session.is_some() {
+            Some(AttachmentFailure::DuplicateAttachment)
+        } else {
+            None
+        };
+        let mut route_installed = false;
+        if failure.is_none()
+            && let (Some(registrar), Some(child_node)) = (&self.route_registrar, child_node)
+        {
+            match registrar.register_child(child_session, child_node) {
+                Ok(()) => route_installed = true,
+                Err(reason) => {
+                    failure = Some(AttachmentFailure::RouteRejected(reason));
+                }
+            }
+        }
+        if failure.is_none() && arena_generation != self.arena_generation {
+            failure = Some(AttachmentFailure::ArenaGenerationMismatch {
+                expected: self.arena_generation,
+                found: arena_generation,
+            });
+        }
+        if failure.is_none() && session_capability != self.capability {
+            failure = Some(AttachmentFailure::CapabilityRejected);
+        }
+
+        if let Some(reason) = failure {
+            let _ = ctx.send(
+                child_session,
+                ChildSessionIn::AttachmentFailed {
+                    error: DataPlaneError::Attachment(reason),
+                },
+            );
+            if route_installed && let Some(registrar) = &self.route_registrar {
+                let _ = registrar.revoke_child(child_session);
+            }
+        } else {
+            self.child_session = Some(child_session);
+            if self.runtime.is_local_actor(child_session) {
+                ctx.watch(child_session);
+            }
+            self.enter_phase(ctx, HostSessionState::Running, Reason::Attached);
+            let _ = ctx.send(
+                child_session,
+                ChildSessionIn::Attached {
+                    session_generation: self.session_generation,
+                },
+            );
+        }
+    }
+
+    fn namespace_requested(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        request: NamespaceOperation,
+        child_session: ActorAddress,
+    ) {
+        let request = match self.validate_namespace_operation(child_session, request) {
+            Ok(request) => request,
+            Err(error) => {
+                self.send_namespace_result(ctx, child_session, operation, Err(error));
+                return;
+            }
+        };
+        let Some(namespace) = &self.namespace else {
+            self.send_namespace_result(
+                ctx,
+                child_session,
+                operation,
+                Err(DataPlaneError::SessionFailed(
+                    "data namespace service is unavailable".to_owned(),
+                )),
+            );
+            return;
+        };
+        match ctx.spawn(NamespaceControlActor {
+            namespace_proxy: namespace.proxy(),
+            host_session: ctx.self_addr(),
+            child_session,
+            operation,
+            request,
+            phase: NamespaceOperationPhase::Created,
+            transitions: self.transitions.clone(),
+            generation: Some(self.session_generation),
+        }) {
+            Ok(actor) => {
+                self.namespace_operations.insert(operation, actor);
+                ctx.watch(actor);
+            }
+            Err(error) => self.send_namespace_result(
+                ctx,
+                child_session,
+                operation,
+                Err(DataPlaneError::SessionFailed(error.to_string())),
+            ),
+        }
+    }
+
+    fn namespace_resolved(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        child_session: ActorAddress,
+        result: Result<NamespaceOperationResult, DataPlaneError>,
+    ) {
+        if self.namespace_operations.remove(&operation).is_some() {
+            self.send_namespace_result(ctx, child_session, operation, result);
+        }
+        self.maybe_finish_close(ctx);
+    }
+
+    fn namespace_cancelled(&mut self, ctx: &Ctx<'_>, operation: ActorAddress) {
+        if let Some(actor) = self.namespace_operations.remove(&operation) {
+            let _ = ctx.stop_actor(actor);
+            if let Some(child) = self.child_session {
+                self.send_namespace_result(
+                    ctx,
+                    child,
+                    operation,
+                    Err(DataPlaneError::OperationCancelled),
+                );
+            }
+        }
+        self.maybe_finish_close(ctx);
+    }
+
+    fn open_requested(
+        &mut self,
+        ctx: &Ctx<'_>,
+        path: DataPath,
+        options: OpenOptions,
+        policy: OpenPolicy,
+        child_session: ActorAddress,
+        operation: ActorAddress,
+    ) {
+        if let Err(error) = options.validate() {
+            self.send_open_failure(ctx, child_session, operation, error);
+            return;
+        }
+        let resolved = match self.validate_open(child_session, &path, options.access) {
+            Ok(path) => path,
+            Err(error) => {
+                self.send_open_failure(ctx, child_session, operation, error);
+                return;
+            }
+        };
+        if let OpenPolicy::EnsureStream { replace } = policy {
+            if options.create
+                || options.exclusive
+                || options.truncate
+                || options.allocation.is_some()
+            {
+                self.send_open_failure(
+                    ctx,
+                    child_session,
+                    operation,
+                    DataPlaneError::InvalidArgument(
+                        "stream ensure policy does not accept blob creation flags".to_owned(),
+                    ),
+                );
+                return;
+            }
+            let role = match options.access {
+                AccessMode::ReadOnly => StreamRole::Sink,
+                AccessMode::WriteOnly => StreamRole::Source,
+                AccessMode::ReadWrite => {
+                    self.send_open_failure(
+                        ctx,
+                        child_session,
+                        operation,
+                        DataPlaneError::Unsupported(
+                            "read-write stream descriptors are not supported".to_owned(),
+                        ),
+                    );
+                    return;
+                }
+            };
+            self.spawn_stream(
+                ctx,
+                StreamSpawn {
+                    child_session,
+                    operation,
+                    path: resolved,
+                    role,
+                    replace,
+                    ensure: true,
+                    expected_revision: None,
+                },
+            );
+            return;
+        }
+        let Some(namespace) = &self.namespace else {
+            self.send_open_failure(
+                ctx,
+                child_session,
+                operation,
+                DataPlaneError::SessionFailed("data namespace service is unavailable".to_owned()),
+            );
+            return;
+        };
+        self.pending_opens.insert(
+            operation,
+            PendingOpen {
+                child_session,
+                path: resolved.clone(),
+                options,
+            },
+        );
+        match ctx.spawn(NamespaceOpenLookupActor {
+            namespace_proxy: namespace.proxy(),
+            host_session: ctx.self_addr(),
+            operation,
+            path: resolved,
+            phase: NamespaceOperationPhase::Created,
+            transitions: self.transitions.clone(),
+            generation: Some(self.session_generation),
+        }) {
+            Ok(lookup) => {
+                self.open_lookups.insert(operation, lookup);
+                ctx.watch(lookup);
+            }
+            Err(error) => {
+                self.pending_opens.remove(&operation);
+                self.send_open_failure(
+                    ctx,
+                    child_session,
+                    operation,
+                    DataPlaneError::SessionFailed(error.to_string()),
+                );
+            }
+        }
+    }
+
+    fn open_resolved(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        result: Result<NamespaceNode, NamespaceError>,
+    ) {
+        self.open_lookups.remove(&operation);
+        let Some(pending) = self.pending_opens.remove(&operation) else {
+            return;
+        };
+        let PendingOpen {
+            child_session,
+            path,
+            options,
+        } = pending;
+        match result {
+            Err(NamespaceError::PathNotFound(_)) if options.create => {
+                let Some(allocation) = options.allocation.clone() else {
+                    self.send_open_failure(
+                        ctx,
+                        child_session,
+                        operation,
+                        DataPlaneError::Unsupported(
+                            "fixed-length blob creation requires allocation metadata".to_owned(),
+                        ),
+                    );
+                    return;
+                };
+                if options.exclusive {
+                    let reservation = namespace_operation_id(operation);
+                    let namespace = self
+                        .namespace
+                        .as_ref()
+                        .expect("lookup requires namespace service");
+                    self.pending_opens.insert(
+                        operation,
+                        PendingOpen {
+                            child_session,
+                            path: path.clone(),
+                            options,
+                        },
+                    );
+                    match ctx.spawn(NamespaceBlobReserveActor {
+                        namespace_proxy: namespace.proxy(),
+                        host_session: ctx.self_addr(),
+                        operation,
+                        path,
+                        reservation,
+                        phase: NamespaceOperationPhase::Created,
+                        transitions: self.transitions.clone(),
+                        generation: Some(self.session_generation),
+                    }) {
+                        Ok(resolver) => {
+                            self.open_lookups.insert(operation, resolver);
+                            ctx.watch(resolver);
+                        }
+                        Err(error) => {
+                            self.pending_opens.remove(&operation);
+                            self.send_open_failure(
+                                ctx,
+                                child_session,
+                                operation,
+                                DataPlaneError::SessionFailed(error.to_string()),
+                            );
+                        }
+                    }
+                } else {
+                    self.spawn_blob_write(
+                        ctx,
+                        BlobWriteSpawn {
+                            child_session,
+                            operation,
+                            path,
+                            length: allocation.length,
+                            digest: allocation.digest,
+                            reservation: None,
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                self.send_open_failure(ctx, child_session, operation, namespace_error(error));
+            }
+            Ok(NamespaceNode {
+                kind: EntryKind::Blob,
+                revision,
+                ..
+            }) => {
+                if options.create && options.exclusive {
+                    self.send_open_failure(
+                        ctx,
+                        child_session,
+                        operation,
+                        DataPlaneError::PathExists(path),
+                    );
+                } else if options.access == AccessMode::ReadOnly
+                    && !options.create
+                    && !options.truncate
+                    && options.allocation.is_none()
+                {
+                    self.spawn_blob_read(ctx, child_session, operation, path, Some(revision));
+                } else if options.access.can_write() && options.truncate {
+                    let Some(allocation) = options.allocation else {
+                        self.send_open_failure(
+                            ctx,
+                            child_session,
+                            operation,
+                            DataPlaneError::Unsupported(
+                                "fixed-length blob replacement requires allocation metadata"
+                                    .to_owned(),
+                            ),
+                        );
+                        return;
+                    };
+                    self.spawn_blob_write(
+                        ctx,
+                        BlobWriteSpawn {
+                            child_session,
+                            operation,
+                            path,
+                            length: allocation.length,
+                            digest: allocation.digest,
+                            reservation: None,
+                        },
+                    );
+                } else {
+                    self.send_open_failure(
+                        ctx,
+                        child_session,
+                        operation,
+                        DataPlaneError::Unsupported(
+                            "non-truncating writable blob opens are not supported".to_owned(),
+                        ),
+                    );
+                }
+            }
+            Ok(NamespaceNode {
+                kind: EntryKind::Stream,
+                revision,
+                ..
+            }) => {
+                if options.create
+                    || options.exclusive
+                    || options.truncate
+                    || options.allocation.is_some()
+                {
+                    self.send_open_failure(
+                        ctx,
+                        child_session,
+                        operation,
+                        DataPlaneError::WrongEntryType {
+                            path,
+                            expected: EntryKind::Blob,
+                            found: EntryKind::Stream,
+                        },
+                    );
+                    return;
+                }
+                let role = match options.access {
+                    AccessMode::ReadOnly => StreamRole::Sink,
+                    AccessMode::WriteOnly => StreamRole::Source,
+                    AccessMode::ReadWrite => {
+                        self.send_open_failure(
+                            ctx,
+                            child_session,
+                            operation,
+                            DataPlaneError::Unsupported(
+                                "read-write stream descriptors are not supported".to_owned(),
+                            ),
+                        );
+                        return;
+                    }
+                };
+                self.spawn_stream(
+                    ctx,
+                    StreamSpawn {
+                        child_session,
+                        operation,
+                        path,
+                        role,
+                        replace: false,
+                        ensure: false,
+                        expected_revision: Some(revision),
+                    },
+                );
+            }
+        }
+    }
+
+    fn blob_reserved(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        reserved_path: DataPath,
+        reservation: OperationId,
+        result: Result<(), NamespaceError>,
+    ) {
+        self.open_lookups.remove(&operation);
+        let Some(PendingOpen {
+            child_session,
+            path,
+            options,
+        }) = self.pending_opens.remove(&operation)
+        else {
+            if result.is_ok()
+                && let Some(namespace) = &self.namespace
+            {
+                let _ = ctx.send(
+                    namespace.proxy(),
+                    NamespaceClientIn::CancelBlobReservation {
+                        path: reserved_path,
+                        operation_id: reservation,
+                        reply_to: ctx.self_addr(),
+                    },
+                );
+            }
+            return;
+        };
+        match result {
+            Ok(()) => {
+                let allocation = options
+                    .allocation
+                    .expect("exclusive fixed blob reservation has allocation");
+                self.spawn_blob_write(
+                    ctx,
+                    BlobWriteSpawn {
+                        child_session,
+                        operation,
+                        path,
+                        length: allocation.length,
+                        digest: allocation.digest,
+                        reservation: Some(reservation),
+                    },
+                );
+            }
+            Err(error) => {
+                self.send_open_failure(ctx, child_session, operation, namespace_error(error))
+            }
+        }
+    }
+
+    fn open_cancelled(&mut self, ctx: &Ctx<'_>, operation: ActorAddress) {
+        if let Some(pending) = self.pending_opens.remove(&operation) {
+            self.send_open_failure(
+                ctx,
+                pending.child_session,
+                operation,
+                DataPlaneError::OperationCancelled,
+            );
+        }
+        if let Some(lookup) = self.open_lookups.remove(&operation) {
+            let _ = ctx.stop_actor(lookup);
+        }
+        for binding in self.active_bindings.keys().copied() {
+            let _ = ctx.send(binding, HostBindingIn::CancelOpen { operation });
+        }
+        if let Some(binding) = self.stream_bindings.get(&operation).copied() {
+            let _ = ctx.send(
+                binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            );
+        }
+    }
+
+    fn stream_open_forwarded(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        host_binding: ActorAddress,
+        incarnation: StreamIncarnation,
+    ) {
+        if self.stream_bindings.get(&operation) == Some(&host_binding) {
+            let _ = ctx.send(host_binding, HostStreamIn::OpenForwarded { incarnation });
+        }
+    }
+
+    fn stream_control(&mut self, ctx: &Ctx<'_>, binding: ActorAddress, message: HostStreamIn) {
+        let reply_to = message.child_reply_to();
+        let completed_close = matches!(
+            &message,
+            HostStreamIn::Close {
+                reply_to: Some(_),
+                ..
+            }
+        );
+        let active = self
+            .stream_bindings
+            .values()
+            .any(|stream_binding| *stream_binding == binding);
+        let delivered = active && ctx.send(binding, message).is_ok();
+        if !delivered && let (Some(child_session), Some(reply_to)) = (self.child_session, reply_to)
+        {
+            let result = if completed_close {
+                Ok(())
+            } else {
+                Err(DataPlaneError::StreamClosed)
+            };
+            let _ = ctx.send(
+                child_session,
+                ChildSessionIn::StreamWake { reply_to, result },
+            );
+        }
+    }
+
+    fn release_blob(
+        &mut self,
+        ctx: &Ctx<'_>,
+        binding: ActorAddress,
+        lease_id: crate::ids::BlobLeaseId,
+        generation: u64,
+    ) {
+        let delivered = self.active_bindings.contains_key(&binding)
+            && ctx
+                .send(
+                    binding,
+                    HostBindingIn::Release {
+                        lease_id,
+                        generation,
+                    },
+                )
+                .is_ok();
+        if !delivered && let Some(child) = self.child_session {
+            let _ = ctx.send(
+                child,
+                ChildSessionIn::BlobReleased {
+                    binding,
+                    lease_id,
+                    generation,
+                },
+            );
+        }
+    }
+
+    fn seal_write_blob(
+        &mut self,
+        ctx: &Ctx<'_>,
+        binding: ActorAddress,
+        operation: ActorAddress,
+        lease: BlobLease,
+        metadata: BlobMetadata,
+    ) {
+        let delivered = self.active_bindings.get(&binding) == Some(&operation)
+            && ctx
+                .send(
+                    binding,
+                    HostBindingIn::Seal {
+                        operation,
+                        lease,
+                        metadata,
+                    },
+                )
+                .is_ok();
+        if !delivered && let Some(child) = self.child_session {
+            self.send_open_failure(ctx, child, operation, DataPlaneError::SessionNotRunning);
+        }
+    }
+
+    fn abort_write_blob(
+        &mut self,
+        ctx: &Ctx<'_>,
+        binding: ActorAddress,
+        operation: ActorAddress,
+        lease_id: crate::ids::BlobLeaseId,
+        generation: u64,
+    ) {
+        let delivered = self.active_bindings.get(&binding) == Some(&operation)
+            && ctx
+                .send(
+                    binding,
+                    HostBindingIn::Abort {
+                        operation,
+                        lease_id,
+                        generation,
+                    },
+                )
+                .is_ok();
+        if !delivered && let Some(child) = self.child_session {
+            self.send_open_failure(ctx, child, operation, DataPlaneError::SessionNotRunning);
+        }
+    }
+
+    fn binding_faulted(
+        &mut self,
+        ctx: &Ctx<'_>,
+        binding: ActorAddress,
+        operation: ActorAddress,
+        error: DataPlaneError,
+    ) {
+        if self.active_bindings.contains_key(&binding)
+            && let Some(child) = self.child_session
+        {
+            let _ = ctx.send(child, ChildSessionIn::OperationFailed { operation, error });
+        }
+    }
+
+    fn binding_done(&mut self, ctx: &Ctx<'_>, binding: ActorAddress) {
+        self.active_bindings.remove(&binding);
+        let was_stream = self
+            .stream_bindings
+            .values()
+            .any(|stream_binding| *stream_binding == binding);
+        self.stream_bindings
+            .retain(|_, stream_binding| *stream_binding != binding);
+        if was_stream {
+            let _ = ctx.send(binding, HostStreamIn::SessionDetached);
+        }
+        self.maybe_finish_close(ctx);
+    }
+
+    fn binding_detached(&mut self, ctx: &Ctx<'_>, binding: ActorAddress) {
+        self.active_bindings.remove(&binding);
+        self.stream_bindings
+            .retain(|_, stream_binding| *stream_binding != binding);
+        self.maybe_finish_close(ctx);
+    }
+
+    fn configure_execution(&mut self, ctx: &Ctx<'_>, execution_id: String, reply_to: ActorAddress) {
+        let result =
+            if self.state != HostSessionState::AwaitingAttachment || self.child_session.is_some() {
+                Err(DataPlaneError::SessionNotRunning)
+            } else {
+                let mut access = self.session_access.clone();
+                access.execution_id = execution_id;
+                match access.validate() {
+                    Ok(()) => {
+                        self.session_access = access;
+                        Ok(())
+                    }
+                    Err(error) => Err(DataPlaneError::InvalidPath(error.to_string())),
+                }
+            };
+        let _ = ctx.send(reply_to, result);
+    }
+
+    fn revoke(&mut self, ctx: &Ctx<'_>) {
+        self.revoke_session(ctx, true);
+    }
+
+    fn close(&mut self, ctx: &Ctx<'_>, reply_to: Option<ActorAddress>) {
+        self.begin_close(ctx, reply_to);
+    }
+
+    fn close_child(&mut self, ctx: &Ctx<'_>, child_session: ActorAddress) {
+        self.begin_child_close(ctx, child_session)
+    }
 }
 
 impl ActorInterface for HostDataPlaneSessionActor {
@@ -633,9 +1385,11 @@ impl ActorInterface for HostDataPlaneSessionActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, self.state, Reason::Started);
         let arena = self.arena.take().expect("host arena is installed once");
         let allocator = ctx
             .spawn(ArenaAllocatorActor::new(
+                self.transitions.clone(),
                 arena,
                 self.arena_generation,
                 self.runtime.clone(),
@@ -643,6 +1397,7 @@ impl ActorInterface for HostDataPlaneSessionActor {
             ))
             .expect("spawn arena allocator actor");
         self.allocator = Some(allocator);
+        ctx.watch(allocator);
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: HostSessionIn) {
@@ -652,118 +1407,25 @@ impl ActorInterface for HostDataPlaneSessionActor {
                 arena_generation,
                 session_capability,
                 child_node,
-            } => {
-                let mut failure = if matches!(
-                    self.state,
-                    HostSessionState::Revoked
-                        | HostSessionState::Closing
-                        | HostSessionState::Closed
-                ) {
-                    Some(AttachmentFailure::SessionClosed)
-                } else if self.child_session.is_some() {
-                    Some(AttachmentFailure::DuplicateAttachment)
-                } else {
-                    None
-                };
-                let mut route_installed = false;
-                if failure.is_none()
-                    && let (Some(registrar), Some(child_node)) = (&self.route_registrar, child_node)
-                {
-                    match registrar.register_child(child_session, child_node) {
-                        Ok(()) => route_installed = true,
-                        Err(reason) => {
-                            failure = Some(AttachmentFailure::RouteRejected(reason));
-                        }
-                    }
-                }
-                if failure.is_none() && arena_generation != self.arena_generation {
-                    failure = Some(AttachmentFailure::ArenaGenerationMismatch {
-                        expected: self.arena_generation,
-                        found: arena_generation,
-                    });
-                }
-                if failure.is_none() && session_capability != self.capability {
-                    failure = Some(AttachmentFailure::CapabilityRejected);
-                }
-
-                if let Some(reason) = failure {
-                    let _ = ctx.send(
-                        child_session,
-                        ChildSessionIn::AttachmentFailed {
-                            error: DataPlaneError::Attachment(reason),
-                        },
-                    );
-                    if route_installed && let Some(registrar) = &self.route_registrar {
-                        let _ = registrar.revoke_child(child_session);
-                    }
-                } else {
-                    self.child_session = Some(child_session);
-                    self.state = HostSessionState::Running;
-                    let _ = ctx.send(
-                        child_session,
-                        ChildSessionIn::Attached {
-                            session_generation: self.session_generation,
-                        },
-                    );
-                }
-            }
+            } => self.attach(
+                ctx,
+                child_session,
+                arena_generation,
+                session_capability,
+                child_node,
+            ),
             HostSessionIn::Namespace {
                 operation,
                 request,
                 child_session,
-            } => {
-                let request = match self.validate_namespace_operation(child_session, request) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        self.send_namespace_result(ctx, child_session, operation, Err(error));
-                        return;
-                    }
-                };
-                let Some(namespace) = &self.namespace else {
-                    self.send_namespace_result(
-                        ctx,
-                        child_session,
-                        operation,
-                        Err(DataPlaneError::SessionFailed(
-                            "data namespace service is unavailable".to_owned(),
-                        )),
-                    );
-                    return;
-                };
-                match ctx.spawn(NamespaceControlActor {
-                    namespace_proxy: namespace.proxy(),
-                    host_session: ctx.self_addr(),
-                    child_session,
-                    operation,
-                    request,
-                    completed: false,
-                }) {
-                    Ok(actor) => {
-                        self.namespace_operations.insert(operation, actor);
-                    }
-                    Err(error) => self.send_namespace_result(
-                        ctx,
-                        child_session,
-                        operation,
-                        Err(DataPlaneError::SessionFailed(error.to_string())),
-                    ),
-                }
-            }
+            } => self.namespace_requested(ctx, operation, request, child_session),
             HostSessionIn::NamespaceResolved {
                 operation,
                 child_session,
                 result,
-            } => {
-                if self.namespace_operations.remove(&operation).is_some() {
-                    self.send_namespace_result(ctx, child_session, operation, result);
-                }
-                self.maybe_finish_close(ctx);
-            }
+            } => self.namespace_resolved(ctx, operation, child_session, result),
             HostSessionIn::CancelNamespace { operation } => {
-                if let Some(actor) = self.namespace_operations.remove(&operation) {
-                    let _ = ctx.stop_actor(actor);
-                }
-                self.maybe_finish_close(ctx);
+                self.namespace_cancelled(ctx, operation)
             }
             HostSessionIn::Open {
                 path,
@@ -771,469 +1433,135 @@ impl ActorInterface for HostDataPlaneSessionActor {
                 policy,
                 child_session,
                 operation,
-            } => {
-                if let Err(error) = options.validate() {
-                    self.send_open_failure(ctx, child_session, operation, error);
-                    return;
-                }
-                let resolved = match self.validate_open(child_session, &path, options.access) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.send_open_failure(ctx, child_session, operation, error);
-                        return;
-                    }
-                };
-                if let OpenPolicy::EnsureStream { replace } = policy {
-                    if options.create
-                        || options.exclusive
-                        || options.truncate
-                        || options.allocation.is_some()
-                    {
-                        self.send_open_failure(
-                            ctx,
-                            child_session,
-                            operation,
-                            DataPlaneError::InvalidArgument(
-                                "stream ensure policy does not accept blob creation flags"
-                                    .to_owned(),
-                            ),
-                        );
-                        return;
-                    }
-                    let role = match options.access {
-                        AccessMode::ReadOnly => StreamRole::Sink,
-                        AccessMode::WriteOnly => StreamRole::Source,
-                        AccessMode::ReadWrite => {
-                            self.send_open_failure(
-                                ctx,
-                                child_session,
-                                operation,
-                                DataPlaneError::Unsupported(
-                                    "read-write stream descriptors are not supported".to_owned(),
-                                ),
-                            );
-                            return;
-                        }
-                    };
-                    self.spawn_stream(
-                        ctx,
-                        StreamSpawn {
-                            child_session,
-                            operation,
-                            path: resolved,
-                            role,
-                            replace,
-                            ensure: true,
-                            expected_revision: None,
-                        },
-                    );
-                    return;
-                }
-                let Some(namespace) = &self.namespace else {
-                    self.send_open_failure(
-                        ctx,
-                        child_session,
-                        operation,
-                        DataPlaneError::SessionFailed(
-                            "data namespace service is unavailable".to_owned(),
-                        ),
-                    );
-                    return;
-                };
-                self.pending_opens.insert(
-                    operation,
-                    PendingOpen {
-                        child_session,
-                        path: resolved.clone(),
-                        options,
-                    },
-                );
-                match ctx.spawn(NamespaceOpenLookupActor {
-                    namespace_proxy: namespace.proxy(),
-                    host_session: ctx.self_addr(),
-                    operation,
-                    path: resolved,
-                    completed: false,
-                }) {
-                    Ok(lookup) => {
-                        self.open_lookups.insert(operation, lookup);
-                    }
-                    Err(error) => {
-                        self.pending_opens.remove(&operation);
-                        self.send_open_failure(
-                            ctx,
-                            child_session,
-                            operation,
-                            DataPlaneError::SessionFailed(error.to_string()),
-                        );
-                    }
-                }
-            }
+            } => self.open_requested(ctx, path, options, policy, child_session, operation),
             HostSessionIn::OpenResolved { operation, result } => {
-                self.open_lookups.remove(&operation);
-                let Some(pending) = self.pending_opens.remove(&operation) else {
-                    return;
-                };
-                let PendingOpen {
-                    child_session,
-                    path,
-                    options,
-                } = pending;
-                match result {
-                    Err(NamespaceError::PathNotFound(_)) if options.create => {
-                        let Some(allocation) = options.allocation.clone() else {
-                            self.send_open_failure(
-                                ctx,
-                                child_session,
-                                operation,
-                                DataPlaneError::Unsupported(
-                                    "fixed-length blob creation requires allocation metadata"
-                                        .to_owned(),
-                                ),
-                            );
-                            return;
-                        };
-                        if options.exclusive {
-                            let reservation = namespace_operation_id(operation);
-                            let namespace = self
-                                .namespace
-                                .as_ref()
-                                .expect("lookup requires namespace service");
-                            self.pending_opens.insert(
-                                operation,
-                                PendingOpen {
-                                    child_session,
-                                    path: path.clone(),
-                                    options,
-                                },
-                            );
-                            match ctx.spawn(NamespaceBlobReserveActor {
-                                namespace_proxy: namespace.proxy(),
-                                host_session: ctx.self_addr(),
-                                operation,
-                                path,
-                                reservation,
-                                completed: false,
-                            }) {
-                                Ok(resolver) => {
-                                    self.open_lookups.insert(operation, resolver);
-                                }
-                                Err(error) => {
-                                    self.pending_opens.remove(&operation);
-                                    self.send_open_failure(
-                                        ctx,
-                                        child_session,
-                                        operation,
-                                        DataPlaneError::SessionFailed(error.to_string()),
-                                    );
-                                }
-                            }
-                        } else {
-                            self.spawn_blob_write(
-                                ctx,
-                                BlobWriteSpawn {
-                                    child_session,
-                                    operation,
-                                    path,
-                                    length: allocation.length,
-                                    digest: allocation.digest,
-                                    reservation: None,
-                                },
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        self.send_open_failure(
-                            ctx,
-                            child_session,
-                            operation,
-                            namespace_error(error),
-                        );
-                    }
-                    Ok(NamespaceNode {
-                        kind: EntryKind::Blob,
-                        revision,
-                        ..
-                    }) => {
-                        if options.create && options.exclusive {
-                            self.send_open_failure(
-                                ctx,
-                                child_session,
-                                operation,
-                                DataPlaneError::PathExists(path),
-                            );
-                        } else if options.access == AccessMode::ReadOnly
-                            && !options.create
-                            && !options.truncate
-                            && options.allocation.is_none()
-                        {
-                            self.spawn_blob_read(
-                                ctx,
-                                child_session,
-                                operation,
-                                path,
-                                Some(revision),
-                            );
-                        } else if options.access.can_write() && options.truncate {
-                            let Some(allocation) = options.allocation else {
-                                self.send_open_failure(
-                                    ctx,
-                                    child_session,
-                                    operation,
-                                    DataPlaneError::Unsupported(
-                                        "fixed-length blob replacement requires allocation metadata"
-                                            .to_owned(),
-                                    ),
-                                );
-                                return;
-                            };
-                            self.spawn_blob_write(
-                                ctx,
-                                BlobWriteSpawn {
-                                    child_session,
-                                    operation,
-                                    path,
-                                    length: allocation.length,
-                                    digest: allocation.digest,
-                                    reservation: None,
-                                },
-                            );
-                        } else {
-                            self.send_open_failure(
-                                ctx,
-                                child_session,
-                                operation,
-                                DataPlaneError::Unsupported(
-                                    "non-truncating writable blob opens are not supported"
-                                        .to_owned(),
-                                ),
-                            );
-                        }
-                    }
-                    Ok(NamespaceNode {
-                        kind: EntryKind::Stream,
-                        revision,
-                        ..
-                    }) => {
-                        if options.create
-                            || options.exclusive
-                            || options.truncate
-                            || options.allocation.is_some()
-                        {
-                            self.send_open_failure(
-                                ctx,
-                                child_session,
-                                operation,
-                                DataPlaneError::WrongEntryType {
-                                    path,
-                                    expected: EntryKind::Blob,
-                                    found: EntryKind::Stream,
-                                },
-                            );
-                            return;
-                        }
-                        let role = match options.access {
-                            AccessMode::ReadOnly => StreamRole::Sink,
-                            AccessMode::WriteOnly => StreamRole::Source,
-                            AccessMode::ReadWrite => {
-                                self.send_open_failure(
-                                    ctx,
-                                    child_session,
-                                    operation,
-                                    DataPlaneError::Unsupported(
-                                        "read-write stream descriptors are not supported"
-                                            .to_owned(),
-                                    ),
-                                );
-                                return;
-                            }
-                        };
-                        self.spawn_stream(
-                            ctx,
-                            StreamSpawn {
-                                child_session,
-                                operation,
-                                path,
-                                role,
-                                replace: false,
-                                ensure: false,
-                                expected_revision: Some(revision),
-                            },
-                        );
-                    }
-                }
+                self.open_resolved(ctx, operation, result)
             }
             HostSessionIn::BlobReserved {
                 operation,
                 path: reserved_path,
                 reservation,
                 result,
-            } => {
-                self.open_lookups.remove(&operation);
-                let Some(PendingOpen {
-                    child_session,
-                    path,
-                    options,
-                }) = self.pending_opens.remove(&operation)
-                else {
-                    if result.is_ok()
-                        && let Some(namespace) = &self.namespace
-                    {
-                        let _ = ctx.send(
-                            namespace.proxy(),
-                            NamespaceClientIn::CancelBlobReservation {
-                                path: reserved_path,
-                                operation_id: reservation,
-                                reply_to: ctx.self_addr(),
-                            },
-                        );
-                    }
-                    return;
-                };
-                match result {
-                    Ok(()) => {
-                        let allocation = options
-                            .allocation
-                            .expect("exclusive fixed blob reservation has allocation");
-                        self.spawn_blob_write(
-                            ctx,
-                            BlobWriteSpawn {
-                                child_session,
-                                operation,
-                                path,
-                                length: allocation.length,
-                                digest: allocation.digest,
-                                reservation: Some(reservation),
-                            },
-                        );
-                    }
-                    Err(error) => self.send_open_failure(
-                        ctx,
-                        child_session,
-                        operation,
-                        namespace_error(error),
-                    ),
-                }
-            }
-            HostSessionIn::CancelOpen { operation } => {
-                self.pending_opens.remove(&operation);
-                if let Some(lookup) = self.open_lookups.remove(&operation) {
-                    let _ = ctx.stop_actor(lookup);
-                }
-                for binding in self.active_bindings.iter().copied() {
-                    let _ = ctx.send(binding, HostBindingIn::CancelOpen { operation });
-                }
-                if let Some(binding) = self.stream_bindings.get(&operation).copied() {
-                    let _ = ctx.send(
-                        binding,
-                        HostStreamIn::Close {
-                            clean: false,
-                            reply_to: None,
-                        },
-                    );
-                }
-            }
+            } => self.blob_reserved(ctx, operation, reserved_path, reservation, result),
+            HostSessionIn::CancelOpen { operation } => self.open_cancelled(ctx, operation),
+            HostSessionIn::StreamOpenForwarded {
+                operation,
+                host_binding,
+                incarnation,
+            } => self.stream_open_forwarded(ctx, operation, host_binding, incarnation),
             HostSessionIn::StreamControl { binding, message } => {
-                if self
-                    .stream_bindings
-                    .values()
-                    .any(|stream_binding| *stream_binding == binding)
-                {
-                    let _ = ctx.send(binding, message);
-                }
+                self.stream_control(ctx, binding, message)
             }
             HostSessionIn::ReleaseBlob {
                 binding,
                 lease_id,
                 generation,
-            } => {
-                if self.active_bindings.contains(&binding) {
-                    let _ = ctx.send(
-                        binding,
-                        HostBindingIn::Release {
-                            lease_id,
-                            generation,
-                        },
-                    );
-                }
-            }
+            } => self.release_blob(ctx, binding, lease_id, generation),
             HostSessionIn::SealWriteBlob {
                 binding,
                 operation,
                 lease,
                 metadata,
-            } => {
-                if self.active_bindings.contains(&binding) {
-                    let _ = ctx.send(
-                        binding,
-                        HostBindingIn::Seal {
-                            operation,
-                            lease,
-                            metadata,
-                        },
-                    );
-                }
-            }
+            } => self.seal_write_blob(ctx, binding, operation, lease, metadata),
             HostSessionIn::AbortWriteBlob {
                 binding,
                 operation,
                 lease_id,
                 generation,
-            } => {
-                if self.active_bindings.contains(&binding) {
-                    let _ = ctx.send(
-                        binding,
-                        HostBindingIn::Abort {
-                            operation,
-                            lease_id,
-                            generation,
-                        },
-                    );
-                }
-            }
+            } => self.abort_write_blob(ctx, binding, operation, lease_id, generation),
             HostSessionIn::BindingFaulted {
                 binding,
                 operation,
                 error,
-            } => {
-                if self.active_bindings.contains(&binding)
-                    && let Some(child) = self.child_session
-                {
-                    let _ = ctx.send(child, ChildSessionIn::OperationFailed { operation, error });
-                }
-            }
-            HostSessionIn::BindingDone { binding } | HostSessionIn::BindingDetached { binding } => {
-                self.active_bindings.remove(&binding);
-                self.stream_bindings
-                    .retain(|_, stream_binding| *stream_binding != binding);
-                self.maybe_finish_close(ctx);
-            }
+            } => self.binding_faulted(ctx, binding, operation, error),
+            HostSessionIn::BindingDone { binding } => self.binding_done(ctx, binding),
+            HostSessionIn::BindingDetached { binding } => self.binding_detached(ctx, binding),
             HostSessionIn::ConfigureExecution {
                 execution_id,
                 reply_to,
-            } => {
-                let result = if self.state != HostSessionState::AwaitingAttachment
-                    || self.child_session.is_some()
-                {
-                    Err(DataPlaneError::SessionNotRunning)
-                } else {
-                    let mut access = self.session_access.clone();
-                    access.execution_id = execution_id;
-                    match access.validate() {
-                        Ok(()) => {
-                            self.session_access = access;
-                            Ok(())
-                        }
-                        Err(error) => Err(DataPlaneError::InvalidPath(error.to_string())),
-                    }
-                };
-                let _ = ctx.send(reply_to, result);
+            } => self.configure_execution(ctx, execution_id, reply_to),
+            HostSessionIn::Revoke => self.revoke(ctx),
+            HostSessionIn::Close { reply_to } => self.close(ctx, reply_to),
+            HostSessionIn::CloseChild { child_session } => self.close_child(ctx, child_session),
+        }
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if Some(exited.addr) == self.child_session {
+            self.begin_close(ctx, None);
+            return;
+        }
+        if Some(exited.addr) == self.allocator {
+            self.allocator = None;
+            self.begin_close(ctx, None);
+            return;
+        }
+        if let Some(operation) = self.active_bindings.remove(&exited.addr)
+            && let Some(child) = self.child_session
+        {
+            self.send_open_failure(ctx, child, operation, DataPlaneError::SessionNotRunning);
+        }
+        if let Some(operation) = self
+            .stream_bindings
+            .iter()
+            .find_map(|(operation, binding)| (*binding == exited.addr).then_some(*operation))
+        {
+            self.stream_bindings.remove(&operation);
+            if let Some(child) = self.child_session {
+                self.send_open_failure(ctx, child, operation, DataPlaneError::SessionNotRunning);
             }
-            HostSessionIn::Revoke => self.revoke_session(ctx, true),
-            HostSessionIn::Close { reply_to } => self.begin_close(ctx, reply_to),
-            HostSessionIn::CloseChild { child_session } => {
-                self.begin_child_close(ctx, child_session)
+        }
+        if let Some(operation) = self
+            .open_lookups
+            .iter()
+            .find_map(|(operation, lookup)| (*lookup == exited.addr).then_some(*operation))
+        {
+            self.open_lookups.remove(&operation);
+            if let Some(pending) = self.pending_opens.remove(&operation) {
+                self.send_open_failure(
+                    ctx,
+                    pending.child_session,
+                    operation,
+                    DataPlaneError::SessionNotRunning,
+                );
             }
+        }
+        if let Some(operation) = self
+            .namespace_operations
+            .iter()
+            .find_map(|(operation, actor)| (*actor == exited.addr).then_some(*operation))
+        {
+            self.namespace_operations.remove(&operation);
+            if let Some(child) = self.child_session {
+                self.send_namespace_result(
+                    ctx,
+                    child,
+                    operation,
+                    Err(DataPlaneError::SessionNotRunning),
+                );
+            }
+        }
+        self.maybe_finish_close(ctx);
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if self.state != HostSessionState::Closed {
+            self.revoke_session(ctx, false);
+            for reply_to in self.close_replies.drain(..) {
+                let _ = ctx.send(reply_to, Err::<(), _>(DataPlaneError::SessionNotRunning));
+            }
+            if let Some(child) = self.child_close_reply.take() {
+                let _ = ctx.send(
+                    child,
+                    ChildSessionIn::CloseCompleted {
+                        result: Err(DataPlaneError::SessionNotRunning),
+                    },
+                );
+            }
+        }
+        self.revoke_child_route();
+        if let Some(allocator) = self.allocator.take() {
+            let _ = ctx.stop_actor(allocator);
         }
     }
 }
@@ -1302,6 +1630,8 @@ enum ArenaAllocatorIn {
 
 struct ArenaSourceRetirement {
     runtime: Runtime,
+    allocator: ActorAddress,
+    lease: BlobLease,
     binding: ActorAddress,
 }
 
@@ -1311,6 +1641,21 @@ impl BlobSourceRetirement for ArenaSourceRetirement {
     }
 
     fn retired(&self) {
+        if self.runtime.is_local_actor(self.allocator)
+            && self
+                .runtime
+                .send_to(
+                    self.allocator,
+                    ArenaAllocatorIn::Release {
+                        binding: self.binding,
+                        lease: self.lease,
+                    },
+                )
+                .is_ok()
+        {
+            return;
+        }
+        // A stopped allocator already dropped the arena's lease ownership.
         let _ = self
             .runtime
             .send_to(self.binding, HostBindingIn::ReleasePublished);
@@ -1318,6 +1663,7 @@ impl BlobSourceRetirement for ArenaSourceRetirement {
 }
 
 struct ArenaAllocatorActor {
+    transitions: Option<TransitionEmitter>,
     arena: ArenaManager,
     next_request_id: u64,
     next_generation: u64,
@@ -1327,12 +1673,14 @@ struct ArenaAllocatorActor {
 
 impl ArenaAllocatorActor {
     fn new(
+        transitions: Option<TransitionEmitter>,
         arena: ArenaManager,
         arena_generation: u64,
         runtime: Runtime,
         source_sender: Option<Arc<dyn BlobTransferSender>>,
     ) -> Self {
         Self {
+            transitions,
             arena,
             next_request_id: FIRST_BLOB_REQUEST_ID,
             next_generation: arena_generation,
@@ -1457,6 +1805,8 @@ impl ArenaAllocatorActor {
         })?;
         let retirement: Arc<dyn BlobSourceRetirement> = Arc::new(ArenaSourceRetirement {
             runtime: self.runtime.clone(),
+            allocator: ctx.self_addr(),
+            lease,
             binding,
         });
         let source = FileBlobSourceActor::from_file_region(
@@ -1467,7 +1817,8 @@ impl ArenaAllocatorActor {
             metadata.length,
             Some(retirement),
         )
-        .map_err(namespace_error)?;
+        .map_err(namespace_error)?
+        .with_transitions(self.transitions.clone());
         ctx.spawn(source)
             .map_err(|error| DataPlaneError::SessionFailed(error.to_string()))
     }
@@ -1608,6 +1959,8 @@ impl ActorInterface for ArenaAllocatorActor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DestinationTransferState {
     Allocating,
+    CancellingAllocation,
+    AwaitingSource,
     Filling,
     Sealing,
     Releasing,
@@ -1615,6 +1968,7 @@ enum DestinationTransferState {
 }
 
 struct DestinationBlobTransferActor {
+    transitions: Option<TransitionEmitter>,
     allocator: ActorAddress,
     binding: ActorAddress,
     receiver: Arc<dyn BlobTransferReceiver>,
@@ -1625,7 +1979,6 @@ struct DestinationBlobTransferActor {
     engine: EngineHandle,
     sender: ExternalSender,
     route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
-    source_confirmed: bool,
     route_attempts: u16,
     route_watch: Option<HostRouteWatch>,
     route_retry: Option<ActorTimer>,
@@ -1640,6 +1993,7 @@ struct DestinationBlobTransferActor {
 /// Wiring for a [`DestinationBlobTransferActor`], bundled to keep the
 /// constructor within arity limits.
 struct DestinationTransferParams {
+    transitions: Option<TransitionEmitter>,
     allocator: ActorAddress,
     binding: ActorAddress,
     receiver: Arc<dyn BlobTransferReceiver>,
@@ -1653,8 +2007,43 @@ struct DestinationTransferParams {
 }
 
 impl DestinationBlobTransferActor {
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: DestinationTransferState, reason: Reason) {
+        let previous = self.state;
+        self.state = next;
+        let phase = |state| match state {
+            DestinationTransferState::Allocating => Phase::Allocating,
+            DestinationTransferState::CancellingAllocation => Phase::Aborting,
+            DestinationTransferState::AwaitingSource => Phase::AwaitingPeer,
+            DestinationTransferState::Filling => Phase::Filling,
+            DestinationTransferState::Sealing => Phase::Sealing,
+            DestinationTransferState::Releasing => Phase::Releasing,
+            DestinationTransferState::Finished => Phase::Finished,
+        };
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::DestinationBlobTransferActor,
+                protocol: Protocol::BlobTransfer,
+                operation: Some(self.binding.0[..16].try_into().expect("binding identity")),
+                generation: self.lease.map(|lease| lease.generation),
+                incarnation: Some(self.transfer_id.0),
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: (next == DestinationTransferState::Finished).then_some(
+                    if reason == Reason::Failed {
+                        Outcome::Failed
+                    } else {
+                        Outcome::Success
+                    },
+                ),
+            });
+        }
+    }
+
     fn new(params: DestinationTransferParams) -> Self {
         let DestinationTransferParams {
+            transitions,
             allocator,
             binding,
             receiver,
@@ -1667,6 +2056,7 @@ impl DestinationBlobTransferActor {
             route_registrar,
         } = params;
         Self {
+            transitions,
             allocator,
             binding,
             receiver,
@@ -1677,7 +2067,6 @@ impl DestinationBlobTransferActor {
             engine,
             sender,
             route_registrar,
-            source_confirmed: false,
             route_attempts: 0,
             route_watch: None,
             route_retry: None,
@@ -1699,7 +2088,7 @@ impl DestinationBlobTransferActor {
 
     fn finish_failure(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
         self.stop_route_wait();
-        self.state = DestinationTransferState::Finished;
+        self.enter_phase(ctx, DestinationTransferState::Finished, Reason::Failed);
         let _ = ctx.send(self.binding, HostBindingIn::TransferFailed(error));
         ctx.stop_self();
     }
@@ -1755,16 +2144,21 @@ impl DestinationBlobTransferActor {
         if let Some(offer) = self.offer.take() {
             self.receiver.cancel(&offer);
         }
-        self.state = DestinationTransferState::Sealing;
-        let _ = ctx.send(
-            self.allocator,
-            ArenaAllocatorIn::SealTransfer {
-                transfer: ctx.self_addr(),
-                lease: self.lease.expect("allocated destination lease"),
-                metadata: self.metadata.clone().expect("destination metadata"),
-                written: self.written,
-            },
-        );
+        self.enter_phase(ctx, DestinationTransferState::Sealing, Reason::Completed);
+        if ctx
+            .send(
+                self.allocator,
+                ArenaAllocatorIn::SealTransfer {
+                    transfer: ctx.self_addr(),
+                    lease: self.lease.expect("allocated destination lease"),
+                    metadata: self.metadata.clone().expect("destination metadata"),
+                    written: self.written,
+                },
+            )
+            .is_err()
+        {
+            self.finish_failure(ctx, DataPlaneError::SessionNotRunning);
+        }
     }
 
     fn fault(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
@@ -1780,50 +2174,56 @@ impl DestinationBlobTransferActor {
         }
         if let Some(lease) = self.lease {
             self.pending_error = Some(error);
-            self.state = DestinationTransferState::Releasing;
-            let _ = ctx.send(
-                self.allocator,
-                ArenaAllocatorIn::AbortTransfer {
-                    transfer: ctx.self_addr(),
-                    lease,
-                },
+            self.enter_phase(
+                ctx,
+                DestinationTransferState::Releasing,
+                Reason::ReleaseRequested,
+            );
+            if ctx
+                .send(
+                    self.allocator,
+                    ArenaAllocatorIn::AbortTransfer {
+                        transfer: ctx.self_addr(),
+                        lease,
+                    },
+                )
+                .is_err()
+            {
+                self.finish_failure(ctx, DataPlaneError::SessionNotRunning);
+            }
+        } else if matches!(
+            self.state,
+            DestinationTransferState::Allocating | DestinationTransferState::CancellingAllocation
+        ) {
+            self.pending_error = Some(error);
+            self.enter_phase(
+                ctx,
+                DestinationTransferState::CancellingAllocation,
+                Reason::Cancelled,
             );
         } else {
             self.finish_failure(ctx, error);
         }
     }
-}
-
-impl Drop for DestinationBlobTransferActor {
-    fn drop(&mut self) {
-        self.stop_route_wait();
-    }
-}
-
-impl ActorInterface for DestinationBlobTransferActor {
-    type Incoming = BlobTransferEvent;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.allocator,
-            ArenaAllocatorIn::AllocateTransfer {
-                transfer: ctx.self_addr(),
-                kind: AllocationKind::FillingRead {
-                    length: self.length,
-                    digest: None,
-                },
-            },
-        );
-    }
-
-    fn handle(&mut self, ctx: &Ctx<'_>, message: BlobTransferEvent) {
-        match message {
-            BlobTransferEvent::Allocated(Ok((lease, metadata)))
-                if self.state == DestinationTransferState::Allocating =>
+    fn allocated(
+        &mut self,
+        ctx: &Ctx<'_>,
+        result: Result<(BlobLease, BlobMetadata), DataPlaneError>,
+    ) {
+        match result {
+            Ok((lease, metadata))
+                if matches!(
+                    self.state,
+                    DestinationTransferState::Allocating
+                        | DestinationTransferState::CancellingAllocation
+                ) =>
             {
                 self.lease = Some(lease);
                 self.metadata = Some(metadata);
+                if let Some(error) = self.pending_error.take() {
+                    self.fault(ctx, error);
+                    return;
+                }
                 if self.length == 0 {
                     self.seal(ctx);
                 } else {
@@ -1831,7 +2231,11 @@ impl ActorInterface for DestinationBlobTransferActor {
                         Ok(mut offer) => {
                             offer.failure_proxy = Some(self.failure_proxy);
                             self.offer = Some(offer);
-                            self.state = DestinationTransferState::Filling;
+                            self.enter_phase(
+                                ctx,
+                                DestinationTransferState::AwaitingSource,
+                                Reason::Allocated,
+                            );
                             if let Some(routes) = &self.route_registrar {
                                 let sender = self.sender.clone();
                                 let target = ctx.self_addr();
@@ -1849,27 +2253,51 @@ impl ActorInterface for DestinationBlobTransferActor {
                     }
                 }
             }
-            BlobTransferEvent::RouteRetry
-                if self.state == DestinationTransferState::Filling && !self.source_confirmed =>
-            {
-                self.route_retry = None;
-                self.try_start_transfer(ctx, true);
-            }
-            BlobTransferEvent::RouteChanged
-                if self.state == DestinationTransferState::Filling && !self.source_confirmed =>
-            {
-                self.try_start_transfer(ctx, false);
-            }
-            BlobTransferEvent::Allocated(Err(error))
-                if self.state == DestinationTransferState::Allocating =>
+            Err(error)
+                if matches!(
+                    self.state,
+                    DestinationTransferState::Allocating
+                        | DestinationTransferState::CancellingAllocation
+                ) =>
             {
                 self.finish_failure(ctx, error);
             }
-            BlobTransferEvent::Chunk { transfer_id, bytes }
-                if self.state == DestinationTransferState::Filling
-                    && transfer_id == self.transfer_id =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn allocator_failed(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
+        self.fault(ctx, error);
+    }
+
+    fn route_retry(&mut self, ctx: &Ctx<'_>) {
+        match () {
+            () if self.state == DestinationTransferState::AwaitingSource => {
+                self.route_retry = None;
+                self.try_start_transfer(ctx, true);
+            }
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn route_changed(&mut self, ctx: &Ctx<'_>) {
+        match () {
+            () if self.state == DestinationTransferState::AwaitingSource => {
+                self.try_start_transfer(ctx, false);
+            }
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn chunk(&mut self, ctx: &Ctx<'_>, transfer_id: BlobTransferId, bytes: Vec<u8>) {
+        match (transfer_id, bytes) {
+            (transfer_id, bytes)
+                if matches!(
+                    self.state,
+                    DestinationTransferState::AwaitingSource | DestinationTransferState::Filling
+                ) && transfer_id == self.transfer_id =>
             {
-                self.source_confirmed = true;
+                self.enter_phase(ctx, DestinationTransferState::Filling, Reason::Ready);
                 self.stop_route_wait();
                 let found = self.written.saturating_add(bytes.len() as u64);
                 let Some(next) = self
@@ -1897,42 +2325,72 @@ impl ActorInterface for DestinationBlobTransferActor {
                 );
                 self.written = next;
             }
-            BlobTransferEvent::Finished { transfer_id }
-                if self.state == DestinationTransferState::Filling
-                    && transfer_id == self.transfer_id =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn finished(&mut self, ctx: &Ctx<'_>, transfer_id: BlobTransferId) {
+        match (transfer_id,) {
+            (transfer_id,)
+                if matches!(
+                    self.state,
+                    DestinationTransferState::AwaitingSource | DestinationTransferState::Filling
+                ) && transfer_id == self.transfer_id =>
             {
-                self.source_confirmed = true;
+                self.enter_phase(ctx, DestinationTransferState::Filling, Reason::Ready);
                 self.seal(ctx);
             }
-            BlobTransferEvent::Failed {
-                transfer_id,
-                reason,
-            } if transfer_id == self.transfer_id => {
-                self.source_confirmed = true;
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn failed(&mut self, ctx: &Ctx<'_>, transfer_id: BlobTransferId, reason: String) {
+        match (transfer_id, reason) {
+            (transfer_id, reason)
+                if transfer_id == self.transfer_id
+                    && matches!(
+                        self.state,
+                        DestinationTransferState::AwaitingSource
+                            | DestinationTransferState::Filling
+                    ) =>
+            {
+                self.enter_phase(ctx, DestinationTransferState::Filling, Reason::Ready);
                 self.fault(ctx, DataPlaneError::SourceFailure(reason));
             }
-            BlobTransferEvent::AllocatorFailed(error) => self.fault(ctx, error),
-            BlobTransferEvent::Sealed(Ok(()))
-                if self.state == DestinationTransferState::Sealing =>
-            {
-                self.state = DestinationTransferState::Finished;
-                let _ = ctx.send(
-                    self.binding,
-                    HostBindingIn::TransferReady {
-                        lease: self.lease.expect("sealed destination lease"),
-                        metadata: self.metadata.clone().expect("sealed destination metadata"),
-                    },
-                );
-                ctx.stop_self();
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn sealed(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        match result {
+            Ok(()) if self.state == DestinationTransferState::Sealing => {
+                if ctx
+                    .send(
+                        self.binding,
+                        HostBindingIn::TransferReady {
+                            lease: self.lease.expect("sealed destination lease"),
+                            metadata: self.metadata.clone().expect("sealed destination metadata"),
+                        },
+                    )
+                    .is_err()
+                {
+                    self.fault(ctx, DataPlaneError::OperationCancelled);
+                } else {
+                    self.lease = None;
+                    self.enter_phase(ctx, DestinationTransferState::Finished, Reason::Completed);
+                    ctx.stop_self();
+                }
             }
-            BlobTransferEvent::Sealed(Err(error))
-                if self.state == DestinationTransferState::Sealing =>
-            {
+            Err(error) if self.state == DestinationTransferState::Sealing => {
                 self.fault(ctx, error);
             }
-            BlobTransferEvent::Released(result)
-                if self.state == DestinationTransferState::Releasing =>
-            {
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn released(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        match result {
+            result if self.state == DestinationTransferState::Releasing => {
                 let error = self.pending_error.take().unwrap_or_else(|| {
                     DataPlaneError::SessionFailed(
                         "destination transfer released without a failure".to_owned(),
@@ -1944,24 +2402,179 @@ impl ActorInterface for DestinationBlobTransferActor {
                     self.finish_failure(ctx, error);
                 }
             }
-            BlobTransferEvent::Cancel => self.fault(ctx, DataPlaneError::OperationCancelled),
-            _ => {}
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn cancel(&mut self, ctx: &Ctx<'_>) {
+        self.fault(ctx, DataPlaneError::OperationCancelled);
+    }
+}
+
+impl ActorInterface for DestinationBlobTransferActor {
+    type Incoming = BlobTransferEvent;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, self.state, Reason::Started);
+        ctx.watch(self.allocator);
+        ctx.watch(self.binding);
+        ctx.watch(self.source);
+        if ctx
+            .send(
+                self.allocator,
+                ArenaAllocatorIn::AllocateTransfer {
+                    transfer: ctx.self_addr(),
+                    kind: AllocationKind::FillingRead {
+                        length: self.length,
+                        digest: None,
+                    },
+                },
+            )
+            .is_err()
+        {
+            self.finish_failure(ctx, DataPlaneError::SessionNotRunning);
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: BlobTransferEvent) {
+        match message {
+            BlobTransferEvent::Allocated(result) => self.allocated(ctx, result),
+            BlobTransferEvent::AllocatorFailed(error) => self.allocator_failed(ctx, error),
+            BlobTransferEvent::RouteRetry => self.route_retry(ctx),
+            BlobTransferEvent::RouteChanged => self.route_changed(ctx),
+            BlobTransferEvent::Chunk { transfer_id, bytes } => self.chunk(ctx, transfer_id, bytes),
+            BlobTransferEvent::Finished { transfer_id } => self.finished(ctx, transfer_id),
+            BlobTransferEvent::Failed {
+                transfer_id,
+                reason,
+            } => self.failed(ctx, transfer_id, reason),
+            BlobTransferEvent::Sealed(result) => self.sealed(ctx, result),
+            BlobTransferEvent::Released(result) => self.released(ctx, result),
+            BlobTransferEvent::Cancel => self.cancel(ctx),
+        }
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if self.state == DestinationTransferState::Finished {
+            return;
+        }
+        if exited.addr == self.allocator {
+            self.lease = None;
+            self.finish_failure(ctx, DataPlaneError::SessionNotRunning);
+        } else if exited.addr == self.binding {
+            self.fault(ctx, DataPlaneError::OperationCancelled);
+        } else if exited.addr == self.source {
+            self.fault(ctx, DataPlaneError::PeerLost);
+        }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if let Some(offer) = self.offer.take() {
+            self.receiver.cancel(&offer);
+        }
+        if self.state != DestinationTransferState::Finished {
+            if let Some(lease) = self.lease.take() {
+                let _ = ctx.send(
+                    self.allocator,
+                    ArenaAllocatorIn::AbortTransfer {
+                        transfer: ctx.self_addr(),
+                        lease,
+                    },
+                );
+            }
+            let _ = ctx.send(
+                self.binding,
+                HostBindingIn::TransferFailed(DataPlaneError::OperationCancelled),
+            );
+        }
+    }
+}
+
+impl Drop for DestinationBlobTransferActor {
+    fn drop(&mut self) {
+        self.stop_route_wait();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamespaceOperationPhase {
+    Created,
+    AwaitingReply,
+    Finished(Outcome),
+}
+
+impl NamespaceOperationPhase {
+    fn telemetry(self) -> Phase {
+        match self {
+            Self::Created => Phase::Created,
+            Self::AwaitingReply => Phase::AwaitingReply,
+            Self::Finished(_) => Phase::Finished,
+        }
+    }
+
+    fn outcome(self) -> Option<Outcome> {
+        match self {
+            Self::Finished(outcome) => Some(outcome),
+            _ => None,
         }
     }
 }
 
 struct NamespaceControlActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
     namespace_proxy: ActorAddress,
     host_session: ActorAddress,
     child_session: ActorAddress,
     operation: ActorAddress,
     request: NamespaceOperation,
-    completed: bool,
 }
 
 impl NamespaceControlActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceControlActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
     fn finish(&mut self, ctx: &Ctx<'_>, result: Result<NamespaceOperationResult, DataPlaneError>) {
-        self.completed = true;
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
         let _ = ctx.send(
             self.host_session,
             HostSessionIn::NamespaceResolved {
@@ -1979,6 +2592,8 @@ impl ActorInterface for NamespaceControlActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         let operation_id = namespace_operation_id(self.operation);
         let request = match &self.request {
             NamespaceOperation::Lookup { path } => NamespaceRequest::Lookup { path: path.clone() },
@@ -2017,6 +2632,9 @@ impl ActorInterface for NamespaceControlActor {
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
         let result = match (&self.request, message) {
             (NamespaceOperation::Lookup { .. }, DataDirectoryOut::LookedUp { result, .. }) => {
                 result
@@ -2038,8 +2656,24 @@ impl ActorInterface for NamespaceControlActor {
         self.finish(ctx, result);
     }
 
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            ctx.stop_self();
+        }
+    }
+
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if !self.completed {
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
             let _ = ctx.send(
                 self.namespace_proxy,
                 NamespaceClientIn::Cancel {
@@ -2051,11 +2685,67 @@ impl ActorInterface for NamespaceControlActor {
 }
 
 struct NamespaceOpenLookupActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
     namespace_proxy: ActorAddress,
     host_session: ActorAddress,
     operation: ActorAddress,
     path: DataPath,
-    completed: bool,
+}
+
+impl NamespaceOpenLookupActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceOpenLookupActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<NamespaceNode, NamespaceError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(
+            self.host_session,
+            HostSessionIn::OpenResolved {
+                operation: self.operation,
+                result,
+            },
+        );
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceOpenLookupActor {
@@ -2063,6 +2753,8 @@ impl ActorInterface for NamespaceOpenLookupActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         if ctx
             .send(
                 self.namespace_proxy,
@@ -2075,40 +2767,46 @@ impl ActorInterface for NamespaceOpenLookupActor {
             )
             .is_err()
         {
-            self.completed = true;
-            let _ = ctx.send(
-                self.host_session,
-                HostSessionIn::OpenResolved {
-                    operation: self.operation,
-                    result: Err(NamespaceError::DirectoryUnavailable(
-                        "namespace client is unavailable".to_owned(),
-                    )),
-                },
+            self.finish(
+                ctx,
+                Err(NamespaceError::DirectoryUnavailable(
+                    "namespace client is unavailable".to_owned(),
+                )),
             );
-            ctx.stop_self();
         }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
         let result = match message {
             DataDirectoryOut::LookedUp { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected lookup reply, received {other:?}"
             ))),
         };
-        self.completed = true;
-        let _ = ctx.send(
-            self.host_session,
-            HostSessionIn::OpenResolved {
-                operation: self.operation,
-                result,
-            },
-        );
-        ctx.stop_self();
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            ctx.stop_self();
+        }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if !self.completed {
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
             let _ = ctx.send(
                 self.namespace_proxy,
                 NamespaceClientIn::Cancel {
@@ -2120,12 +2818,70 @@ impl ActorInterface for NamespaceOpenLookupActor {
 }
 
 struct NamespaceBlobReserveActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
     namespace_proxy: ActorAddress,
     host_session: ActorAddress,
     operation: ActorAddress,
     path: DataPath,
     reservation: OperationId,
-    completed: bool,
+}
+
+impl NamespaceBlobReserveActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceBlobReserveActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), NamespaceError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(
+            self.host_session,
+            HostSessionIn::BlobReserved {
+                operation: self.operation,
+                path: self.path.clone(),
+                reservation: self.reservation,
+                result,
+            },
+        );
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceBlobReserveActor {
@@ -2133,6 +2889,8 @@ impl ActorInterface for NamespaceBlobReserveActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         if ctx
             .send(
                 self.namespace_proxy,
@@ -2146,44 +2904,46 @@ impl ActorInterface for NamespaceBlobReserveActor {
             )
             .is_err()
         {
-            self.completed = true;
-            let _ = ctx.send(
-                self.host_session,
-                HostSessionIn::BlobReserved {
-                    operation: self.operation,
-                    path: self.path.clone(),
-                    reservation: self.reservation,
-                    result: Err(NamespaceError::DirectoryUnavailable(
-                        "namespace client is unavailable".to_owned(),
-                    )),
-                },
+            self.finish(
+                ctx,
+                Err(NamespaceError::DirectoryUnavailable(
+                    "namespace client is unavailable".to_owned(),
+                )),
             );
-            ctx.stop_self();
         }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
         let result = match message {
             DataDirectoryOut::BlobReserved { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected blob reservation reply, received {other:?}"
             ))),
         };
-        self.completed = true;
-        let _ = ctx.send(
-            self.host_session,
-            HostSessionIn::BlobReserved {
-                operation: self.operation,
-                path: self.path.clone(),
-                reservation: self.reservation,
-                result,
-            },
-        );
-        ctx.stop_self();
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            ctx.stop_self();
+        }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if !self.completed {
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
             let _ = ctx.send(
                 self.namespace_proxy,
                 NamespaceClientIn::CancelBlobReservation {
@@ -2197,9 +2957,64 @@ impl ActorInterface for NamespaceBlobReserveActor {
 }
 
 struct NamespaceResolveActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
+    operation: ActorAddress,
     namespace_proxy: ActorAddress,
     path: DataPath,
     binding: ActorAddress,
+}
+
+impl NamespaceResolveActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceResolveActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<NamespaceBlobBinding, DataPlaneError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        if let Ok(binding) = &result {
+            self.generation = Some(binding.revision);
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(self.binding, HostBindingIn::Resolved(result));
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceResolveActor {
@@ -2207,6 +3022,8 @@ impl ActorInterface for NamespaceResolveActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         if ctx
             .send(
                 self.namespace_proxy,
@@ -2219,35 +3036,60 @@ impl ActorInterface for NamespaceResolveActor {
             )
             .is_err()
         {
-            let _ = ctx.send(
-                self.binding,
-                HostBindingIn::Resolved(Err(DataPlaneError::SessionFailed(
+            self.finish(
+                ctx,
+                Err(DataPlaneError::SessionFailed(
                     "namespace client is unavailable".to_owned(),
-                ))),
+                )),
             );
-            ctx.stop_self();
         }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
-        if let DataDirectoryOut::Resolved { result, .. } = message {
-            let result = result.map_err(namespace_error);
-            let _ = ctx.send(self.binding, HostBindingIn::Resolved(result));
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let result = match message {
+            DataDirectoryOut::Resolved { result, .. } => result.map_err(namespace_error),
+            other => Err(DataPlaneError::SessionFailed(format!(
+                "expected resolve reply, received {other:?}"
+            ))),
+        };
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
             ctx.stop_self();
         }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.namespace_proxy,
-            NamespaceClientIn::Cancel {
-                reply_to: ctx.self_addr(),
-            },
-        );
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
+            let _ = ctx.send(
+                self.namespace_proxy,
+                NamespaceClientIn::Cancel {
+                    reply_to: ctx.self_addr(),
+                },
+            );
+        }
     }
 }
 
 struct NamespacePublishActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
     namespace_proxy: ActorAddress,
     path: DataPath,
     source: ActorAddress,
@@ -2257,7 +3099,60 @@ struct NamespacePublishActor {
     reservation: Option<OperationId>,
     operation: ActorAddress,
     binding: ActorAddress,
-    completed: bool,
+}
+
+impl NamespacePublishActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespacePublishActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let response = match result {
+            Ok(()) => HostBindingIn::PublicationAccepted {
+                operation: self.operation,
+            },
+            Err(error) => HostBindingIn::PublicationRejected(error),
+        };
+        let _ = ctx.send(self.binding, response);
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespacePublishActor {
@@ -2265,6 +3160,8 @@ impl ActorInterface for NamespacePublishActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         if ctx
             .send(
                 self.namespace_proxy,
@@ -2287,32 +3184,48 @@ impl ActorInterface for NamespacePublishActor {
             )
             .is_err()
         {
-            let _ = ctx.send(
-                self.binding,
-                HostBindingIn::PublicationRejected(DataPlaneError::SessionFailed(
+            self.finish(
+                ctx,
+                Err(DataPlaneError::SessionFailed(
                     "namespace client is unavailable".to_owned(),
                 )),
             );
-            ctx.stop_self();
         }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
-        if let DataDirectoryOut::Registered { result, .. } = message {
-            let response = match result {
-                Ok(_) => HostBindingIn::PublicationAccepted {
-                    operation: self.operation,
-                },
-                Err(error) => HostBindingIn::PublicationRejected(namespace_error(error)),
-            };
-            self.completed = true;
-            let _ = ctx.send(self.binding, response);
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let result = match message {
+            DataDirectoryOut::Registered { result, .. } => {
+                result.map(|_| ()).map_err(namespace_error)
+            }
+            other => Err(DataPlaneError::SessionFailed(format!(
+                "expected publish reply, received {other:?}"
+            ))),
+        };
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
             ctx.stop_self();
         }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if !self.completed {
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
             let _ = ctx.send(
                 self.namespace_proxy,
                 NamespaceClientIn::Cancel {
@@ -2324,10 +3237,62 @@ impl ActorInterface for NamespacePublishActor {
 }
 
 struct NamespaceBlobReservationReleaseActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
+    operation: ActorAddress,
     namespace_proxy: ActorAddress,
     binding: ActorAddress,
     path: DataPath,
     reservation: OperationId,
+}
+
+impl NamespaceBlobReservationReleaseActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceBlobReservationReleaseActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(self.binding, HostBindingIn::ReservationReleased(result));
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceBlobReservationReleaseActor {
@@ -2335,6 +3300,8 @@ impl ActorInterface for NamespaceBlobReservationReleaseActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         if ctx
             .send(
                 self.namespace_proxy,
@@ -2348,17 +3315,19 @@ impl ActorInterface for NamespaceBlobReservationReleaseActor {
             )
             .is_err()
         {
-            let _ = ctx.send(
-                self.binding,
-                HostBindingIn::ReservationReleased(Err(DataPlaneError::SessionFailed(
+            self.finish(
+                ctx,
+                Err(DataPlaneError::SessionFailed(
                     "namespace client is unavailable".to_owned(),
-                ))),
+                )),
             );
-            ctx.stop_self();
         }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
         let result = match message {
             DataDirectoryOut::BlobReservationReleased { result, .. } => {
                 result.map_err(namespace_error)
@@ -2367,25 +3336,95 @@ impl ActorInterface for NamespaceBlobReservationReleaseActor {
                 "expected blob reservation release, received {other:?}"
             ))),
         };
-        let _ = ctx.send(self.binding, HostBindingIn::ReservationReleased(result));
-        ctx.stop_self();
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            ctx.stop_self();
+        }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.namespace_proxy,
-            NamespaceClientIn::Cancel {
-                reply_to: ctx.self_addr(),
-            },
-        );
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
+            let _ = ctx.send(
+                self.namespace_proxy,
+                NamespaceClientIn::Cancel {
+                    reply_to: ctx.self_addr(),
+                },
+            );
+        }
     }
 }
 
 struct NamespaceUnpublishActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    generation: Option<u64>,
+    operation: ActorAddress,
+    binding: ActorAddress,
     namespace_proxy: ActorAddress,
     path: DataPath,
     operation_id: OperationId,
     source: ActorAddress,
+}
+
+impl NamespaceUnpublishActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceUnpublishActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.generation,
+                incarnation: None,
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(self.binding, HostBindingIn::Unpublished(result));
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceUnpublishActor {
@@ -2393,6 +3432,8 @@ impl ActorInterface for NamespaceUnpublishActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.namespace_proxy);
         if ctx
             .send(
                 self.namespace_proxy,
@@ -2406,30 +3447,75 @@ impl ActorInterface for NamespaceUnpublishActor {
             )
             .is_err()
         {
-            ctx.stop_self();
+            self.finish(ctx, Err(DataPlaneError::SessionNotRunning));
         }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
-        if let DataDirectoryOut::Unregistered { result, .. } = message {
-            if matches!(result, Err(NamespaceError::PathNotFound(_))) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let result = match message {
+            DataDirectoryOut::Unregistered { result: Ok(_), .. } => Ok(()),
+            DataDirectoryOut::Unregistered {
+                result: Err(NamespaceError::PathNotFound(_)),
+                ..
+            } => {
                 let _ = ctx.send(self.source, BlobSourceIn::Retire { reply_to: None });
+                Ok(())
             }
+            DataDirectoryOut::Unregistered {
+                result: Err(error), ..
+            } => Err(namespace_error(error)),
+            other => Err(DataPlaneError::SessionFailed(format!(
+                "expected unpublish reply, received {other:?}"
+            ))),
+        };
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.namespace_proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            let _ = ctx.send(
+                self.binding,
+                HostBindingIn::Unpublished(Err(DataPlaneError::SessionNotRunning)),
+            );
             ctx.stop_self();
         }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.namespace_proxy,
-            NamespaceClientIn::Cancel {
-                reply_to: ctx.self_addr(),
-            },
-        );
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
+            let _ = ctx.send(
+                self.binding,
+                HostBindingIn::Unpublished(Err(DataPlaneError::SessionNotRunning)),
+            );
+            let _ = ctx.send(
+                self.namespace_proxy,
+                NamespaceClientIn::Cancel {
+                    reply_to: ctx.self_addr(),
+                },
+            );
+        }
     }
 }
 
 struct NamespaceStreamOpenActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    session_generation: u64,
+    incarnation: Option<StreamIncarnation>,
+    operation: ActorAddress,
     proxy: ActorAddress,
     parent: ActorAddress,
     path: DataPath,
@@ -2439,7 +3525,62 @@ struct NamespaceStreamOpenActor {
     expected_revision: Option<u64>,
     descriptor: Vec<u8>,
     operation_id: OperationId,
-    completed: bool,
+}
+
+impl NamespaceStreamOpenActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceStreamOpenActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: Some(
+                    self.incarnation
+                        .map_or(self.session_generation, |incarnation| {
+                            incarnation.authority_epoch
+                        }),
+                ),
+                incarnation: self.incarnation.map(|incarnation| incarnation.revision),
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<StreamMatch, NamespaceError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        if let Ok(matched) = &result {
+            self.incarnation = Some(matched.incarnation);
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(self.parent, HostStreamIn::NamespaceMatched(result));
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceStreamOpenActor {
@@ -2447,38 +3588,67 @@ impl ActorInterface for NamespaceStreamOpenActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.proxy,
-            NamespaceClientIn::Request {
-                request: NamespaceRequest::OpenStream {
-                    path: self.path.clone(),
-                    role: self.role,
-                    endpoint: self.parent,
-                    descriptor: self.descriptor.clone(),
-                    replace: self.replace,
-                    ensure: self.ensure,
-                    expected_revision: self.expected_revision,
-                    operation_id: self.operation_id,
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.proxy);
+        if ctx
+            .send(
+                self.proxy,
+                NamespaceClientIn::Request {
+                    request: NamespaceRequest::OpenStream {
+                        path: self.path.clone(),
+                        role: self.role,
+                        endpoint: self.parent,
+                        descriptor: self.descriptor.clone(),
+                        replace: self.replace,
+                        ensure: self.ensure,
+                        expected_revision: self.expected_revision,
+                        operation_id: self.operation_id,
+                    },
+                    reply_to: ctx.self_addr(),
                 },
-                reply_to: ctx.self_addr(),
-            },
-        );
+            )
+            .is_err()
+        {
+            self.finish(
+                ctx,
+                Err(NamespaceError::DirectoryUnavailable(
+                    "namespace client is unavailable".to_owned(),
+                )),
+            );
+        }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
         let result = match message {
             DataDirectoryOut::StreamOpened { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected stream-open reply, received {other:?}"
             ))),
         };
-        self.completed = true;
-        let _ = ctx.send(self.parent, HostStreamIn::NamespaceMatched(result));
-        ctx.stop_self();
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            ctx.stop_self();
+        }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if !self.completed {
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
             let _ = ctx.send(
                 self.proxy,
                 NamespaceClientIn::Cancel {
@@ -2490,9 +3660,61 @@ impl ActorInterface for NamespaceStreamOpenActor {
 }
 
 struct NamespaceStreamCloseActor {
+    phase: NamespaceOperationPhase,
+    transitions: Option<TransitionEmitter>,
+    operation: ActorAddress,
     proxy: ActorAddress,
+    parent: ActorAddress,
     path: DataPath,
     incarnation: StreamIncarnation,
+}
+
+impl NamespaceStreamCloseActor {
+    fn enter_phase(
+        &mut self,
+        ctx: &Ctx<'_>,
+        next: NamespaceOperationPhase,
+        reason: Reason,
+    ) -> bool {
+        if self.phase.outcome().is_some() {
+            return false;
+        }
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceStreamCloseActor,
+                protocol: Protocol::NamespaceOperation,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: Some(self.incarnation.authority_epoch),
+                incarnation: Some(self.incarnation.revision),
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome: next.outcome(),
+            });
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (Outcome::Success, Reason::Completed)
+        } else {
+            (Outcome::Failed, Reason::Failed)
+        };
+        self.enter_phase(ctx, NamespaceOperationPhase::Finished(outcome), reason);
+        let _ = ctx.send(self.parent, HostStreamIn::NamespaceClosed(result));
+        ctx.stop_self();
+    }
 }
 
 impl ActorInterface for NamespaceStreamCloseActor {
@@ -2500,46 +3722,166 @@ impl ActorInterface for NamespaceStreamCloseActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.proxy,
-            NamespaceClientIn::Request {
-                request: NamespaceRequest::CloseStream {
-                    path: self.path.clone(),
-                    incarnation: self.incarnation,
+        self.enter_phase(ctx, NamespaceOperationPhase::AwaitingReply, Reason::Started);
+        ctx.watch(self.proxy);
+        if ctx
+            .send(
+                self.proxy,
+                NamespaceClientIn::Request {
+                    request: NamespaceRequest::CloseStream {
+                        path: self.path.clone(),
+                        incarnation: self.incarnation,
+                    },
+                    reply_to: ctx.self_addr(),
                 },
-                reply_to: ctx.self_addr(),
-            },
-        );
+            )
+            .is_err()
+        {
+            self.finish(ctx, Err(DataPlaneError::SessionNotRunning));
+        }
     }
 
-    fn handle(&mut self, ctx: &Ctx<'_>, _message: DataDirectoryOut) {
-        ctx.stop_self();
+    fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryOut) {
+        if self.phase != NamespaceOperationPhase::AwaitingReply {
+            return;
+        }
+        let result = match message {
+            DataDirectoryOut::StreamClosed { result, .. } => result.map_err(namespace_error),
+            other => Err(DataPlaneError::SessionFailed(format!(
+                "expected stream-close reply, received {other:?}"
+            ))),
+        };
+        self.finish(ctx, result);
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if exited.addr == self.proxy
+            && self.enter_phase(
+                ctx,
+                NamespaceOperationPhase::Finished(Outcome::PeerLost),
+                Reason::PeerTerminated,
+            )
+        {
+            let _ = ctx.send(
+                self.parent,
+                HostStreamIn::NamespaceClosed(Err(DataPlaneError::SessionNotRunning)),
+            );
+            ctx.stop_self();
+        }
     }
 
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        let _ = ctx.send(
-            self.proxy,
-            NamespaceClientIn::Cancel {
-                reply_to: ctx.self_addr(),
-            },
-        );
+        if self.enter_phase(
+            ctx,
+            NamespaceOperationPhase::Finished(Outcome::Cancelled),
+            Reason::ParentStopped,
+        ) {
+            let _ = ctx.send(
+                self.parent,
+                HostStreamIn::NamespaceClosed(Err(DataPlaneError::SessionNotRunning)),
+            );
+            let _ = ctx.send(
+                self.proxy,
+                NamespaceClientIn::Cancel {
+                    reply_to: ctx.self_addr(),
+                },
+            );
+        }
     }
 }
 
 struct RuntimeStreamNotifier {
     runtime: Runtime,
     target: ActorAddress,
+    incarnation: StreamIncarnation,
 }
 
 impl StreamTransportNotifier for RuntimeStreamNotifier {
     fn notify(&self, event: StreamTransportEvent) {
-        let _ = self
-            .runtime
-            .send_to(self.target, HostStreamIn::Transport(event));
+        let _ = self.runtime.send_to(
+            self.target,
+            HostStreamIn::Transport {
+                incarnation: self.incarnation,
+                event,
+            },
+        );
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamPhase {
+    Resolving,
+    AwaitingPeer,
+    AwaitingTransport,
+    Opening,
+    Open,
+    Closing,
+    Releasing,
+    Closed,
+}
+
+impl StreamPhase {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Closing | Self::Releasing | Self::Closed)
+    }
+
+    fn telemetry(self) -> Phase {
+        match self {
+            Self::Resolving => Phase::Resolving,
+            Self::AwaitingPeer => Phase::AwaitingPeer,
+            Self::AwaitingTransport => Phase::AwaitingTransport,
+            Self::Opening => Phase::Opening,
+            Self::Open => Phase::Open,
+            Self::Closing => Phase::Closing,
+            Self::Releasing => Phase::Releasing,
+            Self::Closed => Phase::Closed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamTransportState {
+    Absent,
+    Installed,
+    Ready,
+    Quiescing,
+    Quiesced,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamPeerState {
+    Negotiating,
+    Acknowledged,
+    AwaitingTerminationAck,
+    Terminated,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamRouteState {
+    Unknown,
+    Routable,
+    Lost,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamOpenCompletion {
+    Owned,
+    Forwarding,
+    Delivered,
+    Failed,
+}
+
+enum StreamRelease {
+    NotStarted,
+    Pending,
+    Complete(Result<(), DataPlaneError>),
+}
+
 struct HostStreamBindingActor {
+    transitions: Option<TransitionEmitter>,
+    session_generation: u64,
+    phase: StreamPhase,
     runtime: Runtime,
     engine: EngineHandle,
     sender: ExternalSender,
@@ -2558,29 +3900,35 @@ struct HostStreamBindingActor {
     transport: Arc<dyn StreamTransport>,
     local_descriptor: StreamPeerDescriptor,
     ring: Option<RingHandle>,
+    ring_probe: Option<RingProbe>,
     ring_allocation_pending: bool,
     matched: Option<StreamMatch>,
     pending_displacements: HashMap<StreamIncarnation, HashSet<ActorAddress>>,
     fenced_displacements: HashSet<StreamIncarnation>,
     pending_peer_terminations: HashMap<StreamIncarnation, (DataPlaneError, Option<ActorAddress>)>,
     peer_descriptor: Option<StreamPeerDescriptor>,
-    peer_offer_acknowledged: bool,
-    transport_installed: bool,
-    transport_ready: bool,
-    opened: bool,
-    transport_quiesced: bool,
+    peer_state: StreamPeerState,
+    transport_state: StreamTransportState,
+    open_completion: StreamOpenCompletion,
+    route_state: StreamRouteState,
     terminal: Option<DataPlaneError>,
     data_waiters: Vec<ActorAddress>,
     capacity_waiters: Vec<ActorAddress>,
+    progress_waiters: Vec<ActorAddress>,
     close_waiters: Vec<ActorAddress>,
-    release_started: bool,
+    release: StreamRelease,
+    namespace_close_result: Option<Result<(), DataPlaneError>>,
     namespace_open: Option<ActorAddress>,
     namespace_close: Option<ActorAddress>,
-    peer_ack_pending: bool,
     route_watch: Option<HostRouteWatch>,
     offer_retry: Option<ActorTimer>,
     termination_retry: Option<ActorTimer>,
-    pending_peer_offer: Option<(StreamIncarnation, StreamPeerDescriptor)>,
+    termination_route_retries: u8,
+    route_loss_timer: Option<ActorTimer>,
+    route_loss_generation: u64,
+    peer_was_local: bool,
+    pending_peer_offers: HashMap<StreamIncarnation, StreamPeerDescriptor>,
+    detach_pending: bool,
 }
 
 impl HostStreamBindingActor {
@@ -2598,31 +3946,25 @@ impl HostStreamBindingActor {
         }
     }
 
+    fn peer_is_routable(&self, peer: ActorAddress) -> bool {
+        (!self.peer_was_local || self.runtime.is_local_actor(peer))
+            && self
+                .route_registrar
+                .as_ref()
+                .is_none_or(|routes| routes.is_routable(peer))
+    }
+
     fn fail_open(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
-        if !self.opened && self.terminal.is_none() {
-            let _ = ctx.send(
-                self.child_session,
-                ChildSessionIn::OperationFailed {
-                    operation: self.operation,
-                    error: error.clone(),
-                },
-            );
-        }
         self.begin_terminal(ctx, error, true, true);
     }
 
     fn displace(&mut self, ctx: &Ctx<'_>) {
-        let error = DataPlaneError::PathReplaced(self.path.clone());
-        if !self.opened && self.terminal.is_none() {
-            let _ = ctx.send(
-                self.child_session,
-                ChildSessionIn::OperationFailed {
-                    operation: self.operation,
-                    error: error.clone(),
-                },
-            );
-        }
-        self.begin_terminal(ctx, error, false, true);
+        self.begin_terminal(
+            ctx,
+            DataPlaneError::PathReplaced(self.path.clone()),
+            false,
+            true,
+        );
     }
 
     fn acknowledge_displacement(
@@ -2667,15 +4009,6 @@ impl HostStreamBindingActor {
         error: DataPlaneError,
         reply_to: Option<ActorAddress>,
     ) {
-        if !self.opened && self.terminal.is_none() {
-            let _ = ctx.send(
-                self.child_session,
-                ChildSessionIn::OperationFailed {
-                    operation: self.operation,
-                    error: error.clone(),
-                },
-            );
-        }
         self.begin_terminal(ctx, error, false, true);
         if let Some(reply_to) = reply_to {
             let _ = ctx.send(reply_to, HostStreamIn::PeerTerminationAck { incarnation });
@@ -2688,21 +4021,20 @@ impl HostStreamBindingActor {
         };
         if self.role != StreamRole::Sink
             || !matched.sink_descriptor.is_empty()
-            || self.peer_offer_acknowledged
-            || self.terminal.is_some()
-            || !self.transport_installed
+            || self.peer_state == StreamPeerState::Acknowledged
+            || self.phase.terminal()
+            || self.transport_state == StreamTransportState::Absent
         {
             return;
         }
-        let routable = self
-            .route_registrar
-            .as_ref()
-            .is_none_or(|routes| routes.is_routable(matched.source));
-        if routable {
+        let source = matched.source;
+        let incarnation = matched.incarnation;
+        self.enter_phase(ctx, self.phase, Reason::PeerOffered);
+        if self.peer_is_routable(source) {
             let _ = ctx.send(
-                matched.source,
+                source,
                 HostStreamIn::PeerOffer {
-                    incarnation: matched.incarnation,
+                    incarnation,
                     descriptor: self.local_descriptor.clone(),
                 },
             );
@@ -2712,15 +4044,13 @@ impl HostStreamBindingActor {
                 STREAM_PEER_OFFER_RETRY,
                 self.sender.clone(),
                 ctx.self_addr(),
-                HostStreamIn::PeerOfferRetry {
-                    incarnation: matched.incarnation,
-                },
+                HostStreamIn::PeerOfferRetry { incarnation },
             ));
         }
     }
 
     fn send_peer_termination(&mut self, ctx: &Ctx<'_>) {
-        if !self.peer_ack_pending {
+        if self.peer_state != StreamPeerState::AwaitingTerminationAck {
             return;
         }
         let Some(matched) = self.matched.as_ref() else {
@@ -2736,20 +4066,39 @@ impl HostStreamBindingActor {
         } else {
             DataPlaneError::PeerLost
         };
-        let routable = self
-            .route_registrar
-            .as_ref()
-            .is_none_or(|routes| routes.is_routable(peer));
-        if routable {
-            let _ = ctx.send(
-                peer,
-                HostStreamIn::PeerTerminated {
-                    incarnation,
-                    error,
-                    reply_to: Some(ctx.self_addr()),
-                },
-            );
+        let routable = self.peer_is_routable(peer);
+        let sent = routable
+            && ctx
+                .send(
+                    peer,
+                    HostStreamIn::PeerTerminated {
+                        incarnation,
+                        error,
+                        reply_to: Some(ctx.self_addr()),
+                    },
+                )
+                .is_ok();
+        let local_peer_is_gone = self.peer_was_local && !self.runtime.is_local_actor(peer);
+        if local_peer_is_gone || !sent {
+            self.route_state = StreamRouteState::Unavailable;
         }
+        if local_peer_is_gone
+            || self.termination_route_retries >= STREAM_PEER_TERMINATION_ROUTE_RETRY_LIMIT
+        {
+            // A peer whose exact local actor is gone, or whose remote route
+            // never converges within the bounded grace, cannot acknowledge.
+            // Namespace closure and transport termination still fence the
+            // incarnation; retaining this actor would only leak the session.
+            self.peer_state = StreamPeerState::Terminated;
+            if matches!(
+                self.transport_state,
+                StreamTransportState::Absent | StreamTransportState::Quiesced
+            ) {
+                self.release_ring(ctx);
+            }
+            return;
+        }
+        self.termination_route_retries += 1;
         if self.termination_retry.is_none() {
             self.termination_retry = Some(self.engine.send_after(
                 STREAM_PEER_OFFER_RETRY,
@@ -2759,9 +4108,82 @@ impl HostStreamBindingActor {
             ));
         }
     }
+    fn peer_route(&self) -> Option<(StreamIncarnation, ActorAddress)> {
+        self.matched.as_ref().map(|matched| {
+            let peer = match self.role {
+                StreamRole::Source => matched.sink,
+                StreamRole::Sink => matched.source,
+            };
+            (matched.incarnation, peer)
+        })
+    }
+
+    fn peer_loss_blocks_progress(&self) -> bool {
+        if matches!(
+            self.open_completion,
+            StreamOpenCompletion::Owned | StreamOpenCompletion::Forwarding
+        ) {
+            return true;
+        }
+        match self.role {
+            StreamRole::Source => {
+                !self.capacity_waiters.is_empty() || !self.progress_waiters.is_empty()
+            }
+            StreamRole::Sink => !self.data_waiters.is_empty(),
+        }
+    }
+
+    fn cancel_peer_route_loss(&mut self) {
+        if let Some(timer) = self.route_loss_timer.take() {
+            self.route_loss_generation = self.route_loss_generation.wrapping_add(1);
+            timer.cancel();
+        }
+    }
+
+    fn update_peer_route_loss(&mut self, ctx: &Ctx<'_>) {
+        let Some((incarnation, peer)) = self.peer_route() else {
+            self.cancel_peer_route_loss();
+            return;
+        };
+        let routable = self.peer_is_routable(peer);
+        let next_route = if routable {
+            StreamRouteState::Routable
+        } else {
+            StreamRouteState::Lost
+        };
+        if self.route_state != next_route {
+            self.route_state = next_route;
+            self.enter_phase(
+                ctx,
+                self.phase,
+                if routable {
+                    Reason::RouteRestored
+                } else {
+                    Reason::RouteLost
+                },
+            );
+        }
+        if routable || self.phase.terminal() || !self.peer_loss_blocks_progress() {
+            self.cancel_peer_route_loss();
+            return;
+        }
+        if self.route_loss_timer.is_none() {
+            self.route_loss_generation = self.route_loss_generation.wrapping_add(1);
+            let generation = self.route_loss_generation;
+            self.route_loss_timer = Some(self.engine.send_after(
+                STREAM_PEER_ROUTE_LOSS_GRACE,
+                self.sender.clone(),
+                ctx.self_addr(),
+                HostStreamIn::PeerRouteLossCheck {
+                    incarnation,
+                    generation,
+                },
+            ));
+        }
+    }
 
     fn try_install_transport(&mut self, ctx: &Ctx<'_>) {
-        if self.transport_installed || self.terminal.is_some() {
+        if self.transport_state != StreamTransportState::Absent || self.phase.terminal() {
             return;
         }
         let (Some(ring), Some(matched)) = (self.ring, self.matched.clone()) else {
@@ -2781,9 +4203,11 @@ impl HostStreamBindingActor {
                 return;
             }
         };
+        let ring_probe = Some(endpoint.probe());
         let notifier: Arc<dyn StreamTransportNotifier> = Arc::new(RuntimeStreamNotifier {
             runtime: self.runtime.clone(),
             target: ctx.self_addr(),
+            incarnation: matched.incarnation,
         });
         let install = match self.role {
             StreamRole::Source => {
@@ -2805,7 +4229,13 @@ impl HostStreamBindingActor {
         };
         match install {
             Ok(()) => {
-                self.transport_installed = true;
+                self.transport_state = StreamTransportState::Installed;
+                self.enter_phase(
+                    ctx,
+                    StreamPhase::AwaitingTransport,
+                    Reason::TransportInstalled,
+                );
+                self.ring_probe = ring_probe;
                 if self.role == StreamRole::Sink && matched.sink_descriptor.is_empty() {
                     self.send_peer_offer(ctx);
                 }
@@ -2815,26 +4245,47 @@ impl HostStreamBindingActor {
     }
 
     fn open_if_ready(&mut self, ctx: &Ctx<'_>) {
-        if self.opened || !self.transport_ready || self.terminal.is_some() {
+        if self.open_completion != StreamOpenCompletion::Owned
+            || self.transport_state != StreamTransportState::Ready
+            || self.phase.terminal()
+        {
             return;
         }
         let (Some(ring), Some(matched)) = (self.ring, self.matched.as_ref()) else {
             return;
         };
-        self.opened = true;
-        let _ = ctx.send(
-            self.child_session,
-            ChildSessionIn::StreamOpened {
-                operation: self.operation,
-                host_binding: ctx.self_addr(),
-                incarnation: matched.incarnation,
-                ring,
-                role: match self.role {
-                    StreamRole::Source => Role::Producer,
-                    StreamRole::Sink => Role::Consumer,
+        let incarnation = matched.incarnation;
+        self.open_completion = StreamOpenCompletion::Forwarding;
+        self.enter_phase(ctx, StreamPhase::Opening, Reason::Opened);
+        if ctx
+            .send(
+                self.child_session,
+                ChildSessionIn::StreamOpened {
+                    operation: self.operation,
+                    host_binding: ctx.self_addr(),
+                    incarnation,
+                    ring,
+                    role: match self.role {
+                        StreamRole::Source => Role::Producer,
+                        StreamRole::Sink => Role::Consumer,
+                    },
                 },
-            },
-        );
+            )
+            .is_err()
+        {
+            self.fail_open(ctx, DataPlaneError::SessionNotRunning);
+        }
+    }
+
+    fn open_forwarded(&mut self, ctx: &Ctx<'_>, incarnation: StreamIncarnation) {
+        if self.matches_incarnation(incarnation)
+            && self.open_completion == StreamOpenCompletion::Forwarding
+            && !self.phase.terminal()
+        {
+            self.open_completion = StreamOpenCompletion::Delivered;
+            self.enter_phase(ctx, StreamPhase::Open, Reason::Completed);
+            self.update_peer_route_loss(ctx);
+        }
     }
 
     fn wake_waiters(
@@ -2854,6 +4305,51 @@ impl HostStreamBindingActor {
         }
     }
 
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: StreamPhase, reason: Reason) {
+        let previous = self.phase;
+        self.phase = next;
+        if let Some(transitions) = &self.transitions {
+            let outcome = next.terminal().then_some(match self.terminal.as_ref() {
+                Some(DataPlaneError::OperationCancelled) => Outcome::Cancelled,
+                Some(DataPlaneError::PeerLost) => Outcome::PeerLost,
+                Some(DataPlaneError::PathReplaced(_)) => Outcome::Replaced,
+                Some(DataPlaneError::StreamClosed) | None => Outcome::Success,
+                Some(_) => Outcome::Failed,
+            });
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::HostStreamBindingActor,
+                protocol: Protocol::HostStream,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: Some(
+                    self.matched
+                        .as_ref()
+                        .map_or(self.session_generation, |matched| {
+                            matched.incarnation.authority_epoch
+                        }),
+                ),
+                incarnation: self
+                    .matched
+                    .as_ref()
+                    .map(|matched| matched.incarnation.revision),
+                previous: previous.telemetry(),
+                next: next.telemetry(),
+                reason,
+                outcome,
+            });
+        }
+    }
+
+    fn matches_incarnation(&self, incarnation: StreamIncarnation) -> bool {
+        self.matched
+            .as_ref()
+            .is_some_and(|matched| matched.incarnation == incarnation)
+    }
+
     fn begin_terminal(
         &mut self,
         ctx: &Ctx<'_>,
@@ -2861,10 +4357,33 @@ impl HostStreamBindingActor {
         notify_peer: bool,
         terminate_transport: bool,
     ) {
-        if self.terminal.is_some() {
+        if self.phase.terminal() {
             return;
         }
-        if let Some(namespace_open) = self.namespace_open.take() {
+        let opening = matches!(
+            self.open_completion,
+            StreamOpenCompletion::Owned | StreamOpenCompletion::Forwarding
+        );
+        if opening {
+            self.open_completion = StreamOpenCompletion::Failed;
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::OperationFailed {
+                    operation: self.operation,
+                    error: error.clone(),
+                },
+            );
+        }
+        let reason = match &error {
+            DataPlaneError::OperationCancelled => Reason::Cancelled,
+            DataPlaneError::PeerLost => Reason::PeerTerminated,
+            DataPlaneError::PathReplaced(_) => Reason::Displaced,
+            DataPlaneError::StreamClosed => Reason::CloseRequested,
+            _ => Reason::Failed,
+        };
+        self.terminal = Some(error.clone());
+        self.enter_phase(ctx, StreamPhase::Closing, reason);
+        if let Some(namespace_open) = self.namespace_open {
             let _ = ctx.stop_actor(namespace_open);
         }
         if let Some(ring) = self.ring {
@@ -2874,11 +4393,12 @@ impl HostStreamBindingActor {
                 Self::ring_peer_termination(&error),
             );
         }
-        self.terminal = Some(error.clone());
         if let Some(timer) = self.offer_retry.take() {
             timer.cancel();
         }
-        self.pending_peer_offer = None;
+        self.cancel_peer_route_loss();
+        self.pending_peer_offers.clear();
+        self.pending_peer_terminations.clear();
         Self::wake_waiters(
             ctx,
             self.child_session,
@@ -2891,67 +4411,634 @@ impl HostStreamBindingActor {
             &mut self.capacity_waiters,
             Err(error.clone()),
         );
-        if notify_peer && self.matched.is_some() {
-            self.peer_ack_pending = true;
-            self.send_peer_termination(ctx);
-        }
-        if let Some(matched) = &self.matched {
-            if let Ok(namespace_close) = ctx.spawn(NamespaceStreamCloseActor {
-                proxy: self.namespace.proxy(),
-                path: self.path.clone(),
-                incarnation: matched.incarnation,
-            }) {
-                self.namespace_close = Some(namespace_close);
-            }
-            if self.transport_installed {
-                if terminate_transport {
-                    self.transport.terminate(matched.incarnation);
-                }
-                if !self.transport_quiesced {
-                    return;
+        Self::wake_waiters(
+            ctx,
+            self.child_session,
+            &mut self.progress_waiters,
+            Err(error),
+        );
+        self.start_namespace_close(ctx);
+        if let Some(incarnation) = self.matched.as_ref().map(|matched| matched.incarnation) {
+            if !matches!(
+                self.transport_state,
+                StreamTransportState::Absent | StreamTransportState::Quiesced
+            ) {
+                self.transport_state = StreamTransportState::Quiescing;
+                if terminate_transport || opening {
+                    self.transport.terminate(incarnation);
                 }
             }
-            if self.peer_ack_pending {
-                return;
+            if notify_peer || (opening && !terminate_transport) {
+                self.peer_state = StreamPeerState::AwaitingTerminationAck;
+                self.send_peer_termination(ctx);
             }
         }
         self.release_ring(ctx);
     }
 
-    fn complete_release(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
-        for reply_to in self.close_waiters.drain(..) {
-            let _ = ctx.send(
-                self.child_session,
-                ChildSessionIn::StreamWake {
-                    reply_to,
-                    result: result.clone(),
-                },
-            );
+    fn start_namespace_close(&mut self, ctx: &Ctx<'_>) {
+        if self.namespace_close.is_some() || self.namespace_close_result.is_some() {
+            return;
         }
-        let _ = ctx.send(
-            self.host_session,
-            HostSessionIn::BindingDone {
-                binding: ctx.self_addr(),
-            },
-        );
-        ctx.stop_self();
+        let Some(matched) = self.matched.as_ref() else {
+            return;
+        };
+        match ctx.spawn(NamespaceStreamCloseActor {
+            proxy: self.namespace.proxy(),
+            parent: ctx.self_addr(),
+            path: self.path.clone(),
+            incarnation: matched.incarnation,
+            phase: NamespaceOperationPhase::Created,
+            transitions: self.transitions.clone(),
+            operation: self.operation,
+        }) {
+            Ok(namespace_close) => {
+                self.namespace_close = Some(namespace_close);
+                ctx.watch(namespace_close);
+            }
+            Err(error) => {
+                self.namespace_close_result =
+                    Some(Err(DataPlaneError::SessionFailed(error.to_string())))
+            }
+        }
+    }
+
+    fn namespace_closed(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.namespace_close.take().is_none() || self.namespace_close_result.is_some() {
+            return;
+        }
+        self.namespace_close_result = Some(result);
+        self.finish_release(ctx);
+    }
+
+    fn complete_release(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if !matches!(self.release, StreamRelease::Pending) {
+            return;
+        }
+        self.ring = None;
+        self.ring_probe = None;
+        self.release = StreamRelease::Complete(result);
+        self.finish_release(ctx);
+    }
+
+    fn finish_release(&mut self, ctx: &Ctx<'_>) {
+        if self.phase == StreamPhase::Closed
+            || self.namespace_open.is_some()
+            || self.namespace_close.is_some()
+        {
+            return;
+        }
+        let StreamRelease::Complete(result) = &self.release else {
+            return;
+        };
+        let result = result
+            .clone()
+            .and_then(|()| self.namespace_close_result.clone().unwrap_or(Ok(())));
+        self.release = StreamRelease::Complete(result.clone());
+        self.pending_displacements.clear();
+        self.pending_peer_terminations.clear();
+        self.route_watch = None;
+        self.enter_phase(ctx, StreamPhase::Closed, Reason::Released);
+        Self::wake_waiters(ctx, self.child_session, &mut self.close_waiters, result);
+        if ctx
+            .send(
+                self.host_session,
+                HostSessionIn::BindingDone {
+                    binding: ctx.self_addr(),
+                },
+            )
+            .is_err()
+        {
+            ctx.stop_self();
+        }
     }
 
     fn release_ring(&mut self, ctx: &Ctx<'_>) {
-        if self.release_started || self.ring_allocation_pending {
+        if !self.phase.terminal()
+            || !matches!(self.release, StreamRelease::NotStarted)
+            || self.ring_allocation_pending
+            || self.peer_state == StreamPeerState::AwaitingTerminationAck
+            || !matches!(
+                self.transport_state,
+                StreamTransportState::Absent | StreamTransportState::Quiesced
+            )
+        {
             return;
         }
-        self.release_started = true;
+        self.release = StreamRelease::Pending;
+        self.enter_phase(ctx, StreamPhase::Releasing, Reason::Released);
         if let Some(ring) = self.ring {
-            let _ = ctx.send(
-                self.allocator,
-                ArenaAllocatorIn::ReleaseStream {
-                    binding: ctx.self_addr(),
-                    ring,
-                },
-            );
+            if ctx
+                .send(
+                    self.allocator,
+                    ArenaAllocatorIn::ReleaseStream {
+                        binding: ctx.self_addr(),
+                        ring,
+                    },
+                )
+                .is_err()
+            {
+                self.complete_release(ctx, Err(DataPlaneError::SessionNotRunning));
+            }
         } else {
             self.complete_release(ctx, Ok(()));
+        }
+    }
+
+    fn namespace_matched(&mut self, ctx: &Ctx<'_>, result: Result<StreamMatch, NamespaceError>) {
+        self.namespace_open = None;
+        if self.matched.is_some() {
+            return;
+        }
+        match result {
+            Ok(matched) => {
+                let expected = match self.role {
+                    StreamRole::Source => matched.source,
+                    StreamRole::Sink => matched.sink,
+                };
+                if expected != ctx.self_addr() {
+                    self.fail_open(
+                        ctx,
+                        DataPlaneError::StreamFault(
+                            "namespace matched the wrong stream endpoint".to_owned(),
+                        ),
+                    );
+                    return;
+                }
+                let incarnation = matched.incarnation;
+                if self.phase.terminal() {
+                    self.matched = Some(matched);
+                    self.enter_phase(ctx, self.phase, Reason::NamespaceResolved);
+                    self.start_namespace_close(ctx);
+                    self.finish_release(ctx);
+                    return;
+                }
+                let pending_peer_termination = self.pending_peer_terminations.remove(&incarnation);
+                if self.pending_displacements.contains_key(&incarnation) {
+                    self.matched = Some(matched);
+                    self.enter_phase(ctx, self.phase, Reason::NamespaceResolved);
+                    self.fence_displacement(ctx, incarnation, None);
+                    if let Some((error, reply_to)) = pending_peer_termination {
+                        self.apply_peer_termination(ctx, incarnation, error, reply_to);
+                    }
+                    return;
+                }
+                let peer = match self.role {
+                    StreamRole::Source => matched.sink,
+                    StreamRole::Sink => matched.source,
+                };
+                self.peer_was_local = self.runtime.is_local_actor(peer);
+                if self.peer_was_local {
+                    ctx.watch(peer);
+                }
+                if self.role == StreamRole::Source && !matched.sink_descriptor.is_empty() {
+                    self.peer_descriptor =
+                        Some(StreamPeerDescriptor(matched.sink_descriptor.clone()));
+                }
+                self.matched = Some(matched);
+                self.enter_phase(ctx, StreamPhase::AwaitingPeer, Reason::NamespaceResolved);
+                self.enter_phase(ctx, StreamPhase::AwaitingPeer, Reason::PeerMatched);
+                if let Some((error, reply_to)) = pending_peer_termination {
+                    self.apply_peer_termination(ctx, incarnation, error, reply_to);
+                    return;
+                }
+                if let Some(routes) = &self.route_registrar {
+                    let matched = self.matched.as_ref().expect("installed match");
+                    let peer = match self.role {
+                        StreamRole::Source => matched.sink,
+                        StreamRole::Sink => matched.source,
+                    };
+                    let incarnation = matched.incarnation;
+                    let sender = self.sender.clone();
+                    let target = ctx.self_addr();
+                    self.route_watch = routes.watch_route(
+                        peer,
+                        Arc::new(move || {
+                            let _ =
+                                sender.send_to(target, HostStreamIn::RouteChanged { incarnation });
+                        }),
+                    );
+                }
+                if let Some(descriptor) = self.pending_peer_offers.remove(&incarnation)
+                    && let Some(matched) = self.matched.as_ref()
+                {
+                    self.peer_descriptor = Some(descriptor);
+                    let _ = ctx.send(matched.sink, HostStreamIn::PeerOfferAck { incarnation });
+                }
+                self.pending_peer_offers.clear();
+                self.pending_peer_terminations.clear();
+                self.pending_displacements.clear();
+                self.try_install_transport(ctx);
+                self.update_peer_route_loss(ctx);
+            }
+            Err(error) => {
+                if self.phase.terminal() {
+                    self.finish_release(ctx);
+                } else {
+                    self.fail_open(ctx, namespace_error(error));
+                }
+            }
+        }
+    }
+
+    fn allocated(&mut self, ctx: &Ctx<'_>, result: Result<RingHandle, DataPlaneError>) {
+        if !self.ring_allocation_pending {
+            return;
+        }
+        self.ring_allocation_pending = false;
+        match result {
+            Ok(ring) => {
+                self.ring = Some(ring);
+                if let Some(error) = self.terminal.as_ref() {
+                    let _ = byte_ring::mark_peer_terminated_mapped(
+                        &self.arena,
+                        ring,
+                        Self::ring_peer_termination(error),
+                    );
+                }
+            }
+            Err(error) => self.fail_open(ctx, error),
+        }
+        if self.phase.terminal() {
+            self.release_ring(ctx);
+        } else {
+            self.try_install_transport(ctx);
+        }
+    }
+
+    fn peer_offer(
+        &mut self,
+        ctx: &Ctx<'_>,
+        incarnation: StreamIncarnation,
+        descriptor: StreamPeerDescriptor,
+    ) {
+        if self.role != StreamRole::Source || self.phase.terminal() {
+            return;
+        }
+        if self.matched.is_none() {
+            // Only the namespace match authenticates an offer's incarnation.
+            self.pending_peer_offers
+                .entry(incarnation)
+                .or_insert(descriptor);
+            return;
+        }
+        let sink = self
+            .matched
+            .as_ref()
+            .filter(|matched| matched.incarnation == incarnation)
+            .map(|matched| matched.sink);
+        if let Some(sink) = sink {
+            if self.peer_descriptor.is_none() {
+                self.peer_descriptor = Some(descriptor);
+            }
+            self.enter_phase(ctx, self.phase, Reason::PeerOffered);
+            let _ = ctx.send(sink, HostStreamIn::PeerOfferAck { incarnation });
+            self.try_install_transport(ctx);
+        }
+    }
+
+    fn peer_offer_ack(&mut self, ctx: &Ctx<'_>, incarnation: StreamIncarnation) {
+        if self.phase.terminal() {
+            return;
+        }
+        if self.role == StreamRole::Sink
+            && self
+                .matched
+                .as_ref()
+                .is_some_and(|matched| matched.incarnation == incarnation)
+        {
+            self.peer_state = StreamPeerState::Acknowledged;
+            self.enter_phase(ctx, self.phase, Reason::PeerAcknowledged);
+            if let Some(timer) = self.offer_retry.take() {
+                timer.cancel();
+            }
+        }
+    }
+
+    fn peer_offer_retry(&mut self, ctx: &Ctx<'_>, incarnation: StreamIncarnation) {
+        if self
+            .matched
+            .as_ref()
+            .is_some_and(|matched| matched.incarnation == incarnation)
+        {
+            self.offer_retry = None;
+            self.send_peer_offer(ctx);
+        }
+    }
+
+    fn route_changed(&mut self, ctx: &Ctx<'_>, incarnation: StreamIncarnation) {
+        if self
+            .matched
+            .as_ref()
+            .is_some_and(|matched| matched.incarnation == incarnation)
+        {
+            self.update_peer_route_loss(ctx);
+            self.send_peer_offer(ctx);
+            self.send_peer_termination(ctx);
+            if self.role == StreamRole::Source
+                && self.peer_descriptor.is_some()
+                && !self.phase.terminal()
+                && let Some(matched) = &self.matched
+                && matched.sink_descriptor.is_empty()
+            {
+                let _ = ctx.send(matched.sink, HostStreamIn::PeerOfferAck { incarnation });
+            }
+        }
+    }
+
+    fn peer_route_loss_check(
+        &mut self,
+        ctx: &Ctx<'_>,
+        incarnation: StreamIncarnation,
+        generation: u64,
+    ) {
+        if generation != self.route_loss_generation {
+            return;
+        }
+        if !self.matches_incarnation(incarnation) {
+            return;
+        }
+        self.route_loss_timer = None;
+        let Some((matched_incarnation, peer)) = self.peer_route() else {
+            return;
+        };
+        let routable = self.peer_is_routable(peer);
+        if incarnation == matched_incarnation
+            && !routable
+            && !self.phase.terminal()
+            && self.peer_loss_blocks_progress()
+        {
+            self.apply_peer_termination(ctx, incarnation, DataPlaneError::PeerLost, None);
+        }
+    }
+
+    fn transport_ready(&mut self, ctx: &Ctx<'_>) {
+        if self.transport_state != StreamTransportState::Installed || self.phase.terminal() {
+            return;
+        }
+        self.transport_state = StreamTransportState::Ready;
+        self.enter_phase(ctx, StreamPhase::AwaitingTransport, Reason::TransportReady);
+        self.open_if_ready(ctx);
+    }
+
+    fn transport_data_available(&mut self, ctx: &Ctx<'_>) {
+        if self.phase.terminal() {
+            return;
+        }
+        self.cancel_peer_route_loss();
+        Self::wake_waiters(ctx, self.child_session, &mut self.data_waiters, Ok(()));
+    }
+
+    fn transport_capacity_available(&mut self, ctx: &Ctx<'_>) {
+        if self.phase.terminal() {
+            return;
+        }
+        self.cancel_peer_route_loss();
+        Self::wake_waiters(ctx, self.child_session, &mut self.capacity_waiters, Ok(()));
+        Self::wake_waiters(ctx, self.child_session, &mut self.progress_waiters, Ok(()));
+    }
+
+    fn transport_fault(&mut self, ctx: &Ctx<'_>, reason: String) {
+        self.fail_open(ctx, DataPlaneError::StreamFault(reason));
+    }
+
+    fn transport_quiesced(&mut self, ctx: &Ctx<'_>) {
+        if matches!(
+            self.transport_state,
+            StreamTransportState::Absent | StreamTransportState::Quiesced
+        ) {
+            return;
+        }
+        self.transport_state = StreamTransportState::Quiesced;
+        if self.open_completion == StreamOpenCompletion::Owned && !self.phase.terminal() {
+            self.fail_open(ctx, DataPlaneError::PeerLost);
+        }
+        self.release_ring(ctx);
+    }
+
+    fn data_available(&mut self) {
+        if self.phase.terminal() {
+            return;
+        }
+        if let Some(matched) = &self.matched {
+            self.transport.source_progress(matched.incarnation);
+        }
+    }
+
+    fn capacity_available(&mut self) {
+        if self.phase.terminal() {
+            return;
+        }
+        if let Some(matched) = &self.matched {
+            self.transport.sink_progress(matched.incarnation);
+        }
+    }
+
+    fn wait_data(&mut self, ctx: &Ctx<'_>, reply_to: ActorAddress) {
+        let result = self
+            .terminal
+            .as_ref()
+            .map(|error| Err(error.clone()))
+            .or_else(|| {
+                self.ring_probe
+                    .as_ref()
+                    .filter(|probe| probe.has_data())
+                    .map(|_| Ok(()))
+            });
+        if let Some(result) = result {
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::StreamWake { reply_to, result },
+            );
+        } else {
+            self.data_waiters.push(reply_to);
+            self.update_peer_route_loss(ctx);
+        }
+    }
+
+    fn wait_capacity(&mut self, ctx: &Ctx<'_>, reply_to: ActorAddress) {
+        let result = self
+            .terminal
+            .as_ref()
+            .map(|error| Err(error.clone()))
+            .or_else(|| {
+                self.ring_probe
+                    .as_ref()
+                    .filter(|probe| probe.has_capacity())
+                    .map(|_| Ok(()))
+            });
+        if let Some(result) = result {
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::StreamWake { reply_to, result },
+            );
+        } else {
+            self.capacity_waiters.push(reply_to);
+            self.update_peer_route_loss(ctx);
+        }
+    }
+
+    fn wait_progress(&mut self, ctx: &Ctx<'_>, reply_to: ActorAddress, target: u64) {
+        let result = self
+            .terminal
+            .as_ref()
+            .map(|error| Err(error.clone()))
+            .or_else(|| {
+                self.ring_probe.as_ref().and_then(|probe| {
+                    probe
+                        .positions()
+                        .map(|(_, consumed)| (consumed >= target).then_some(Ok(())))
+                        .unwrap_or_else(|error| {
+                            Some(Err(DataPlaneError::StreamFault(format!(
+                                "observe stream flush progress: {error:?}"
+                            ))))
+                        })
+                })
+            });
+        if let Some(result) = result {
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::StreamWake { reply_to, result },
+            );
+        } else {
+            self.progress_waiters.push(reply_to);
+            self.update_peer_route_loss(ctx);
+        }
+    }
+
+    fn close(&mut self, ctx: &Ctx<'_>, clean: bool, reply_to: Option<ActorAddress>) {
+        if let Some(reply_to) = reply_to {
+            if self.phase == StreamPhase::Closed {
+                if let StreamRelease::Complete(result) = &self.release {
+                    let _ = ctx.send(
+                        self.child_session,
+                        ChildSessionIn::StreamWake {
+                            reply_to,
+                            result: result.clone(),
+                        },
+                    );
+                }
+                return;
+            }
+            self.close_waiters.push(reply_to);
+        }
+        if clean {
+            self.begin_terminal(ctx, DataPlaneError::StreamClosed, false, false);
+        } else {
+            self.fail_open(ctx, DataPlaneError::OperationCancelled);
+        }
+    }
+
+    fn peer_terminated(
+        &mut self,
+        ctx: &Ctx<'_>,
+        incarnation: StreamIncarnation,
+        error: DataPlaneError,
+        reply_to: Option<ActorAddress>,
+    ) {
+        let matched_incarnation = self.matched.as_ref().map(|matched| matched.incarnation);
+        if matched_incarnation == Some(incarnation) {
+            self.apply_peer_termination(ctx, incarnation, error, reply_to);
+        } else if matched_incarnation.is_none() && !self.phase.terminal() {
+            // Peer termination can overtake this binding's namespace
+            // reply. Retain it by incarnation so only the authenticated
+            // match applies the terminal state and receives an ACK.
+            self.pending_peer_terminations
+                .insert(incarnation, (error, reply_to));
+        }
+    }
+
+    fn displaced(
+        &mut self,
+        ctx: &Ctx<'_>,
+        incarnation: StreamIncarnation,
+        reply_to: Option<ActorAddress>,
+    ) {
+        let matched_incarnation = self.matched.as_ref().map(|matched| matched.incarnation);
+        if matched_incarnation == Some(incarnation) {
+            self.fence_displacement(ctx, incarnation, reply_to);
+        } else if self.fenced_displacements.contains(&incarnation) {
+            if let Some(reply_to) = reply_to {
+                self.acknowledge_displacement(ctx, reply_to, incarnation);
+            }
+        } else if matched_incarnation.is_none() && !self.phase.terminal() {
+            // The directory notice can overtake the namespace reply.
+            // Retain its acknowledger until the exact incarnation is
+            // matched and synchronously fenced.
+            let replies = self.pending_displacements.entry(incarnation).or_default();
+            if let Some(reply_to) = reply_to {
+                replies.insert(reply_to);
+            }
+        }
+    }
+
+    fn peer_termination_ack(&mut self, ctx: &Ctx<'_>, incarnation: StreamIncarnation) {
+        if self
+            .matched
+            .as_ref()
+            .is_some_and(|matched| matched.incarnation == incarnation)
+        {
+            self.peer_state = StreamPeerState::Terminated;
+            if let Some(timer) = self.termination_retry.take() {
+                timer.cancel();
+            }
+            if self.phase.terminal()
+                && (matches!(
+                    self.transport_state,
+                    StreamTransportState::Absent | StreamTransportState::Quiesced
+                ))
+            {
+                self.release_ring(ctx);
+            }
+        }
+    }
+
+    fn peer_termination_retry(&mut self, ctx: &Ctx<'_>, incarnation: StreamIncarnation) {
+        if self.peer_state == StreamPeerState::AwaitingTerminationAck
+            && self
+                .matched
+                .as_ref()
+                .is_some_and(|matched| matched.incarnation == incarnation)
+        {
+            self.termination_retry = None;
+            self.send_peer_termination(ctx);
+        }
+    }
+
+    fn release_complete(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        self.complete_release(ctx, result);
+    }
+
+    fn session_detached(&mut self, ctx: &Ctx<'_>) {
+        if self.phase != StreamPhase::Closed {
+            return;
+        }
+        if self.detach_pending {
+            ctx.stop_self();
+        } else {
+            // BindingDone can race controls already forwarded from the
+            // host session. Requeue the detach marker behind the current
+            // mailbox so those controls receive the terminal result.
+            self.detach_pending = true;
+            let _ = ctx.send(ctx.self_addr(), HostStreamIn::SessionDetached);
+        }
+    }
+
+    fn transport_event(
+        &mut self,
+        ctx: &Ctx<'_>,
+        incarnation: StreamIncarnation,
+        event: StreamTransportEvent,
+    ) {
+        if !self.matches_incarnation(incarnation) {
+            return;
+        }
+        match event {
+            StreamTransportEvent::Ready => self.transport_ready(ctx),
+            StreamTransportEvent::DataAvailable => self.transport_data_available(ctx),
+            StreamTransportEvent::CapacityAvailable => self.transport_capacity_available(ctx),
+            StreamTransportEvent::Fault(reason) => self.transport_fault(ctx, reason),
+            StreamTransportEvent::Quiesced => self.transport_quiesced(ctx),
         }
     }
 }
@@ -2961,6 +5048,12 @@ impl ActorInterface for HostStreamBindingActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, StreamPhase::Resolving, Reason::Started);
+        ctx.watch(self.host_session);
+        ctx.watch(self.allocator);
+        if self.runtime.is_local_actor(self.child_session) {
+            ctx.watch(self.child_session);
+        }
         if let Err(error) = ctx.send(
             self.allocator,
             ArenaAllocatorIn::AllocateStream {
@@ -2981,11 +5074,16 @@ impl ActorInterface for HostStreamBindingActor {
             replace: self.replace,
             ensure: self.ensure,
             expected_revision: self.expected_revision,
-            operation_id: Self::operation_id(ctx.self_addr()),
-            completed: false,
+            operation_id: Self::operation_id(self.operation),
+            phase: NamespaceOperationPhase::Created,
+            transitions: self.transitions.clone(),
+            operation: self.operation,
+            session_generation: self.session_generation,
+            incarnation: None,
         }) {
             Ok(namespace_open) => {
                 self.namespace_open = Some(namespace_open);
+                ctx.watch(namespace_open);
             }
             Err(error) => {
                 self.fail_open(ctx, DataPlaneError::SessionFailed(error.to_string()));
@@ -2995,339 +5093,111 @@ impl ActorInterface for HostStreamBindingActor {
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: HostStreamIn) {
         match message {
-            HostStreamIn::NamespaceMatched(result) => {
-                self.namespace_open = None;
-                if self.terminal.is_some() {
-                    return;
-                }
-                match result {
-                    Ok(matched) => {
-                        let expected = match self.role {
-                            StreamRole::Source => matched.source,
-                            StreamRole::Sink => matched.sink,
-                        };
-                        if expected != ctx.self_addr() {
-                            self.fail_open(
-                                ctx,
-                                DataPlaneError::StreamFault(
-                                    "namespace matched the wrong stream endpoint".to_owned(),
-                                ),
-                            );
-                            return;
-                        }
-                        let incarnation = matched.incarnation;
-                        let pending_peer_termination =
-                            self.pending_peer_terminations.remove(&incarnation);
-                        if self.pending_displacements.contains_key(&incarnation) {
-                            self.matched = Some(matched);
-                            self.fence_displacement(ctx, incarnation, None);
-                            if let Some((error, reply_to)) = pending_peer_termination {
-                                self.apply_peer_termination(ctx, incarnation, error, reply_to);
-                            }
-                            return;
-                        }
-                        if self.role == StreamRole::Source && !matched.sink_descriptor.is_empty() {
-                            self.peer_descriptor =
-                                Some(StreamPeerDescriptor(matched.sink_descriptor.clone()));
-                        }
-                        self.matched = Some(matched);
-                        if let Some((error, reply_to)) = pending_peer_termination {
-                            self.apply_peer_termination(ctx, incarnation, error, reply_to);
-                            return;
-                        }
-                        if let Some(routes) = &self.route_registrar {
-                            let matched = self.matched.as_ref().expect("installed match");
-                            let peer = match self.role {
-                                StreamRole::Source => matched.sink,
-                                StreamRole::Sink => matched.source,
-                            };
-                            let incarnation = matched.incarnation;
-                            let sender = self.sender.clone();
-                            let target = ctx.self_addr();
-                            self.route_watch = routes.watch_route(
-                                peer,
-                                Arc::new(move || {
-                                    let _ = sender.send_to(
-                                        target,
-                                        HostStreamIn::RouteChanged { incarnation },
-                                    );
-                                }),
-                            );
-                        }
-                        if let Some((incarnation, descriptor)) = self.pending_peer_offer.take()
-                            && let Some(matched) = self.matched.as_ref()
-                            && matched.incarnation == incarnation
-                        {
-                            self.peer_descriptor = Some(descriptor);
-                            let _ =
-                                ctx.send(matched.sink, HostStreamIn::PeerOfferAck { incarnation });
-                        }
-                        self.try_install_transport(ctx);
-                    }
-                    Err(error) => self.fail_open(ctx, namespace_error(error)),
-                }
-            }
-            HostStreamIn::Allocated(result) => {
-                self.ring_allocation_pending = false;
-                match result {
-                    Ok(ring) => {
-                        self.ring = Some(ring);
-                        if let Some(error) = self.terminal.as_ref() {
-                            let _ = byte_ring::mark_peer_terminated_mapped(
-                                &self.arena,
-                                ring,
-                                Self::ring_peer_termination(error),
-                            );
-                        }
-                    }
-                    Err(error) => self.fail_open(ctx, error),
-                }
-                if self.terminal.is_some() {
-                    self.release_ring(ctx);
-                } else {
-                    self.try_install_transport(ctx);
-                }
-            }
+            HostStreamIn::NamespaceMatched(result) => self.namespace_matched(ctx, result),
+            HostStreamIn::Allocated(result) => self.allocated(ctx, result),
             HostStreamIn::PeerOffer {
                 incarnation,
                 descriptor,
-            } => {
-                if self.role != StreamRole::Source || self.terminal.is_some() {
-                    return;
-                }
-                if self.matched.is_none() {
-                    // Offers and namespace replies travel independently. Keep
-                    // the newest offer until the exact match authenticates it.
-                    if self
-                        .pending_peer_offer
-                        .as_ref()
-                        .is_none_or(|(known, _)| *known <= incarnation)
-                    {
-                        self.pending_peer_offer = Some((incarnation, descriptor));
-                    }
-                    return;
-                }
-                let sink = self
-                    .matched
-                    .as_ref()
-                    .filter(|matched| matched.incarnation == incarnation)
-                    .map(|matched| matched.sink);
-                if let Some(sink) = sink {
-                    self.peer_descriptor = Some(descriptor);
-                    let _ = ctx.send(sink, HostStreamIn::PeerOfferAck { incarnation });
-                    self.try_install_transport(ctx);
-                }
+            } => self.peer_offer(ctx, incarnation, descriptor),
+            HostStreamIn::PeerOfferAck { incarnation } => self.peer_offer_ack(ctx, incarnation),
+            HostStreamIn::PeerOfferRetry { incarnation } => self.peer_offer_retry(ctx, incarnation),
+            HostStreamIn::RouteChanged { incarnation } => self.route_changed(ctx, incarnation),
+            HostStreamIn::PeerRouteLossCheck {
+                incarnation,
+                generation,
+            } => self.peer_route_loss_check(ctx, incarnation, generation),
+            HostStreamIn::DataAvailable => self.data_available(),
+            HostStreamIn::CapacityAvailable => self.capacity_available(),
+            HostStreamIn::WaitData { reply_to } => self.wait_data(ctx, reply_to),
+            HostStreamIn::WaitCapacity { reply_to } => self.wait_capacity(ctx, reply_to),
+            HostStreamIn::WaitProgress { reply_to, target } => {
+                self.wait_progress(ctx, reply_to, target)
             }
-            HostStreamIn::PeerOfferAck { incarnation } => {
-                if self.role == StreamRole::Sink
-                    && self
-                        .matched
-                        .as_ref()
-                        .is_some_and(|matched| matched.incarnation == incarnation)
-                {
-                    self.peer_offer_acknowledged = true;
-                    if let Some(timer) = self.offer_retry.take() {
-                        timer.cancel();
-                    }
-                }
-            }
-            HostStreamIn::PeerOfferRetry { incarnation } => {
-                if self
-                    .matched
-                    .as_ref()
-                    .is_some_and(|matched| matched.incarnation == incarnation)
-                {
-                    self.offer_retry = None;
-                    self.send_peer_offer(ctx);
-                }
-            }
-            HostStreamIn::RouteChanged { incarnation } => {
-                if self
-                    .matched
-                    .as_ref()
-                    .is_some_and(|matched| matched.incarnation == incarnation)
-                {
-                    self.send_peer_offer(ctx);
-                    self.send_peer_termination(ctx);
-                    if self.role == StreamRole::Source
-                        && self.peer_descriptor.is_some()
-                        && self.terminal.is_none()
-                        && let Some(matched) = &self.matched
-                        && matched.sink_descriptor.is_empty()
-                    {
-                        let _ = ctx.send(matched.sink, HostStreamIn::PeerOfferAck { incarnation });
-                    }
-                }
-            }
-            HostStreamIn::Transport(StreamTransportEvent::Ready) => {
-                self.transport_ready = true;
-                self.open_if_ready(ctx);
-            }
-            HostStreamIn::Transport(StreamTransportEvent::DataAvailable) => {
-                Self::wake_waiters(ctx, self.child_session, &mut self.data_waiters, Ok(()));
-            }
-            HostStreamIn::Transport(StreamTransportEvent::CapacityAvailable) => {
-                Self::wake_waiters(ctx, self.child_session, &mut self.capacity_waiters, Ok(()));
-            }
-            HostStreamIn::Transport(StreamTransportEvent::Fault(reason)) => {
-                self.fail_open(ctx, DataPlaneError::StreamFault(reason));
-            }
-            HostStreamIn::Transport(StreamTransportEvent::Quiesced) => {
-                self.transport_quiesced = true;
-                if self.terminal.is_some() && !self.peer_ack_pending {
-                    self.release_ring(ctx);
-                }
-            }
-            HostStreamIn::DataAvailable => {
-                if let Some(matched) = &self.matched {
-                    self.transport.source_progress(matched.incarnation);
-                }
-            }
-            HostStreamIn::CapacityAvailable => {
-                if let Some(matched) = &self.matched {
-                    self.transport.sink_progress(matched.incarnation);
-                }
-            }
-            HostStreamIn::WaitData { reply_to } => {
-                let result = self
-                    .terminal
-                    .as_ref()
-                    .map(|error| Err(error.clone()))
-                    .or_else(|| {
-                        self.matched
-                            .as_ref()
-                            .filter(|matched| self.transport.sink_has_data(matched.incarnation))
-                            .map(|_| Ok(()))
-                    });
-                if let Some(result) = result {
-                    let _ = ctx.send(
-                        self.child_session,
-                        ChildSessionIn::StreamWake { reply_to, result },
-                    );
-                } else {
-                    self.data_waiters.push(reply_to);
-                }
-            }
-            HostStreamIn::WaitCapacity { reply_to } => {
-                let result = self
-                    .terminal
-                    .as_ref()
-                    .map(|error| Err(error.clone()))
-                    .or_else(|| {
-                        self.matched
-                            .as_ref()
-                            .filter(|matched| {
-                                self.transport.source_has_capacity(matched.incarnation)
-                            })
-                            .map(|_| Ok(()))
-                    });
-                if let Some(result) = result {
-                    let _ = ctx.send(
-                        self.child_session,
-                        ChildSessionIn::StreamWake { reply_to, result },
-                    );
-                } else {
-                    self.capacity_waiters.push(reply_to);
-                }
-            }
-            HostStreamIn::Close { clean, reply_to } => {
-                if let Some(reply_to) = reply_to {
-                    self.close_waiters.push(reply_to);
-                }
-                if clean {
-                    self.begin_terminal(ctx, DataPlaneError::StreamClosed, false, false);
-                } else {
-                    self.fail_open(ctx, DataPlaneError::OperationCancelled);
-                }
-            }
+            HostStreamIn::Close { clean, reply_to } => self.close(ctx, clean, reply_to),
             HostStreamIn::PeerTerminated {
                 incarnation,
                 error,
                 reply_to,
-            } => {
-                let matched_incarnation = self.matched.as_ref().map(|matched| matched.incarnation);
-                if matched_incarnation == Some(incarnation) {
-                    self.apply_peer_termination(ctx, incarnation, error, reply_to);
-                } else if matched_incarnation.is_none() {
-                    // Peer termination can overtake this binding's namespace
-                    // reply. Retain it by incarnation so only the authenticated
-                    // match applies the terminal state and receives an ACK.
-                    self.pending_peer_terminations
-                        .insert(incarnation, (error, reply_to));
-                }
-            }
+            } => self.peer_terminated(ctx, incarnation, error, reply_to),
             HostStreamIn::Displaced {
                 incarnation,
                 reply_to,
-            } => {
-                let matched_incarnation = self.matched.as_ref().map(|matched| matched.incarnation);
-                if matched_incarnation == Some(incarnation) {
-                    self.fence_displacement(ctx, incarnation, reply_to);
-                } else if self.fenced_displacements.contains(&incarnation) {
-                    if let Some(reply_to) = reply_to {
-                        self.acknowledge_displacement(ctx, reply_to, incarnation);
-                    }
-                } else if matched_incarnation.is_none() {
-                    // The directory notice can overtake the namespace reply.
-                    // Retain its acknowledger until the exact incarnation is
-                    // matched and synchronously fenced.
-                    let replies = self.pending_displacements.entry(incarnation).or_default();
-                    if let Some(reply_to) = reply_to {
-                        replies.insert(reply_to);
-                    }
-                }
-            }
+            } => self.displaced(ctx, incarnation, reply_to),
             HostStreamIn::PeerTerminationAck { incarnation } => {
-                if self
-                    .matched
-                    .as_ref()
-                    .is_some_and(|matched| matched.incarnation == incarnation)
-                {
-                    self.peer_ack_pending = false;
-                    if let Some(timer) = self.termination_retry.take() {
-                        timer.cancel();
-                    }
-                    if self.terminal.is_some()
-                        && (!self.transport_installed || self.transport_quiesced)
-                    {
-                        self.release_ring(ctx);
-                    }
-                }
+                self.peer_termination_ack(ctx, incarnation)
             }
             HostStreamIn::PeerTerminationRetry { incarnation } => {
-                if self.peer_ack_pending
-                    && self
-                        .matched
-                        .as_ref()
-                        .is_some_and(|matched| matched.incarnation == incarnation)
-                {
-                    self.termination_retry = None;
-                    self.send_peer_termination(ctx);
-                }
+                self.peer_termination_retry(ctx, incarnation)
             }
-            HostStreamIn::ReleaseComplete(result) => {
-                if let Err(error) = &result
-                    && !self.opened
-                {
-                    let _ = ctx.send(
-                        self.child_session,
-                        ChildSessionIn::OperationFailed {
-                            operation: self.operation,
-                            error: error.clone(),
-                        },
-                    );
-                }
-                self.complete_release(ctx, result);
+            HostStreamIn::ReleaseComplete(result) => self.release_complete(ctx, result),
+            HostStreamIn::SessionDetached => self.session_detached(ctx),
+            HostStreamIn::NamespaceClosed(result) => self.namespace_closed(ctx, result),
+            HostStreamIn::OpenForwarded { incarnation } => self.open_forwarded(ctx, incarnation),
+            HostStreamIn::Transport { incarnation, event } => {
+                self.transport_event(ctx, incarnation, event)
             }
         }
     }
 
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if self.namespace_open == Some(exited.addr) {
+            self.namespace_open = None;
+            if self.phase.terminal() {
+                self.finish_release(ctx);
+            } else {
+                self.fail_open(ctx, DataPlaneError::SessionNotRunning);
+            }
+        } else if self.namespace_close == Some(exited.addr) {
+            self.namespace_closed(ctx, Err(DataPlaneError::SessionNotRunning));
+        } else if exited.addr == self.allocator {
+            self.ring_allocation_pending = false;
+            self.fail_open(ctx, DataPlaneError::SessionNotRunning);
+            if matches!(self.release, StreamRelease::Pending) {
+                self.complete_release(ctx, Err(DataPlaneError::SessionNotRunning));
+            }
+        } else if exited.addr == self.child_session || exited.addr == self.host_session {
+            self.fail_open(ctx, DataPlaneError::SessionNotRunning);
+            if exited.addr == self.host_session && self.phase == StreamPhase::Closed {
+                ctx.stop_self();
+            }
+        } else if let Some((incarnation, peer)) = self.peer_route()
+            && peer == exited.addr
+        {
+            self.route_state = StreamRouteState::Unavailable;
+            self.apply_peer_termination(ctx, incarnation, DataPlaneError::PeerLost, None);
+            self.peer_state = StreamPeerState::Terminated;
+            if let Some(timer) = self.termination_retry.take() {
+                timer.cancel();
+            }
+            self.release_ring(ctx);
+        }
+    }
+
     fn on_stop(&mut self, ctx: &Ctx<'_>) {
-        if let Some(namespace_close) = self.namespace_close.take() {
-            let _ = ctx.stop_actor(namespace_close);
+        if !self.phase.terminal() {
+            self.begin_terminal(ctx, DataPlaneError::SessionNotRunning, true, true);
+        }
+        if let Some(namespace_open) = self.namespace_open.take() {
+            let _ = ctx.stop_actor(namespace_open);
         }
         if let Some(matched) = &self.matched {
             self.transport.terminate(matched.incarnation);
+        }
+        // Namespace cleanup owns its request independently until it receives a
+        // terminal reply; stopping the binding must not cancel that cleanup.
+        if self.phase != StreamPhase::Closed {
+            Self::wake_waiters(
+                ctx,
+                self.child_session,
+                &mut self.close_waiters,
+                Err(DataPlaneError::SessionNotRunning),
+            );
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::BindingDone {
+                    binding: ctx.self_addr(),
+                },
+            );
         }
     }
 }
@@ -3338,6 +5208,9 @@ impl Drop for HostStreamBindingActor {
             timer.cancel();
         }
         if let Some(timer) = self.termination_retry.take() {
+            timer.cancel();
+        }
+        if let Some(timer) = self.route_loss_timer.take() {
             timer.cancel();
         }
     }
@@ -3351,30 +5224,167 @@ mod stream_displacement_tests {
     use crate::byte_ring::{Endpoint, RecordKind};
     use crate::namespace::DirectoryRequestId;
     use crate::stream_transport::LocalStreamTransport;
-    use std::time::Instant;
+    use futures_lite::future;
+    use std::any::Any;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, Weak};
     use swactor::actor::Message;
-    use swactor::runtime::{Inbox, RuntimeConfig, RuntimeParts};
-    use swactor_engine::{Engine, TokioBackend, TokioConfig};
+    use swactor::runtime::{Inbox, RemoteSink, RuntimeConfig, RuntimeParts};
+    use swactor::std::StdExtension;
+    use swactor_engine::{Engine, SteppingBackend};
 
-    fn receive<M: Message>(inbox: &Inbox<M>) -> M {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+    fn settle(backend: &SteppingBackend) {
+        for _ in 0..64 {
+            backend.step();
+        }
+    }
+
+    fn receive<M: Message>(backend: &SteppingBackend, inbox: &Inbox<M>) -> M {
+        for _ in 0..256 {
+            backend.step();
             if let Some(message) = inbox.try_recv() {
                 return message;
             }
-            assert!(Instant::now() < deadline, "stream actor did not respond");
-            std::thread::yield_now();
+        }
+        panic!("stream actor did not respond after deterministic scheduling");
+    }
+
+    struct TestRoutes {
+        routable: AtomicBool,
+        changed: Mutex<Option<Weak<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl TestRoutes {
+        fn new() -> Self {
+            Self {
+                routable: AtomicBool::new(true),
+                changed: Mutex::new(None),
+            }
+        }
+
+        fn revoke(&self) {
+            self.routable.store(false, Ordering::Release);
+            let changed = self.changed.lock().expect("route callback lock").clone();
+            if let Some(changed) = changed.and_then(|changed| changed.upgrade()) {
+                changed();
+            }
+        }
+
+        fn restore(&self) {
+            self.routable.store(true, Ordering::Release);
+            let changed = self.changed.lock().expect("route callback lock").clone();
+            if let Some(changed) = changed.and_then(|changed| changed.upgrade()) {
+                changed();
+            }
+        }
+    }
+
+    impl HostRouteRegistrar for TestRoutes {
+        fn register_child(
+            &self,
+            _child_session: ActorAddress,
+            _child_node: [u8; 32],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn revoke_child(&self, _child_session: ActorAddress) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn is_routable(&self, _actor: ActorAddress) -> bool {
+            self.routable.load(Ordering::Acquire)
+        }
+
+        fn watch_route(
+            &self,
+            _actor: ActorAddress,
+            changed: Arc<dyn Fn() + Send + Sync>,
+        ) -> Option<HostRouteWatch> {
+            *self.changed.lock().expect("route callback lock") = Some(Arc::downgrade(&changed));
+            Some(HostRouteWatch::new(changed))
+        }
+    }
+
+    struct PassivePeer;
+
+    impl ActorInterface for PassivePeer {
+        type Incoming = HostStreamIn;
+        type Response = ();
+
+        fn handle(&mut self, _ctx: &Ctx<'_>, _message: HostStreamIn) {}
+    }
+
+    struct AcceptingRemoteSink;
+
+    impl RemoteSink for AcceptingRemoteSink {
+        fn send(
+            &self,
+            _addr: ActorAddress,
+            _message: Box<dyn Any + Send>,
+        ) -> Result<(), swactor::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRemoteSink {
+        messages: Mutex<Vec<(ActorAddress, HostStreamIn)>>,
+    }
+
+    impl RecordingRemoteSink {
+        fn receive(&self, backend: &SteppingBackend) -> (ActorAddress, HostStreamIn) {
+            for _ in 0..256 {
+                backend.step();
+                if let Some(message) = self.messages.lock().expect("remote messages").pop() {
+                    return message;
+                }
+            }
+            panic!("remote stream notice was not sent");
+        }
+    }
+
+    impl RemoteSink for RecordingRemoteSink {
+        fn send(
+            &self,
+            addr: ActorAddress,
+            message: Box<dyn Any + Send>,
+        ) -> Result<(), swactor::Error> {
+            let message = message
+                .downcast::<HostStreamIn>()
+                .expect("unexpected remote message type");
+            self.messages
+                .lock()
+                .expect("remote messages")
+                .push((addr, *message));
+            Ok(())
         }
     }
 
     // Hold namespace and allocator replies independently while using the real
     // binding actor, arena allocator, and local stream transport.
+    struct NamespaceProxy {
+        requests: ActorAddress,
+    }
+
+    impl ActorInterface for NamespaceProxy {
+        type Incoming = NamespaceClientIn;
+        type Response = ();
+
+        fn handle(&mut self, ctx: &Ctx<'_>, message: Self::Incoming) {
+            ctx.send(self.requests, message).unwrap();
+        }
+    }
+
     struct Harness {
         _engine: Engine,
+        backend: SteppingBackend,
         runtime: Runtime,
+        telemetry: telemetry::TelemetryEndpoint,
         allocator: ArenaAllocatorActor,
         allocation_requests: Inbox<ArenaAllocatorIn>,
         namespace_requests: Inbox<NamespaceClientIn>,
+        namespace_proxy: ActorAddress,
         namespace_reply: ActorAddress,
         allocation_capacity: u64,
         child: Inbox<ChildSessionIn>,
@@ -3383,26 +5393,26 @@ mod stream_displacement_tests {
         directory: Inbox<DataDirectoryIn>,
         binding: ActorAddress,
         path: DataPath,
+        role: StreamRole,
         arena: Arc<MappedArena>,
         transport: Arc<LocalStreamTransport>,
+        routes: Arc<TestRoutes>,
     }
 
     impl Harness {
         fn new() -> Self {
+            Self::with_role(StreamRole::Sink)
+        }
+
+        fn with_role(role: StreamRole) -> Self {
             let parts = RuntimeParts::new(RuntimeConfig {
                 worker_count: 1,
                 ..RuntimeConfig::default()
-            });
+            })
+            .with_extension(Arc::new(StdExtension::new()));
             let runtime = parts.runtime().clone();
-            let engine = Engine::new(
-                parts,
-                TokioBackend::new(TokioConfig {
-                    worker_threads: 1,
-                    ..TokioConfig::default()
-                })
-                .expect("stream backend"),
-            )
-            .expect("stream engine");
+            let backend = SteppingBackend::new();
+            let engine = Engine::new(parts, backend.clone()).expect("stream engine");
             let mut allocator_arena = ArenaManager::boot(ArenaConfig {
                 node_id: NodeId(1),
                 reservation_ceiling: 2 << 20,
@@ -3421,18 +5431,33 @@ mod stream_displacement_tests {
             let arena = Arc::new(arena);
             let allocation_requests = runtime.new_inbox().expect("allocator inbox");
             let namespace_requests = runtime.new_inbox().expect("namespace inbox");
+            let namespace_proxy = runtime
+                .spawn(NamespaceProxy {
+                    requests: *namespace_requests.addr(),
+                })
+                .expect("namespace proxy actor");
             let child = runtime.new_inbox().expect("child inbox");
             let host = runtime.new_inbox().expect("host inbox");
             let peer = runtime.new_inbox().expect("peer inbox");
             let directory = runtime.new_inbox().expect("directory inbox");
             let path = DataPath::parse("/streams/displacement").expect("stream path");
             let transport = Arc::new(LocalStreamTransport::new());
+            let routes = Arc::new(TestRoutes::new());
+            let telemetry = telemetry::TelemetryEndpoint::new(telemetry::StreamId::new(
+                telemetry::NodeId::new("namespace-wrappers"),
+                telemetry::Lifetime(1),
+            ))
+            .with_retention(1024, 1 << 20);
+            let transitions = TransitionEmitter::register(&telemetry.producer());
             let binding = runtime
                 .spawn(HostStreamBindingActor {
+                    transitions: Some(transitions),
+                    session_generation: 1,
+                    phase: StreamPhase::Resolving,
                     runtime: runtime.clone(),
                     engine: engine.handle(),
                     sender: runtime.create_sender(),
-                    route_registrar: None,
+                    route_registrar: Some(routes.clone()),
                     host_session: *host.addr(),
                     allocator: *allocation_requests.addr(),
                     child_session: *child.addr(),
@@ -3441,54 +5466,70 @@ mod stream_displacement_tests {
                     replace: false,
                     ensure: false,
                     expected_revision: None,
-                    role: StreamRole::Sink,
-                    namespace: NamespaceClient::new(runtime.clone(), *namespace_requests.addr()),
+                    role,
+                    namespace: NamespaceClient::new(runtime.clone(), namespace_proxy),
                     arena: arena.clone(),
                     transport: transport.clone(),
                     local_descriptor: transport.descriptor().expect("local descriptor"),
                     ring: None,
+                    ring_probe: None,
                     ring_allocation_pending: true,
                     matched: None,
                     pending_displacements: HashMap::new(),
                     fenced_displacements: HashSet::new(),
                     pending_peer_terminations: HashMap::new(),
                     peer_descriptor: None,
-                    peer_offer_acknowledged: false,
-                    transport_installed: false,
-                    transport_ready: false,
-                    opened: false,
-                    transport_quiesced: false,
+                    peer_state: StreamPeerState::Negotiating,
+                    transport_state: StreamTransportState::Absent,
+                    open_completion: StreamOpenCompletion::Owned,
+                    route_state: StreamRouteState::Unknown,
                     terminal: None,
                     data_waiters: Vec::new(),
                     capacity_waiters: Vec::new(),
+                    progress_waiters: Vec::new(),
                     close_waiters: Vec::new(),
-                    release_started: false,
+                    release: StreamRelease::NotStarted,
+                    peer_was_local: false,
+                    namespace_close_result: None,
                     namespace_open: None,
                     namespace_close: None,
-                    peer_ack_pending: false,
                     route_watch: None,
                     offer_retry: None,
                     termination_retry: None,
-                    pending_peer_offer: None,
+                    termination_route_retries: 0,
+                    route_loss_timer: None,
+                    route_loss_generation: 0,
+                    pending_peer_offers: HashMap::new(),
+                    detach_pending: false,
                 })
                 .expect("stream binding");
-            let ArenaAllocatorIn::AllocateStream { capacity, .. } = receive(&allocation_requests)
+            let ArenaAllocatorIn::AllocateStream { capacity, .. } =
+                receive(&backend, &allocation_requests)
             else {
                 panic!("expected stream allocation");
             };
             let NamespaceClientIn::Request {
                 request: NamespaceRequest::OpenStream { .. },
                 reply_to: namespace_reply,
-            } = receive(&namespace_requests)
+            } = receive(&backend, &namespace_requests)
             else {
                 panic!("expected stream namespace open");
             };
             Self {
                 _engine: engine,
-                allocator: ArenaAllocatorActor::new(allocator_arena, 1, runtime.clone(), None),
+                backend,
+                allocator: ArenaAllocatorActor::new(
+                    None,
+                    allocator_arena,
+                    1,
+                    runtime.clone(),
+                    None,
+                ),
                 runtime,
+                telemetry,
                 allocation_requests,
                 namespace_requests,
+                namespace_proxy,
                 namespace_reply,
                 allocation_capacity: capacity,
                 child,
@@ -3497,9 +5538,50 @@ mod stream_displacement_tests {
                 directory,
                 binding,
                 path,
+                role,
                 arena,
                 transport,
+                routes,
             }
+        }
+
+        fn namespace_transitions(&self, actor: ActorAddress) -> Vec<TransitionRecord> {
+            self.telemetry.tick();
+            let retained = self.telemetry.subscribe_retained(
+                "namespace-wrapper-lifecycle",
+                telemetry::SubscriptionRequest::all(),
+            );
+            let mut decoder =
+                protocol_telemetry::consumer::TransitionDecoder::from_snapshot(retained.snapshot());
+            retained
+                .drain_available()
+                .iter()
+                .filter_map(|event| {
+                    decoder
+                        .observe(event)
+                        .expect("decode namespace transition")
+                        .map(|observed| observed.record)
+                })
+                .filter(|record| {
+                    record.actor == actor && record.protocol == Protocol::NamespaceOperation
+                })
+                .collect()
+        }
+
+        fn receive_child(&self) -> ChildSessionIn {
+            let message = receive(&self.backend, &self.child);
+            if let ChildSessionIn::StreamOpened { incarnation, .. } = &message {
+                self.runtime
+                    .send_to(
+                        self.binding,
+                        HostStreamIn::OpenForwarded {
+                            incarnation: *incarnation,
+                        },
+                    )
+                    .expect("acknowledge caller grant");
+                settle(&self.backend);
+            }
+            message
         }
 
         fn allocate(&mut self) -> RingHandle {
@@ -3515,23 +5597,50 @@ mod stream_displacement_tests {
 
         fn install_peer(&mut self, incarnation: StreamIncarnation) -> Endpoint {
             let ring = self.allocator.allocate_stream(64).expect("peer ring");
-            self.transport
-                .install_source(StreamSourceRequest {
-                    incarnation,
-                    peer: self.transport.descriptor().expect("peer descriptor"),
-                    endpoint: byte_ring::attach_mapped(&self.arena, ring, Role::Consumer)
-                        .expect("peer transport endpoint"),
-                    notifier: Arc::new(RuntimeStreamNotifier {
-                        runtime: self.runtime.clone(),
-                        target: *self.peer.addr(),
-                    }),
-                })
-                .expect("install peer source");
-            byte_ring::attach_mapped(&self.arena, ring, Role::Producer).expect("peer writer")
+            let notifier: Arc<dyn StreamTransportNotifier> = Arc::new(RuntimeStreamNotifier {
+                runtime: self.runtime.clone(),
+                target: *self.peer.addr(),
+                incarnation,
+            });
+            match self.role {
+                StreamRole::Source => {
+                    self.transport
+                        .install_sink(StreamSinkRequest {
+                            incarnation,
+                            endpoint: byte_ring::attach_mapped(&self.arena, ring, Role::Producer)
+                                .expect("peer transport endpoint"),
+                            notifier,
+                        })
+                        .expect("install peer sink");
+                    byte_ring::attach_mapped(&self.arena, ring, Role::Consumer)
+                        .expect("peer reader")
+                }
+                StreamRole::Sink => {
+                    self.transport
+                        .install_source(StreamSourceRequest {
+                            incarnation,
+                            peer: self.transport.descriptor().expect("peer descriptor"),
+                            endpoint: byte_ring::attach_mapped(&self.arena, ring, Role::Consumer)
+                                .expect("peer transport endpoint"),
+                            notifier,
+                        })
+                        .expect("install peer source");
+                    byte_ring::attach_mapped(&self.arena, ring, Role::Producer)
+                        .expect("peer writer")
+                }
+            }
         }
 
         fn match_namespace(&self, incarnation: StreamIncarnation) {
+            self.match_namespace_with_peer(incarnation, *self.peer.addr());
+        }
+
+        fn match_namespace_with_peer(&self, incarnation: StreamIncarnation, peer: ActorAddress) {
             let descriptor = self.transport.descriptor().expect("peer descriptor").0;
+            let (source, sink) = match self.role {
+                StreamRole::Source => (self.binding, peer),
+                StreamRole::Sink => (peer, self.binding),
+            };
             self.runtime
                 .send_to(
                     self.namespace_reply,
@@ -3540,10 +5649,10 @@ mod stream_displacement_tests {
                         authority_epoch: incarnation.authority_epoch,
                         result: Ok(StreamMatch {
                             incarnation,
-                            source: *self.peer.addr(),
+                            source,
                             source_descriptor: descriptor.clone(),
                             sink_descriptor: descriptor,
-                            sink: self.binding,
+                            sink,
                             revision: incarnation.revision,
                         }),
                     },
@@ -3565,13 +5674,13 @@ mod stream_displacement_tests {
 
         fn expect_displacement_ack(&self) {
             assert!(matches!(
-                receive(&self.directory),
+                receive(&self.backend, &self.directory),
                 DataDirectoryIn::StreamDisplaced { endpoint, .. } if endpoint == self.binding
             ));
         }
         fn expect_replaced(&self) {
             assert!(matches!(
-                receive(&self.child),
+                receive(&self.backend, &self.child),
                 ChildSessionIn::OperationFailed {
                     error: DataPlaneError::PathReplaced(path),
                     ..
@@ -3579,11 +5688,11 @@ mod stream_displacement_tests {
             ));
         }
 
-        fn finish_release(&mut self) {
+        fn finish_release_before_detach(&mut self) {
             let NamespaceClientIn::Request {
                 request: NamespaceRequest::CloseStream { incarnation, .. },
                 reply_to,
-            } = receive(&self.namespace_requests)
+            } = receive(&self.backend, &self.namespace_requests)
             else {
                 panic!("expected namespace stream close");
             };
@@ -3597,8 +5706,12 @@ mod stream_displacement_tests {
                     },
                 )
                 .expect("complete namespace close");
+            for _ in 0..=STREAM_PEER_TERMINATION_ROUTE_RETRY_LIMIT {
+                self.backend.advance_time(STREAM_PEER_OFFER_RETRY);
+                settle(&self.backend);
+            }
             let ArenaAllocatorIn::ReleaseStream { binding, ring } =
-                receive(&self.allocation_requests)
+                receive(&self.backend, &self.allocation_requests)
             else {
                 panic!("expected stream release");
             };
@@ -3614,10 +5727,48 @@ mod stream_displacement_tests {
                 .send_to(binding, HostStreamIn::ReleaseComplete(result))
                 .expect("complete allocation release");
             assert!(matches!(
-                receive(&self.host),
+                receive(&self.backend, &self.host),
                 HostSessionIn::BindingDone { binding } if binding == self.binding
             ));
             assert!(self.child.try_recv().is_none(), "retired stream reopened");
+        }
+
+        fn detach_binding(&self) {
+            self.runtime
+                .send_to(self.binding, HostStreamIn::SessionDetached)
+                .expect("detach retired stream binding");
+            settle(&self.backend);
+            assert!(!self.runtime.is_local_actor(self.binding));
+        }
+
+        fn finish_release(&mut self) {
+            self.finish_release_before_detach();
+            self.detach_binding();
+        }
+
+        fn finish_unmatched_release(&mut self) {
+            let ArenaAllocatorIn::ReleaseStream { binding, ring } =
+                receive(&self.backend, &self.allocation_requests)
+            else {
+                panic!("expected unmatched stream release");
+            };
+            let result = self.allocator.release_stream(ring);
+            assert_eq!(result, Ok(()));
+            self.runtime
+                .send_to(binding, HostStreamIn::ReleaseComplete(result))
+                .expect("complete unmatched allocation release");
+            assert!(matches!(
+                receive(&self.backend, &self.host),
+                HostSessionIn::BindingDone { binding } if binding == self.binding
+            ));
+            self.detach_binding();
+            assert!(self.child.try_recv().is_none(), "open completed twice");
+            assert!(self.host.try_recv().is_none(), "binding completed twice");
+        }
+
+        fn disconnect_peer(&mut self) {
+            let replacement = self.runtime.new_inbox().expect("replacement peer inbox");
+            drop(std::mem::replace(&mut self.peer, replacement));
         }
     }
 
@@ -3670,7 +5821,7 @@ mod stream_displacement_tests {
         harness.allocate();
         let mut writer = harness.install_peer(CURRENT);
         harness.match_namespace(CURRENT);
-        let ChildSessionIn::StreamOpened { ring, .. } = receive(&harness.child) else {
+        let ChildSessionIn::StreamOpened { ring, .. } = harness.receive_child() else {
             panic!("unrelated displacement rejected current stream");
         };
         let mut reader = byte_ring::attach_mapped(&harness.arena, ring, Role::Consumer)
@@ -3691,6 +5842,542 @@ mod stream_displacement_tests {
             reader.peer_termination().expect("read displacement fence"),
             Some(PeerTermination::PathReplaced)
         );
+        harness.finish_release();
+    }
+
+    #[test]
+    fn terminal_stream_releases_when_its_peer_route_is_gone() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        harness.disconnect_peer();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            )
+            .expect("close stream after peer exit");
+        harness.finish_release();
+    }
+
+    #[test]
+    fn terminal_stream_retries_peer_notice_while_remote_route_converges() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        let peer = ActorAddress::new_random();
+        let remote = Arc::new(RecordingRemoteSink::default());
+        harness.runtime.set_remote_sink(remote.clone());
+        harness.match_namespace_with_peer(CURRENT, peer);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+
+        harness.routes.revoke();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            )
+            .expect("close stream while peer route is converging");
+        let NamespaceClientIn::Request {
+            request: NamespaceRequest::CloseStream { incarnation, .. },
+            reply_to: namespace_reply,
+        } = receive(&harness.backend, &harness.namespace_requests)
+        else {
+            panic!("expected namespace stream close");
+        };
+        assert!(
+            remote.messages.lock().expect("remote messages").is_empty(),
+            "terminal notice bypassed the missing route"
+        );
+
+        harness.routes.restore();
+        let (target, message) = remote.receive(&harness.backend);
+        let HostStreamIn::PeerTerminated {
+            incarnation: noticed,
+            error: DataPlaneError::PeerLost,
+            reply_to: Some(acknowledger),
+        } = message
+        else {
+            panic!("expected peer termination notice");
+        };
+        assert_eq!(target, peer);
+        assert_eq!(noticed, CURRENT);
+        harness
+            .runtime
+            .send_to(
+                acknowledger,
+                HostStreamIn::PeerTerminationAck {
+                    incarnation: noticed,
+                },
+            )
+            .expect("acknowledge terminal notice");
+        harness
+            .runtime
+            .send_to(
+                namespace_reply,
+                DataDirectoryOut::StreamClosed {
+                    request_id: DirectoryRequestId(2),
+                    authority_epoch: incarnation.authority_epoch,
+                    result: Ok(()),
+                },
+            )
+            .expect("complete namespace close");
+
+        let ArenaAllocatorIn::ReleaseStream { binding, ring } =
+            receive(&harness.backend, &harness.allocation_requests)
+        else {
+            panic!("expected stream release");
+        };
+        let result = harness.allocator.release_stream(ring);
+        assert_eq!(result, Ok(()));
+        harness
+            .runtime
+            .send_to(binding, HostStreamIn::ReleaseComplete(result))
+            .expect("complete allocation release");
+        assert!(matches!(
+            receive(&harness.backend, &harness.host),
+            HostSessionIn::BindingDone { binding } if binding == harness.binding
+        ));
+        harness.detach_binding();
+    }
+
+    #[test]
+    fn terminal_stream_releases_when_local_peer_disappears_behind_remote_sink() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        let peer = harness
+            .runtime
+            .spawn(PassivePeer)
+            .expect("spawn local peer");
+        harness.match_namespace_with_peer(CURRENT, peer);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+
+        harness
+            .runtime
+            .stop_actor(peer)
+            .expect("stop local stream peer");
+        settle(&harness.backend);
+        assert!(!harness.runtime.is_local_actor(peer));
+        harness
+            .runtime
+            .set_remote_sink(Arc::new(AcceptingRemoteSink));
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            )
+            .expect("close stream after local peer exit");
+        harness.finish_release();
+    }
+
+    #[test]
+    fn released_stream_binding_drains_reply_controls_before_session_detach() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        harness.disconnect_peer();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            )
+            .expect("terminate stream");
+        harness.finish_release_before_detach();
+
+        let reply_to = *harness.directory.addr();
+        harness
+            .runtime
+            .send_to(harness.binding, HostStreamIn::WaitCapacity { reply_to })
+            .expect("forward late capacity wait");
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake {
+                reply_to: observed,
+                result: Err(DataPlaneError::OperationCancelled | DataPlaneError::PeerLost),
+            } if observed == reply_to
+        ));
+        harness.detach_binding();
+    }
+
+    #[test]
+    fn session_detach_drains_already_queued_stream_controls() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        harness.disconnect_peer();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: None,
+                },
+            )
+            .expect("terminate stream");
+        harness.finish_release_before_detach();
+
+        let suspended = harness
+            .runtime
+            .admin()
+            .suspend_actor(harness.binding)
+            .expect("suspend binding");
+        settle(&harness.backend);
+        future::block_on(suspended.recv()).expect("binding suspended");
+        let reply_to = *harness.directory.addr();
+        harness
+            .runtime
+            .send_to(harness.binding, HostStreamIn::SessionDetached)
+            .expect("queue session detach");
+        harness
+            .runtime
+            .send_to(harness.binding, HostStreamIn::WaitCapacity { reply_to })
+            .expect("queue final capacity wait");
+        let resumed = harness
+            .runtime
+            .admin()
+            .resume_actor(harness.binding)
+            .expect("resume binding");
+        settle(&harness.backend);
+        future::block_on(resumed.recv()).expect("binding resumed");
+
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake {
+                reply_to: observed,
+                result: Err(DataPlaneError::OperationCancelled | DataPlaneError::PeerLost),
+            } if observed == reply_to
+        ));
+    }
+
+    #[test]
+    fn host_session_wakes_reply_controls_after_stream_binding_retirement() {
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
+            ..RuntimeConfig::default()
+        })
+        .with_extension(Arc::new(StdExtension::new()));
+        let runtime = parts.runtime().clone();
+        let backend = SteppingBackend::new();
+        let engine = Engine::new(parts, backend.clone()).expect("host-session engine");
+        let child = runtime.new_inbox::<ChildSessionIn>().expect("child inbox");
+        let binding = runtime
+            .new_inbox::<HostStreamIn>()
+            .expect("stream binding inbox");
+        let mut session = HostDataPlaneSessionActor::new(HostDataPlaneConfig {
+            runtime: runtime.clone(),
+            engine: engine.handle(),
+            arena: ArenaManager::boot(ArenaConfig {
+                node_id: NodeId(2),
+                reservation_ceiling: 2 << 20,
+                base_alignment: 64,
+            })
+            .expect("host-session arena"),
+            arena_generation: 1,
+            session_generation: 1,
+            capability: SessionCapability::new([3; 32]),
+            session_access: SessionAccess {
+                execution_id: "retired-stream-control".to_owned(),
+                read_prefixes: Vec::new(),
+                write_prefixes: Vec::new(),
+            },
+            namespace: None,
+            transfer_receiver: None,
+            source_sender: None,
+            source_publisher: None,
+            route_registrar: None,
+            stream_transport: None,
+            transitions: None,
+        })
+        .expect("host session");
+        session.state = HostSessionState::Running;
+        session.child_session = Some(*child.addr());
+        session
+            .stream_bindings
+            .insert(*binding.addr(), *binding.addr());
+        let host_session = runtime.spawn(session).expect("spawn host session");
+
+        runtime
+            .send_to(
+                host_session,
+                HostSessionIn::BindingDone {
+                    binding: *binding.addr(),
+                },
+            )
+            .expect("retire binding");
+        assert!(matches!(
+            receive(&backend, &binding),
+            HostStreamIn::SessionDetached
+        ));
+
+        let reply_to = *binding.addr();
+        runtime
+            .send_to(
+                host_session,
+                HostSessionIn::StreamControl {
+                    binding: *binding.addr(),
+                    message: HostStreamIn::WaitCapacity { reply_to },
+                },
+            )
+            .expect("send late stream control");
+        assert!(matches!(
+            receive(&backend, &child),
+            ChildSessionIn::StreamWake {
+                reply_to: observed,
+                result: Err(DataPlaneError::StreamClosed),
+            } if observed == reply_to
+        ));
+    }
+
+    #[test]
+    fn active_stream_terminates_when_peer_route_is_revoked_without_peer_notice() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        let ChildSessionIn::StreamOpened { ring, .. } = harness.receive_child() else {
+            panic!("expected open stream");
+        };
+        let reader =
+            byte_ring::attach_mapped(&harness.arena, ring, Role::Consumer).expect("stream reader");
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::WaitData {
+                    reply_to: *harness.directory.addr(),
+                },
+            )
+            .expect("park stream read");
+
+        harness.routes.revoke();
+        settle(&harness.backend);
+
+        assert!(
+            harness.child.try_recv().is_none(),
+            "transient route loss terminated the stream before its grace period"
+        );
+
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::PeerRouteLossCheck {
+                    incarnation: CURRENT,
+                    generation: 1,
+                },
+            )
+            .expect("expire route-loss grace");
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake {
+                result: Err(DataPlaneError::PeerLost),
+                ..
+            }
+        ));
+        assert_eq!(
+            reader.peer_termination().expect("read peer loss"),
+            Some(PeerTermination::Closed)
+        );
+        harness.finish_release();
+    }
+
+    #[test]
+    fn active_stream_survives_transient_route_loss_with_transport_progress() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        let ChildSessionIn::StreamOpened { ring, .. } = harness.receive_child() else {
+            panic!("expected open stream");
+        };
+        let reader =
+            byte_ring::attach_mapped(&harness.arena, ring, Role::Consumer).expect("stream reader");
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::WaitData {
+                    reply_to: *harness.directory.addr(),
+                },
+            )
+            .expect("park stream read");
+        harness.routes.revoke();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Transport {
+                    incarnation: CURRENT,
+                    event: StreamTransportEvent::DataAvailable,
+                },
+            )
+            .expect("report transport progress");
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake { result: Ok(()), .. }
+        ));
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::PeerRouteLossCheck {
+                    incarnation: CURRENT,
+                    generation: 1,
+                },
+            )
+            .expect("deliver stale route-loss timer");
+        settle(&harness.backend);
+
+        assert!(
+            harness.child.try_recv().is_none(),
+            "stale route-loss timer terminated a progressing stream"
+        );
+
+        assert_eq!(reader.peer_termination().expect("live peer"), None);
+        harness.displace(CURRENT);
+        harness.expect_displacement_ack();
+        harness.finish_release();
+    }
+
+    #[test]
+    fn flush_progress_waits_for_transport_consumption() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::WaitProgress {
+                    reply_to: *harness.directory.addr(),
+                    target: 1,
+                },
+            )
+            .expect("park flush progress");
+        settle(&harness.backend);
+
+        assert!(
+            harness.child.try_recv().is_none(),
+            "flush progress woke before transport consumption"
+        );
+
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Transport {
+                    incarnation: CURRENT,
+                    event: StreamTransportEvent::CapacityAvailable,
+                },
+            )
+            .expect("report transport consumption");
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake { result: Ok(()), .. }
+        ));
+
+        harness.displace(CURRENT);
+        harness.expect_displacement_ack();
+        harness.finish_release();
+    }
+
+    #[test]
+    fn flush_progress_observes_consumption_before_wait_registration() {
+        let mut harness = Harness::with_role(StreamRole::Source);
+        let ring = harness.allocate();
+        let _reader = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        let mut writer =
+            byte_ring::attach_mapped(&harness.arena, ring, Role::Producer).expect("child writer");
+        writer
+            .send_record(RecordKind::Data, b"already-consumed")
+            .expect("commit source data");
+        let target = writer.positions().expect("source positions").0;
+        harness
+            .runtime
+            .send_to(harness.binding, HostStreamIn::DataAvailable)
+            .expect("drive source transport");
+        settle(&harness.backend);
+        assert!(writer.positions().expect("source progress").1 >= target);
+
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::WaitCapacity {
+                    reply_to: *harness.directory.addr(),
+                },
+            )
+            .expect("synchronize completed capacity notification");
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake { result: Ok(()), .. }
+        ));
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::WaitProgress {
+                    reply_to: *harness.directory.addr(),
+                    target,
+                },
+            )
+            .expect("register completed flush progress");
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamWake { result: Ok(()), .. }
+        ));
+
+        harness.displace(CURRENT);
+        harness.expect_displacement_ack();
         harness.finish_release();
     }
 
@@ -3718,6 +6405,544 @@ mod stream_displacement_tests {
             .read_arena(ring.offset + byte_ring::OFF_TERMINAL, 8)
             .expect("read terminal marker");
         assert_eq!(u64::from_le_bytes(marker.try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn clean_close_before_readiness_completes_open_and_reclaims_ring() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        harness.match_namespace(CURRENT);
+        settle(&harness.backend);
+        assert!(harness.child.try_recv().is_none());
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: true,
+                    reply_to: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::StreamClosed,
+                ..
+            }
+        ));
+        // A transport callback already queued when close ran cannot resurrect it.
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Transport {
+                    incarnation: CURRENT,
+                    event: StreamTransportEvent::Ready,
+                },
+            )
+            .unwrap();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::PeerTerminationAck {
+                    incarnation: CURRENT,
+                },
+            )
+            .unwrap();
+        harness.finish_release();
+    }
+
+    #[test]
+    fn close_reply_waits_for_namespace_retirement_after_ring_release() {
+        let mut harness = Harness::new();
+        let ring = harness.allocate();
+        let _writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        harness.displace(CURRENT);
+        harness.expect_displacement_ack();
+        let reply_to = *harness.directory.addr();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: false,
+                    reply_to: Some(reply_to),
+                },
+            )
+            .unwrap();
+        let NamespaceClientIn::Request {
+            request: NamespaceRequest::CloseStream { .. },
+            reply_to: namespace_close,
+        } = receive(&harness.backend, &harness.namespace_requests)
+        else {
+            panic!("namespace close missing");
+        };
+        let ArenaAllocatorIn::ReleaseStream {
+            binding,
+            ring: released_ring,
+        } = receive(&harness.backend, &harness.allocation_requests)
+        else {
+            panic!("ring release missing");
+        };
+        assert_eq!(ring, released_ring);
+        let result = harness.allocator.release_stream(ring);
+        assert_eq!(result, Ok(()));
+        harness
+            .runtime
+            .send_to(binding, HostStreamIn::ReleaseComplete(result.clone()))
+            .unwrap();
+        harness
+            .runtime
+            .send_to(binding, HostStreamIn::ReleaseComplete(result))
+            .unwrap();
+        settle(&harness.backend);
+        assert!(
+            harness.host.try_recv().is_none(),
+            "host forgot its namespace cleanup owner"
+        );
+        assert!(
+            harness.child.try_recv().is_none(),
+            "close acknowledged before namespace retirement"
+        );
+        assert!(harness.runtime.is_local_actor(namespace_close));
+        assert!(
+            harness
+                .allocator
+                .arena
+                .lookup_lease(RingId(ring.lease_id))
+                .is_none()
+        );
+        for _ in 0..2 {
+            harness
+                .runtime
+                .send_to(
+                    namespace_close,
+                    DataDirectoryOut::StreamClosed {
+                        request_id: DirectoryRequestId(2),
+                        authority_epoch: CURRENT.authority_epoch,
+                        result: Ok(()),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            matches!(receive(&harness.backend, &harness.child), ChildSessionIn::StreamWake { reply_to: observed, result: Ok(()) } if observed == reply_to)
+        );
+        assert!(
+            matches!(receive(&harness.backend, &harness.host), HostSessionIn::BindingDone { binding } if binding == harness.binding)
+        );
+        settle(&harness.backend);
+        assert!(harness.child.try_recv().is_none());
+        assert!(!harness.runtime.is_local_actor(namespace_close));
+        harness.detach_binding();
+        for (actor, actor_type) in [
+            (harness.namespace_reply, ActorType::NamespaceStreamOpenActor),
+            (namespace_close, ActorType::NamespaceStreamCloseActor),
+        ] {
+            let records = harness.namespace_transitions(actor);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| (record.previous, record.next, record.reason, record.outcome))
+                    .collect::<Vec<_>>(),
+                [
+                    (Phase::Created, Phase::AwaitingReply, Reason::Started, None),
+                    (
+                        Phase::AwaitingReply,
+                        Phase::Finished,
+                        Reason::Completed,
+                        Some(Outcome::Success),
+                    ),
+                ],
+                "a duplicate reply or on_stop must not complete the wrapper twice"
+            );
+            let terminal = records.last().unwrap();
+            assert_eq!(terminal.actor_type, actor_type);
+            assert_eq!(
+                terminal.operation,
+                Some(harness.child.addr().0[..16].try_into().unwrap())
+            );
+            assert_eq!(terminal.generation, Some(CURRENT.authority_epoch));
+            assert_eq!(terminal.incarnation, Some(CURRENT.revision));
+        }
+    }
+
+    #[test]
+    fn namespace_open_cancel_retains_one_terminal_and_resolves_caller() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        for _ in 0..2 {
+            harness
+                .runtime
+                .send_to(
+                    harness.binding,
+                    HostStreamIn::Close {
+                        clean: false,
+                        reply_to: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::OperationCancelled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            receive(&harness.backend, &harness.namespace_requests),
+            NamespaceClientIn::Cancel { reply_to } if reply_to == harness.namespace_reply
+        ));
+        harness.finish_unmatched_release();
+        let records = harness.namespace_transitions(harness.namespace_reply);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].next, Phase::AwaitingReply);
+        assert_eq!(records[0].outcome, None);
+        assert_eq!(records[1].previous, Phase::AwaitingReply);
+        assert_eq!(records[1].next, Phase::Finished);
+        assert_eq!(records[1].reason, Reason::ParentStopped);
+        assert_eq!(records[1].outcome, Some(Outcome::Cancelled));
+        assert_eq!(records[1].actor_type, ActorType::NamespaceStreamOpenActor);
+        assert_eq!(
+            records[1].operation,
+            Some(harness.child.addr().0[..16].try_into().unwrap())
+        );
+        assert_eq!(records[1].generation, Some(1));
+        assert_eq!(records[1].incarnation, None);
+        assert!(harness.namespace_requests.try_recv().is_none());
+    }
+
+    #[test]
+    fn namespace_proxy_exit_retains_peer_loss_and_parent_completes_open_once() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        harness.runtime.stop_actor(harness.namespace_proxy).unwrap();
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::SessionNotRunning,
+                ..
+            }
+        ));
+        harness.finish_unmatched_release();
+        let records = harness.namespace_transitions(harness.namespace_reply);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.outcome.map(|outcome| (record.reason, outcome)))
+                .collect::<Vec<_>>(),
+            [(Reason::PeerTerminated, Outcome::PeerLost)],
+            "the wrapper's subsequent stop must not overwrite or duplicate peer loss"
+        );
+        assert_eq!(records[1].actor_type, ActorType::NamespaceStreamOpenActor);
+        assert_eq!(
+            records[1].operation,
+            Some(harness.child.addr().0[..16].try_into().unwrap())
+        );
+        assert_eq!(records[1].generation, Some(1));
+        assert_eq!(records[1].incarnation, None);
+    }
+
+    #[test]
+    fn namespace_reply_failure_fences_queued_success_and_retains_one_completion() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        harness
+            .runtime
+            .send_to(
+                harness.namespace_reply,
+                DataDirectoryOut::StreamOpened {
+                    request_id: DirectoryRequestId(1),
+                    authority_epoch: CURRENT.authority_epoch,
+                    result: Err(NamespaceError::PathNotFound(harness.path.clone())),
+                },
+            )
+            .unwrap();
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::PathNotFound(path),
+                ..
+            } if path == harness.path
+        ));
+        harness.finish_unmatched_release();
+        let records = harness.namespace_transitions(harness.namespace_reply);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.outcome.map(|outcome| (record.reason, outcome)))
+                .collect::<Vec<_>>(),
+            [(Reason::Failed, Outcome::Failed)]
+        );
+        assert_eq!(records[1].actor_type, ActorType::NamespaceStreamOpenActor);
+        assert_eq!(records[1].incarnation, None);
+        assert!(harness.namespace_requests.try_recv().is_none());
+    }
+
+    #[test]
+    fn route_loss_before_readiness_resolves_pending_reader() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        harness.match_namespace(CURRENT);
+        settle(&harness.backend);
+        harness.routes.revoke();
+        settle(&harness.backend);
+        assert!(harness.child.try_recv().is_none());
+        harness.backend.advance_time(STREAM_PEER_ROUTE_LOSS_GRACE);
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::PeerLost,
+                ..
+            }
+        ));
+        harness.finish_release();
+    }
+
+    #[test]
+    fn stale_namespace_and_transport_events_cannot_rebind_open_incarnation() {
+        let mut harness = Harness::new();
+        let ring = harness.allocate();
+        let mut writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened {
+                incarnation: CURRENT,
+                ..
+            }
+        ));
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::NamespaceMatched(Ok(StreamMatch {
+                    incarnation: UNRELATED,
+                    source: *harness.peer.addr(),
+                    sink: harness.binding,
+                    source_descriptor: Vec::new(),
+                    sink_descriptor: Vec::new(),
+                    revision: UNRELATED.revision,
+                })),
+            )
+            .unwrap();
+        for event in [
+            StreamTransportEvent::Ready,
+            StreamTransportEvent::Quiesced,
+            StreamTransportEvent::Fault("old transport".to_owned()),
+        ] {
+            harness
+                .runtime
+                .send_to(
+                    harness.binding,
+                    HostStreamIn::Transport {
+                        incarnation: UNRELATED,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::PeerTerminated {
+                    incarnation: UNRELATED,
+                    error: DataPlaneError::PeerLost,
+                    reply_to: None,
+                },
+            )
+            .unwrap();
+        settle(&harness.backend);
+        assert!(harness.child.try_recv().is_none());
+        let mut reader = byte_ring::attach_mapped(&harness.arena, ring, Role::Consumer).unwrap();
+        writer
+            .send_record(RecordKind::Data, b"current incarnation")
+            .unwrap();
+        harness.transport.source_progress(CURRENT);
+        assert_eq!(
+            reader.recv_record().unwrap(),
+            Some((RecordKind::Data, b"current incarnation".to_vec()))
+        );
+        assert_eq!(reader.peer_termination().unwrap(), None);
+        harness.displace(CURRENT);
+        harness.expect_displacement_ack();
+        harness.finish_release();
+    }
+
+    #[test]
+    fn peer_termination_before_match_fails_once_and_acknowledges_duplicates() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let notice = HostStreamIn::PeerTerminated {
+            incarnation: CURRENT,
+            error: DataPlaneError::PeerLost,
+            reply_to: Some(*harness.peer.addr()),
+        };
+        harness
+            .runtime
+            .send_to(harness.binding, notice.clone())
+            .unwrap();
+        harness
+            .runtime
+            .send_to(harness.binding, notice.clone())
+            .unwrap();
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::PeerLost,
+                ..
+            }
+        ));
+        assert!(matches!(
+            receive(&harness.backend, &harness.peer),
+            HostStreamIn::PeerTerminationAck {
+                incarnation: CURRENT
+            }
+        ));
+        harness.runtime.send_to(harness.binding, notice).unwrap();
+        assert!(matches!(
+            receive(&harness.backend, &harness.peer),
+            HostStreamIn::PeerTerminationAck {
+                incarnation: CURRENT
+            }
+        ));
+        harness.finish_release();
+    }
+
+    #[test]
+    fn local_peer_exit_before_readiness_releases_open_completion() {
+        let mut harness = Harness::new();
+        harness.allocate();
+        let peer = harness.runtime.spawn(PassivePeer).unwrap();
+        harness.match_namespace_with_peer(CURRENT, peer);
+        settle(&harness.backend);
+        assert!(harness.child.try_recv().is_none());
+        harness.runtime.stop_actor(peer).unwrap();
+        assert!(matches!(
+            receive(&harness.backend, &harness.child),
+            ChildSessionIn::OperationFailed {
+                error: DataPlaneError::PeerLost,
+                ..
+            }
+        ));
+        harness.finish_release();
+        assert!(!harness.runtime.is_local_actor(peer));
+    }
+
+    #[test]
+    fn unmatched_offer_from_newer_epoch_does_not_replace_authenticated_offer() {
+        let mut harness = Harness::with_role(StreamRole::Source);
+        harness.allocate();
+        let _reader = harness.install_peer(CURRENT);
+        let descriptor = harness.transport.descriptor().unwrap();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::PeerOffer {
+                    incarnation: CURRENT,
+                    descriptor: descriptor.clone(),
+                },
+            )
+            .unwrap();
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::PeerOffer {
+                    incarnation: UNRELATED,
+                    descriptor: StreamPeerDescriptor(vec![0xff]),
+                },
+            )
+            .unwrap();
+        harness
+            .runtime
+            .send_to(
+                harness.namespace_reply,
+                DataDirectoryOut::StreamOpened {
+                    request_id: DirectoryRequestId(1),
+                    authority_epoch: CURRENT.authority_epoch,
+                    result: Ok(StreamMatch {
+                        incarnation: CURRENT,
+                        source: harness.binding,
+                        sink: *harness.peer.addr(),
+                        source_descriptor: descriptor.0,
+                        sink_descriptor: Vec::new(),
+                        revision: CURRENT.revision,
+                    }),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened {
+                incarnation: CURRENT,
+                ..
+            }
+        ));
+        harness.displace(CURRENT);
+        harness.expect_displacement_ack();
+        harness.finish_release();
+    }
+
+    #[test]
+    fn unread_eof_wakes_reader_after_transport_has_quiesced() {
+        let mut harness = Harness::new();
+        let ring = harness.allocate();
+        let mut writer = harness.install_peer(CURRENT);
+        harness.match_namespace(CURRENT);
+        assert!(matches!(
+            harness.receive_child(),
+            ChildSessionIn::StreamOpened { .. }
+        ));
+        writer
+            .send_record(RecordKind::Data, b"writer finished")
+            .unwrap();
+        writer.send_record(RecordKind::Eof, b"").unwrap();
+        harness.transport.source_progress(CURRENT);
+        settle(&harness.backend);
+        assert!(
+            !harness.transport.sink_has_data(CURRENT),
+            "transport must have retired its endpoint"
+        );
+        let reply_to = *harness.directory.addr();
+        harness
+            .runtime
+            .send_to(harness.binding, HostStreamIn::WaitData { reply_to })
+            .unwrap();
+        assert!(matches!(receive(&harness.backend, &harness.child),
+            ChildSessionIn::StreamWake { reply_to: observed, result: Ok(()) } if observed == reply_to));
+        let mut reader = byte_ring::attach_mapped(&harness.arena, ring, Role::Consumer).unwrap();
+        assert_eq!(
+            reader.recv_record().unwrap(),
+            Some((RecordKind::Data, b"writer finished".to_vec()))
+        );
+        assert_eq!(
+            reader.recv_record().unwrap(),
+            Some((RecordKind::Eof, Vec::new()))
+        );
+        harness
+            .runtime
+            .send_to(
+                harness.binding,
+                HostStreamIn::Close {
+                    clean: true,
+                    reply_to: None,
+                },
+            )
+            .unwrap();
+        harness.finish_release();
     }
 }
 
@@ -3763,11 +6988,13 @@ enum HostBindingState {
     Resolving,
     Allocated,
     Filling,
+    Cancelling,
     Granted,
     Sealing,
     Publishing,
     Published,
     Unpublishing,
+    Retiring,
     Releasing,
     Released,
     Faulted,
@@ -3832,6 +7059,7 @@ enum HostBindingIn {
         operation: ActorAddress,
     },
     PublicationRejected(DataPlaneError),
+    Unpublished(Result<(), DataPlaneError>),
     ReservationReleased(Result<(), DataPlaneError>),
     ReleasePublished,
     SessionClosed,
@@ -3839,6 +7067,7 @@ enum HostBindingIn {
 }
 
 struct HostBindingAddresses {
+    transitions: Option<TransitionEmitter>,
     host_session: ActorAddress,
     allocator: ActorAddress,
     child_session: ActorAddress,
@@ -3846,6 +7075,7 @@ struct HostBindingAddresses {
 }
 
 struct HostBlobBindingActor {
+    transitions: Option<TransitionEmitter>,
     host_session: ActorAddress,
     allocator: ActorAddress,
     child_session: ActorAddress,
@@ -3859,7 +7089,6 @@ struct HostBlobBindingActor {
     auxiliary: Option<ActorAddress>,
     retained_source: Option<ActorAddress>,
     published_source: Option<ActorAddress>,
-    cancelled: bool,
     reservation: Option<OperationId>,
 }
 
@@ -3877,10 +7106,53 @@ struct NamespaceReadParams {
 }
 
 impl HostBlobBindingActor {
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: HostBindingState, reason: Reason) {
+        let previous = self.state;
+        self.state = next;
+        let phase = |state| match state {
+            HostBindingState::Resolving => Phase::Resolving,
+            HostBindingState::Allocated => Phase::Allocating,
+            HostBindingState::Filling => Phase::Filling,
+            HostBindingState::Cancelling => Phase::Aborting,
+            HostBindingState::Granted => Phase::Open,
+            HostBindingState::Sealing => Phase::Sealing,
+            HostBindingState::Publishing => Phase::Publishing,
+            HostBindingState::Published => Phase::Ready,
+            HostBindingState::Unpublishing => Phase::Closing,
+            HostBindingState::Retiring => Phase::Releasing,
+            HostBindingState::Releasing => Phase::Releasing,
+            HostBindingState::Released => Phase::Closed,
+            HostBindingState::Faulted => Phase::Failed,
+        };
+        if let Some(transitions) = &self.transitions {
+            transitions.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::HostBlobBindingActor,
+                protocol: Protocol::HostBlob,
+                operation: Some(
+                    self.operation.0[..16]
+                        .try_into()
+                        .expect("operation identity"),
+                ),
+                generation: self.lease.map(|lease| lease.generation),
+                incarnation: None,
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: match next {
+                    HostBindingState::Released => Some(Outcome::Success),
+                    HostBindingState::Faulted => Some(Outcome::Failed),
+                    _ => None,
+                },
+            });
+        }
+    }
+
     fn namespace_read(params: NamespaceReadParams) -> Self {
         let NamespaceReadParams {
             addresses:
                 HostBindingAddresses {
+                    transitions,
                     host_session,
                     allocator,
                     child_session,
@@ -3895,6 +7167,7 @@ impl HostBlobBindingActor {
             route_registrar,
         } = params;
         Self {
+            transitions,
             host_session,
             allocator,
             child_session,
@@ -3916,7 +7189,6 @@ impl HostBlobBindingActor {
             auxiliary: None,
             published_source: None,
             reservation: None,
-            cancelled: false,
         }
     }
 
@@ -3930,12 +7202,14 @@ impl HostBlobBindingActor {
         source_publisher: Option<Arc<dyn BlobSourcePublisher>>,
     ) -> Self {
         let HostBindingAddresses {
+            transitions,
             host_session,
             allocator,
             child_session,
             operation,
         } = addresses;
         Self {
+            transitions,
             host_session,
             allocator,
             child_session,
@@ -3954,7 +7228,6 @@ impl HostBlobBindingActor {
             auxiliary: None,
             retained_source: None,
             published_source: None,
-            cancelled: false,
             reservation,
         }
     }
@@ -3975,11 +7248,16 @@ impl HostBlobBindingActor {
             binding: ctx.self_addr(),
             path: self.path.clone(),
             reservation,
+            phase: NamespaceOperationPhase::Created,
+            transitions: self.transitions.clone(),
+            operation: self.operation,
+            generation: self.lease.map(|lease| lease.generation),
         }) {
             Ok(releaser) => {
                 self.auxiliary = Some(releaser);
+                ctx.watch(releaser);
                 self.release_outcome = Some(outcome);
-                self.state = HostBindingState::Releasing;
+                self.enter_phase(ctx, HostBindingState::Releasing, Reason::ReleaseRequested);
                 true
             }
             Err(_) => {
@@ -4014,6 +7292,11 @@ impl HostBlobBindingActor {
         id_bytes.copy_from_slice(&ctx.self_addr().0[..16]);
         let operation_id = OperationId::from_u128(u128::from_be_bytes(id_bytes).wrapping_add(1));
         match ctx.spawn(NamespaceUnpublishActor {
+            binding: ctx.self_addr(),
+            phase: NamespaceOperationPhase::Created,
+            transitions: self.transitions.clone(),
+            operation: self.operation,
+            generation: self.lease.map(|lease| lease.generation),
             namespace_proxy: namespace.proxy(),
             path: self.path.clone(),
             operation_id,
@@ -4021,12 +7304,11 @@ impl HostBlobBindingActor {
         }) {
             Ok(unpublisher) => {
                 self.auxiliary = Some(unpublisher);
+                ctx.watch(unpublisher);
                 self.release_outcome = Some(outcome);
-                self.state = HostBindingState::Unpublishing;
+                self.enter_phase(ctx, HostBindingState::Unpublishing, Reason::CloseRequested);
             }
-            Err(_) => {
-                self.state = HostBindingState::Published;
-            }
+            Err(error) => self.fail(ctx, DataPlaneError::SessionFailed(error.to_string())),
         }
     }
 
@@ -4036,33 +7318,24 @@ impl HostBlobBindingActor {
             return;
         };
         self.release_retained_source();
-        self.state = HostBindingState::Releasing;
+        self.enter_phase(ctx, HostBindingState::Releasing, Reason::ReleaseRequested);
         self.release_outcome = Some(outcome);
-        let _ = ctx.send(
-            self.allocator,
-            ArenaAllocatorIn::Release {
-                binding: ctx.self_addr(),
-                lease,
-            },
-        );
-    }
-
-    fn release_published(&mut self, ctx: &Ctx<'_>, outcome: ReleaseOutcome) {
-        if let Some(lease) = self.lease.take() {
-            let _ = ctx.send(
+        if ctx
+            .send(
                 self.allocator,
                 ArenaAllocatorIn::Release {
                     binding: ctx.self_addr(),
                     lease,
                 },
-            );
+            )
+            .is_err()
+        {
+            let outcome = self
+                .release_outcome
+                .take()
+                .unwrap_or(ReleaseOutcome::Faulted);
+            self.finish_without_lease(ctx, outcome);
         }
-        // Published bindings are detached from their host session. The
-        // allocator may already have stopped with that session, so waiting for
-        // its acknowledgement would strand this binding forever. A live
-        // allocator still receives the release; its own shutdown reclaims all
-        // outstanding leases otherwise.
-        self.finish_without_lease(ctx, outcome);
     }
 
     fn release_retained_source(&mut self) {
@@ -4082,7 +7355,7 @@ impl HostBlobBindingActor {
             return;
         }
         self.release_retained_source();
-        self.state = HostBindingState::Released;
+        self.enter_phase(ctx, HostBindingState::Released, Reason::Released);
         let read_released = matches!(outcome, ReleaseOutcome::ReadReleased);
         if let Some(auxiliary) = self.auxiliary.take() {
             let _ = ctx.stop_actor(auxiliary);
@@ -4093,9 +7366,17 @@ impl HostBlobBindingActor {
                 ChildSessionIn::WriteAborted { operation },
             );
         }
-        if read_released {
-            let _ = ctx.send(self.child_session, ChildSessionIn::BlobReleased);
+        if read_released && let Some(lease) = self.lease {
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::BlobReleased {
+                    binding: ctx.self_addr(),
+                    lease_id: lease.lease_id,
+                    generation: lease.generation,
+                },
+            );
         }
+        self.lease = None;
         let _ = ctx.send(
             self.host_session,
             HostSessionIn::BindingDone {
@@ -4106,10 +7387,13 @@ impl HostBlobBindingActor {
     }
 
     fn fail(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
-        self.state = HostBindingState::Faulted;
-        if let Some(source) = self.published_source.take() {
-            let _ = ctx.send(source, BlobSourceIn::Retire { reply_to: None });
+        if matches!(
+            self.state,
+            HostBindingState::Released | HostBindingState::Retiring
+        ) {
+            return;
         }
+        self.enter_phase(ctx, HostBindingState::Faulted, Reason::Failed);
         let _ = ctx.send(
             self.host_session,
             HostSessionIn::BindingFaulted {
@@ -4118,7 +7402,13 @@ impl HostBlobBindingActor {
                 error,
             },
         );
-        if self.lease.is_some() {
+        if let Some(source) = self.published_source.take() {
+            self.release_outcome = Some(ReleaseOutcome::Faulted);
+            self.enter_phase(ctx, HostBindingState::Retiring, Reason::ReleaseRequested);
+            let _ = ctx.send(source, BlobSourceIn::Retire { reply_to: None });
+            // Source retirement owns allocator release until every physical
+            // adapter callback drops its backing-region owner.
+        } else if self.lease.is_some() {
             self.begin_release(ctx, ReleaseOutcome::Faulted);
         } else {
             self.finish_without_lease(ctx, ReleaseOutcome::Faulted);
@@ -4129,47 +7419,9 @@ impl HostBlobBindingActor {
         self.lease
             .is_some_and(|lease| lease.lease_id == lease_id && lease.generation == generation)
     }
-}
-
-impl ActorInterface for HostBlobBindingActor {
-    type Incoming = HostBindingIn;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx<'_>) {
-        if let BindingMode::NamespaceRead { namespace, .. } = &self.mode {
-            self.state = HostBindingState::Resolving;
-            match ctx.spawn(NamespaceResolveActor {
-                namespace_proxy: namespace.proxy(),
-                path: self.path.clone(),
-                binding: ctx.self_addr(),
-            }) {
-                Ok(resolver) => {
-                    self.auxiliary = Some(resolver);
-                }
-                Err(error) => {
-                    self.fail(ctx, DataPlaneError::SessionFailed(error.to_string()));
-                }
-            }
-            return;
-        }
-
-        self.state = HostBindingState::Filling;
-        let (length, digest) = match &self.mode {
-            BindingMode::Write { length, digest, .. } => (*length, *digest),
-            BindingMode::NamespaceRead { .. } => unreachable!("handled above"),
-        };
-        let _ = ctx.send(
-            self.allocator,
-            ArenaAllocatorIn::Allocate {
-                binding: ctx.self_addr(),
-                kind: AllocationKind::Write { length, digest },
-            },
-        );
-    }
-
-    fn handle(&mut self, ctx: &Ctx<'_>, message: HostBindingIn) {
-        match message {
-            HostBindingIn::Resolved(Ok(binding))
+    fn resolved(&mut self, ctx: &Ctx<'_>, result: Result<NamespaceBlobBinding, DataPlaneError>) {
+        match result {
+            Ok(binding)
                 if self.state == HostBindingState::Resolving
                     && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
             {
@@ -4214,6 +7466,7 @@ impl ActorInterface for HostBlobBindingActor {
                 let transfer_id = BlobTransferId(u64::from_le_bytes(id_bytes).max(1));
                 match ctx.spawn(DestinationBlobTransferActor::new(
                     DestinationTransferParams {
+                        transitions: self.transitions.clone(),
                         allocator: self.allocator,
                         binding: ctx.self_addr(),
                         receiver,
@@ -4228,76 +7481,92 @@ impl ActorInterface for HostBlobBindingActor {
                 )) {
                     Ok(transfer) => {
                         self.auxiliary = Some(transfer);
-                        self.state = HostBindingState::Filling;
+                        ctx.watch(transfer);
+                        self.enter_phase(ctx, HostBindingState::Filling, Reason::Allocated);
                     }
                     Err(error) => {
                         self.fail(ctx, DataPlaneError::SessionFailed(error.to_string()));
                     }
                 }
             }
-            HostBindingIn::Resolved(Err(error)) if self.state == HostBindingState::Resolving => {
+            Err(error) if self.state == HostBindingState::Resolving => {
                 self.auxiliary = None;
                 self.fail(ctx, error);
             }
-            HostBindingIn::TransferReady { lease, metadata }
-                if self.state == HostBindingState::Filling
-                    && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn transfer_ready(&mut self, ctx: &Ctx<'_>, lease: BlobLease, metadata: BlobMetadata) {
+        match (lease, metadata) {
+            (lease, metadata)
+                if matches!(
+                    self.state,
+                    HostBindingState::Filling | HostBindingState::Cancelling
+                ) && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
             {
                 self.auxiliary = None;
                 self.lease = Some(lease);
                 self.metadata = Some(metadata.clone());
-                self.state = HostBindingState::Granted;
-                if self.cancelled {
+                if self.state == HostBindingState::Cancelling {
                     self.begin_release(ctx, ReleaseOutcome::Faulted);
                 } else {
-                    let _ = ctx.send(
-                        self.child_session,
-                        ChildSessionIn::BlobOpened {
-                            operation: self.operation,
-                            host_binding: ctx.self_addr(),
-                            lease,
-                            metadata,
-                        },
-                    );
+                    self.enter_phase(ctx, HostBindingState::Granted, Reason::Opened);
+                    if ctx
+                        .send(
+                            self.child_session,
+                            ChildSessionIn::BlobOpened {
+                                operation: self.operation,
+                                host_binding: ctx.self_addr(),
+                                lease,
+                                metadata,
+                            },
+                        )
+                        .is_err()
+                    {
+                        self.fail(ctx, DataPlaneError::SessionNotRunning);
+                    }
                 }
             }
-            HostBindingIn::CancelOpen { operation } if operation == self.operation => {
-                self.cancelled = true;
-                match self.state {
-                    HostBindingState::Resolving => {
-                        self.finish_without_lease(ctx, ReleaseOutcome::Faulted);
-                    }
-                    HostBindingState::Filling => {
-                        if matches!(self.mode, BindingMode::NamespaceRead { .. })
-                            && let Some(transfer) = self.auxiliary
-                        {
-                            let _ = ctx.send(transfer, BlobTransferEvent::Cancel);
-                        }
-                    }
-                    HostBindingState::Granted => {
-                        self.begin_release(ctx, ReleaseOutcome::Faulted);
-                    }
-                    _ => {}
-                }
-            }
-            HostBindingIn::TransferFailed(error)
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn transfer_failed(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
+        match error {
+            error
                 if matches!(
                     self.state,
-                    HostBindingState::Resolving | HostBindingState::Filling
+                    HostBindingState::Resolving
+                        | HostBindingState::Filling
+                        | HostBindingState::Cancelling
                 ) =>
             {
                 self.auxiliary = None;
                 self.fail(ctx, error);
             }
-            HostBindingIn::Allocated(Ok((lease, metadata)))
-                if self.state == HostBindingState::Filling =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn allocated(
+        &mut self,
+        ctx: &Ctx<'_>,
+        result: Result<(BlobLease, BlobMetadata), DataPlaneError>,
+    ) {
+        match result {
+            Ok((lease, metadata))
+                if matches!(
+                    self.state,
+                    HostBindingState::Filling | HostBindingState::Cancelling
+                ) =>
             {
                 self.lease = Some(lease);
                 self.metadata = Some(metadata.clone());
-                self.state = HostBindingState::Granted;
-                if self.cancelled {
+                if self.state == HostBindingState::Cancelling {
                     self.begin_release(ctx, ReleaseOutcome::Faulted);
                 } else {
+                    self.enter_phase(ctx, HostBindingState::Granted, Reason::Opened);
                     let response = match self.mode {
                         BindingMode::Write { .. } => ChildSessionIn::WriteBlobOpened {
                             operation: self.operation,
@@ -4309,28 +7578,85 @@ impl ActorInterface for HostBlobBindingActor {
                             unreachable!("namespace read uses TransferReady")
                         }
                     };
-                    let _ = ctx.send(self.child_session, response);
+                    if ctx.send(self.child_session, response).is_err() {
+                        self.fail(ctx, DataPlaneError::SessionNotRunning);
+                    }
                 }
             }
-            HostBindingIn::Allocated(Err(error)) if self.state == HostBindingState::Filling => {
+            Err(error)
+                if matches!(
+                    self.state,
+                    HostBindingState::Filling | HostBindingState::Cancelling
+                ) =>
+            {
                 self.fail(ctx, error);
             }
-            HostBindingIn::Release {
-                lease_id,
-                generation,
-            } if self.state == HostBindingState::Granted
-                && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn cancel_open(&mut self, ctx: &Ctx<'_>, operation: ActorAddress) {
+        if operation == self.operation
+            && matches!(
+                self.state,
+                HostBindingState::Resolving | HostBindingState::Filling | HostBindingState::Granted
+            )
+        {
+            let _ = ctx.send(
+                self.child_session,
+                ChildSessionIn::OperationFailed {
+                    operation,
+                    error: DataPlaneError::OperationCancelled,
+                },
+            );
+        }
+        match (operation,) {
+            (operation,) if operation == self.operation => match self.state {
+                HostBindingState::Resolving => {
+                    self.finish_without_lease(ctx, ReleaseOutcome::Faulted);
+                }
+                HostBindingState::Filling => {
+                    self.enter_phase(ctx, HostBindingState::Cancelling, Reason::Cancelled);
+                    if matches!(self.mode, BindingMode::NamespaceRead { .. })
+                        && let Some(transfer) = self.auxiliary
+                    {
+                        let _ = ctx.send(transfer, BlobTransferEvent::Cancel);
+                    }
+                }
+                HostBindingState::Granted => {
+                    self.begin_release(ctx, ReleaseOutcome::Faulted);
+                }
+                _ => {}
+            },
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn release(&mut self, ctx: &Ctx<'_>, lease_id: crate::ids::BlobLeaseId, generation: u64) {
+        match (lease_id, generation) {
+            (lease_id, generation)
+                if self.state == HostBindingState::Granted
+                    && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
             {
                 if self.lease_matches(lease_id, generation) {
                     self.begin_release(ctx, ReleaseOutcome::ReadReleased);
                 }
             }
-            HostBindingIn::Seal {
-                operation,
-                lease,
-                metadata,
-            } if self.state == HostBindingState::Granted
-                && matches!(self.mode, BindingMode::Write { .. }) =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn seal(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        lease: BlobLease,
+        metadata: BlobMetadata,
+    ) {
+        match (operation, lease, metadata) {
+            (operation, lease, metadata)
+                if self.state == HostBindingState::Granted
+                    && matches!(self.mode, BindingMode::Write { .. }) =>
             {
                 if operation != self.operation
                     || self.lease != Some(lease)
@@ -4342,7 +7668,7 @@ impl ActorInterface for HostBlobBindingActor {
                     );
                     return;
                 }
-                self.state = HostBindingState::Sealing;
+                self.enter_phase(ctx, HostBindingState::Sealing, Reason::Requested);
                 let _ = ctx.send(
                     self.allocator,
                     ArenaAllocatorIn::ValidateSealed {
@@ -4352,10 +7678,16 @@ impl ActorInterface for HostBlobBindingActor {
                     },
                 );
             }
-            HostBindingIn::SealValidated(Ok(())) if self.state == HostBindingState::Sealing => {
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn seal_validated(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        match result {
+            Ok(()) if self.state == HostBindingState::Sealing => {
                 let lease = self.lease.expect("validated write lease");
                 let metadata = self.metadata.clone().expect("validated write metadata");
-                self.state = HostBindingState::Publishing;
+                self.enter_phase(ctx, HostBindingState::Publishing, Reason::Requested);
                 if matches!(
                     self.mode,
                     BindingMode::Write {
@@ -4380,9 +7712,16 @@ impl ActorInterface for HostBlobBindingActor {
                     );
                 }
             }
-            HostBindingIn::PublishedSource(Ok(source))
-                if self.state == HostBindingState::Publishing =>
-            {
+            Err(error) if self.state == HostBindingState::Sealing => {
+                self.fail(ctx, error);
+            }
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn published_source(&mut self, ctx: &Ctx<'_>, result: Result<ActorAddress, DataPlaneError>) {
+        match result {
+            Ok(source) if self.state == HostBindingState::Publishing => {
                 let (namespace, publisher) = match &self.mode {
                     BindingMode::Write {
                         namespace: Some(namespace),
@@ -4422,45 +7761,49 @@ impl ActorInterface for HostBlobBindingActor {
                     operation_id,
                     operation: self.operation,
                     binding: ctx.self_addr(),
-                    completed: false,
+                    phase: NamespaceOperationPhase::Created,
+                    transitions: self.transitions.clone(),
+                    generation: self.lease.map(|lease| lease.generation),
                 }) {
                     Ok(publisher) => {
                         self.auxiliary = Some(publisher);
+                        ctx.watch(publisher);
                     }
                     Err(error) => {
                         self.fail(ctx, DataPlaneError::SessionFailed(error.to_string()));
                     }
                 }
             }
-            HostBindingIn::PublishedSource(Err(error))
-                if self.state == HostBindingState::Publishing =>
-            {
+            Err(error) if self.state == HostBindingState::Publishing => {
                 self.fail(ctx, error);
             }
-            HostBindingIn::SealValidated(Err(error)) if self.state == HostBindingState::Sealing => {
-                self.fail(ctx, error);
-            }
-            HostBindingIn::Abort {
-                operation,
-                lease_id,
-                generation,
-            } if self.state == HostBindingState::Granted
-                && matches!(self.mode, BindingMode::Write { .. }) =>
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn abort(
+        &mut self,
+        ctx: &Ctx<'_>,
+        operation: ActorAddress,
+        lease_id: crate::ids::BlobLeaseId,
+        generation: u64,
+    ) {
+        match (operation, lease_id, generation) {
+            (operation, lease_id, generation)
+                if self.state == HostBindingState::Granted
+                    && matches!(self.mode, BindingMode::Write { .. }) =>
             {
                 if operation == self.operation && self.lease_matches(lease_id, generation) {
                     self.begin_release(ctx, ReleaseOutcome::WriteAborted { operation });
                 }
             }
-            HostBindingIn::Abort {
-                operation,
-                lease_id,
-                generation,
-            } if matches!(
-                self.state,
-                HostBindingState::Sealing
-                    | HostBindingState::Publishing
-                    | HostBindingState::Published
-            ) && matches!(self.mode, BindingMode::Write { .. }) =>
+            (operation, lease_id, generation)
+                if matches!(
+                    self.state,
+                    HostBindingState::Sealing
+                        | HostBindingState::Publishing
+                        | HostBindingState::Published
+                ) && matches!(self.mode, BindingMode::Write { .. }) =>
             {
                 if operation != self.operation || !self.lease_matches(lease_id, generation) {
                     return;
@@ -4475,12 +7818,28 @@ impl ActorInterface for HostBlobBindingActor {
                     _ => unreachable!("guarded abort state"),
                 }
             }
-            HostBindingIn::PublicationAccepted { operation }
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn publication_accepted(&mut self, ctx: &Ctx<'_>, operation: ActorAddress) {
+        match (operation,) {
+            (operation,)
                 if self.state == HostBindingState::Publishing && operation == self.operation =>
             {
                 self.auxiliary = None;
                 self.reservation = None;
-                self.state = HostBindingState::Published;
+                self.enter_phase(ctx, HostBindingState::Published, Reason::Completed);
+                if self.lease.is_none() {
+                    self.fail(
+                        ctx,
+                        DataPlaneError::SourceFailure(
+                            "published source retired before publication acknowledgement"
+                                .to_owned(),
+                        ),
+                    );
+                    return;
+                }
                 if let Some(outcome) = self.release_outcome.take() {
                     self.begin_unpublish(ctx, outcome);
                 } else {
@@ -4496,89 +7855,275 @@ impl ActorInterface for HostBlobBindingActor {
                     );
                 }
             }
-            HostBindingIn::PublicationRejected(error)
-                if self.state == HostBindingState::Publishing =>
-            {
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn publication_rejected(&mut self, ctx: &Ctx<'_>, error: DataPlaneError) {
+        match error {
+            error if self.state == HostBindingState::Publishing => {
                 self.auxiliary = None;
                 self.fail(ctx, error);
             }
-            HostBindingIn::ReleasePublished
-                if matches!(
-                    self.state,
-                    HostBindingState::Published | HostBindingState::Unpublishing
-                ) =>
-            {
-                let outcome = self
-                    .release_outcome
-                    .take()
-                    .unwrap_or(ReleaseOutcome::PublishedReleased);
-                self.release_published(ctx, outcome);
-            }
-            HostBindingIn::SessionClosed
-                if self.state == HostBindingState::Filling
-                    && matches!(self.mode, BindingMode::NamespaceRead { .. }) =>
-            {
-                if let Some(transfer) = self.auxiliary {
+            _ => {} // Stale or duplicate event: this phase no longer owns it.
+        }
+    }
+
+    fn unpublished(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.state != HostBindingState::Unpublishing {
+            return;
+        }
+        self.auxiliary = None;
+        if let Err(error) = result {
+            self.fail(ctx, error);
+        } else if self.lease.is_none() {
+            let outcome = self
+                .release_outcome
+                .take()
+                .unwrap_or(ReleaseOutcome::PublishedReleased);
+            self.finish_without_lease(ctx, outcome);
+        } else {
+            self.enter_phase(ctx, HostBindingState::Retiring, Reason::ReleaseRequested);
+        }
+    }
+
+    fn reservation_released(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if self.state != HostBindingState::Releasing || self.auxiliary.is_none() {
+            return;
+        }
+        self.auxiliary = None;
+        if let Err(error) = result {
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::BindingFaulted {
+                    binding: ctx.self_addr(),
+                    operation: self.operation,
+                    error,
+                },
+            );
+        }
+        let outcome = self
+            .release_outcome
+            .take()
+            .unwrap_or(ReleaseOutcome::Faulted);
+        self.finish_without_lease(ctx, outcome);
+    }
+
+    fn release_published_event(&mut self, ctx: &Ctx<'_>) {
+        // Only the source-retirement callback uses this fallback when the
+        // allocator itself has already stopped and reclaimed its arena.
+        self.released(ctx, Ok(()));
+    }
+
+    fn session_closed(&mut self, ctx: &Ctx<'_>) {
+        match self.state {
+            HostBindingState::Filling | HostBindingState::Cancelling => {
+                self.enter_phase(ctx, HostBindingState::Cancelling, Reason::Cancelled);
+                if let Some(transfer) = self.auxiliary
+                    && matches!(self.mode, BindingMode::NamespaceRead { .. })
+                {
                     let _ = ctx.send(transfer, BlobTransferEvent::Cancel);
-                } else {
-                    self.finish_without_lease(ctx, ReleaseOutcome::SessionClosed);
                 }
             }
-            HostBindingIn::SessionClosed
-                if matches!(
-                    self.state,
-                    HostBindingState::Publishing
-                        | HostBindingState::Published
-                        | HostBindingState::Unpublishing
-                ) => {}
-            HostBindingIn::SessionClosed
-                if !matches!(
-                    self.state,
-                    HostBindingState::Released
-                        | HostBindingState::Releasing
-                        | HostBindingState::Publishing
-                        | HostBindingState::Published
-                        | HostBindingState::Unpublishing
-                ) =>
-            {
-                self.begin_release(ctx, ReleaseOutcome::SessionClosed);
+            HostBindingState::Publishing => {
+                self.release_outcome = Some(ReleaseOutcome::SessionClosed);
             }
-            HostBindingIn::Released(result) if self.state == HostBindingState::Releasing => {
-                if let Err(error) = result {
-                    let _ = ctx.send(
-                        self.host_session,
-                        HostSessionIn::BindingFaulted {
-                            binding: ctx.self_addr(),
-                            operation: self.operation,
-                            error,
-                        },
-                    );
+            HostBindingState::Published
+            | HostBindingState::Unpublishing
+            | HostBindingState::Retiring
+            | HostBindingState::Releasing
+            | HostBindingState::Released => {}
+            _ => self.begin_release(ctx, ReleaseOutcome::SessionClosed),
+        }
+    }
+
+    fn released(&mut self, ctx: &Ctx<'_>, result: Result<(), DataPlaneError>) {
+        if !matches!(
+            self.state,
+            HostBindingState::Releasing
+                | HostBindingState::Publishing
+                | HostBindingState::Published
+                | HostBindingState::Unpublishing
+                | HostBindingState::Retiring
+        ) {
+            return;
+        }
+        if let Err(error) = result {
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::BindingFaulted {
+                    binding: ctx.self_addr(),
+                    operation: self.operation,
+                    error,
+                },
+            );
+        }
+        if matches!(
+            self.state,
+            HostBindingState::Publishing | HostBindingState::Unpublishing
+        ) && self.auxiliary.is_some()
+        {
+            self.lease = None;
+            self.published_source = None;
+            return;
+        }
+        let outcome = self.release_outcome.take().unwrap_or_else(|| {
+            if self.state == HostBindingState::Releasing {
+                ReleaseOutcome::Faulted
+            } else {
+                ReleaseOutcome::PublishedReleased
+            }
+        });
+        self.finish_without_lease(ctx, outcome);
+    }
+}
+
+impl ActorInterface for HostBlobBindingActor {
+    type Incoming = HostBindingIn;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, self.state, Reason::Started);
+        ctx.watch(self.allocator);
+        ctx.watch(self.host_session);
+        if let BindingMode::NamespaceRead {
+            namespace,
+            expected_revision,
+            ..
+        } = &self.mode
+        {
+            let namespace_proxy = namespace.proxy();
+            match ctx.spawn(NamespaceResolveActor {
+                namespace_proxy,
+                path: self.path.clone(),
+                binding: ctx.self_addr(),
+                phase: NamespaceOperationPhase::Created,
+                transitions: self.transitions.clone(),
+                operation: self.operation,
+                generation: *expected_revision,
+            }) {
+                Ok(resolver) => {
+                    self.auxiliary = Some(resolver);
+                    ctx.watch(resolver);
                 }
-                let outcome = self
-                    .release_outcome
-                    .take()
-                    .unwrap_or(ReleaseOutcome::Faulted);
-                self.finish_without_lease(ctx, outcome);
-            }
-            HostBindingIn::ReservationReleased(result) => {
-                self.auxiliary = None;
-                if let Err(error) = result {
-                    let _ = ctx.send(
-                        self.host_session,
-                        HostSessionIn::BindingFaulted {
-                            binding: ctx.self_addr(),
-                            operation: self.operation,
-                            error,
-                        },
-                    );
+                Err(error) => {
+                    self.fail(ctx, DataPlaneError::SessionFailed(error.to_string()));
                 }
-                let outcome = self
-                    .release_outcome
-                    .take()
-                    .unwrap_or(ReleaseOutcome::Faulted);
-                self.finish_without_lease(ctx, outcome);
             }
-            _ => {}
+            return;
+        }
+
+        self.enter_phase(ctx, HostBindingState::Filling, Reason::Allocated);
+        let (length, digest) = match &self.mode {
+            BindingMode::Write { length, digest, .. } => (*length, *digest),
+            BindingMode::NamespaceRead { .. } => unreachable!("handled above"),
+        };
+        if ctx
+            .send(
+                self.allocator,
+                ArenaAllocatorIn::Allocate {
+                    binding: ctx.self_addr(),
+                    kind: AllocationKind::Write { length, digest },
+                },
+            )
+            .is_err()
+        {
+            self.fail(ctx, DataPlaneError::SessionNotRunning);
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: HostBindingIn) {
+        match message {
+            HostBindingIn::Resolved(result) => self.resolved(ctx, result),
+            HostBindingIn::TransferReady { lease, metadata } => {
+                self.transfer_ready(ctx, lease, metadata)
+            }
+            HostBindingIn::TransferFailed(error) => self.transfer_failed(ctx, error),
+            HostBindingIn::Allocated(result) => self.allocated(ctx, result),
+            HostBindingIn::CancelOpen { operation } => self.cancel_open(ctx, operation),
+            HostBindingIn::Release {
+                lease_id,
+                generation,
+            } => self.release(ctx, lease_id, generation),
+            HostBindingIn::Seal {
+                operation,
+                lease,
+                metadata,
+            } => self.seal(ctx, operation, lease, metadata),
+            HostBindingIn::SealValidated(result) => self.seal_validated(ctx, result),
+            HostBindingIn::PublishedSource(result) => self.published_source(ctx, result),
+            HostBindingIn::Abort {
+                operation,
+                lease_id,
+                generation,
+            } => self.abort(ctx, operation, lease_id, generation),
+            HostBindingIn::PublicationAccepted { operation } => {
+                self.publication_accepted(ctx, operation)
+            }
+            HostBindingIn::PublicationRejected(error) => self.publication_rejected(ctx, error),
+            HostBindingIn::Unpublished(result) => self.unpublished(ctx, result),
+            HostBindingIn::ReservationReleased(result) => self.reservation_released(ctx, result),
+            HostBindingIn::ReleasePublished => self.release_published_event(ctx),
+            HostBindingIn::SessionClosed => self.session_closed(ctx),
+            HostBindingIn::Released(result) => self.released(ctx, result),
+        }
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, exited: ActorExited) {
+        if self.state == HostBindingState::Released {
+            return;
+        }
+        if self.auxiliary == Some(exited.addr) {
+            self.auxiliary = None;
+            self.fail(ctx, DataPlaneError::SessionNotRunning);
+        } else if exited.addr == self.allocator {
+            if matches!(
+                self.state,
+                HostBindingState::Published | HostBindingState::Unpublishing
+            ) {
+                return;
+            }
+            self.lease = None;
+            self.fail(ctx, DataPlaneError::SessionNotRunning);
+        } else if exited.addr == self.host_session {
+            self.session_closed(ctx);
+        }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        self.release_retained_source();
+        if self.state != HostBindingState::Released {
+            if let Some(auxiliary) = self.auxiliary.take() {
+                let _ = ctx.stop_actor(auxiliary);
+            }
+            let source_owns_release =
+                self.published_source.is_some() || self.state == HostBindingState::Retiring;
+            if let Some(source) = self.published_source.take() {
+                let _ = ctx.send(source, BlobSourceIn::Retire { reply_to: None });
+            }
+            if !source_owns_release && let Some(lease) = self.lease.take() {
+                let _ = ctx.send(
+                    self.allocator,
+                    ArenaAllocatorIn::Release {
+                        binding: ctx.self_addr(),
+                        lease,
+                    },
+                );
+            }
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::BindingFaulted {
+                    binding: ctx.self_addr(),
+                    operation: self.operation,
+                    error: DataPlaneError::SessionNotRunning,
+                },
+            );
+            let _ = ctx.send(
+                self.host_session,
+                HostSessionIn::BindingDone {
+                    binding: ctx.self_addr(),
+                },
+            );
         }
     }
 }

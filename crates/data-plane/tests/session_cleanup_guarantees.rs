@@ -51,7 +51,8 @@ struct Harness {
 }
 
 fn harness(generation: u64) -> Harness {
-    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let parts = RuntimeParts::new(RuntimeConfig::default())
+        .with_extension(Arc::new(swactor::std::StdExtension::new()));
     let runtime = parts.runtime().clone();
     let engine = Engine::new(
         parts,
@@ -94,6 +95,7 @@ fn harness(generation: u64) -> Harness {
                 source_publisher: None,
                 route_registrar: Some(route_port),
                 stream_transport: None,
+                transitions: None,
             })
             .expect("host session config"),
         )

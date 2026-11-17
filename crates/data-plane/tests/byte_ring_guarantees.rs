@@ -226,7 +226,12 @@ fn wraparound_preserves_stream_exactly() {
 
 #[test]
 fn concurrent_producer_consumer_delivers_exactly_once() {
-    use std::thread::scope;
+    let engine = swactor_engine::Engine::new(
+        swactor::runtime::RuntimeParts::new(swactor::config::RuntimeConfig::default()),
+        swactor_engine::TokioBackend::new(swactor_engine::TokioConfig::default()).unwrap(),
+    )
+    .unwrap();
+    let blocking = engine.handle().blocking_work_sender();
 
     let (arena, handle) = installed(1024, 1);
     let expected: Vec<(RecordKind, Vec<u8>)> = {
@@ -246,35 +251,36 @@ fn concurrent_producer_consumer_delivers_exactly_once() {
         records
     };
 
-    let producer_handle = handle;
-    let consumer_handle = handle;
-    let producer_records = &expected;
-    let received: parking_lot::Mutex<Vec<(RecordKind, Vec<u8>)>> =
-        parking_lot::Mutex::new(Vec::new());
-    let mut producer = attach(&arena, producer_handle, Role::Producer).expect("producer");
-    let mut consumer = attach(&arena, consumer_handle, Role::Consumer).expect("consumer");
-
-    scope(|s| {
-        let producer_thread = s.spawn(move || {
-            for (kind, bytes) in producer_records {
-                // Retry until space frees up: the consumer runs concurrently.
+    let mut producer = attach(&arena, handle, Role::Producer).expect("producer");
+    let mut consumer = attach(&arena, handle, Role::Consumer).expect("consumer");
+    // Each submitted owner keeps the mapping alive even if the test unwinds.
+    let source_arena = std::sync::Arc::new(parking_lot::Mutex::new(arena));
+    let sink_arena = source_arena.clone();
+    let producer_work = blocking
+        .submit_joinable(move || {
+            let _arena = source_arena;
+            for (kind, bytes) in &expected {
                 while producer.send_record(*kind, bytes).is_err() {}
             }
-        });
-        let consumer_records = &received;
-        let consumer_thread = s.spawn(move || {
+            expected
+        })
+        .unwrap();
+    let consumer_work = blocking
+        .submit_joinable(move || {
+            let _arena = sink_arena;
+            let mut received = Vec::new();
             loop {
                 match consumer.recv_record().expect("recv") {
                     Some((RecordKind::Eof, _)) => break,
-                    Some(record) => consumer_records.lock().push(record),
-                    None => continue, // spin: sleep discipline is the binding slice's concern
+                    Some(record) => received.push(record),
+                    None => continue,
                 }
             }
-        });
-        producer_thread.join().expect("producer thread");
-        consumer_thread.join().expect("consumer thread");
-    });
-    let got = received.into_inner();
+            received
+        })
+        .unwrap();
+    let expected = producer_work.join().expect("producer work");
+    let got = consumer_work.join().expect("consumer work");
     assert_eq!(
         got,
         expected[..expected.len() - 1],

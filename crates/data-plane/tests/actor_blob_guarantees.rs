@@ -322,15 +322,21 @@ fn cancelled_write_open_releases_queued_grant() {
     );
     std::thread::sleep(Duration::from_millis(10));
     drop(cancelled);
-    std::thread::sleep(Duration::from_millis(10));
-
-    let mut retry = future::block_on(
-        harness
-            .bootstrap
-            .data_plane
-            .write_blob_path("/runs/self/results/cancelled", 8),
-    )
-    .expect("cancelled grant was reclaimed");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut retry = loop {
+        match future::block_on(
+            harness
+                .bootstrap
+                .data_plane
+                .write_blob_path("/runs/self/results/cancelled", 8),
+        ) {
+            Ok(writer) => break writer,
+            Err(DataPlaneError::ArenaExhausted) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("cancelled grant was not reclaimed: {error:?}"),
+        }
+    };
     future::block_on(retry.abort()).unwrap();
 }
 
@@ -483,6 +489,66 @@ fn stream_writer_suspends_until_reader_releases_bounded_capacity() {
         assert_eq!(reader.read().await.expect("eof"), None);
     });
 }
+
+#[test]
+fn blocked_stream_wait_fails_when_host_session_is_gone() {
+    let _stream_test = STREAM_TEST_LOCK.lock();
+    let harness = harness(2 << 20);
+    let data_plane = harness.bootstrap.data_plane.clone();
+    let logical = path("/runs/self/results/missing-host-session");
+
+    future::block_on(async {
+        let mut reader_open = Box::pin(data_plane.read_stream(&logical));
+        assert!(future::poll_once(reader_open.as_mut()).await.is_none());
+        let mut writer = data_plane
+            .write_stream(&logical)
+            .await
+            .expect("writer opens");
+        let _reader = reader_open.await.expect("reader opens");
+
+        harness
+            ._host_runtime
+            .stop_actor(harness._host_session)
+            .expect("stop host session");
+        let stop_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while harness
+            ._host_runtime
+            .stats()
+            .actors
+            .iter()
+            .any(|(actor, _)| *actor == harness._host_session)
+        {
+            assert!(
+                std::time::Instant::now() < stop_deadline,
+                "host session did not stop"
+            );
+            future::yield_now().await;
+        }
+
+        let payload = vec![0x5a; writer.capacity() as usize + 1];
+        let mut writing = Box::pin(writer.write(&payload));
+        let write_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            if let Some(result) = future::poll_once(writing.as_mut()).await {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < write_deadline,
+                "stream wait remained blocked after its host session stopped"
+            );
+            future::yield_now().await;
+        };
+        assert!(
+            matches!(
+                &result,
+                Err(DataPlaneError::BrokenPipe
+                    | DataPlaneError::SessionNotRunning
+                    | DataPlaneError::SessionFailed(_))
+            ),
+            "unexpected terminal result: {result:?}"
+        );
+    });
+}
 #[test]
 fn transport_startup_failure_faults_both_pending_opens() {
     let _stream_test = STREAM_TEST_LOCK.lock();
@@ -537,10 +603,11 @@ fn peer_replacement_requires_and_supports_a_fresh_incarnation() {
             Some(b"old".to_vec())
         );
         first_writer.abort().expect("abort first incarnation");
-        assert!(matches!(
-            first_reader.read().await,
-            Err(DataPlaneError::PeerLost)
-        ));
+        let aborted_read = first_reader.read().await;
+        assert!(
+            matches!(&aborted_read, Err(DataPlaneError::PeerLost)),
+            "aborted incarnation returned {aborted_read:?}"
+        );
 
         let mut replacement_writer_open = Box::pin(data_plane.write_stream_replacing(&logical));
         assert!(

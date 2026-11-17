@@ -187,6 +187,11 @@ pub struct NamespaceSnapshot {
     #[serde(default)]
     pub stream_nodes: BTreeMap<DataPath, u64>,
     pub operations: BTreeMap<OperationId, PersistedOperation>,
+    /// Reservation retractions are durable operation-identity tombstones, like
+    /// `operations`: retained for this namespace's lifetime because no protocol
+    /// watermark bounds how late a previously accepted request can replay.
+    #[serde(default)]
+    pub cancelled_blob_reservations: BTreeMap<OperationId, DataPath>,
     #[serde(default)]
     pub retirements: Vec<ActorAddress>,
     /// Endpoints of stream generations displaced by a replacement whose
@@ -204,6 +209,7 @@ impl Default for NamespaceSnapshot {
             next_revision: 1,
             bindings: BTreeMap::new(),
             operations: BTreeMap::new(),
+            cancelled_blob_reservations: BTreeMap::new(),
             stream_nodes: BTreeMap::new(),
             retirements: Vec::new(),
             stream_retirements: Vec::new(),

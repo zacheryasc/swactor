@@ -793,6 +793,142 @@ fn replacing_waiting_stream_displaces_old_open() {
 }
 
 #[test]
+fn active_stream_replacement_retires_a_terminated_endpoint_without_skipping_a_live_one() {
+    use data_plane::namespace::StreamIncarnation;
+    use data_plane::protocol::HostStreamIn;
+
+    let state = TempState::new("stream-displacement-terminated-endpoint");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let engine = Engine::new(
+        parts,
+        TokioBackend::new(TokioConfig {
+            worker_threads: 1,
+            ..TokioConfig::default()
+        })
+        .expect("tokio backend"),
+    )
+    .expect("directory engine");
+    let routes = Arc::new(Routes::default());
+    let actor = DataDirectoryActor::recover(
+        state.store(),
+        Some(RetirementRetry::new(
+            engine.handle(),
+            runtime.create_sender(),
+            Duration::from_millis(10),
+            Some(routes.clone()),
+        )),
+        |_, _| unreachable!("fixture has no blob bindings"),
+    )
+    .expect("recover directory");
+    let directory = runtime.spawn(actor).expect("spawn directory actor");
+    let client = DirectoryClient::new(runtime.clone(), directory);
+    let logical = path("/replace/terminated-endpoint");
+    let terminated_source = source(40);
+    let live_sink = runtime
+        .new_inbox::<HostStreamIn>()
+        .expect("live sink inbox");
+    routes
+        .routable
+        .lock()
+        .replace(HashSet::from([*live_sink.addr()]));
+
+    future::block_on(async {
+        let mut old_source_open = Box::pin(client.open_stream(
+            logical.clone(),
+            StreamRole::Source,
+            terminated_source,
+            OperationId::from_u128(40),
+        ));
+        assert!(future::poll_once(old_source_open.as_mut()).await.is_none());
+        let old_match = client
+            .open_stream(
+                logical.clone(),
+                StreamRole::Sink,
+                *live_sink.addr(),
+                OperationId::from_u128(41),
+            )
+            .await
+            .expect("match old stream");
+        assert_eq!(
+            old_source_open.await.expect("old source matched"),
+            old_match
+        );
+
+        let replacement_source = source(42);
+        let replacement_sink = source(43);
+        let mut replacement_source_open = Box::pin(client.replace_with_stream(
+            logical.clone(),
+            StreamRole::Source,
+            replacement_source,
+            OperationId::from_u128(42),
+        ));
+        assert!(
+            future::poll_once(replacement_source_open.as_mut())
+                .await
+                .is_none()
+        );
+        let HostStreamIn::Displaced {
+            incarnation,
+            reply_to: Some(reply_to),
+        } = live_sink.recv().await
+        else {
+            panic!("live old endpoint did not receive displacement");
+        };
+        assert_eq!(incarnation, old_match.incarnation);
+
+        let mut replacement_sink_open = Box::pin(client.open_stream(
+            logical,
+            StreamRole::Sink,
+            replacement_sink,
+            OperationId::from_u128(43),
+        ));
+        assert!(
+            future::poll_once(replacement_sink_open.as_mut())
+                .await
+                .is_none(),
+            "replacement bypassed a live endpoint that had not acknowledged displacement"
+        );
+
+        runtime
+            .send_to(
+                reply_to,
+                DataDirectoryIn::StreamDisplaced {
+                    endpoint: *live_sink.addr(),
+                    incarnation: StreamIncarnation {
+                        authority_epoch: incarnation.authority_epoch,
+                        revision: incarnation.revision,
+                    },
+                },
+            )
+            .expect("acknowledge live endpoint displacement");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let replacement_source_match = loop {
+            if let Some(result) = future::poll_once(replacement_source_open.as_mut()).await {
+                break result.expect("replacement source matched");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminated old endpoint stranded the replacement fence"
+            );
+            std::thread::yield_now();
+        };
+        let replacement_sink_match = replacement_sink_open
+            .await
+            .expect("replacement sink matched");
+        assert_eq!(replacement_source_match, replacement_sink_match);
+        assert_eq!(replacement_source_match.source, replacement_source);
+        assert_eq!(replacement_source_match.sink, replacement_sink);
+    });
+
+    drop(engine);
+}
+
+#[test]
 fn duplicate_stream_role_fails_without_replacing_the_waiter() {
     let state = TempState::new("duplicate-stream-role");
     let directory = spawn_directory(&state.store());
@@ -2614,4 +2750,448 @@ fn displacement_acknowledgements_retry_durability_after_endpoints_stop() {
         unrelated_source.try_recv(),
         Some(BlobSourceIn::Retire { .. })
     ));
+}
+
+#[test]
+fn cancelled_reservation_survives_route_loss_and_authority_restart() {
+    let state = TempState::new("reservation-recovery");
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let directory = runtime
+        .spawn(
+            DataDirectoryActor::recover(state.store(), None, |_, _| {
+                unreachable!("no durable blob sources")
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let discovered = Arc::new(RwLock::new(Some(directory)));
+    let proxy = runtime
+        .spawn(NamespaceClientActor::new_with_deadline(
+            engine.handle(),
+            runtime.create_sender(),
+            Arc::new(StaticDiscovery {
+                directory: discovered.clone(),
+            }),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ))
+        .unwrap();
+    let replies = runtime.new_inbox::<DataDirectoryOut>().unwrap();
+    let logical = path("/reservation/restarted");
+    let operation = OperationId::from_u128(900);
+    runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::ReserveBlob {
+                    path: logical.clone(),
+                    operation_id: operation,
+                },
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    assert!(matches!(
+        replies.try_recv(),
+        Some(DataDirectoryOut::BlobReserved { result: Ok(()), .. })
+    ));
+
+    *discovered.write() = None;
+    runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::CancelBlobReservation {
+                path: logical.clone(),
+                operation_id: operation,
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    backend.advance_time(Duration::from_secs(1));
+    settle(&backend);
+    *discovered.write() = Some(directory);
+    runtime.send_to(proxy, NamespaceClientIn::Retry).unwrap();
+    settle(&backend);
+    assert!(
+        replies.try_recv().is_none(),
+        "cleanup must not resolve the cancelled caller again"
+    );
+
+    runtime.stop_actor(directory).unwrap();
+    settle(&backend);
+    let recovered = runtime
+        .spawn(
+            DataDirectoryActor::recover(state.store(), None, |_, _| {
+                unreachable!("no durable blob sources")
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    *discovered.write() = Some(recovered);
+    // A delayed pre-restart reserve cannot resurrect the released operation.
+    runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::ReserveBlob {
+                    path: logical.clone(),
+                    operation_id: operation,
+                },
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    assert!(matches!(
+        replies.try_recv(),
+        Some(DataDirectoryOut::BlobReserved {
+            result: Err(NamespaceError::PathReplaced(_)),
+            ..
+        })
+    ));
+    runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::ReserveBlob {
+                    path: logical,
+                    operation_id: OperationId::from_u128(901),
+                },
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    assert!(matches!(
+        replies.try_recv(),
+        Some(DataDirectoryOut::BlobReserved { result: Ok(()), .. })
+    ));
+    assert!(replies.try_recv().is_none());
+}
+
+#[test]
+fn namespace_owner_shutdown_resolves_outstanding_request_once() {
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    });
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let proxy = runtime
+        .spawn(NamespaceClientActor::new_with_deadline(
+            engine.handle(),
+            runtime.create_sender(),
+            Arc::new(StaticDiscovery {
+                directory: Arc::new(RwLock::new(None)),
+            }),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+    let replies = runtime.new_inbox::<DataDirectoryOut>().unwrap();
+    runtime
+        .send_to(
+            proxy,
+            NamespaceClientIn::Request {
+                request: NamespaceRequest::Lookup {
+                    path: path("/shutdown/pending"),
+                },
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    settle(&backend);
+    assert!(replies.try_recv().is_none());
+    runtime.stop_actor(proxy).unwrap();
+    settle(&backend);
+    assert!(matches!(
+        replies.try_recv(),
+        Some(DataDirectoryOut::LookedUp {
+            result: Err(NamespaceError::DirectoryUnavailable(_)),
+            ..
+        })
+    ));
+    backend.advance_time(Duration::from_secs(2));
+    settle(&backend);
+    assert!(replies.try_recv().is_none());
+}
+
+fn cleanup_directory(label: &str) -> (TempState, DirectoryHarness, SteppingBackend) {
+    let state = TempState::new(label);
+    let parts = RuntimeParts::new(RuntimeConfig {
+        worker_count: 1,
+        ..RuntimeConfig::default()
+    })
+    .with_extension(Arc::new(swactor::std::StdExtension::new()));
+    let runtime = parts.runtime().clone();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
+    let directory = runtime
+        .spawn(
+            DataDirectoryActor::recover(state.store(), None, |_, _| {
+                unreachable!("fresh namespace contains no recovered sources")
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    settle(&backend);
+    (
+        state,
+        DirectoryHarness {
+            engine,
+            runtime: runtime.clone(),
+            client: DirectoryClient::new(runtime, directory),
+        },
+        backend,
+    )
+}
+
+fn directory_result<F: Future>(backend: &SteppingBackend, request: F) -> F::Output {
+    let mut request = Box::pin(request);
+    if let Some(result) = future::block_on(future::poll_once(request.as_mut())) {
+        return result;
+    }
+    settle(backend);
+    future::block_on(future::poll_once(request.as_mut()))
+        .expect("directory request did not complete after its input events")
+}
+
+fn cleanup_stream(
+    directory: &DirectoryHarness,
+    backend: &SteppingBackend,
+    logical: &DataPath,
+    operation: u128,
+) -> data_plane::namespace::StreamMatch {
+    let mut producer = Box::pin(directory.client.open_stream(
+        logical.clone(),
+        StreamRole::Source,
+        source(201),
+        OperationId::from_u128(operation),
+    ));
+    assert!(future::block_on(future::poll_once(producer.as_mut())).is_none());
+    settle(backend);
+    let binding = directory_result(
+        backend,
+        directory.client.open_stream(
+            logical.clone(),
+            StreamRole::Sink,
+            source(202),
+            OperationId::from_u128(operation + 1),
+        ),
+    )
+    .unwrap();
+    assert_eq!(directory_result(backend, producer).unwrap(), binding);
+    binding
+}
+
+#[test]
+fn quiescent_cleanup_cancels_on_drop_and_completes_on_stream_close() {
+    let (_state, directory, backend) = cleanup_directory("cleanup-cancellation");
+    let logical = path("/runs/cleanup/stream");
+    let first = cleanup_stream(&directory, &backend, &logical, 1);
+    let baseline = directory.runtime.stats().actors.len();
+    let mut abandoned = Box::pin(
+        directory
+            .client
+            .unregister_when_quiescent(logical.clone(), OperationId::from_u128(3)),
+    );
+    assert!(future::block_on(future::poll_once(abandoned.as_mut())).is_none());
+    settle(&backend);
+    assert!(future::block_on(future::poll_once(abandoned.as_mut())).is_none());
+    drop(abandoned);
+    settle(&backend);
+    directory_result(
+        &backend,
+        directory
+            .client
+            .close_stream(logical.clone(), first.incarnation),
+    )
+    .unwrap();
+    let retained = directory_result(&backend, directory.client.lookup(logical.clone())).unwrap();
+    assert_eq!(retained.revision, first.revision);
+    assert!(!retained.active);
+    assert_eq!(directory.runtime.stats().actors.len(), baseline);
+
+    let second = cleanup_stream(&directory, &backend, &logical, 4);
+    let mut cleanup = Box::pin(
+        directory
+            .client
+            .unregister_when_quiescent(logical.clone(), OperationId::from_u128(6)),
+    );
+    assert!(future::block_on(future::poll_once(cleanup.as_mut())).is_none());
+    settle(&backend);
+    assert!(future::block_on(future::poll_once(cleanup.as_mut())).is_none());
+    directory_result(
+        &backend,
+        directory
+            .client
+            .close_stream(logical.clone(), second.incarnation),
+    )
+    .unwrap();
+    let removed = directory_result(&backend, cleanup).unwrap().unwrap();
+    assert_eq!(removed.revision, second.revision);
+    assert!(!removed.active);
+    assert!(matches!(
+        directory_result(&backend, directory.client.lookup(logical.clone())),
+        Err(NamespaceError::PathNotFound(found)) if found == logical
+    ));
+    settle(&backend);
+    assert_eq!(directory.runtime.stats().actors.len(), baseline);
+}
+
+#[test]
+fn quiescent_cleanup_rejects_replacement_and_replayed_old_removal() {
+    let (_state, directory, backend) = cleanup_directory("cleanup-replacement");
+    let logical = path("/runs/cleanup/replaced");
+    cleanup_stream(&directory, &backend, &logical, 1);
+    let mut cleanup = Box::pin(
+        directory
+            .client
+            .unregister_when_quiescent(logical.clone(), OperationId::from_u128(3)),
+    );
+    assert!(future::block_on(future::poll_once(cleanup.as_mut())).is_none());
+    settle(&backend);
+    let replacement = directory_result(
+        &backend,
+        directory.client.register(
+            logical.clone(),
+            source(203),
+            [9; 32],
+            8,
+            recovery(source(203)),
+            OperationId::from_u128(4),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        directory_result(&backend, cleanup),
+        Err(NamespaceError::PathReplaced(found)) if found == logical
+    ));
+    assert_eq!(
+        directory_result(&backend, directory.client.lookup(logical.clone()))
+            .unwrap()
+            .revision,
+        replacement.revision
+    );
+    directory_result(
+        &backend,
+        directory
+            .client
+            .unregister_when_quiescent(logical.clone(), OperationId::from_u128(5)),
+    )
+    .unwrap();
+    let newer = directory_result(
+        &backend,
+        directory.client.register(
+            logical.clone(),
+            source(204),
+            [9; 32],
+            8,
+            recovery(source(204)),
+            OperationId::from_u128(6),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        directory_result(&backend, directory.client.unregister_when_quiescent(
+            logical.clone(), OperationId::from_u128(5),
+        )),
+        Err(NamespaceError::PathReplaced(found)) if found == logical
+    ));
+    assert_eq!(
+        directory_result(&backend, directory.client.lookup(logical))
+            .unwrap()
+            .revision,
+        newer.revision
+    );
+}
+
+#[test]
+fn quiescent_cleanup_cancellation_matches_request_and_observer() {
+    let (_state, directory, backend) = cleanup_directory("cleanup-exact-owner");
+    let logical = path("/runs/cleanup/owner");
+    let binding = cleanup_stream(&directory, &backend, &logical, 1);
+    let replies = directory.runtime.new_inbox::<NamespaceClientIn>().unwrap();
+    let other = directory.runtime.new_inbox::<NamespaceClientIn>().unwrap();
+    directory
+        .runtime
+        .send_to(
+            directory.client.directory(),
+            DataDirectoryIn::UnregisterWhenQuiescent {
+                request_id: DirectoryRequestId(10),
+                path: logical.clone(),
+                operation_id: OperationId::from_u128(3),
+                reply_to: *replies.addr(),
+            },
+        )
+        .unwrap();
+    for (request_id, reply_to) in [
+        (DirectoryRequestId(9), *replies.addr()),
+        (DirectoryRequestId(10), *other.addr()),
+    ] {
+        directory
+            .runtime
+            .send_to(
+                directory.client.directory(),
+                DataDirectoryIn::CancelQuiescentUnregister {
+                    request_id,
+                    path: logical.clone(),
+                    reply_to,
+                },
+            )
+            .unwrap();
+    }
+    settle(&backend);
+    assert!(replies.try_recv().is_none());
+    directory_result(
+        &backend,
+        directory
+            .client
+            .close_stream(logical.clone(), binding.incarnation),
+    )
+    .unwrap();
+    assert!(
+        matches!(replies.try_recv(), Some(NamespaceClientIn::DirectoryReply(
+        DataDirectoryOut::QuiescentUnregistered {
+            request_id: DirectoryRequestId(10),
+            result: Ok(Some(node)),
+            ..
+        }
+    )) if node.revision == binding.revision && !node.active)
+    );
+    assert!(other.try_recv().is_none());
+}
+
+#[test]
+fn quiescent_cleanup_resolves_when_authority_stops() {
+    let (_state, directory, backend) = cleanup_directory("cleanup-authority-exit");
+    let logical = path("/runs/cleanup/stopped");
+    cleanup_stream(&directory, &backend, &logical, 1);
+    let mut cleanup = Box::pin(
+        directory
+            .client
+            .unregister_when_quiescent(logical, OperationId::from_u128(3)),
+    );
+    assert!(future::block_on(future::poll_once(cleanup.as_mut())).is_none());
+    settle(&backend);
+    directory
+        .runtime
+        .stop_actor(directory.client.directory())
+        .unwrap();
+    settle(&backend);
+    assert!(matches!(
+        directory_result(&backend, cleanup),
+        Err(NamespaceError::DirectoryUnavailable(_))
+    ));
+    settle(&backend);
+    assert!(directory.runtime.stats().actors.is_empty());
 }

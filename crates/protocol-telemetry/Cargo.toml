@@ -1,0 +1,17 @@
+[package]
+name = "protocol-telemetry"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[dependencies]
+swactor = { path = "../..", features = ["serde"] }
+telemetry = { path = "../telemetry" }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+
+
+[dev-dependencies]
+swactor-engine = { path = "../engine" }
+[lints]
+workspace = true

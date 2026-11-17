@@ -152,3 +152,51 @@ fn guest_failure_reason_reaches_host() {
         AttachmentResult::Failed("route rejected".to_owned())
     );
 }
+
+#[test]
+fn attachment_result_is_consumed_once_and_acknowledgement_requires_it() {
+    let (mut host, child) = bootstrap_channel().unwrap();
+    let pending = GuestBootstrap::begin_claim(child).unwrap();
+    let mut attachment = host
+        .accept_claim(&material(), arena_fd().as_raw_fd())
+        .unwrap();
+    let acknowledgement = pending
+        .receive()
+        .unwrap()
+        .into_parts()
+        .unwrap()
+        .2
+        .begin_attachment_succeeded()
+        .unwrap();
+    assert_eq!(
+        attachment.receive_result().unwrap(),
+        AttachmentResult::Succeeded
+    );
+    assert!(matches!(
+        attachment.receive_result(),
+        Err(BootstrapChannelError::ChannelClosed)
+    ));
+    attachment.acknowledge().unwrap();
+    acknowledgement
+        .wait_deadline(std::time::Duration::ZERO)
+        .unwrap();
+
+    let (mut host, child) = bootstrap_channel().unwrap();
+    let pending = GuestBootstrap::begin_claim(child).unwrap();
+    let attachment = host
+        .accept_claim(&material(), arena_fd().as_raw_fd())
+        .unwrap();
+    let guest = pending.receive().unwrap();
+    assert!(matches!(
+        attachment.acknowledge(),
+        Err(BootstrapChannelError::ChannelClosed)
+    ));
+    assert!(
+        guest
+            .into_parts()
+            .unwrap()
+            .2
+            .begin_attachment_succeeded()
+            .is_err()
+    );
+}

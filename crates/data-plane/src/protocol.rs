@@ -424,6 +424,11 @@ pub enum HostSessionIn {
     CancelOpen {
         operation: ActorAddress,
     },
+    StreamOpenForwarded {
+        operation: ActorAddress,
+        host_binding: ActorAddress,
+        incarnation: StreamIncarnation,
+    },
     StreamControl {
         binding: ActorAddress,
         message: HostStreamIn,
@@ -483,6 +488,9 @@ pub enum ChildSessionIn {
     AttachmentFailed {
         error: DataPlaneError,
     },
+    HostUnavailable {
+        host_session: ActorAddress,
+    },
     Open {
         path: DataPath,
         options: OpenOptions,
@@ -524,7 +532,11 @@ pub enum ChildSessionIn {
         lease_id: BlobLeaseId,
         generation: u64,
     },
-    BlobReleased,
+    BlobReleased {
+        binding: ActorAddress,
+        lease_id: BlobLeaseId,
+        generation: u64,
+    },
     BlobOpened {
         operation: ActorAddress,
         host_binding: ActorAddress,
@@ -588,7 +600,17 @@ pub enum HostStreamIn {
     RouteChanged {
         incarnation: StreamIncarnation,
     },
-    Transport(StreamTransportEvent),
+    PeerRouteLossCheck {
+        incarnation: StreamIncarnation,
+        generation: u64,
+    },
+    Transport {
+        incarnation: StreamIncarnation,
+        event: StreamTransportEvent,
+    },
+    OpenForwarded {
+        incarnation: StreamIncarnation,
+    },
     DataAvailable,
     CapacityAvailable,
     WaitData {
@@ -596,6 +618,10 @@ pub enum HostStreamIn {
     },
     WaitCapacity {
         reply_to: ActorAddress,
+    },
+    WaitProgress {
+        reply_to: ActorAddress,
+        target: u64,
     },
     Close {
         clean: bool,
@@ -617,6 +643,20 @@ pub enum HostStreamIn {
         reply_to: Option<ActorAddress>,
     },
     ReleaseComplete(Result<(), DataPlaneError>),
+    NamespaceClosed(Result<(), DataPlaneError>),
+    SessionDetached,
+}
+
+impl HostStreamIn {
+    pub(crate) fn child_reply_to(&self) -> Option<ActorAddress> {
+        match self {
+            Self::WaitData { reply_to }
+            | Self::WaitCapacity { reply_to }
+            | Self::WaitProgress { reply_to, .. } => Some(*reply_to),
+            Self::Close { reply_to, .. } => *reply_to,
+            _ => None,
+        }
+    }
 }
 
 impl NetworkMessage for HostStreamIn {

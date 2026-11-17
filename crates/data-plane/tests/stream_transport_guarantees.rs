@@ -121,6 +121,92 @@ fn local_transport_preserves_order_backpressure_and_eof() {
 }
 
 #[test]
+fn local_transport_fault_reports_quiescence_once_and_releases_endpoints() {
+    let mut memory = arena(3);
+    let source = install(
+        &mut memory,
+        ByteRingSpec {
+            capacity: 32,
+            generation: 1,
+            alignment: 64,
+            request_id: 1,
+        },
+    )
+    .unwrap();
+    let sink = install(
+        &mut memory,
+        ByteRingSpec {
+            capacity: 32,
+            generation: 1,
+            alignment: 64,
+            request_id: 2,
+        },
+    )
+    .unwrap();
+    let mut writer = attach(&memory, source, Role::Producer).unwrap();
+    writer.send_record(RecordKind::Data, b"payload").unwrap();
+    let transport = LocalStreamTransport::new();
+    let incarnation = StreamIncarnation {
+        authority_epoch: 1,
+        revision: 1,
+    };
+    let source_events = Arc::new(Events::default());
+    let sink_events = Arc::new(Events::default());
+    // A wrongly supplied sink endpoint makes the actual transfer fail.
+    transport
+        .install_sink(StreamSinkRequest {
+            incarnation,
+            endpoint: attach(&memory, sink, Role::Consumer).unwrap(),
+            notifier: sink_events.clone(),
+        })
+        .unwrap();
+    transport
+        .install_source(StreamSourceRequest {
+            incarnation,
+            peer: transport.descriptor().unwrap(),
+            endpoint: attach(&memory, source, Role::Consumer).unwrap(),
+            notifier: source_events.clone(),
+        })
+        .unwrap();
+    transport.terminate(incarnation);
+    transport.source_progress(incarnation);
+    transport.sink_progress(incarnation);
+    for events in [&source_events, &sink_events] {
+        assert!(matches!(
+            events.0.lock().as_slice(),
+            [
+                StreamTransportEvent::Ready,
+                StreamTransportEvent::Fault(_),
+                StreamTransportEvent::Quiesced,
+            ]
+        ));
+    }
+    // Reusing the identity can acquire both endpoints: the failed transfer
+    // retained neither registration and cannot consume later progress.
+    transport
+        .install_sink(StreamSinkRequest {
+            incarnation,
+            endpoint: attach(&memory, sink, Role::Producer).unwrap(),
+            notifier: sink_events,
+        })
+        .unwrap();
+    transport
+        .install_source(StreamSourceRequest {
+            incarnation,
+            peer: transport.descriptor().unwrap(),
+            endpoint: attach(&memory, source, Role::Consumer).unwrap(),
+            notifier: source_events,
+        })
+        .unwrap();
+    let mut reader = attach(&memory, sink, Role::Consumer).unwrap();
+    assert_eq!(
+        reader.recv_record().unwrap(),
+        Some((RecordKind::Data, b"payload".to_vec()))
+    );
+    transport.terminate(incarnation);
+}
+
+#[test]
 fn local_transport_rejects_a_descriptor_from_another_backend() {
     let first = LocalStreamTransport::new();
     let second = LocalStreamTransport::new();

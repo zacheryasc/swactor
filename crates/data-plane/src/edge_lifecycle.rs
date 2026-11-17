@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
 pub use crate::ids::{ActorAddress, EdgeId, ExecutionId, LeaseRequestId, NodeId, RingId};
+use protocol_telemetry::{
+    ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingDirection {
@@ -270,6 +273,15 @@ impl EdgeEstablisher {
         }
     }
 
+    pub fn with_transitions(
+        mut self,
+        owner: swactor::actor::ActorAddress,
+        transitions: Option<TransitionEmitter>,
+    ) -> Self {
+        self.state.transitions = transitions.map(|emitter| (owner, emitter));
+        self
+    }
+
     pub fn observe(&mut self, event: EdgeEvent) {
         self.state.observe(event);
     }
@@ -294,6 +306,7 @@ struct EdgeEstablisherState {
     records: BTreeMap<EdgeId, EdgeRecord>,
     commands: Vec<EdgeCommand>,
     events: Vec<EdgeLifecycleEvent>,
+    transitions: Option<(swactor::actor::ActorAddress, TransitionEmitter)>,
 }
 
 impl EdgeEstablisherState {
@@ -305,6 +318,7 @@ impl EdgeEstablisherState {
             records: BTreeMap::new(),
             commands: Vec::new(),
             events: Vec::new(),
+            transitions: None,
         }
     }
 
@@ -339,7 +353,9 @@ impl EdgeEstablisherState {
     }
 
     fn provision_tx(&mut self, provision: ProvisionTx) {
-        if provision.local_node_id != self.local_node_id {
+        if provision.local_node_id != self.local_node_id
+            || self.records.contains_key(&provision.edge_id)
+        {
             return;
         }
 
@@ -358,7 +374,9 @@ impl EdgeEstablisherState {
     }
 
     fn provision_rx(&mut self, provision: ProvisionRx) {
-        if provision.local_node_id != self.local_node_id {
+        if provision.local_node_id != self.local_node_id
+            || self.records.contains_key(&provision.edge_id)
+        {
             return;
         }
 
@@ -385,6 +403,12 @@ impl EdgeEstablisherState {
             return;
         };
 
+        // A repeated grant is not a fresh allocation. Releasing it here would
+        // revoke the still-installed ring of an active or closing edge.
+        if record.ring_id == Some(ring_id) {
+            return;
+        }
+
         if record.state != EdgeProvisionState::WaitingForLease {
             self.commands.push(EdgeCommand::ReleaseArenaLease {
                 ring_id,
@@ -396,7 +420,11 @@ impl EdgeEstablisherState {
         record.ring_id = Some(ring_id);
         record.layout = Some(layout);
         record.worker_ring_requested = true;
-        record.state = EdgeProvisionState::WaitingForWorkerRing;
+        record.enter_state(
+            EdgeProvisionState::WaitingForWorkerRing,
+            Reason::Allocated,
+            &self.transitions,
+        );
         self.commands.push(EdgeCommand::InstallWorkerRing {
             edge_id,
             ring_id,
@@ -415,7 +443,11 @@ impl EdgeEstablisherState {
             return;
         };
 
-        record.state = EdgeProvisionState::Failed;
+        record.enter_state(
+            EdgeProvisionState::Failed,
+            Reason::Failed,
+            &self.transitions,
+        );
         self.events.push(EdgeLifecycleEvent::EdgeFaulted {
             edge_id,
             reason: EdgeFaultReason::RingLeaseRejected(reason),
@@ -437,7 +469,11 @@ impl EdgeEstablisherState {
 
         record.worker_installed = true;
         record.driver_established = true;
-        record.state = EdgeProvisionState::WaitingForDriver;
+        record.enter_state(
+            EdgeProvisionState::WaitingForDriver,
+            Reason::Requested,
+            &self.transitions,
+        );
         match record.direction {
             RingDirection::Egress => {
                 if let Some(consumer_node_id) = record.peer_node_id {
@@ -463,7 +499,7 @@ impl EdgeEstablisherState {
             return;
         }
 
-        record.state = EdgeProvisionState::Ready;
+        record.enter_state(EdgeProvisionState::Ready, Reason::Ready, &self.transitions);
         self.events.push(EdgeLifecycleEvent::EdgeReady {
             edge_id,
             local_edge_actor: record.local_edge_actor,
@@ -515,7 +551,11 @@ impl EdgeEstablisherState {
         let ring_id = record.ring_id;
         let driver_established = record.driver_established;
         let worker_ring_cleanup_required = record.worker_ring_cleanup_required();
-        record.state = EdgeProvisionState::Stopping;
+        record.enter_state(
+            EdgeProvisionState::Stopping,
+            Reason::CloseRequested,
+            &self.transitions,
+        );
 
         if cancel_lease && let Some(request_id) = request_id {
             self.commands.push(EdgeCommand::CancelQueuedLease {
@@ -609,16 +649,24 @@ impl EdgeEstablisherState {
         if record.state == EdgeProvisionState::Stopped {
             return;
         }
-        record.state = EdgeProvisionState::Stopped;
+        record.enter_state(
+            EdgeProvisionState::Stopped,
+            Reason::Released,
+            &self.transitions,
+        );
         self.events
             .push(EdgeLifecycleEvent::EdgeStopped { edge_id });
     }
 
     fn mark_stopped(&mut self, edge_id: EdgeId) {
-        let Some(record) = self.records.get_mut(&edge_id) else {
+        let Some(record) = self.records.get(&edge_id) else {
             return;
         };
-        record.state = EdgeProvisionState::Stopped;
+        // An uncorrelated stop notification is not a quiescence proof.
+        if record.state != EdgeProvisionState::Stopping || record.ring_id.is_some() {
+            return;
+        }
+        self.mark_stopped_with_event(edge_id);
     }
 
     fn edge_for_request(&self, request_id: LeaseRequestId) -> Option<EdgeId> {
@@ -676,6 +724,48 @@ struct EdgeRecord {
 }
 
 impl EdgeRecord {
+    fn enter_state(
+        &mut self,
+        next: EdgeProvisionState,
+        reason: Reason,
+        transitions: &Option<(swactor::actor::ActorAddress, TransitionEmitter)>,
+    ) {
+        let previous = std::mem::replace(&mut self.state, next);
+        if previous == next {
+            return;
+        }
+        let phase = |phase| match phase {
+            EdgeProvisionState::WaitingForLease => Phase::Allocating,
+            EdgeProvisionState::WaitingForWorkerRing => Phase::Attaching,
+            EdgeProvisionState::WaitingForDriver => Phase::AwaitingTransport,
+            EdgeProvisionState::Ready => Phase::Ready,
+            EdgeProvisionState::Stopping => Phase::Releasing,
+            EdgeProvisionState::Stopped => Phase::Closed,
+            EdgeProvisionState::Failed => Phase::Failed,
+        };
+        if let Some((actor, emitter)) = transitions {
+            let mut operation = [0; 16];
+            operation[..8].copy_from_slice(&self.execution_id.0.to_be_bytes());
+            operation[8..].copy_from_slice(&self.edge_id.0.to_be_bytes());
+            emitter.emit(TransitionRecord {
+                actor: *actor,
+                actor_type: ActorType::EdgeEstablisher,
+                protocol: Protocol::Edge,
+                operation: Some(operation),
+                generation: self.lease_request_id.map(|id| id.0),
+                incarnation: self.ring_id.map(|id| id.0),
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: match next {
+                    EdgeProvisionState::Stopped => Some(Outcome::Success),
+                    EdgeProvisionState::Failed => Some(Outcome::Failed),
+                    _ => None,
+                },
+            });
+        }
+    }
+
     fn new_tx(provision: ProvisionTx, request_id: LeaseRequestId, actor: ActorAddress) -> Self {
         Self {
             execution_id: provision.execution_id,

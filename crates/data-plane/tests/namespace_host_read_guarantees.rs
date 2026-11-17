@@ -31,6 +31,8 @@ use swactor::config::RuntimeConfig;
 use swactor::runtime::{RemoteSink, Runtime, RuntimeParts};
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
+include!("host_route_observer_support.inc");
+
 const CAPABILITY: SessionCapability = SessionCapability::new([0x33; 32]);
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -151,7 +153,8 @@ fn runtime_parts() -> (RuntimeParts, Runtime) {
     let parts = RuntimeParts::new(RuntimeConfig {
         worker_count: 1,
         ..RuntimeConfig::default()
-    });
+    })
+    .with_extension(Arc::new(swactor::std::StdExtension::new()));
     let runtime = parts.runtime().clone();
     (parts, runtime)
 }
@@ -232,6 +235,7 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
         Arc::clone(&sender),
         Arc::clone(&source_publisher),
         None,
+        None,
     )
     .unwrap();
     let directory = service.directory();
@@ -276,15 +280,21 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
                 source_publisher: Some(Arc::clone(&source_publisher)),
                 route_registrar: None,
                 stream_transport: None,
+                transitions: None,
             })
             .unwrap(),
         )
         .unwrap();
-    let bootstrap = future::block_on(DataPlaneBootstrap::attach(
+    let bootstrap = future::block_on(DataPlaneBootstrap::attach_routed(
         handoff.arena_fd,
         child_runtime.clone(),
         host_session,
         CAPABILITY,
+        None,
+        None,
+        Arc::new(RuntimeHostRouteObserver {
+            runtime: host_runtime.clone(),
+        }),
     ))
     .unwrap();
     let consumer_host_session = host_runtime
@@ -310,15 +320,21 @@ fn host_read_resolves_file_source_and_seals_final_arena_lease() {
                 source_publisher: Some(source_publisher),
                 route_registrar: None,
                 stream_transport: None,
+                transitions: None,
             })
             .unwrap(),
         )
         .unwrap();
-    let consumer = future::block_on(DataPlaneBootstrap::attach(
+    let consumer = future::block_on(DataPlaneBootstrap::attach_routed(
         consumer_handoff.arena_fd,
         child_runtime,
         consumer_host_session,
         CAPABILITY,
+        None,
+        None,
+        Arc::new(RuntimeHostRouteObserver {
+            runtime: host_runtime.clone(),
+        }),
     ))
     .unwrap();
     let blob = future::block_on(bootstrap.data_plane.read_blob(&logical)).unwrap();

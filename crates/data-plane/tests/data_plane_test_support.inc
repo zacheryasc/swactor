@@ -17,6 +17,8 @@ use swactor::config::RuntimeConfig;
 use swactor::runtime::{RemoteSink, Runtime, RuntimeParts};
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
+include!("host_route_observer_support.inc");
+
 const CAPABILITY: SessionCapability = SessionCapability::new([9; 32]);
 const ARENA_GENERATION: u64 = 17;
 const SESSION_GENERATION: u64 = 29;
@@ -43,6 +45,7 @@ struct Harness {
     _child_engine: Engine,
     _temp: TempState,
     _host_runtime: Runtime,
+    _host_session: ActorAddress,
     bootstrap: DataPlaneBootstrap,
 }
 
@@ -78,7 +81,7 @@ fn runtime_parts() -> (RuntimeParts, Runtime) {
     let parts = RuntimeParts::new(RuntimeConfig {
         worker_count: 1,
         ..RuntimeConfig::default()
-    });
+    }).with_extension(Arc::new(swactor::std::StdExtension::new()));
     let runtime = parts.runtime().clone();
     (parts, runtime)
 }
@@ -308,15 +311,19 @@ fn harness_with_transport(
                 source_publisher: Some(Arc::new(NoopSourceRegistrar)),
                 route_registrar: None,
                 stream_transport: Some(stream_transport),
+                transitions: None,
             })
             .expect("host session config"),
         )
         .expect("spawn host session");
-    let bootstrap = future::block_on(DataPlaneBootstrap::attach(
+    let bootstrap = future::block_on(DataPlaneBootstrap::attach_routed(
         prepared.arena_fd,
         child_runtime,
         host_session,
         CAPABILITY,
+        None,
+        None,
+        Arc::new(RuntimeHostRouteObserver { runtime: host_runtime.clone() }),
     ))
     .expect("routed attachment");
 
@@ -325,6 +332,7 @@ fn harness_with_transport(
         _child_engine: child_engine,
         _temp: temp,
         _host_runtime: host_runtime,
+        _host_session: host_session,
         bootstrap,
     }
 }

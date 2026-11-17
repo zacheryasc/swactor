@@ -1,10 +1,13 @@
 //! Persistent fixed-length blob sources.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use protocol_telemetry::{
+    ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::Runtime;
@@ -62,22 +65,39 @@ impl NetworkMessage for BlobSourceResources {
 struct ActorTransferCompletion {
     runtime: Runtime,
     source: ActorAddress,
-    transfer_id: BlobTransferId,
+    transfer_id: Option<BlobTransferId>,
     destination: ActorAddress,
     failure_proxy: Option<ActorAddress>,
+    _retirement: Option<Arc<RetainedSource>>,
 }
 
 impl BlobTransferCompletion for ActorTransferCompletion {
-    fn complete(self: Box<Self>, result: Result<(), String>) {
+    fn complete(mut self: Box<Self>, result: Result<(), String>) {
         let _ = self.runtime.send_to(
             self.source,
             BlobSourceIn::TransferCompleted {
-                transfer_id: self.transfer_id,
+                transfer_id: self.transfer_id.take().expect("pending completion"),
                 destination: self.destination,
                 failure_proxy: self.failure_proxy,
                 result,
             },
         );
+    }
+}
+
+impl Drop for ActorTransferCompletion {
+    fn drop(&mut self) {
+        if let Some(transfer_id) = self.transfer_id.take() {
+            let _ = self.runtime.send_to(
+                self.source,
+                BlobSourceIn::TransferCompleted {
+                    transfer_id,
+                    destination: self.destination,
+                    failure_proxy: self.failure_proxy,
+                    result: Err("blob transfer owner dropped before completion".to_owned()),
+                },
+            );
+        }
     }
 }
 
@@ -90,6 +110,23 @@ pub trait BlobSourceRetirement: Send + Sync + 'static {
     fn binding(&self) -> ActorAddress;
 }
 
+/// The backing region remains leased through every adapter-owned transfer,
+/// even if the source actor is stopped before the adapter completes.
+struct RetainedSource(Arc<dyn BlobSourceRetirement>);
+
+impl Drop for RetainedSource {
+    fn drop(&mut self) {
+        self.0.retired();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourcePhase {
+    Available,
+    Retiring,
+    Closed,
+}
+
 pub struct FileBlobSourceActor {
     runtime: Runtime,
     sender: Arc<dyn BlobTransferSender>,
@@ -98,11 +135,12 @@ pub struct FileBlobSourceActor {
     file: File,
     offset: u64,
     length: u64,
-    active: HashSet<BlobTransferId>,
+    active: HashMap<BlobTransferId, (ActorAddress, Option<ActorAddress>)>,
     completed: HashSet<BlobTransferId>,
     completed_order: VecDeque<BlobTransferId>,
-    retiring: bool,
-    retirement: Option<Arc<dyn BlobSourceRetirement>>,
+    phase: SourcePhase,
+    retirement: Option<Arc<RetainedSource>>,
+    transitions: Option<TransitionEmitter>,
 }
 
 impl FileBlobSourceActor {
@@ -129,10 +167,11 @@ impl FileBlobSourceActor {
             file,
             offset: 0,
             length,
-            active: HashSet::new(),
+            active: HashMap::new(),
             completed: HashSet::new(),
             completed_order: VecDeque::new(),
-            retiring: false,
+            phase: SourcePhase::Available,
+            transitions: None,
             retirement: None,
         })
     }
@@ -181,12 +220,48 @@ impl FileBlobSourceActor {
             file,
             offset,
             length,
-            active: HashSet::new(),
+            active: HashMap::new(),
             completed: HashSet::new(),
             completed_order: VecDeque::new(),
-            retiring: false,
-            retirement,
+            phase: SourcePhase::Available,
+            transitions: None,
+            retirement: retirement.map(|retirement| Arc::new(RetainedSource(retirement))),
         })
+    }
+
+    pub fn with_transitions(mut self, transitions: Option<TransitionEmitter>) -> Self {
+        self.transitions = transitions;
+        self
+    }
+
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: SourcePhase, reason: Reason) {
+        let previous = std::mem::replace(&mut self.phase, next);
+        if previous == next {
+            return;
+        }
+        let phase = |phase| match phase {
+            SourcePhase::Available => Phase::Ready,
+            SourcePhase::Retiring => Phase::Releasing,
+            SourcePhase::Closed => Phase::Closed,
+        };
+        if let Some(emitter) = &self.transitions {
+            emitter.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::FileBlobSourceActor,
+                protocol: Protocol::BlobSource,
+                operation: None,
+                generation: None,
+                incarnation: None,
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: (next == SourcePhase::Closed).then_some(if reason == Reason::Shutdown {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Success
+                }),
+            });
+        }
     }
 
     pub fn length(&self) -> u64 {
@@ -253,12 +328,134 @@ impl FileBlobSourceActor {
     }
 
     fn maybe_stop_retired(&mut self, ctx: &Ctx<'_>) {
-        if self.retiring && self.active.is_empty() {
-            if let Some(retirement) = self.retirement.take() {
-                retirement.retired();
-            }
+        if self.phase == SourcePhase::Retiring && self.active.is_empty() {
+            self.enter_phase(ctx, SourcePhase::Closed, Reason::Completed);
+            self.retirement.take();
             ctx.stop_self();
         }
+    }
+
+    fn emit_transfer(
+        &self,
+        ctx: &Ctx<'_>,
+        id: BlobTransferId,
+        previous: Phase,
+        next: Phase,
+        reason: Reason,
+        outcome: Option<Outcome>,
+    ) {
+        if let Some(emitter) = &self.transitions {
+            emitter.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::FileBlobSourceActor,
+                protocol: Protocol::BlobSource,
+                operation: Some(u128::from(id.0).to_be_bytes()),
+                generation: None,
+                incarnation: None,
+                previous,
+                next,
+                reason,
+                outcome,
+            });
+        }
+    }
+
+    fn begin_transfer(&mut self, ctx: &Ctx<'_>, offer: BlobTransferOffer) {
+        if self.phase != SourcePhase::Available {
+            self.fail_destination(ctx, &offer, "blob source is retired".to_owned());
+            return;
+        }
+        if self.completed.contains(&offer.transfer_id)
+            || self.active.contains_key(&offer.transfer_id)
+        {
+            return;
+        }
+        let file = match self.file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                self.fail_destination(
+                    ctx,
+                    &offer,
+                    format!("clone source file {}: {error}", self.label),
+                );
+                return;
+            }
+        };
+        let transfer_id = offer.transfer_id;
+        let destination = offer.destination;
+        let failure_proxy = offer.failure_proxy;
+        self.active
+            .insert(transfer_id, (destination, failure_proxy));
+        self.emit_transfer(
+            ctx,
+            transfer_id,
+            Phase::Created,
+            Phase::Transferring,
+            Reason::Started,
+            None,
+        );
+        let completion = Box::new(ActorTransferCompletion {
+            runtime: self.runtime.clone(),
+            source: ctx.self_addr(),
+            transfer_id: Some(transfer_id),
+            destination,
+            failure_proxy,
+            _retirement: self.retirement.clone(),
+        });
+        let request = FileTransferRequest {
+            offer,
+            file,
+            offset: self.offset,
+            length: self.length,
+            completion,
+        };
+        if let Err(error) = self.sender.start_file(request) {
+            self.transfer_completed(ctx, transfer_id, destination, failure_proxy, Err(error));
+        }
+    }
+
+    fn transfer_completed(
+        &mut self,
+        ctx: &Ctx<'_>,
+        transfer_id: BlobTransferId,
+        destination: ActorAddress,
+        failure_proxy: Option<ActorAddress>,
+        result: Result<(), String>,
+    ) {
+        if self.active.get(&transfer_id) != Some(&(destination, failure_proxy)) {
+            return;
+        }
+        self.active.remove(&transfer_id);
+        self.emit_transfer(
+            ctx,
+            transfer_id,
+            Phase::Transferring,
+            Phase::Completed,
+            Reason::Completed,
+            Some(if result.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Failed
+            }),
+        );
+        match result {
+            Ok(()) => self.remember_completed(transfer_id),
+            Err(reason) => self.send_failure(ctx, destination, failure_proxy, transfer_id, reason),
+        }
+        self.maybe_stop_retired(ctx);
+    }
+
+    fn retire(&mut self, ctx: &Ctx<'_>, reply_to: Option<ActorAddress>) {
+        self.enter_phase(ctx, SourcePhase::Retiring, Reason::Retired);
+        if let Some(reply_to) = reply_to {
+            let _ = ctx.send(
+                reply_to,
+                DataDirectoryIn::SourceRetired {
+                    source: ctx.self_addr(),
+                },
+            );
+        }
+        self.maybe_stop_retired(ctx);
     }
 }
 
@@ -280,87 +477,43 @@ impl ActorInterface for FileBlobSourceActor {
                         binding: self
                             .retirement
                             .as_ref()
-                            .map(|retirement| retirement.binding()),
+                            .map(|retirement| retirement.0.binding()),
                         active_transfers: self.active.len(),
-                        retiring: self.retiring,
+                        retiring: self.phase != SourcePhase::Available,
                     },
                 );
             }
-            BlobSourceIn::BeginTransfer { offer } => {
-                if self.retiring {
-                    self.fail_destination(ctx, &offer, "blob source is retired".to_owned());
-                    return;
-                }
-                if self.completed.contains(&offer.transfer_id)
-                    || !self.active.insert(offer.transfer_id)
-                {
-                    // BeginTransfer is an idempotent rendezvous request. The
-                    // destination repeats it until transfer traffic confirms
-                    // the route.
-                    return;
-                }
-                let file = match self.file.try_clone() {
-                    Ok(file) => file,
-                    Err(error) => {
-                        self.active.remove(&offer.transfer_id);
-                        self.fail_destination(
-                            ctx,
-                            &offer,
-                            format!("clone source file {}: {error}", self.label),
-                        );
-                        return;
-                    }
-                };
-                let completion: Box<dyn BlobTransferCompletion> =
-                    Box::new(ActorTransferCompletion {
-                        runtime: self.runtime.clone(),
-                        source: ctx.self_addr(),
-                        transfer_id: offer.transfer_id,
-                        destination: offer.destination,
-                        failure_proxy: offer.failure_proxy,
-                    });
-                let request = FileTransferRequest {
-                    offer: offer.clone(),
-                    file,
-                    offset: self.offset,
-                    length: self.length,
-                    completion,
-                };
-                if let Err(error) = self.sender.start_file(request) {
-                    self.active.remove(&offer.transfer_id);
-                    self.fail_destination(ctx, &offer, error);
-                    self.maybe_stop_retired(ctx);
-                }
-            }
+            BlobSourceIn::BeginTransfer { offer } => self.begin_transfer(ctx, offer),
             BlobSourceIn::TransferCompleted {
                 transfer_id,
                 destination,
                 failure_proxy,
                 result,
-            } => {
-                if self.active.remove(&transfer_id) {
-                    match result {
-                        Ok(()) => self.remember_completed(transfer_id),
-                        Err(reason) => {
-                            self.send_failure(ctx, destination, failure_proxy, transfer_id, reason);
-                        }
-                    }
-                    self.maybe_stop_retired(ctx);
-                }
-            }
-            BlobSourceIn::Retire { reply_to } => {
-                self.retiring = true;
-                if let Some(reply_to) = reply_to {
-                    let _ = ctx.send(
-                        reply_to,
-                        DataDirectoryIn::SourceRetired {
-                            source: ctx.self_addr(),
-                        },
-                    );
-                }
-                self.maybe_stop_retired(ctx);
-            }
+            } => self.transfer_completed(ctx, transfer_id, destination, failure_proxy, result),
+            BlobSourceIn::Retire { reply_to } => self.retire(ctx, reply_to),
         }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        for (transfer_id, (destination, failure_proxy)) in std::mem::take(&mut self.active) {
+            self.emit_transfer(
+                ctx,
+                transfer_id,
+                Phase::Transferring,
+                Phase::Closed,
+                Reason::Shutdown,
+                Some(Outcome::Cancelled),
+            );
+            self.send_failure(
+                ctx,
+                destination,
+                failure_proxy,
+                transfer_id,
+                "blob source stopped during transfer".to_owned(),
+            );
+        }
+        self.enter_phase(ctx, SourcePhase::Closed, Reason::Shutdown);
+        self.retirement.take();
     }
 }
 

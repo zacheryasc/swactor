@@ -14,6 +14,7 @@ use data_plane::path::SessionAccess;
 use data_plane::protocol::{HostSessionIn, SessionCapability};
 use data_plane::source::BlobSourcePublisher;
 use data_plane::stream_transport::StreamTransport;
+use protocol_telemetry::TransitionEmitter;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor_engine::EngineHandle;
@@ -62,6 +63,7 @@ pub struct DataPlaneProvisionerConfig {
     pub route_registrar: Option<Arc<dyn HostRouteRegistrar>>,
     pub stream_transport: Option<Arc<dyn StreamTransport>>,
     pub routing: Arc<dyn RoutingMaterialProvider>,
+    pub transitions: Option<TransitionEmitter>,
 }
 
 pub struct DataPlaneProvisioner {
@@ -90,10 +92,12 @@ impl ContextProvisioner for DataPlaneProvisioner {
         access
             .validate()
             .map_err(|error| format!("validate session access: {error}"))?;
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        if generation == 0 {
-            return Err("context generation space exhausted".to_owned());
-        }
+        let generation = self
+            .next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| "context generation space exhausted".to_owned())?;
         let routing = self.config.routing.routing_material(identity)?;
         let capability = SessionCapability::new(ActorAddress::new_random().0);
         let mut arena = ArenaManager::boot(ArenaConfig {
@@ -128,6 +132,7 @@ impl ContextProvisioner for DataPlaneProvisioner {
                     source_publisher: self.config.source_publisher.clone(),
                     route_registrar: self.config.route_registrar.clone(),
                     stream_transport: self.config.stream_transport.clone(),
+                    transitions: self.config.transitions.clone(),
                 })
                 .map_err(|error| format!("configure contextual host session: {error}"))?,
             )

@@ -6,6 +6,19 @@
 use data_plane::bootstrap::channel::GuestBootstrap;
 
 fn main() {
+    if std::env::args().any(|argument| argument == "--close-bootstrap-and-wait") {
+        // Close the inherited peer while remaining live. A retained parent copy
+        // would conceal EOF and leave the host's bootstrap owner blocked.
+        assert_eq!(
+            unsafe { libc::close(data_plane::bootstrap::channel::CHILD_BOOTSTRAP_FD) },
+            0
+        );
+        let (_keep_alive, released) = std::sync::mpsc::channel::<()>();
+        released
+            .recv()
+            .expect("probe is cancelled by its native owner");
+        return;
+    }
     let guest = match GuestBootstrap::claim() {
         Ok(guest) => guest,
         Err(error) => {
@@ -33,4 +46,10 @@ fn main() {
         std::process::exit(3);
     }
     println!("probe context ready");
+    if std::env::args().any(|argument| argument == "--hold-context") {
+        let (_keep_alive, released) = std::sync::mpsc::channel::<()>();
+        released
+            .recv()
+            .expect("probe is cancelled by its native owner");
+    }
 }

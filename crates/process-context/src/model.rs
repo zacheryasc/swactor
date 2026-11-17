@@ -13,7 +13,23 @@ pub struct ExecutionIdentity {
 pub struct ContextualProcessSpec {
     pub process: ProcessSpec,
     pub access: SessionAccess,
-    pub attach_deadline: Duration,
+    /// Optional policy for timed consumers. Event-driven executions retain
+    /// ownership until completion, failure, or explicit cancellation.
+    pub attach_deadline: Option<Duration>,
+}
+
+impl ContextualProcessSpec {
+    /// Observe attachment and session-close completion without deadlines.
+    /// Ordinary stop remains graceful without timed escalation. Explicit
+    /// cancellation interrupts the owned native process; terminal output still
+    /// comes from the native process observer.
+    pub fn event_driven(process: ProcessSpec, access: SessionAccess) -> Self {
+        Self {
+            process,
+            access,
+            attach_deadline: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +50,7 @@ pub enum ContextualProcessOutput {
     Process(ProcessOutput),
     ContextReady,
     BootstrapFailed { reason: BootstrapFailure },
+    StopAcknowledged { operation: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +66,7 @@ pub enum EventKind {
     AttachmentFailed(String),
     AttachmentDeadline,
     StopRequested,
+    ParentStopped,
     SessionFault(String),
     CleanupCompleted,
 }

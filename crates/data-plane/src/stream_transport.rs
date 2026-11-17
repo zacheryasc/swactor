@@ -18,6 +18,8 @@ pub enum StreamTransportEvent {
     Ready,
     DataAvailable,
     CapacityAvailable,
+    /// All endpoint access has stopped and transport-held endpoints are dropped.
+    /// Fault reports the error; it does not replace this terminal observation.
     Quiesced,
     Fault(String),
 }
@@ -185,10 +187,6 @@ impl LocalStreamTransport {
                     StreamTransportEvent::DataAvailable,
                 ));
             }
-            if terminal_moved {
-                notifications.push((Arc::clone(&source.notifier), StreamTransportEvent::Quiesced));
-                notifications.push((Arc::clone(&sink.notifier), StreamTransportEvent::Quiesced));
-            }
             if let Some(reason) = &fault {
                 notifications.push((
                     Arc::clone(&source.notifier),
@@ -199,12 +197,16 @@ impl LocalStreamTransport {
                     StreamTransportEvent::Fault(reason.clone()),
                 ));
             }
+            if terminal_moved || fault.is_some() {
+                notifications.push((Arc::clone(&source.notifier), StreamTransportEvent::Quiesced));
+                notifications.push((Arc::clone(&sink.notifier), StreamTransportEvent::Quiesced));
+                // Release both endpoint owners before publishing quiescence.
+                // Fault observers may synchronously request termination again.
+                state.transfers.remove(&incarnation);
+            }
         }
         for (notifier, event) in notifications {
             notifier.notify(event);
-        }
-        if fault.is_some() {
-            self.state.lock().transfers.remove(&incarnation);
         }
     }
 }
@@ -278,11 +280,22 @@ impl StreamTransport for LocalStreamTransport {
     fn terminate(&self, incarnation: StreamIncarnation) {
         let transfer = self.state.lock().transfers.remove(&incarnation);
         if let Some(transfer) = transfer {
-            if let Some(source) = transfer.source {
-                source.notifier.notify(StreamTransportEvent::Quiesced);
-            }
-            if let Some(sink) = transfer.sink {
-                sink.notifier.notify(StreamTransportEvent::Quiesced);
+            let source = transfer.source.map(|source| {
+                let LocalSource {
+                    endpoint: _endpoint,
+                    notifier,
+                } = source;
+                notifier
+            });
+            let sink = transfer.sink.map(|sink| {
+                let LocalSink {
+                    endpoint: _endpoint,
+                    notifier,
+                } = sink;
+                notifier
+            });
+            for notifier in [source, sink].into_iter().flatten() {
+                notifier.notify(StreamTransportEvent::Quiesced);
             }
         }
     }

@@ -59,6 +59,48 @@ fn leased_and_installed_tx() -> edge::EdgeEstablisherHarness {
     harness
 }
 
+#[test]
+fn duplicate_provision_and_grant_cannot_replace_or_release_an_installed_ring() {
+    let mut harness = leased_and_installed_tx();
+    let before = harness.commands().len();
+    harness.observe(edge::EdgeEvent::ProvisionTx(tx_provision()));
+    harness.observe(edge::EdgeEvent::RingLeased {
+        request_id: edge::LeaseRequestId(1),
+        ring_id: edge::RingId(8001),
+        layout: edge::RingLayout::test_layout(0),
+    });
+    assert_eq!(harness.commands().len(), before);
+    harness.observe(edge::EdgeEvent::DriverEdgeReady {
+        edge_id: edge::EdgeId(7001),
+    });
+    assert!(harness.events().iter().any(|event| matches!(
+        event,
+        edge::EdgeLifecycleEvent::EdgeReady {
+            edge_id: edge::EdgeId(7001),
+            ..
+        }
+    )));
+    harness.observe(edge::EdgeEvent::Stopped {
+        edge_id: edge::EdgeId(7001),
+    });
+    harness.observe(edge::EdgeEvent::StopEdge {
+        edge_id: edge::EdgeId(7001),
+    });
+    assert!(harness.commands().iter().any(|command| matches!(
+        command,
+        edge::EdgeCommand::StopPump {
+            ring_id: edge::RingId(8001),
+            ..
+        }
+    )));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }))
+    );
+}
+
 // This proves ProvisionTx and ProvisionRx create local edge records with the
 // required addressing facts and without remote actor addresses.
 #[test]

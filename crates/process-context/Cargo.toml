@@ -12,6 +12,7 @@ swactor-engine = { path = "../engine" }
 data-plane = { path = "../data-plane" }
 serde = { version = "1", features = ["derive"] }
 telemetry = { path = "../telemetry" }
+protocol-telemetry = { path = "../protocol-telemetry" }
 libc = "0.2"
 
 [dev-dependencies]

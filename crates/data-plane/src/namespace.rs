@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+use swactor::actor::{ActorAddress, ActorExited, ActorInterface, Ctx};
 use swactor::runtime::{ExternalSender, Runtime};
+use swactor::std::CtxWatching;
 use swactor_engine::{ActorTimer, EngineHandle, EngineInstant};
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
@@ -22,6 +23,9 @@ use crate::namespace_store::{
 use crate::path::DataPath;
 use crate::protocol::HostStreamIn;
 use crate::source::BlobSourceIn;
+use protocol_telemetry::{
+    ActorType, Outcome, Phase, Protocol, Reason, TransitionEmitter, TransitionRecord,
+};
 
 const RETIREMENT_RETRY_BATCH: usize = 32;
 
@@ -191,6 +195,17 @@ pub enum DataDirectoryIn {
         operation_id: OperationId,
         reply_to: ActorAddress,
     },
+    UnregisterWhenQuiescent {
+        request_id: DirectoryRequestId,
+        path: DataPath,
+        operation_id: OperationId,
+        reply_to: ActorAddress,
+    },
+    CancelQuiescentUnregister {
+        request_id: DirectoryRequestId,
+        path: DataPath,
+        reply_to: ActorAddress,
+    },
     Rename {
         request_id: DirectoryRequestId,
         source: DataPath,
@@ -279,6 +294,11 @@ pub enum DataDirectoryOut {
         authority_epoch: u64,
         result: Result<MutationReceipt, NamespaceError>,
     },
+    QuiescentUnregistered {
+        request_id: DirectoryRequestId,
+        authority_epoch: u64,
+        result: Result<Option<NamespaceNode>, NamespaceError>,
+    },
     Renamed {
         request_id: DirectoryRequestId,
         authority_epoch: u64,
@@ -309,10 +329,50 @@ impl DataDirectoryOut {
             | Self::BlobReserved { request_id, .. }
             | Self::BlobReservationReleased { request_id, .. }
             | Self::Unregistered { request_id, .. }
+            | Self::QuiescentUnregistered { request_id, .. }
             | Self::Renamed { request_id, .. }
             | Self::StreamOpened { request_id, .. }
             | Self::StreamClosed { request_id, .. }
             | Self::StreamCancelled { request_id, .. } => *request_id,
+        }
+    }
+
+    fn error(&self) -> Option<&NamespaceError> {
+        match self {
+            Self::Registered {
+                result: Err(error), ..
+            }
+            | Self::Resolved {
+                result: Err(error), ..
+            }
+            | Self::LookedUp {
+                result: Err(error), ..
+            }
+            | Self::BlobReserved {
+                result: Err(error), ..
+            }
+            | Self::BlobReservationReleased {
+                result: Err(error), ..
+            }
+            | Self::Unregistered {
+                result: Err(error), ..
+            }
+            | Self::QuiescentUnregistered {
+                result: Err(error), ..
+            }
+            | Self::Renamed {
+                result: Err(error), ..
+            }
+            | Self::StreamOpened {
+                result: Err(error), ..
+            }
+            | Self::StreamClosed {
+                result: Err(error), ..
+            }
+            | Self::StreamCancelled {
+                result: Err(error), ..
+            } => Some(error),
+            _ => None,
         }
     }
 
@@ -334,6 +394,9 @@ impl DataDirectoryOut {
                 authority_epoch, ..
             }
             | Self::Unregistered {
+                authority_epoch, ..
+            }
+            | Self::QuiescentUnregistered {
                 authority_epoch, ..
             }
             | Self::Renamed {
@@ -497,17 +560,31 @@ enum RuntimeStream {
     Active(ActiveStream),
 }
 
+struct PendingQuiescentUnregister {
+    request_id: DirectoryRequestId,
+    operation_id: OperationId,
+    reply_to: ActorAddress,
+    node: NamespaceNode,
+}
+
 struct PendingStreamDisplacement {
     incarnation: StreamIncarnation,
-    // Once the endpoint acknowledges it may stop, so only durability remains
-    // retryable. Keep the acknowledgement until that commit succeeds.
+    // Once the endpoint acknowledges displacement or its registered route is
+    // revoked, only durability remains retryable. Preserve that terminal
+    // observation until the commit succeeds.
     acknowledged: bool,
 }
 
 impl PendingStreamDisplacement {
-    /// Returns true only when the acknowledged obligation is durably complete.
-    fn retry(&self, ctx: &Ctx<'_>, endpoint: ActorAddress, store: &mut NamespaceStore) -> bool {
-        if !self.acknowledged {
+    /// Returns true only when the terminal obligation is durably complete.
+    fn retry(
+        &mut self,
+        ctx: &Ctx<'_>,
+        endpoint: ActorAddress,
+        store: &mut NamespaceStore,
+        routable: bool,
+    ) -> bool {
+        if !self.acknowledged && routable {
             let _ = ctx.send(
                 endpoint,
                 HostStreamIn::Displaced {
@@ -517,6 +594,7 @@ impl PendingStreamDisplacement {
             );
             return false;
         }
+        self.acknowledged = true;
         let mut next = store.snapshot().clone();
         next.stream_retirements
             .retain(|(known, _)| *known != endpoint);
@@ -528,6 +606,13 @@ impl PendingStreamDisplacement {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryPhase {
+    Recovering,
+    Serving,
+    Closed,
+}
+
 pub struct DataDirectoryActor {
     store: NamespaceStore,
     sources: BTreeMap<DataPath, RuntimeSource>,
@@ -536,11 +621,14 @@ pub struct DataDirectoryActor {
     pending_retirements: HashSet<ActorAddress>,
     pending_stream_displacements: HashMap<ActorAddress, PendingStreamDisplacement>,
     stream_replacement_fences: BTreeMap<DataPath, StreamReplacementFence>,
+    quiescent_unregistrations: BTreeMap<DataPath, Vec<PendingQuiescentUnregister>>,
     authority_epoch: u64,
     retire_retry: Option<RetirementRetry>,
     retirement_watches: HashMap<ActorAddress, HostRouteWatch>,
     retirement_retry_queue: VecDeque<ActorAddress>,
     retirement_timer: Option<ActorTimer>,
+    phase: DirectoryPhase,
+    transitions: Option<TransitionEmitter>,
     #[cfg(feature = "directory-trace")]
     trace: DirectoryTrace,
 }
@@ -712,14 +800,64 @@ impl DataDirectoryActor {
             pending_retirements,
             pending_stream_displacements,
             stream_replacement_fences,
+            quiescent_unregistrations: BTreeMap::new(),
             authority_epoch,
             retire_retry,
             retirement_watches: HashMap::new(),
             retirement_retry_queue,
             retirement_timer: None,
+            phase: DirectoryPhase::Recovering,
+            transitions: None,
             #[cfg(feature = "directory-trace")]
             trace: DirectoryTrace::new(),
         })
+    }
+
+    pub fn with_transitions(mut self, transitions: Option<TransitionEmitter>) -> Self {
+        self.transitions = transitions;
+        self
+    }
+
+    fn emit_transition(
+        &self,
+        ctx: &Ctx<'_>,
+        operation: Option<OperationId>,
+        revision: Option<u64>,
+        (previous, next): (Phase, Phase),
+        reason: Reason,
+        outcome: Option<Outcome>,
+    ) {
+        if let Some(emitter) = &self.transitions {
+            emitter.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::DataDirectoryActor,
+                protocol: Protocol::NamespaceDirectory,
+                operation: operation.map(OperationId::bytes),
+                generation: Some(self.authority_epoch),
+                incarnation: revision,
+                previous,
+                next,
+                reason,
+                outcome,
+            });
+        }
+    }
+
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: DirectoryPhase, reason: Reason) {
+        let previous = std::mem::replace(&mut self.phase, next);
+        let phase = |phase| match phase {
+            DirectoryPhase::Recovering => Phase::Recovering,
+            DirectoryPhase::Serving => Phase::Ready,
+            DirectoryPhase::Closed => Phase::Closed,
+        };
+        self.emit_transition(
+            ctx,
+            None,
+            None,
+            (phase(previous), phase(next)),
+            reason,
+            (next == DirectoryPhase::Closed).then_some(Outcome::Cancelled),
+        );
     }
 
     fn watch_retirement(&mut self, ctx: &Ctx<'_>, target: ActorAddress) {
@@ -748,20 +886,20 @@ impl DataDirectoryActor {
     }
 
     fn retry_retirement(&mut self, ctx: &Ctx<'_>, target: ActorAddress) {
-        if self
-            .pending_stream_displacements
-            .get(&target)
-            .is_some_and(|pending| pending.retry(ctx, target, &mut self.store))
-        {
-            self.pending_stream_displacements.remove(&target);
-            self.retirement_watches.remove(&target);
-        }
-        self.resume_stream_replacement_fences(ctx);
         let routable = self
             .retire_retry
             .as_ref()
             .and_then(|retry| retry.routes.as_deref())
             .is_none_or(|routes| routes.is_routable(target));
+        if self
+            .pending_stream_displacements
+            .get_mut(&target)
+            .is_some_and(|pending| pending.retry(ctx, target, &mut self.store, routable))
+        {
+            self.pending_stream_displacements.remove(&target);
+            self.retirement_watches.remove(&target);
+        }
+        self.resume_stream_replacement_fences(ctx);
         if routable && self.pending_retirements.contains(&target) {
             let _ = ctx.send(
                 target,
@@ -786,20 +924,23 @@ impl DataDirectoryActor {
     }
 
     fn retry_retirements(&mut self, ctx: &Ctx<'_>) {
+        let routes = self
+            .retire_retry
+            .as_ref()
+            .and_then(|retry| retry.routes.clone());
         let store = &mut self.store;
         let watches = &mut self.retirement_watches;
         self.pending_stream_displacements
             .retain(|endpoint, pending| {
-                if !pending.retry(ctx, *endpoint, store) {
+                let routable = routes
+                    .as_deref()
+                    .is_none_or(|routes| routes.is_routable(*endpoint));
+                if !pending.retry(ctx, *endpoint, store, routable) {
                     return true;
                 }
                 watches.remove(endpoint);
                 false
             });
-        let routes = self
-            .retire_retry
-            .as_ref()
-            .and_then(|retry| retry.routes.clone());
         let mut examined = 0;
         let mut sent = 0_u64;
         let pending = self.retirement_retry_queue.len();
@@ -1047,13 +1188,7 @@ impl DataDirectoryActor {
             },
         );
         self.watch_retirement(ctx, endpoint);
-        let _ = ctx.send(
-            endpoint,
-            HostStreamIn::Displaced {
-                incarnation,
-                reply_to: Some(ctx.self_addr()),
-            },
-        );
+        self.retry_retirement(ctx, endpoint);
         Ok(())
     }
 
@@ -1077,6 +1212,14 @@ impl DataDirectoryActor {
             self.send_stream_result(ctx, request.request_id, request.reply_to, Err(error.into()));
             return;
         }
+        self.emit_transition(
+            ctx,
+            Some(request.operation_id),
+            Some(incarnation.revision),
+            (Phase::Ready, Phase::Releasing),
+            Reason::Requested,
+            None,
+        );
         for endpoint in &endpoints {
             self.pending_stream_displacements.insert(
                 *endpoint,
@@ -1097,17 +1240,14 @@ impl DataDirectoryActor {
             },
         );
         for endpoint in endpoints {
-            let _ = ctx.send(
-                endpoint,
-                HostStreamIn::Displaced {
-                    incarnation,
-                    reply_to: Some(ctx.self_addr()),
-                },
-            );
+            self.retry_retirement(ctx, endpoint);
         }
     }
 
     fn resume_stream_replacement_fences(&mut self, ctx: &Ctx<'_>) {
+        if self.phase != DirectoryPhase::Serving {
+            return;
+        }
         let ready: Vec<_> = self
             .stream_replacement_fences
             .iter()
@@ -1126,6 +1266,7 @@ impl DataDirectoryActor {
                     self.open_stream(ctx, request);
                 }
             }
+            self.complete_quiescent_unregistrations(ctx, &path);
         }
     }
 
@@ -1185,6 +1326,17 @@ impl DataDirectoryActor {
     }
 
     fn open_stream(&mut self, ctx: &Ctx<'_>, request: StreamOpenRequest) {
+        let observed_path = self
+            .quiescent_unregistrations
+            .contains_key(&request.path)
+            .then(|| request.path.clone());
+        self.open_stream_inner(ctx, request);
+        if let Some(path) = observed_path {
+            self.complete_quiescent_unregistrations(ctx, &path);
+        }
+    }
+
+    fn open_stream_inner(&mut self, ctx: &Ctx<'_>, request: StreamOpenRequest) {
         if self.stream_replacement_fences.contains_key(&request.path) {
             self.hold_stream_open_for_fence(ctx, request);
             return;
@@ -1397,6 +1549,23 @@ impl DataDirectoryActor {
                     sink_operation,
                 }),
             );
+            for operation in [source_operation, sink_operation] {
+                self.emit_transition(
+                    ctx,
+                    Some(operation),
+                    Some(pending.revision),
+                    (
+                        if operation == operation_id {
+                            Phase::Created
+                        } else {
+                            Phase::Awaiting
+                        },
+                        Phase::Ready,
+                    ),
+                    Reason::Completed,
+                    Some(Outcome::Success),
+                );
+            }
             return;
         }
 
@@ -1445,6 +1614,14 @@ impl DataDirectoryActor {
                         opened_from_revision: (!ensure).then_some(expected_revision).flatten(),
                     }),
                 );
+                self.emit_transition(
+                    ctx,
+                    Some(operation_id),
+                    Some(receipt.revision),
+                    (Phase::Created, Phase::Awaiting),
+                    Reason::Requested,
+                    None,
+                );
             }
             Err(error) => self.send_stream_result(ctx, request_id, reply_to, Err(error)),
         }
@@ -1459,6 +1636,7 @@ impl DataDirectoryActor {
     /// no live actor will ever close.
     fn cancel_stream(
         &mut self,
+        ctx: &Ctx<'_>,
         path: &DataPath,
         operation_id: OperationId,
     ) -> Result<(), NamespaceError> {
@@ -1481,17 +1659,27 @@ impl DataDirectoryActor {
             Some(RuntimeStream::Pending(pending)) if pending.operation_id == operation_id
         ) {
             self.streams.remove(path);
+            self.emit_transition(
+                ctx,
+                Some(operation_id),
+                None,
+                (Phase::Awaiting, Phase::Closed),
+                Reason::Cancelled,
+                Some(Outcome::Cancelled),
+            );
         }
         if let Some(fence) = self.stream_replacement_fences.get_mut(path) {
             fence
                 .requests
                 .retain(|request| request.operation_id != operation_id);
         }
+        self.complete_quiescent_unregistrations(ctx, path);
         Ok(())
     }
 
     fn close_stream(
         &mut self,
+        ctx: &Ctx<'_>,
         path: &DataPath,
         incarnation: StreamIncarnation,
     ) -> Result<(), NamespaceError> {
@@ -1501,6 +1689,15 @@ impl DataDirectoryActor {
         );
         if active_matches {
             self.streams.remove(path);
+            self.emit_transition(
+                ctx,
+                None,
+                Some(incarnation.revision),
+                (Phase::Ready, Phase::Closed),
+                Reason::Completed,
+                Some(Outcome::Success),
+            );
+            self.complete_quiescent_unregistrations(ctx, path);
             return Ok(());
         }
         let already_closed = !self.streams.contains_key(path)
@@ -1520,6 +1717,18 @@ impl DataDirectoryActor {
         path: DataPath,
         operation_id: OperationId,
     ) -> Result<(), NamespaceError> {
+        if let Some(cancelled) = self
+            .store
+            .snapshot()
+            .cancelled_blob_reservations
+            .get(&operation_id)
+        {
+            return Err(if cancelled == &path {
+                NamespaceError::PathReplaced(path)
+            } else {
+                NamespaceError::OperationConflict(operation_id)
+            });
+        }
         if self.store.snapshot().bindings.contains_key(&path)
             || self.store.snapshot().stream_nodes.contains_key(&path)
         {
@@ -1540,14 +1749,27 @@ impl DataDirectoryActor {
         path: &DataPath,
         operation_id: OperationId,
     ) -> Result<(), NamespaceError> {
-        match self.blob_reservations.get(path) {
-            Some(existing) if *existing == operation_id => {
-                self.blob_reservations.remove(path);
-                Ok(())
+        match self
+            .store
+            .snapshot()
+            .cancelled_blob_reservations
+            .get(&operation_id)
+        {
+            Some(cancelled) if cancelled != path => {
+                return Err(NamespaceError::OperationConflict(operation_id));
             }
-            Some(_) => Err(NamespaceError::OperationConflict(operation_id)),
-            None => Ok(()),
+            Some(_) => {}
+            None => {
+                let mut next = self.store.snapshot().clone();
+                next.cancelled_blob_reservations
+                    .insert(operation_id, path.clone());
+                self.store.commit(next)?;
+            }
         }
+        if self.blob_reservations.get(path) == Some(&operation_id) {
+            self.blob_reservations.remove(path);
+        }
+        Ok(())
     }
 
     fn register(
@@ -1689,6 +1911,118 @@ impl DataDirectoryActor {
             (Some(_), Some(_)) => Err(NamespaceError::Storage(format!(
                 "data path {path} is bound as both blob and stream"
             ))),
+        }
+    }
+
+    fn send_quiescent_unregister(
+        &self,
+        ctx: &Ctx<'_>,
+        request_id: DirectoryRequestId,
+        reply_to: ActorAddress,
+        result: Result<Option<NamespaceNode>, NamespaceError>,
+    ) {
+        let _ = ctx.send(
+            reply_to,
+            NamespaceClientIn::DirectoryReply(DataDirectoryOut::QuiescentUnregistered {
+                request_id,
+                authority_epoch: self.authority_epoch,
+                result,
+            }),
+        );
+    }
+
+    fn unregister_quiescent_node(
+        &mut self,
+        ctx: &Ctx<'_>,
+        path: &DataPath,
+        operation_id: OperationId,
+        node: NamespaceNode,
+    ) -> Result<Option<NamespaceNode>, NamespaceError> {
+        let retired = self.sources.get(path).and_then(|source| match source {
+            RuntimeSource::Available { actor, .. } => Some(*actor),
+            RuntimeSource::Unavailable(_) => None,
+        });
+        self.unregister(path.clone(), operation_id, retired)?;
+        match self.lookup(path) {
+            Err(NamespaceError::PathNotFound(_)) => {}
+            Ok(_) => return Err(NamespaceError::PathReplaced(path.clone())),
+            Err(error) => return Err(error),
+        }
+        if let Some(retired) = retired {
+            self.queue_retirement(ctx, retired);
+        }
+        Ok(Some(node))
+    }
+
+    fn unregister_absent(
+        &mut self,
+        path: &DataPath,
+        operation_id: OperationId,
+    ) -> Result<Option<NamespaceNode>, NamespaceError> {
+        // Record even an absent result so replaying this operation cannot
+        // remove a later incarnation created at the same path.
+        match self.unregister(path.clone(), operation_id, None) {
+            Ok(_) | Err(NamespaceError::PathNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn unregister_when_quiescent(
+        &mut self,
+        ctx: &Ctx<'_>,
+        request_id: DirectoryRequestId,
+        path: DataPath,
+        operation_id: OperationId,
+        reply_to: ActorAddress,
+    ) {
+        let result = match self.lookup(&path) {
+            Ok(node) if node.active || self.stream_replacement_fences.contains_key(&path) => {
+                let waiters = self.quiescent_unregistrations.entry(path).or_default();
+                if !waiters
+                    .iter()
+                    .any(|waiter| waiter.request_id == request_id && waiter.reply_to == reply_to)
+                {
+                    waiters.push(PendingQuiescentUnregister {
+                        request_id,
+                        operation_id,
+                        reply_to,
+                        node,
+                    });
+                }
+                return;
+            }
+            Ok(node) => self.unregister_quiescent_node(ctx, &path, operation_id, node),
+            Err(NamespaceError::PathNotFound(_)) => self.unregister_absent(&path, operation_id),
+            Err(error) => Err(error),
+        };
+        self.send_quiescent_unregister(ctx, request_id, reply_to, result);
+    }
+
+    fn complete_quiescent_unregistrations(&mut self, ctx: &Ctx<'_>, path: &DataPath) {
+        let Some(mut waiters) = self.quiescent_unregistrations.remove(path) else {
+            return;
+        };
+        waiters.retain(|waiter| {
+            let result = match self.lookup(path) {
+                Ok(node)
+                    if node.kind != waiter.node.kind || node.revision != waiter.node.revision =>
+                {
+                    Err(NamespaceError::PathReplaced(path.clone()))
+                }
+                Ok(node) if node.active || self.stream_replacement_fences.contains_key(path) => {
+                    return true;
+                }
+                Ok(node) => self.unregister_quiescent_node(ctx, path, waiter.operation_id, node),
+                Err(NamespaceError::PathNotFound(_)) => {
+                    self.unregister_absent(path, waiter.operation_id)
+                }
+                Err(error) => Err(error),
+            };
+            self.send_quiescent_unregister(ctx, waiter.request_id, waiter.reply_to, result);
+            false
+        });
+        if !waiters.is_empty() {
+            self.quiescent_unregistrations.insert(path.clone(), waiters);
         }
     }
 
@@ -1854,6 +2188,7 @@ impl ActorInterface for DataDirectoryActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, DirectoryPhase::Serving, Reason::Started);
         if let Some(retire_retry) = &self.retire_retry {
             self.retirement_timer = Some(retire_retry.engine.send_every(
                 retire_retry.period,
@@ -1875,6 +2210,9 @@ impl ActorInterface for DataDirectoryActor {
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: DataDirectoryIn) {
+        if self.phase != DirectoryPhase::Serving {
+            return;
+        }
         #[cfg(feature = "directory-trace")]
         self.trace
             .observed_step(self.pending_retirements.len(), &self.store);
@@ -1916,6 +2254,7 @@ impl ActorInterface for DataDirectoryActor {
                 }
                 if result.is_ok() {
                     self.displace_stream(ctx, &logical);
+                    self.complete_quiescent_unregistrations(ctx, &logical);
                 }
                 let _ = ctx.send(
                     reply_to,
@@ -2009,6 +2348,10 @@ impl ActorInterface for DataDirectoryActor {
                     );
                     return;
                 }
+                let observed_path = self
+                    .quiescent_unregistrations
+                    .contains_key(&path)
+                    .then(|| path.clone());
                 let replayed = self.store.snapshot().operations.contains_key(&operation_id);
                 let retired = (!replayed)
                     .then(|| self.sources.get(&path))
@@ -2023,6 +2366,11 @@ impl ActorInterface for DataDirectoryActor {
                 {
                     self.queue_retirement(ctx, retired);
                 }
+                if result.is_ok()
+                    && let Some(path) = observed_path
+                {
+                    self.complete_quiescent_unregistrations(ctx, &path);
+                }
                 let _ = ctx.send(
                     reply_to,
                     NamespaceClientIn::DirectoryReply(DataDirectoryOut::Unregistered {
@@ -2031,6 +2379,26 @@ impl ActorInterface for DataDirectoryActor {
                         result,
                     }),
                 );
+            }
+            DataDirectoryIn::UnregisterWhenQuiescent {
+                request_id,
+                path,
+                operation_id,
+                reply_to,
+            } => self.unregister_when_quiescent(ctx, request_id, path, operation_id, reply_to),
+            DataDirectoryIn::CancelQuiescentUnregister {
+                request_id,
+                path,
+                reply_to,
+            } => {
+                if let Some(waiters) = self.quiescent_unregistrations.get_mut(&path) {
+                    waiters.retain(|waiter| {
+                        waiter.request_id != request_id || waiter.reply_to != reply_to
+                    });
+                    if waiters.is_empty() {
+                        self.quiescent_unregistrations.remove(&path);
+                    }
+                }
             }
             DataDirectoryIn::Rename {
                 request_id,
@@ -2048,11 +2416,27 @@ impl ActorInterface for DataDirectoryActor {
                         RuntimeSource::Available { actor, .. } => Some(*actor),
                         RuntimeSource::Unavailable(_) => None,
                     });
+                let observed_source = self
+                    .quiescent_unregistrations
+                    .contains_key(&source)
+                    .then(|| source.clone());
+                let observed_destination = self
+                    .quiescent_unregistrations
+                    .contains_key(&destination)
+                    .then(|| destination.clone());
                 let result = self.rename(source, destination, replace, operation_id);
                 if result.is_ok()
                     && let Some(retired) = retired
                 {
                     self.queue_retirement(ctx, retired);
+                }
+                if result.is_ok() {
+                    if let Some(path) = observed_source {
+                        self.complete_quiescent_unregistrations(ctx, &path);
+                    }
+                    if let Some(path) = observed_destination {
+                        self.complete_quiescent_unregistrations(ctx, &path);
+                    }
                 }
                 let _ = ctx.send(
                     reply_to,
@@ -2095,7 +2479,7 @@ impl ActorInterface for DataDirectoryActor {
                 operation_id,
                 reply_to,
             } => {
-                let result = self.cancel_stream(&path, operation_id);
+                let result = self.cancel_stream(ctx, &path, operation_id);
                 if let Some(reply_to) = reply_to {
                     let _ = ctx.send(
                         reply_to,
@@ -2113,7 +2497,7 @@ impl ActorInterface for DataDirectoryActor {
                 incarnation,
                 reply_to,
             } => {
-                let result = self.close_stream(&path, incarnation);
+                let result = self.close_stream(ctx, &path, incarnation);
                 let _ = ctx.send(
                     reply_to,
                     NamespaceClientIn::DirectoryReply(DataDirectoryOut::StreamClosed {
@@ -2144,6 +2528,61 @@ impl ActorInterface for DataDirectoryActor {
             }
         }
     }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        self.enter_phase(ctx, DirectoryPhase::Closed, Reason::Shutdown);
+        if let Some(timer) = self.retirement_timer.take() {
+            timer.cancel();
+        }
+        for (_, waiters) in std::mem::take(&mut self.quiescent_unregistrations) {
+            for waiter in waiters {
+                self.send_quiescent_unregister(
+                    ctx,
+                    waiter.request_id,
+                    waiter.reply_to,
+                    Err(NamespaceError::DirectoryUnavailable(
+                        "namespace authority stopped".to_owned(),
+                    )),
+                );
+            }
+        }
+        for (_, stream) in std::mem::take(&mut self.streams) {
+            match stream {
+                RuntimeStream::Pending(pending) => {
+                    self.send_stream_result(
+                        ctx,
+                        pending.request_id,
+                        pending.reply_to,
+                        Err(NamespaceError::DirectoryUnavailable(
+                            "namespace authority stopped".to_owned(),
+                        )),
+                    );
+                }
+                RuntimeStream::Active(active) => {
+                    for endpoint in [active.binding.source, active.binding.sink] {
+                        let _ = self.queue_stream_displacement(
+                            ctx,
+                            endpoint,
+                            active.binding.incarnation,
+                        );
+                    }
+                }
+            }
+        }
+        for (_, fence) in std::mem::take(&mut self.stream_replacement_fences) {
+            for request in fence.requests {
+                self.send_stream_result(
+                    ctx,
+                    request.request_id,
+                    request.reply_to,
+                    Err(NamespaceError::DirectoryUnavailable(
+                        "namespace authority stopped".to_owned(),
+                    )),
+                );
+            }
+        }
+        self.retirement_watches.clear();
+    }
 }
 
 impl Drop for DataDirectoryActor {
@@ -2154,8 +2593,22 @@ impl Drop for DataDirectoryActor {
     }
 }
 
+/// Whether the authority can safely route the reply to this client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamespaceRouteReadiness {
+    Ready,
+    Pending,
+    Unavailable,
+}
+
 pub trait NamespaceDiscovery: Send + Sync + 'static {
     fn current_directory(&self) -> Option<ActorAddress>;
+    /// Initiate causal reply-route installation when needed. A pending
+    /// handshake retains requests until the integration delivers `Retry`;
+    /// it does not permit an RPC to leave before the peer acknowledges.
+    fn prepare_reply_route(&self, _directory: ActorAddress) -> NamespaceRouteReadiness {
+        NamespaceRouteReadiness::Ready
+    }
     /// Discoveries carrying a durable authority epoch must validate it exactly
     /// and reject replies while the current authority is undiscovered. A
     /// transport wake alone never authenticates an old authority.
@@ -2164,26 +2617,46 @@ pub trait NamespaceDiscovery: Send + Sync + 'static {
     }
 }
 
-struct PendingRequest {
-    request: NamespaceRequest,
-    reply_to: ActorAddress,
-    enqueued: EngineInstant,
+#[derive(Clone, Copy)]
+enum PendingOwner {
+    Caller {
+        reply_to: ActorAddress,
+        enqueued: Option<EngineInstant>,
+    },
+    Cleanup,
 }
 
-/// How long a namespace request may stay unanswered while no directory is
-/// discoverable. Authority loss must surface as a bounded typed failure to
-/// callers (e.g. a contextual process blocked on `lookup` after the
-/// orchestrator died), never as a hang.
+struct PendingRequest {
+    request: NamespaceRequest,
+    owner: PendingOwner,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NamespaceClientPhase {
+    Discovering,
+    Routing(ActorAddress),
+    Closed,
+}
+
+/// Deadline policy for clients using the preexisting timed constructors.
+/// Event-driven clients instead report observed route loss or unavailability.
 const NAMESPACE_REQUEST_DEADLINE: Duration = Duration::from_secs(80);
 
-pub struct NamespaceClientActor {
+struct NamespaceClientTiming {
     engine: EngineHandle,
     sender: ExternalSender,
-    discovery: Arc<dyn NamespaceDiscovery>,
     retry_period: Duration,
     request_deadline: Duration,
+    retry_timer: Option<ActorTimer>,
+}
+
+pub struct NamespaceClientActor {
+    timing: Option<NamespaceClientTiming>,
+    discovery: Arc<dyn NamespaceDiscovery>,
     next_request_id: u64,
     pending: HashMap<DirectoryRequestId, PendingRequest>,
+    phase: NamespaceClientPhase,
+    transitions: Option<TransitionEmitter>,
 }
 
 impl NamespaceClientActor {
@@ -2209,21 +2682,135 @@ impl NamespaceClientActor {
         retry_period: Duration,
         request_deadline: Duration,
     ) -> Self {
-        Self {
+        let mut client = Self::new_event_driven(discovery);
+        client.timing = Some(NamespaceClientTiming {
             engine,
             sender,
-            discovery,
             retry_period,
             request_deadline,
+            retry_timer: None,
+        });
+        client
+    }
+
+    /// Progress through requests and externally delivered [`NamespaceClientIn::Retry`]
+    /// notifications of registry, route, or connection changes, without a clock.
+    ///
+    /// Observed unavailability fails callers with [`NamespaceError::DirectoryUnavailable`].
+    /// Cleanup obligations remain pending until a recovery notification allows
+    /// delivery and the current authority acknowledges them. Integrations must
+    /// deliver those notifications on both route loss and recovery.
+    pub fn new_event_driven(discovery: Arc<dyn NamespaceDiscovery>) -> Self {
+        Self {
+            timing: None,
+            discovery,
             next_request_id: 1,
             pending: HashMap::new(),
+            phase: NamespaceClientPhase::Discovering,
+            transitions: None,
         }
     }
 
-    fn dispatch(&self, ctx: &Ctx<'_>, request_id: DirectoryRequestId, request: &NamespaceRequest) {
-        let Some(directory) = self.discovery.current_directory() else {
+    pub fn with_transitions(mut self, transitions: Option<TransitionEmitter>) -> Self {
+        self.transitions = transitions;
+        self
+    }
+
+    fn enter_phase(&mut self, ctx: &Ctx<'_>, next: NamespaceClientPhase, reason: Reason) {
+        let previous = std::mem::replace(&mut self.phase, next);
+        if previous == next {
+            return;
+        }
+        let phase = |phase| match phase {
+            NamespaceClientPhase::Discovering => Phase::Recovering,
+            NamespaceClientPhase::Routing(_) => Phase::Ready,
+            NamespaceClientPhase::Closed => Phase::Closed,
+        };
+        if let Some(emitter) = &self.transitions {
+            emitter.emit(TransitionRecord {
+                actor: ctx.self_addr(),
+                actor_type: ActorType::NamespaceClientActor,
+                protocol: Protocol::NamespaceClient,
+                operation: None,
+                generation: None,
+                incarnation: None,
+                previous: phase(previous),
+                next: phase(next),
+                reason,
+                outcome: (next == NamespaceClientPhase::Closed).then_some(Outcome::Cancelled),
+            });
+        }
+    }
+
+    fn emit_operation(
+        &self,
+        ctx: &Ctx<'_>,
+        id: DirectoryRequestId,
+        pending: &PendingRequest,
+        (previous, next): (Phase, Phase),
+        reason: Reason,
+        outcome: Option<Outcome>,
+    ) {
+        let Some(emitter) = &self.transitions else {
             return;
         };
+        let operation = match &pending.request {
+            NamespaceRequest::Register { operation_id, .. }
+            | NamespaceRequest::ReserveBlob { operation_id, .. }
+            | NamespaceRequest::ReleaseBlobReservation { operation_id, .. }
+            | NamespaceRequest::Unregister { operation_id, .. }
+            | NamespaceRequest::Rename { operation_id, .. }
+            | NamespaceRequest::OpenStream { operation_id, .. }
+            | NamespaceRequest::CancelStream { operation_id, .. } => operation_id.bytes(),
+            _ => u128::from(id.0).to_be_bytes(),
+        };
+        let (generation, incarnation) = match &pending.request {
+            NamespaceRequest::CloseStream { incarnation, .. } => (
+                Some(incarnation.authority_epoch),
+                Some(incarnation.revision),
+            ),
+            _ => (None, None),
+        };
+        emitter.emit(TransitionRecord {
+            actor: ctx.self_addr(),
+            actor_type: ActorType::NamespaceClientActor,
+            protocol: Protocol::NamespaceClient,
+            operation: Some(operation),
+            generation,
+            incarnation,
+            previous,
+            next,
+            reason,
+            outcome,
+        });
+    }
+
+    fn discover(&mut self, ctx: &Ctx<'_>) {
+        let next = self.discovery.current_directory().map_or(
+            NamespaceClientPhase::Discovering,
+            NamespaceClientPhase::Routing,
+        );
+        let reason = if matches!(next, NamespaceClientPhase::Routing(_)) {
+            Reason::Discovered
+        } else {
+            Reason::RouteLost
+        };
+        self.enter_phase(ctx, next, reason);
+    }
+
+    fn dispatch(
+        &self,
+        ctx: &Ctx<'_>,
+        request_id: DirectoryRequestId,
+        request: &NamespaceRequest,
+    ) -> NamespaceRouteReadiness {
+        let NamespaceClientPhase::Routing(directory) = self.phase else {
+            return NamespaceRouteReadiness::Unavailable;
+        };
+        match self.discovery.prepare_reply_route(directory) {
+            NamespaceRouteReadiness::Ready => {}
+            waiting => return waiting,
+        }
         let message = match request {
             NamespaceRequest::Register {
                 path,
@@ -2323,15 +2910,16 @@ impl NamespaceClientActor {
                 reply_to: ctx.self_addr(),
             },
         };
-        let _ = ctx.send(directory, message);
+        if ctx.send(directory, message).is_ok() {
+            NamespaceRouteReadiness::Ready
+        } else {
+            NamespaceRouteReadiness::Unavailable
+        }
     }
 
-    /// Enqueue a tracked CancelStream retraction for an abandoned stream
-    /// open. The retraction is a pending request the retry tick re-drives
-    /// until the directory acknowledges it: a dropped frame would otherwise
-    /// strand the parked endpoint in the directory forever, and unlink of
-    /// its path would then fail with ENXIO indefinitely.
-    fn retract_stream_open(&mut self, ctx: &Ctx<'_>, path: DataPath, operation_id: OperationId) {
+    /// Cleanup owns no caller deadline. Route loss transfers, rather than
+    /// abandons, an accepted resource-release obligation.
+    fn enqueue_cleanup(&mut self, ctx: &Ctx<'_>, request: NamespaceRequest) {
         let Some(next) = self
             .next_request_id
             .checked_add(1)
@@ -2341,16 +2929,260 @@ impl NamespaceClientActor {
         };
         let request_id = DirectoryRequestId(self.next_request_id);
         self.next_request_id = next;
-        let request = NamespaceRequest::CancelStream { path, operation_id };
+        self.discover(ctx);
         self.dispatch(ctx, request_id, &request);
         self.pending.insert(
             request_id,
             PendingRequest {
                 request,
-                reply_to: ctx.self_addr(),
-                enqueued: self.engine.now(),
+                owner: PendingOwner::Cleanup,
             },
         );
+        self.emit_operation(
+            ctx,
+            request_id,
+            &self.pending[&request_id],
+            (Phase::AwaitingReply, Phase::Releasing),
+            Reason::Cancelled,
+            None,
+        );
+    }
+
+    fn cleanup_for(request: &NamespaceRequest) -> Option<NamespaceRequest> {
+        match request {
+            NamespaceRequest::OpenStream {
+                path, operation_id, ..
+            } => Some(NamespaceRequest::CancelStream {
+                path: path.clone(),
+                operation_id: *operation_id,
+            }),
+            NamespaceRequest::ReserveBlob { path, operation_id } => {
+                Some(NamespaceRequest::ReleaseBlobReservation {
+                    path: path.clone(),
+                    operation_id: *operation_id,
+                })
+            }
+            NamespaceRequest::CloseStream { .. }
+            | NamespaceRequest::CancelStream { .. }
+            | NamespaceRequest::ReleaseBlobReservation { .. } => Some(request.clone()),
+            _ => None,
+        }
+    }
+
+    fn request(&mut self, ctx: &Ctx<'_>, request: NamespaceRequest, reply_to: ActorAddress) {
+        let request_id = DirectoryRequestId(self.next_request_id);
+        let Some(next) = self
+            .next_request_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+        else {
+            let _ = ctx.send(
+                reply_to,
+                failed_reply(
+                    request_id,
+                    &request,
+                    NamespaceError::Protocol("namespace client request IDs exhausted".to_owned()),
+                ),
+            );
+            return;
+        };
+        self.next_request_id = next;
+        self.discover(ctx);
+        let dispatched = self.dispatch(ctx, request_id, &request);
+        self.pending.insert(
+            request_id,
+            PendingRequest {
+                request,
+                owner: PendingOwner::Caller {
+                    reply_to,
+                    enqueued: self.timing.as_ref().map(|timing| timing.engine.now()),
+                },
+            },
+        );
+        self.emit_operation(
+            ctx,
+            request_id,
+            &self.pending[&request_id],
+            (Phase::Created, Phase::AwaitingReply),
+            Reason::Requested,
+            None,
+        );
+        if self.timing.is_none() && dispatched == NamespaceRouteReadiness::Unavailable {
+            self.fail_unavailable(
+                ctx,
+                request_id,
+                "namespace directory route unavailable",
+                Reason::RouteLost,
+                Outcome::Failed,
+            );
+        }
+    }
+
+    fn cancel(&mut self, ctx: &Ctx<'_>, reply_to: ActorAddress) {
+        let cancelled: Vec<_> = self.pending.iter().filter_map(|(id, pending)| {
+            matches!(pending.owner, PendingOwner::Caller { reply_to: owner, .. } if owner == reply_to)
+                .then_some(*id)
+        }).collect();
+        for id in cancelled {
+            if let Some(pending) = self.pending.remove(&id) {
+                self.emit_operation(
+                    ctx,
+                    id,
+                    &pending,
+                    (Phase::AwaitingReply, Phase::Closed),
+                    Reason::Cancelled,
+                    Some(Outcome::Cancelled),
+                );
+                if let Some(cleanup) = Self::cleanup_for(&pending.request) {
+                    self.enqueue_cleanup(ctx, cleanup);
+                }
+            }
+        }
+    }
+
+    fn directory_reply(&mut self, ctx: &Ctx<'_>, reply: DataDirectoryOut) {
+        if !self
+            .discovery
+            .accepts_authority_epoch(reply.authority_epoch())
+        {
+            if let Some(pending) = self.pending.get(&reply.request_id()) {
+                let phase = match pending.owner {
+                    PendingOwner::Caller { .. } => Phase::AwaitingReply,
+                    PendingOwner::Cleanup => Phase::Releasing,
+                };
+                self.emit_operation(
+                    ctx,
+                    reply.request_id(),
+                    pending,
+                    (phase, phase),
+                    Reason::StaleIdentity,
+                    None,
+                );
+            }
+            return;
+        }
+        let id = reply.request_id();
+        let Some(pending) = self.pending.get(&id) else {
+            return;
+        };
+        let error = reply.error();
+        if matches!(pending.owner, PendingOwner::Cleanup)
+            && matches!(
+                error,
+                Some(NamespaceError::Storage(_) | NamespaceError::DirectoryUnavailable(_))
+            )
+        {
+            return;
+        }
+        let failed = error.is_some();
+        let pending = self.pending.remove(&id).expect("pending response checked");
+        let previous = match pending.owner {
+            PendingOwner::Caller { .. } => Phase::AwaitingReply,
+            PendingOwner::Cleanup => Phase::Releasing,
+        };
+        self.emit_operation(
+            ctx,
+            id,
+            &pending,
+            (previous, Phase::Completed),
+            Reason::Completed,
+            Some(if failed {
+                Outcome::Failed
+            } else {
+                Outcome::Success
+            }),
+        );
+        if let PendingOwner::Caller { reply_to, .. } = pending.owner {
+            let _ = ctx.send(reply_to, reply);
+            if failed && let Some(cleanup) = Self::cleanup_for(&pending.request) {
+                self.enqueue_cleanup(ctx, cleanup);
+            }
+        }
+    }
+
+    fn fail_unavailable(
+        &mut self,
+        ctx: &Ctx<'_>,
+        id: DirectoryRequestId,
+        message: &str,
+        reason: Reason,
+        outcome: Outcome,
+    ) {
+        let Some(pending) = self.pending.remove(&id) else {
+            return;
+        };
+        self.emit_operation(
+            ctx,
+            id,
+            &pending,
+            (Phase::AwaitingReply, Phase::Closed),
+            reason,
+            Some(outcome),
+        );
+        if let PendingOwner::Caller { reply_to, .. } = pending.owner {
+            let _ = ctx.send(
+                reply_to,
+                failed_reply(
+                    id,
+                    &pending.request,
+                    NamespaceError::DirectoryUnavailable(message.to_owned()),
+                ),
+            );
+        }
+        if let Some(cleanup) = Self::cleanup_for(&pending.request) {
+            self.enqueue_cleanup(ctx, cleanup);
+        }
+    }
+
+    fn retry(&mut self, ctx: &Ctx<'_>) {
+        self.discover(ctx);
+        if let Some(timing) = &self.timing {
+            let now = timing.engine.now();
+            let expired: Vec<_> = self
+                .pending
+                .iter()
+                .filter_map(|(id, pending)| match pending.owner {
+                    PendingOwner::Caller {
+                        enqueued: Some(enqueued),
+                        ..
+                    } if now.to_instant().duration_since(enqueued.to_instant())
+                        >= timing.request_deadline =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for id in expired {
+                self.fail_unavailable(
+                    ctx,
+                    id,
+                    "namespace request deadline expired",
+                    Reason::Timeout,
+                    Outcome::TimedOut,
+                );
+            }
+        }
+        let unavailable: Vec<_> = self
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                let dispatched = self.dispatch(ctx, *id, &pending.request);
+                (self.timing.is_none()
+                    && dispatched == NamespaceRouteReadiness::Unavailable
+                    && matches!(pending.owner, PendingOwner::Caller { .. }))
+                .then_some(*id)
+            })
+            .collect();
+        for id in unavailable {
+            self.fail_unavailable(
+                ctx,
+                id,
+                "namespace directory route unavailable",
+                Reason::RouteLost,
+                Outcome::Failed,
+            );
+        }
     }
 }
 
@@ -2359,113 +3191,35 @@ impl ActorInterface for NamespaceClientActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx<'_>) {
-        self.engine.send_every(
-            self.retry_period,
-            self.sender.clone(),
-            ctx.self_addr(),
-            NamespaceClientIn::Retry,
-        );
+        self.discover(ctx);
+        if let Some(timing) = &mut self.timing {
+            timing.retry_timer = Some(timing.engine.send_every(
+                timing.retry_period,
+                timing.sender.clone(),
+                ctx.self_addr(),
+                NamespaceClientIn::Retry,
+            ));
+        }
     }
 
     fn handle(&mut self, ctx: &Ctx<'_>, message: NamespaceClientIn) {
         match message {
             NamespaceClientIn::Request { request, reply_to } => {
-                let request_id = DirectoryRequestId(self.next_request_id);
-                let Some(next) = self
-                    .next_request_id
-                    .checked_add(1)
-                    .filter(|next| *next != 0)
-                else {
-                    let _ = ctx.send(
-                        reply_to,
-                        DataDirectoryOut::Resolved {
-                            request_id,
-                            authority_epoch: 0,
-                            result: Err(NamespaceError::Protocol(
-                                "namespace client request IDs exhausted".to_owned(),
-                            )),
-                        },
-                    );
-                    return;
-                };
-                self.next_request_id = next;
-                self.dispatch(ctx, request_id, &request);
-                self.pending.insert(
-                    request_id,
-                    PendingRequest {
-                        request,
-                        reply_to,
-                        enqueued: self.engine.now(),
-                    },
-                );
+                self.request(ctx, request, reply_to)
             }
-            NamespaceClientIn::Cancel { reply_to } => {
-                let cancelled: Vec<(DataPath, OperationId)> = self
-                    .pending
-                    .values()
-                    .filter(|pending| pending.reply_to == reply_to)
-                    .filter_map(|pending| match &pending.request {
-                        NamespaceRequest::OpenStream {
-                            path, operation_id, ..
-                        } => Some((path.clone(), *operation_id)),
-                        _ => None,
-                    })
-                    .collect();
-                self.pending.retain(|_, pending| {
-                    if pending.reply_to != reply_to {
-                        return true;
-                    }
-                    if matches!(
-                        pending.request,
-                        NamespaceRequest::CloseStream { .. }
-                            | NamespaceRequest::CancelStream { .. }
-                    ) {
-                        // Caller cancellation transfers cleanup ownership to
-                        // the proxy; it cannot revoke an unacknowledged retract.
-                        pending.reply_to = ctx.self_addr();
-                        true
-                    } else {
-                        false
-                    }
-                });
-                // A dropped cancel frame would strand the pending endpoint
-                // in the directory forever (nothing else retracts it), so
-                // the retraction is tracked as a pending request the retry
-                // tick re-drives until the directory acknowledges it.
-                for (path, operation_id) in cancelled {
-                    self.retract_stream_open(ctx, path, operation_id);
-                }
-            }
+            NamespaceClientIn::Cancel { reply_to } => self.cancel(ctx, reply_to),
             NamespaceClientIn::CancelBlobReservation {
                 path,
                 operation_id,
                 reply_to,
             } => {
-                self.pending
-                    .retain(|_, pending| pending.reply_to != reply_to);
-                if let Some(directory) = self.discovery.current_directory() {
-                    let _ = ctx.send(
-                        directory,
-                        DataDirectoryIn::ReleaseBlobReservation {
-                            request_id: DirectoryRequestId(0),
-                            path,
-                            operation_id,
-                            reply_to: ctx.self_addr(),
-                        },
-                    );
-                }
+                self.cancel(ctx, reply_to);
+                self.enqueue_cleanup(
+                    ctx,
+                    NamespaceRequest::ReleaseBlobReservation { path, operation_id },
+                );
             }
-            NamespaceClientIn::DirectoryReply(reply) => {
-                if !self
-                    .discovery
-                    .accepts_authority_epoch(reply.authority_epoch())
-                {
-                    return;
-                }
-                if let Some(pending) = self.pending.remove(&reply.request_id()) {
-                    let _ = ctx.send(pending.reply_to, reply);
-                }
-            }
+            NamespaceClientIn::DirectoryReply(reply) => self.directory_reply(ctx, reply),
             NamespaceClientIn::TransferFailed {
                 destination,
                 transfer_id,
@@ -2479,125 +3233,111 @@ impl ActorInterface for NamespaceClientActor {
                     },
                 );
             }
-            NamespaceClientIn::Retry => {
-                // A request no directory has answered within the bound fails
-                // with a typed error instead of hanging the caller forever
-                // (e.g. authority loss — the registry may keep serving the
-                // dead directory's address, so age is the only sound bound).
-                // Stream retractions are exempt: a CloseStream or
-                // CancelStream that expires while the directory is
-                // unreachable would strand the endpoint in the directory
-                // forever — unlink of that path then fails with ENXIO
-                // indefinitely — while every later request flows again.
-                // Retractions have no caller left to disappoint; they retry
-                // until the directory acknowledges them.
-                let now = self.engine.now();
-                let expired: Vec<DirectoryRequestId> = self
-                    .pending
-                    .iter()
-                    .filter(|(_, pending)| {
-                        !matches!(
-                            pending.request,
-                            NamespaceRequest::CloseStream { .. }
-                                | NamespaceRequest::CancelStream { .. }
-                        ) && now
-                            .to_instant()
-                            .duration_since(pending.enqueued.to_instant())
-                            > self.request_deadline
-                    })
-                    .map(|(request_id, _)| *request_id)
-                    .collect();
-                for request_id in expired {
-                    if let Some(pending) = self.pending.remove(&request_id) {
-                        // An expired stream open may already be registered
-                        // in the directory: first-role opens park without a
-                        // reply until their peer arrives, so the deadline
-                        // fires while the endpoint is committed. Its caller
-                        // is gone with the failure reply — nothing else
-                        // retracts the open — so the expiry itself must
-                        // enqueue the same deadline-exempt retraction the
-                        // cancel path uses. Without it the parked endpoint
-                        // survives forever and unlink of the path fails
-                        // with ENXIO indefinitely.
-                        if let NamespaceRequest::OpenStream {
-                            path, operation_id, ..
-                        } = &pending.request
-                        {
-                            self.retract_stream_open(ctx, path.clone(), *operation_id);
-                        }
-                        let _ = ctx.send(
-                            pending.reply_to,
-                            expired_reply(request_id, &pending.request),
-                        );
-                    }
-                }
-                for (request_id, pending) in &self.pending {
-                    self.dispatch(ctx, *request_id, &pending.request);
-                }
+            NamespaceClientIn::Retry => self.retry(ctx),
+        }
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if let Some(timer) = self
+            .timing
+            .as_mut()
+            .and_then(|timing| timing.retry_timer.take())
+        {
+            timer.cancel();
+        }
+        // Drain caller ownership once. Retractions are attempted against the
+        // last authority; durable directory retirement remains directory-owned.
+        for (id, pending) in std::mem::take(&mut self.pending) {
+            self.emit_operation(
+                ctx,
+                id,
+                &pending,
+                (
+                    match pending.owner {
+                        PendingOwner::Caller { .. } => Phase::AwaitingReply,
+                        PendingOwner::Cleanup => Phase::Releasing,
+                    },
+                    Phase::Closed,
+                ),
+                Reason::Shutdown,
+                Some(Outcome::Cancelled),
+            );
+            if let PendingOwner::Caller { reply_to, .. } = pending.owner {
+                let _ = ctx.send(
+                    reply_to,
+                    failed_reply(
+                        id,
+                        &pending.request,
+                        NamespaceError::DirectoryUnavailable("namespace client stopped".to_owned()),
+                    ),
+                );
+            }
+            if let Some(cleanup) = Self::cleanup_for(&pending.request) {
+                self.dispatch(ctx, id, &cleanup);
             }
         }
+        self.enter_phase(ctx, NamespaceClientPhase::Closed, Reason::Shutdown);
     }
 }
 
-/// Build the typed failure a caller receives when its namespace request
-fn expired_reply(request_id: DirectoryRequestId, request: &NamespaceRequest) -> DataDirectoryOut {
-    fn failure<T>() -> Result<T, NamespaceError> {
-        Err(NamespaceError::DirectoryUnavailable(
-            "no namespace authority was discoverable within the request deadline".to_owned(),
-        ))
-    }
+/// Preserve the request's response variant on every local failure path.
+fn failed_reply(
+    request_id: DirectoryRequestId,
+    request: &NamespaceRequest,
+    error: NamespaceError,
+) -> DataDirectoryOut {
     match request {
         NamespaceRequest::Register { .. } => DataDirectoryOut::Registered {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::Resolve { .. } => DataDirectoryOut::Resolved {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::Lookup { .. } => DataDirectoryOut::LookedUp {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::ReserveBlob { .. } => DataDirectoryOut::BlobReserved {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::ReleaseBlobReservation { .. } => {
             DataDirectoryOut::BlobReservationReleased {
                 request_id,
                 authority_epoch: 0,
-                result: failure(),
+                result: Err(error),
             }
         }
         NamespaceRequest::Unregister { .. } => DataDirectoryOut::Unregistered {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::Rename { .. } => DataDirectoryOut::Renamed {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::OpenStream { .. } => DataDirectoryOut::StreamOpened {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::CancelStream { .. } => DataDirectoryOut::StreamCancelled {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
         NamespaceRequest::CloseStream { .. } => DataDirectoryOut::StreamClosed {
             request_id,
             authority_epoch: 0,
-            result: failure(),
+            result: Err(error),
         },
     }
 }
@@ -2809,6 +3549,105 @@ impl NamespaceClient {
     }
 }
 
+struct QuiescentUnregisterObserver {
+    runtime: Runtime,
+    directory: ActorAddress,
+    path: DataPath,
+    operation_id: OperationId,
+    request_id: DirectoryRequestId,
+    reply_to: Option<ActorAddress>,
+    registered: bool,
+}
+
+impl QuiescentUnregisterObserver {
+    fn finish(&mut self, ctx: &Ctx<'_>, reply: DataDirectoryOut) {
+        if let Some(reply_to) = self.reply_to.take() {
+            let _ = ctx.send(reply_to, NamespaceClientIn::DirectoryReply(reply));
+        }
+        ctx.stop_self();
+    }
+
+    fn unavailable(&mut self, ctx: &Ctx<'_>, reason: String) {
+        self.finish(
+            ctx,
+            DataDirectoryOut::QuiescentUnregistered {
+                request_id: self.request_id,
+                authority_epoch: 0,
+                result: Err(NamespaceError::DirectoryUnavailable(reason)),
+            },
+        );
+    }
+}
+
+impl ActorInterface for QuiescentUnregisterObserver {
+    type Incoming = NamespaceClientIn;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx<'_>) {
+        ctx.watch(self.directory);
+        if !self.runtime.is_local_actor(self.directory) {
+            self.unavailable(ctx, "namespace authority stopped".to_owned());
+            return;
+        }
+        match ctx.send(
+            self.directory,
+            DataDirectoryIn::UnregisterWhenQuiescent {
+                request_id: self.request_id,
+                path: self.path.clone(),
+                operation_id: self.operation_id,
+                reply_to: ctx.self_addr(),
+            },
+        ) {
+            Ok(()) => self.registered = true,
+            Err(error) => self.unavailable(ctx, error.to_string()),
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx<'_>, message: NamespaceClientIn) {
+        if let NamespaceClientIn::DirectoryReply(
+            reply @ DataDirectoryOut::QuiescentUnregistered { request_id, .. },
+        ) = message
+            && request_id == self.request_id
+        {
+            self.registered = false;
+            self.finish(ctx, reply);
+        }
+    }
+
+    fn on_actor_exit(&mut self, ctx: &Ctx<'_>, _: ActorExited) {
+        self.registered = false;
+        self.unavailable(ctx, "namespace authority stopped".to_owned());
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx<'_>) {
+        if self.registered {
+            let _ = ctx.send(
+                self.directory,
+                DataDirectoryIn::CancelQuiescentUnregister {
+                    request_id: self.request_id,
+                    path: self.path.clone(),
+                    reply_to: ctx.self_addr(),
+                },
+            );
+            self.registered = false;
+        }
+        if self.reply_to.is_some() {
+            self.unavailable(ctx, "namespace cleanup observer stopped".to_owned());
+        }
+    }
+}
+
+struct QuiescentUnregisterCancellation {
+    runtime: Runtime,
+    observer: ActorAddress,
+}
+
+impl Drop for QuiescentUnregisterCancellation {
+    fn drop(&mut self) {
+        let _ = self.runtime.stop_actor(self.observer);
+    }
+}
+
 struct DirectoryStreamCancellation {
     runtime: Runtime,
     directory: ActorAddress,
@@ -2952,6 +3791,56 @@ impl DirectoryClient {
             DataDirectoryOut::LookedUp { result, .. } => result,
             other => Err(NamespaceError::Protocol(format!(
                 "expected lookup reply, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Remove the current entry atomically once its stream closes. A
+    /// replacement revision is rejected rather than removed by an older waiter.
+    /// This local-authority operation requires the standard lifecycle extension.
+    pub async fn unregister_when_quiescent(
+        &self,
+        path: DataPath,
+        operation_id: OperationId,
+    ) -> Result<Option<NamespaceNode>, NamespaceError> {
+        if self
+            .runtime
+            .extension()
+            .is_none_or(|extension| !extension.as_any().is::<swactor::std::StdExtension>())
+        {
+            return Err(NamespaceError::DirectoryUnavailable(
+                "namespace cleanup requires lifecycle notifications".to_owned(),
+            ));
+        }
+        let inbox = self
+            .runtime
+            .new_inbox::<NamespaceClientIn>()
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        let request_id = self.request_id();
+        let observer = self
+            .runtime
+            .spawn(QuiescentUnregisterObserver {
+                runtime: self.runtime.clone(),
+                directory: self.directory,
+                path,
+                operation_id,
+                request_id,
+                reply_to: Some(*inbox.addr()),
+                registered: false,
+            })
+            .map_err(|error| NamespaceError::DirectoryUnavailable(error.to_string()))?;
+        let _cancellation = QuiescentUnregisterCancellation {
+            runtime: self.runtime.clone(),
+            observer,
+        };
+        match self.receive(&inbox).await? {
+            DataDirectoryOut::QuiescentUnregistered {
+                request_id: completed,
+                result,
+                ..
+            } if completed == request_id => result,
+            other => Err(NamespaceError::Protocol(format!(
+                "expected matching quiescent unregister reply, received {other:?}"
             ))),
         }
     }

@@ -32,7 +32,7 @@ impl DeterministicDriver {
             if replace {
                 self.coordinators.insert(
                     identity.execution_id,
-                    Coordinator::new(identity, Duration::from_millis(50)),
+                    Coordinator::new(identity, Some(Duration::from_millis(50))),
                 );
             }
         }
@@ -626,4 +626,210 @@ impl TraceResourceMut for Vec<TraceStep> {
             .find_map(|step| step.ledger.executions.get_mut(&execution_id))
             .expect("execution resource snapshot")
     }
+}
+
+#[test]
+fn event_driven_attachment_and_cancellation_require_observed_completion() {
+    let identity = identity(11);
+    let mut coordinator = Coordinator::new(identity, None);
+    for event in happy_events(identity).into_iter().take(4) {
+        coordinator.apply(event);
+    }
+    // A stale deadline observation cannot fail an execution that never armed it.
+    coordinator.apply(event(identity, EventKind::AttachmentDeadline));
+    let attached = coordinator.apply(event(identity, EventKind::AttachmentSucceeded));
+    assert!(attached.contains(&Effect::Emit(ContextualProcessOutput::ContextReady)));
+
+    coordinator.apply(event(identity, EventKind::StopRequested));
+    assert!(!coordinator.snapshot().process_terminal);
+    assert!(!coordinator.snapshot().finished);
+    coordinator.apply(event(identity, EventKind::CleanupCompleted));
+    assert!(
+        !coordinator.snapshot().finished,
+        "native exit still owns cleanup"
+    );
+
+    let exited = coordinator.apply(event(
+        identity,
+        EventKind::Process(ProcessOutput::Exited {
+            status: ExitStatus::Signal(9),
+        }),
+    ));
+    assert!(
+        exited.contains(&Effect::Emit(ContextualProcessOutput::Process(
+            ProcessOutput::Exited {
+                status: ExitStatus::Signal(9)
+            },
+        )))
+    );
+    assert!(
+        !coordinator.snapshot().finished,
+        "session close still owns cleanup"
+    );
+    coordinator.apply(event(identity, EventKind::CleanupCompleted));
+    assert!(coordinator.snapshot().finished);
+}
+
+#[test]
+fn cancellation_during_provisioning_retains_session_cleanup_until_acknowledged() {
+    let identity = identity(9);
+    let mut coordinator = Coordinator::new(identity, Some(Duration::from_secs(1)));
+    coordinator.apply(event(identity, EventKind::SpawnRequested));
+    coordinator.apply(event(identity, EventKind::StopRequested));
+    let cancelled = coordinator.apply(event(identity, EventKind::ProvisionSucceeded));
+    assert!(cancelled.iter().any(|effect| matches!(
+        effect,
+        Effect::Emit(ContextualProcessOutput::Process(
+            ProcessOutput::SpawnFailed { .. }
+        ))
+    )));
+    assert!(cancelled.contains(&Effect::ReleaseArena));
+    assert!(
+        !coordinator.snapshot().finished,
+        "close acknowledgement still owns session cleanup"
+    );
+    assert!(
+        coordinator
+            .apply(event(identity, EventKind::ProvisionSucceeded))
+            .is_empty()
+    );
+    assert!(
+        coordinator
+            .apply(event(identity, EventKind::AttachmentSucceeded))
+            .is_empty()
+    );
+    assert_eq!(
+        coordinator.apply(event(identity, EventKind::CleanupCompleted)),
+        [Effect::Finish]
+    );
+    assert!(coordinator.snapshot().finished);
+    assert!(
+        coordinator
+            .apply(event(identity, EventKind::CleanupCompleted))
+            .is_empty()
+    );
+}
+
+#[test]
+fn parent_shutdown_and_restarted_generation_fence_late_terminal_observations() {
+    use protocol_telemetry::{
+        Outcome, Phase, Protocol, TransitionEmitter, consumer::TransitionDecoder,
+    };
+    let endpoint = telemetry::TelemetryEndpoint::with_capacity(
+        telemetry::StreamId::new(
+            telemetry::NodeId::new("context-restart"),
+            telemetry::Lifetime(1),
+        ),
+        128,
+        128,
+    )
+    .with_retention(128, 64 << 10);
+    let emitter = TransitionEmitter::register(&endpoint.producer());
+    let old_owner = swactor::actor::ActorAddress::new_random();
+    let current_owner = swactor::actor::ActorAddress::new_random();
+    let old_identity = identity(10);
+    let mut coordinator = Coordinator::new(old_identity, Some(Duration::from_secs(1)));
+    coordinator.set_transitions(old_owner, Some(emitter.clone()));
+    for event in happy_events(old_identity).into_iter().take(4) {
+        coordinator.apply(event);
+    }
+    let stopped = coordinator.apply(event(old_identity, EventKind::ParentStopped));
+    assert_eq!(
+        stopped
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                Effect::Emit(ContextualProcessOutput::BootstrapFailed {
+                    reason: BootstrapFailure::StopRequested
+                })
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        stopped
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                Effect::Emit(ContextualProcessOutput::Process(
+                    ProcessOutput::Error { .. }
+                ))
+            ))
+            .count(),
+        1
+    );
+    assert!(stopped.contains(&Effect::StopNativeProcess));
+    assert!(stopped.contains(&Effect::ReleaseArena));
+    assert!(
+        coordinator
+            .apply(event(old_identity, EventKind::AttachmentSucceeded))
+            .is_empty()
+    );
+    coordinator.apply(event(old_identity, EventKind::CleanupCompleted));
+    assert!(coordinator.snapshot().finished);
+    let current = ExecutionIdentity {
+        generation: 2,
+        ..old_identity
+    };
+    let mut restarted = Coordinator::new(current, Some(Duration::from_secs(1)));
+    restarted.set_transitions(current_owner, Some(emitter));
+    restarted.apply(event(current, EventKind::SpawnRequested));
+    assert!(
+        restarted
+            .apply(event(
+                old_identity,
+                EventKind::ProvisionFailed("old failure".to_owned())
+            ))
+            .is_empty()
+    );
+    assert!(
+        restarted
+            .apply(event(old_identity, EventKind::ParentStopped))
+            .is_empty()
+    );
+    let effects = restarted.apply(event(
+        current,
+        EventKind::ProvisionFailed("current failure".to_owned()),
+    ));
+    assert!(
+        matches!(effects.as_slice(), [Effect::Emit(ContextualProcessOutput::Process(ProcessOutput::SpawnFailed { error })), Effect::Finish] if error == "current failure")
+    );
+    assert!(restarted.snapshot().finished);
+
+    endpoint.tick();
+    let retained = endpoint.subscribe_retained(
+        "context-restart-proof",
+        telemetry::SubscriptionRequest::all(),
+    );
+    let mut decoder = TransitionDecoder::from_snapshot(retained.snapshot());
+    let records: Vec<_> = retained
+        .drain_available()
+        .iter()
+        .filter_map(|event| decoder.observe(event).unwrap())
+        .map(|observed| observed.record)
+        .filter(|record| record.protocol == Protocol::ContextualProcess)
+        .collect();
+    let terminals: Vec<_> = records
+        .iter()
+        .filter(|record| record.outcome.is_some())
+        .map(|record| (record.actor, record.generation, record.next, record.outcome))
+        .collect();
+    assert_eq!(
+        terminals,
+        vec![
+            (
+                old_owner,
+                Some(old_identity.generation),
+                Phase::Closed,
+                Some(Outcome::Cancelled)
+            ),
+            (
+                current_owner,
+                Some(current.generation),
+                Phase::Closed,
+                Some(Outcome::Failed)
+            ),
+        ],
+        "retained terminal outcomes must remain generation-scoped and exactly once"
+    );
 }
